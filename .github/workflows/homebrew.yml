@@ -1,0 +1,38 @@
+name: Homebrew formula
+
+# The repository doubles as its own Homebrew tap (Formula/copperline.rb).
+# Its url/sha256 are hand-edited at each release (see RELEASE.md), which is
+# the error-prone step this workflow guards: a stale checksum, an
+# unreachable tarball, or deprecated formula syntax all fail the audit.
+# Scoped to formula changes so it does not run on unrelated commits.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Formula/**"
+      - ".github/workflows/homebrew.yml"
+  pull_request:
+    paths:
+      - "Formula/**"
+      - ".github/workflows/homebrew.yml"
+
+concurrency:
+  group: homebrew-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Style and audit
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Homebrew/actions/setup-homebrew@master
+      - name: Style
+        run: brew style "$GITHUB_WORKSPACE/Formula/copperline.rb"
+      - name: Audit
+        # Tap the checked-out commit by name, then audit it. --online checks
+        # that the release tarball is reachable and its sha256 matches; this
+        # is the part `brew style` alone cannot catch.
+        run: |
+          brew tap LinuxJedi/copperline "$GITHUB_WORKSPACE"
+          brew audit --strict --online LinuxJedi/copperline/copperline
