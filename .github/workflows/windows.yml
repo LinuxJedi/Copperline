@@ -1,0 +1,86 @@
+name: Windows
+
+# Builds the portable Windows zip and uploads it as a workflow artifact on
+# every qualifying change, and attaches it to the GitHub Release when a v* tag
+# is pushed. Building the zip also doubles as the Windows build check: there is
+# no other Windows coverage (the main CI runs on macOS), so the code-path
+# triggers below run the full release build on pull requests too.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "src/**"
+      - "vendor/**"
+      - "assets/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".cargo/**"
+      - "packaging/windows/**"
+      - ".github/workflows/windows.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "vendor/**"
+      - "assets/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".cargo/**"
+      - "packaging/windows/**"
+      - ".github/workflows/windows.yml"
+  # Manual rebuild. Use this to attach a zip to a release whose tag predates
+  # this workflow (the v* tag tree has no windows.yml, so a tag push cannot
+  # trigger it): run it against a branch that has the source parity you want
+  # (for v0.2.0, main is identical to the tag bar the Homebrew bump) and set
+  # release_tag to push the built zip onto that existing release.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the zip to (e.g. v0.2.0). Leave blank to only upload a workflow artifact."
+        required: false
+        default: ""
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows zip
+    runs-on: windows-latest
+    # Needed only by the release-attach step on v* tags.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release zip
+        shell: pwsh
+        run: packaging/windows/build-zip.ps1
+      - name: Locate artifact
+        id: artifact
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem Copperline-*-win-x64.zip | Select-Object -First 1
+          "path=$($zip.Name)" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: copperline-windows
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.artifact.outputs.path }}
+      - name: Attach to existing release (manual run)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        # --clobber so a re-run replaces the asset instead of failing on a
+        # name clash.
+        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.artifact.outputs.path }}" --clobber

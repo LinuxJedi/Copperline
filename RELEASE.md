@@ -96,6 +96,23 @@ build one by hand on a Linux host:
 ./packaging/appimage/build-appimage.sh
 ```
 
+## Windows
+
+Windows distribution is a portable zip (`packaging/windows/`). The `Windows`
+workflow builds it on `windows-latest` and, on a `v*` tag, attaches
+`Copperline-X.Y.Z-win-x64.zip` to the GitHub Release automatically. The same
+workflow runs the full release build on pull requests that touch the code, so
+it doubles as the Windows build check (the main CI runs on macOS only).
+
+The zip is self-contained: the MSVC C runtime is linked statically (see
+`.cargo/config.toml`) so it needs no Visual C++ Redistributable, and the
+bundled AROS ROM sits in a sibling `aros\` folder that `romsearch.rs` probes
+first. To build one by hand on a Windows host:
+
+```pwsh
+packaging/windows/build-zip.ps1
+```
+
 ## Crate packaging
 
 `cargo package --no-verify --offline` can be used to inspect the source
