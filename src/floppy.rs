@@ -595,7 +595,25 @@ impl FloppyController {
         status | self.last_dskbytr_byte as u16
     }
 
+    /// True when advancing time changes nothing observable: no transfer is
+    /// scheduled, no index timing is in flight, no drive is selected, and
+    /// every drive is fully spun down and settled. In that state `tick`
+    /// only accumulates each drive's diagnostic `elapsed_cck` (read solely
+    /// behind `COPPERLINE_DIAG_DISK` at DMA start), so it can be skipped
+    /// entirely. Spans most of the time an Amiga spends not using the disk.
+    fn is_idle(&self) -> bool {
+        self.dma.is_none()
+            && self.direct_write.is_none()
+            && self.index_pulse_cck == 0
+            && self.index_flag_sync_cck == 0
+            && self.selected_drive().is_none()
+            && self.drives.iter().all(FloppyDrive::is_settled)
+    }
+
     pub fn tick(&mut self, cck: u32, dmacon: u16, chip_ram: &mut [u8]) -> bool {
+        if self.is_idle() {
+            return false;
+        }
         self.tick_index_pulse(cck);
         let active_dma = self
             .dma
@@ -1389,6 +1407,16 @@ impl FloppyDrive {
             debug!("floppy step: cylinder={}", self.cylinder);
         }
         self.last_step_inward = Some(inward);
+    }
+
+    /// True when the platter is stopped and no settle/seek countdown is
+    /// pending, so `tick_motor` would only advance the diagnostic
+    /// `elapsed_cck`. Used by the controller's idle fast-path.
+    fn is_settled(&self) -> bool {
+        !self.motor_on
+            && self.motor_cck == 0
+            && self.seek_settle_cck == 0
+            && self.status_settle_cck == 0
     }
 
     fn tick_motor(&mut self, cck: u32) {

@@ -43,7 +43,8 @@ const STATE_MAGIC: &[u8; 8] = b"CLSSTATE";
 //   1: initial format
 //   2: keyboard MCU model replaced the Bus kbd_queue byte path
 //   3: keyboard MCU clock-based handshake timing (state shape change)
-pub const STATE_VERSION: u32 = 3;
+//   4: PollStats.custom HashMap replaced by a flat Vec table
+pub const STATE_VERSION: u32 = 4;
 
 /// Default state file name, timestamped like the screenshot/recorder names.
 pub fn auto_filename() -> std::path::PathBuf {

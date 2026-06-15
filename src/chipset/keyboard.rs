@@ -607,6 +607,18 @@ impl KeyboardMcu {
         Some(cck.min(u32::MAX as u64) as u32)
     }
 
+    /// True when the MCU has nothing in flight: it is sitting in `Idle`
+    /// with an empty key buffer and no handshake pulse being timed. While
+    /// this holds, `tick` only advances `now_cck`, which no one reads until
+    /// the next byte or handshake (both of which run with ticking active),
+    /// so the whole tick can be skipped. This is the steady state whenever
+    /// the user is not pressing keys.
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, McuState::Idle)
+            && self.buffer.is_empty()
+            && self.kdat_low_since.is_none()
+    }
+
     /// Advance the MCU by `cck` colour clocks, driving CIA-A's CNT/SP
     /// pins. Returns true if a shifted bit asserted the CIA's IRQ line.
     pub fn tick(&mut self, cck: u32, cia_a: &mut Cia) -> bool {

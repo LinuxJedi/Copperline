@@ -311,14 +311,6 @@ impl ControlState {
         (border && self.border_blank_enabled()) || color_key || bitplane_key
     }
 
-    fn border_contains_pixel(&self, line: usize, x: usize, visible_line0: i32) -> bool {
-        if !self.display_window_contains_line(line, visible_line0) {
-            return true;
-        }
-        let (x_start, x_stop) = self.display_window_x();
-        x < x_start || x >= x_stop
-    }
-
     fn sprite_pixel_repeat(&self) -> i32 {
         match self.bplcon3 & BPLCON3_SPRES_MASK {
             0 => {
@@ -4910,6 +4902,21 @@ fn fill_background(
     );
 }
 
+/// The background colour for one pixel given the latched control/palette
+/// state and whether the pixel is in the border. `sample` is always `None`
+/// for a background pixel, so the result depends only on these three
+/// inputs -- which is what lets [`fill_background_with_visible_line0`] fill
+/// constant runs instead of recomputing per pixel.
+fn background_pixel(control: &ControlState, color0: u16, border: bool) -> u32 {
+    let color_latch = if control.border_blank_enabled() && border {
+        0
+    } else {
+        color0
+    };
+    let transparent = control.genlock_transparent(color_latch, None, border);
+    rgb12_to_rgba8_alpha(color_rgb12(color_latch), !transparent)
+}
+
 fn fill_background_with_visible_line0(
     fb: &mut [u32],
     base_palettes: &[Palette],
@@ -4920,29 +4927,60 @@ fn fill_background_with_visible_line0(
 ) {
     for y in 0..base_palettes.len() {
         let row = &mut fb[y * FB_WIDTH..(y + 1) * FB_WIDTH];
+        let pal_segs = &palette_segments[y];
+        let ctl_segs = &control_segments[y];
         let mut palette = base_palettes[y];
         let mut control = base_controls[y];
         let mut palette_idx = 0usize;
         let mut control_idx = 0usize;
-        for (x, pixel) in row.iter_mut().enumerate() {
-            while palette_idx < palette_segments[y].len() && palette_segments[y][palette_idx].x <= x
-            {
-                palette_segments[y][palette_idx].apply(&mut palette);
+        // Walk runs over which `palette[0]` and `control` are constant. Each
+        // run is then split by the border-zone boundary (the display
+        // window edges), which is also fixed while `control` is. Within
+        // each resulting sub-run every pixel is identical, so it is filled
+        // in one go. A plain row collapses to left-border/active/right-
+        // border, three fills instead of FB_WIDTH per-pixel computations.
+        let mut x = 0usize;
+        while x < FB_WIDTH {
+            while palette_idx < pal_segs.len() && pal_segs[palette_idx].x <= x {
+                pal_segs[palette_idx].apply(&mut palette);
                 palette_idx += 1;
             }
-            while control_idx < control_segments[y].len() && control_segments[y][control_idx].x <= x
-            {
-                control = control_segments[y][control_idx].control;
+            while control_idx < ctl_segs.len() && ctl_segs[control_idx].x <= x {
+                control = ctl_segs[control_idx].control;
                 control_idx += 1;
             }
-            let border = control.border_contains_pixel(y, x, visible_line0);
-            let color_latch = if control.border_blank_enabled() && border {
-                0
-            } else {
-                palette[0]
-            };
-            let transparent = control.genlock_transparent(color_latch, None, border);
-            *pixel = rgb12_to_rgba8_alpha(color_rgb12(color_latch), !transparent);
+            let next_pal = pal_segs
+                .get(palette_idx)
+                .map_or(FB_WIDTH, |seg| seg.x.min(FB_WIDTH));
+            let next_ctl = ctl_segs
+                .get(control_idx)
+                .map_or(FB_WIDTH, |seg| seg.x.min(FB_WIDTH));
+            let run_end = next_pal.min(next_ctl).max(x + 1);
+            let color0 = palette[0];
+
+            if !control.display_window_contains_line(y, visible_line0) {
+                // Whole run is border: a single fill.
+                row[x..run_end].fill(background_pixel(&control, color0, true));
+                x = run_end;
+                continue;
+            }
+            // In the vertical window: border holds outside [x_start, x_stop).
+            let (x_start, x_stop) = control.display_window_x();
+            let mut sx = x;
+            while sx < run_end {
+                let border = sx < x_start || sx >= x_stop;
+                let flip = if sx < x_start {
+                    x_start
+                } else if sx < x_stop {
+                    x_stop
+                } else {
+                    FB_WIDTH
+                };
+                let sub_end = flip.min(run_end).max(sx + 1);
+                row[sx..sub_end].fill(background_pixel(&control, color0, border));
+                sx = sub_end;
+            }
+            x = run_end;
         }
     }
 }

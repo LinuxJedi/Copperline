@@ -1222,11 +1222,26 @@ fn digital_joydat(up: bool, down: bool, left: bool, right: bool) -> u16 {
 
 /// Counts reads of each MMIO register so we can see what DiagROM is
 /// busy-polling. Dumped on Bus::drop via the `poll-stats` log target.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PollStats {
     pub cia_a: [u64; 16],
     pub cia_b: [u64; 16],
-    pub custom: std::collections::HashMap<u16, u64>,
+    /// Read counts per custom register, indexed by `offset >> 1` (registers
+    /// are word-aligned, offsets $000..=$FFE). A flat table rather than a
+    /// `HashMap`: `tick_read_custom` is hit on every $DFF000 register read,
+    /// which Kickstart busy-polls hard, so the default-SipHash probe showed
+    /// up on the hot path.
+    pub custom: Vec<u64>,
+}
+
+impl Default for PollStats {
+    fn default() -> Self {
+        Self {
+            cia_a: [0; 16],
+            cia_b: [0; 16],
+            custom: vec![0; 0x800],
+        }
+    }
 }
 
 impl PollStats {
@@ -1238,7 +1253,9 @@ impl PollStats {
         }
     }
     pub fn tick_read_custom(&mut self, off: u16) {
-        *self.custom.entry(off).or_default() += 1;
+        if let Some(count) = self.custom.get_mut((off >> 1) as usize) {
+            *count += 1;
+        }
     }
     pub fn dump_top(&self, label: &str) {
         log::info!("== poll stats ({}) ==", label);
@@ -1252,8 +1269,14 @@ impl PollStats {
                 log::info!("  cia_b reg ${:X}: {}", i, n);
             }
         }
-        let mut customs: Vec<_> = self.custom.iter().collect();
-        customs.sort_by(|a, b| b.1.cmp(a.1));
+        let mut customs: Vec<(u16, u64)> = self
+            .custom
+            .iter()
+            .enumerate()
+            .filter(|(_, &n)| n > 0)
+            .map(|(idx, &n)| ((idx as u16) << 1, n))
+            .collect();
+        customs.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
         for (off, n) in customs.iter().take(20) {
             log::info!("  custom ${:03X}: {}", off, n);
         }
@@ -2566,7 +2589,7 @@ impl Bus {
             }
         }
 
-        if self.keyboard.tick(cck, &mut self.cia_a) {
+        if !self.keyboard.is_idle() && self.keyboard.tick(cck, &mut self.cia_a) {
             self.paula.intreq |= INT_PORTS;
         }
         if self.keyboard.take_system_reset_request() {
