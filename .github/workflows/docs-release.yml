@@ -1,0 +1,74 @@
+name: Docs release PDF
+
+# Builds the PDF manual and attaches it to the GitHub Release when a v* tag is
+# pushed. The PDF is already built on every push/PR by the docs job in ci.yml,
+# which is the build check; this workflow only handles release attachment, so
+# it does not run on ordinary pushes or PRs. A workflow_dispatch trigger allows
+# manual rebuilds and back-filling the PDF onto a release whose tag predates
+# this workflow.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the PDF to (e.g. v0.2.0). Leave blank to only upload a workflow artifact."
+        required: false
+        default: ""
+
+concurrency:
+  group: docs-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pdf:
+    name: Build and attach PDF
+    # macos-latest matches the docs job in ci.yml: MyST shells out to Typst,
+    # installed here via brew, exactly as documented in docs/README.md.
+    runs-on: macos-latest
+    # Needed only by the release-attach steps.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install MyST CLI
+        run: npm install -g mystmd
+      - name: Install Typst (PDF renderer)
+        run: brew install typst
+      - name: Build PDF
+        working-directory: docs
+        # The PDF export merges every chapter into one document; --strict fails
+        # on cross-reference/label errors. Assert the artifact is non-empty so
+        # the job fails even if the CLI returns success on a partial render.
+        run: |
+          myst build --pdf --ci --strict
+          test -s _build/exports/copperline.pdf
+      - name: Name the asset
+        id: asset
+        # Version-stamp the file so the release asset is self-describing,
+        # mirroring the AppImage/Windows naming convention.
+        run: |
+          ver="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          out="Copperline-$ver-manual.pdf"
+          cp docs/_build/exports/copperline.pdf "$out"
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: copperline-docs-pdf
+          path: ${{ steps.asset.outputs.path }}
+          if-no-files-found: error
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.asset.outputs.path }}
+      - name: Attach to existing release (manual run)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # --clobber so a re-run replaces the asset instead of failing on a
+        # name clash.
+        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.asset.outputs.path }}" --clobber
