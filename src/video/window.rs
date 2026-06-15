@@ -4005,13 +4005,14 @@ impl App {
 
     /// Pick a Kickstart ROM (and an optional extended ROM) and fit it,
     /// cold-resetting the machine as if the chip had been swapped and the
-    /// power cycled (menu "Load Kickstart ROM..."). The main ROM must be
-    /// 512 KiB; an extended ROM is 512 KiB ($E00000) or 256 KiB ($F00000).
+    /// power cycled (menu "Load Kickstart ROM..."). The main ROM is 512 KiB,
+    /// or 256 KiB for a Kickstart 1.x part (mirrored up to the full window);
+    /// an extended ROM is 512 KiB ($E00000) or 256 KiB ($F00000).
     /// On any error the running machine keeps its current ROM.
     fn load_rom_from_dialog(&mut self) {
         self.suspend_live_audio_for_host_io();
         let picked = rfd::FileDialog::new()
-            .set_title("Load Kickstart ROM (512 KiB)")
+            .set_title("Load Kickstart ROM (512 or 256 KiB)")
             .add_filter("Amiga ROM images", &["rom", "bin"])
             .pick_file();
         if let Some(main_path) = picked {

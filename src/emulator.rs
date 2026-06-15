@@ -408,14 +408,9 @@ impl Emulator {
     /// running machine keeps its current ROMs. `extended` of `None` removes
     /// any fitted extended ROM.
     pub fn reload_rom(&mut self, rom: Vec<u8>, extended: Option<Vec<u8>>) -> Result<()> {
-        use crate::memory::ROM_SIZE;
-        if rom.len() != ROM_SIZE {
-            anyhow::bail!(
-                "ROM size is {} bytes, expected {} (512 KiB)",
-                rom.len(),
-                ROM_SIZE
-            );
-        }
+        // Accept a 256 KiB Kickstart 1.x part by mirroring it up to the full
+        // 512 KiB ROM window, matching how it decodes on real hardware.
+        let rom = crate::memory::normalize_boot_rom(rom)?;
         // Validate the extended-ROM size up front so a bad image cannot
         // leave the main ROM swapped but the extended ROM half-applied.
         if let Some(image) = &extended {
