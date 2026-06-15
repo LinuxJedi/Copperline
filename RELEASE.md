@@ -48,6 +48,12 @@ myst build --pdf --ci --strict
 test -s _build/exports/copperline.pdf
 ```
 
+On a `v*` tag the `Docs release PDF` workflow rebuilds the PDF and attaches
+`Copperline-X.Y.Z-manual.pdf` to the GitHub Release automatically (the
+everyday PDF build check stays in the `docs` job in ci.yml). To back-fill a
+release whose tag predates the workflow, run it from the Actions tab against
+`main` with `release_tag` set to that tag.
+
 ## Homebrew formula
 
 This repository is its own Homebrew tap (`Formula/copperline.rb`). After
