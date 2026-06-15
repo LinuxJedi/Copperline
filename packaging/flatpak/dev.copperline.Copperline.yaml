@@ -88,14 +88,23 @@ modules:
       - install -Dm644 LICENSE
         ${FLATPAK_DEST}/share/licenses/dev.copperline.Copperline/LICENSE
     sources:
-      # For Flathub the source is the tagged release; switch this to
-      #   - type: dir
-      #     path: ../..
-      # for fast local iteration against the working tree.
-      - type: git
-        url: https://github.com/LinuxJedi/Copperline.git
-        tag: v0.1.0
-        commit: 5c91918761c48431cca100d803d16f07fbdda904
+      # Build the checked-out source tree. This is what CI
+      # (.github/workflows/flatpak.yml) validates, and it includes both the
+      # bundled AROS ROM (assets/aros/) and these packaging files.
+      #
+      # For the Flathub submission, replace this with the tagged release so
+      # builds are reproducible from a fixed point:
+      #   - type: git
+      #     url: https://github.com/LinuxJedi/Copperline.git
+      #     tag: vX.Y.Z
+      #     commit: <sha>
+      # NOTE: the tag must be one that already contains assets/aros/ (the AROS
+      # ROM was added after v0.1.0), or the install steps below fail.
+      #
+      # Locally, build from a clean checkout: a dir source copies the whole
+      # tree, including any large uncommitted ROM/disk images in the repo root.
+      - type: dir
+        path: ../..
       # Vendored crate archives + cargo config pointing at the offline
       # registry. Regenerate with packaging/flatpak/generate-cargo-sources.sh
       # whenever Cargo.lock changes.

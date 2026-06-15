@@ -38,13 +38,10 @@ flatpak run org.flatpak.Builder --force-clean --user --install \
 flatpak run dev.copperline.Copperline
 ```
 
-For fast iteration against the working tree, temporarily replace the `git`
-source in the manifest with:
-
-```yaml
-      - type: dir
-        path: ../..
-```
+The manifest's source is `type: dir path: ../..`, so it builds the checked-out
+tree (this is also what CI validates). Build from a clean checkout: a `dir`
+source copies the whole tree, including any large uncommitted ROM/disk images
+sitting in the repo root.
 
 ## Lint before submitting
 
@@ -57,8 +54,11 @@ appstreamcli validate packaging/flatpak/dev.copperline.Copperline.metainfo.xml
 
 ## Submitting to Flathub
 
-1. Make sure the manifest builds and lints clean, and the `git` source points
-   at the tagged release (`tag:` and `commit:`) you want published.
+1. Make sure the manifest builds and lints clean, then switch the `type: dir`
+   source to a `type: git` source pointing at the tagged release (`tag:` and
+   `commit:`) you want published. The tag must already contain `assets/aros/`
+   (the AROS ROM was added after `v0.1.0`), or the build's asset-install steps
+   fail.
 2. Fork <https://github.com/flathub/flathub>, branch off `new-pr`.
 3. Add the manifest, metainfo, desktop file and `cargo-sources.json`.
 4. Open a PR titled `Add dev.copperline.Copperline`.
