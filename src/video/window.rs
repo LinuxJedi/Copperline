@@ -1093,6 +1093,7 @@ impl ApplicationHandler for App {
             if let Err(e) = self.emu.step_frame() {
                 error!("emulator step halted: {e:?}");
                 self.cpu_halted = true;
+                self.sync_live_audio_suspension();
             }
             // A breakpoint/watchpoint hit pauses the machine and brings
             // the debugger window up with the reason.
@@ -3895,6 +3896,7 @@ impl App {
             self.set_mouse_captured(false);
             self.paused_before_debugger = self.paused;
             self.paused = true;
+            self.sync_live_audio_suspension();
             let mut panel = ui::DebuggerPanel::new();
             // Start the memory view at the current program counter's
             // neighbourhood; it is usually what you came to look at.
@@ -3909,6 +3911,7 @@ impl App {
         if matches!(self.ui.panel, Some(Panel::Debugger(_))) {
             self.paused = self.paused_before_debugger;
             self.last_debug_stop = None;
+            self.sync_live_audio_suspension();
         }
         self.ui.panel = None;
         self.request_redraw();
@@ -3950,6 +3953,7 @@ impl App {
     /// flash the filename on screen. Runs between frames by construction
     /// (the event loop only dispatches input/menu events outside step_frame).
     fn save_state_interactive(&mut self) {
+        self.suspend_live_audio_for_host_io();
         let path = crate::savestate::auto_filename();
         match self.emu.save_state(&path) {
             Ok(()) => {
@@ -3961,6 +3965,7 @@ impl App {
                 self.show_osd("State save failed (see log)");
             }
         }
+        self.finish_host_io_pause();
     }
 
     /// Pick a save-state file and restore it (shortcut / menu). On
@@ -3968,6 +3973,7 @@ impl App {
     /// forced on, any CPU halt is cleared, and the display re-renders from
     /// the restored Bus. On failure the running machine is untouched.
     fn load_state_from_dialog(&mut self) {
+        self.suspend_live_audio_for_host_io();
         let picked = rfd::FileDialog::new()
             .set_title("Load save state")
             .add_filter("Copperline save states", &["clstate"])
@@ -3994,7 +4000,7 @@ impl App {
                 }
             }
         }
-        self.emu.reanchor_realtime_clock();
+        self.finish_host_io_pause();
     }
 
     /// Pick a Kickstart ROM (and an optional extended ROM) and fit it,
@@ -4003,51 +4009,48 @@ impl App {
     /// 512 KiB; an extended ROM is 512 KiB ($E00000) or 256 KiB ($F00000).
     /// On any error the running machine keeps its current ROM.
     fn load_rom_from_dialog(&mut self) {
+        self.suspend_live_audio_for_host_io();
         let picked = rfd::FileDialog::new()
             .set_title("Load Kickstart ROM (512 KiB)")
             .add_filter("Amiga ROM images", &["rom", "bin"])
             .pick_file();
-        let Some(main_path) = picked else {
-            // Re-baseline pacing after the modal dialog even when cancelled.
-            self.emu.reanchor_realtime_clock();
-            return;
-        };
-        // Offer an optional extended ROM (AROS/CDTV/CD32). Cancelling skips it
-        // and removes any extended ROM currently fitted.
-        let ext_path = rfd::FileDialog::new()
-            .set_title("Load extended ROM (optional; Cancel to skip)")
-            .add_filter("Amiga ROM images", &["rom", "bin"])
-            .pick_file();
+        if let Some(main_path) = picked {
+            // Offer an optional extended ROM (AROS/CDTV/CD32). Cancelling skips it
+            // and removes any extended ROM currently fitted.
+            let ext_path = rfd::FileDialog::new()
+                .set_title("Load extended ROM (optional; Cancel to skip)")
+                .add_filter("Amiga ROM images", &["rom", "bin"])
+                .pick_file();
 
-        let result = (|| -> anyhow::Result<()> {
-            let rom = std::fs::read(&main_path)
-                .map_err(|e| anyhow::anyhow!("reading ROM {}: {e}", main_path.display()))?;
-            let ext =
-                match &ext_path {
+            let result = (|| -> anyhow::Result<()> {
+                let rom = std::fs::read(&main_path)
+                    .map_err(|e| anyhow::anyhow!("reading ROM {}: {e}", main_path.display()))?;
+                let ext = match &ext_path {
                     Some(p) => Some(std::fs::read(p).map_err(|e| {
                         anyhow::anyhow!("reading extended ROM {}: {e}", p.display())
                     })?),
                     None => None,
                 };
-            self.emu.reload_rom(rom, ext)
-        })();
+                self.emu.reload_rom(rom, ext)
+            })();
 
-        match result {
-            Ok(()) => {
-                info!("boot ROM loaded: {}", main_path.display());
-                self.powered_on = true;
-                self.cpu_halted = false;
-                // The cold reset restarts the frame timeline; force a repaint.
-                self.last_rendered_emulated_frame = None;
-                self.show_osd(format!("ROM: {}", display_file_name(&main_path)));
-                self.request_redraw();
-            }
-            Err(e) => {
-                warn!("ROM load failed ({}): {e:#}", main_path.display());
-                self.show_osd("ROM load failed (see log)");
+            match result {
+                Ok(()) => {
+                    info!("boot ROM loaded: {}", main_path.display());
+                    self.powered_on = true;
+                    self.cpu_halted = false;
+                    // The cold reset restarts the frame timeline; force a repaint.
+                    self.last_rendered_emulated_frame = None;
+                    self.show_osd(format!("ROM: {}", display_file_name(&main_path)));
+                    self.request_redraw();
+                }
+                Err(e) => {
+                    warn!("ROM load failed ({}): {e:#}", main_path.display());
+                    self.show_osd("ROM load failed (see log)");
+                }
             }
         }
-        self.emu.reanchor_realtime_clock();
+        self.finish_host_io_pause();
     }
 
     /// Start or stop the video+audio capture (shortcut / menu item).
@@ -4145,15 +4148,18 @@ impl App {
         // Run/Pause inside the debugger is an explicit choice; closing the
         // window must not revert it.
         self.paused_before_debugger = self.paused;
+        self.sync_live_audio_suspension();
     }
 
     /// Execute a single instruction while paused in the debugger.
     fn debugger_step(&mut self) {
         self.paused = true;
+        self.sync_live_audio_suspension();
         self.last_debug_stop = None;
         if let Err(e) = self.emu.debug_step_instructions(1) {
             error!("debugger step halted: {e:?}");
             self.cpu_halted = true;
+            self.sync_live_audio_suspension();
         }
         self.surface_debug_stop();
     }
@@ -4164,12 +4170,14 @@ impl App {
     /// frame counter advances (bounded for safety).
     fn debugger_step_frame(&mut self) {
         self.paused = true;
+        self.sync_live_audio_suspension();
         self.last_debug_stop = None;
         let target = self.emu.bus().emulated_frames() + 1;
         for _ in 0..8 {
             if let Err(e) = self.emu.step_frame() {
                 error!("debugger frame step halted: {e:?}");
                 self.cpu_halted = true;
+                self.sync_live_audio_suspension();
                 break;
             }
             if self.surface_debug_stop() {
@@ -4194,6 +4202,7 @@ impl App {
             return;
         };
         self.paused = true;
+        self.sync_live_audio_suspension();
         self.last_debug_stop = None;
         match self.emu.debug_run_to_pc(addr, RUN_TO_BUDGET) {
             Ok(true) => {}
@@ -4207,6 +4216,7 @@ impl App {
             Err(e) => {
                 error!("debugger run-to halted: {e:?}");
                 self.cpu_halted = true;
+                self.sync_live_audio_suspension();
             }
         }
         self.render_emulated_frame_if_needed();
@@ -4223,6 +4233,7 @@ impl App {
         info!("debugger stop: {message}");
         self.paused = true;
         self.paused_before_debugger = true;
+        self.sync_live_audio_suspension();
         self.open_debugger();
         self.last_debug_stop = Some(message.clone());
         self.show_osd(message);
@@ -4550,6 +4561,7 @@ impl App {
     /// the drive's swap playlist; the first image is inserted right away
     /// and the rest are queued for the swap button / shortcut.
     fn load_drive_disks_from_dialog(&mut self, drive_idx: usize) {
+        self.suspend_live_audio_for_host_io();
         let picked = rfd::FileDialog::new()
             .set_title(format!("Load DF{drive_idx} disk image(s)"))
             .add_filter("Amiga disk images", &["adf", "adz", "dms", "scp", "gz"])
@@ -4577,7 +4589,7 @@ impl App {
                 self.show_osd(format!("DF{drive_idx}: load failed (see log)"));
             }
         }
-        self.emu.reanchor_realtime_clock();
+        self.finish_host_io_pause();
     }
 
     /// Advance the disk-swap playlist of the first drive that has more
@@ -4631,6 +4643,7 @@ impl App {
     /// Pick a CD image and mount it with the media-change notification,
     /// ejecting any current disc first.
     fn load_cd_from_dialog(&mut self) {
+        self.suspend_live_audio_for_host_io();
         let picked = rfd::FileDialog::new()
             .set_title("Load CD image (cue sheet)")
             .add_filter("CD cue sheets", &["cue"])
@@ -4651,7 +4664,7 @@ impl App {
                 }
             }
         }
-        self.emu.reanchor_realtime_clock();
+        self.finish_host_io_pause();
     }
 
     fn eject_cd(&mut self) {
@@ -4670,12 +4683,12 @@ impl App {
         path: PathBuf,
         write_protected: bool,
     ) -> bool {
-        match self
-            .emu
-            .bus_mut()
-            .floppy
-            .insert_disk_image(drive_idx, path.clone(), write_protected)
-        {
+        self.suspend_live_audio_for_host_io();
+        let result = match self.emu.bus_mut().floppy.insert_disk_image(
+            drive_idx,
+            path.clone(),
+            write_protected,
+        ) {
             Ok(()) => {
                 self.last_fdd_track = None;
                 info!("floppy.df{} inserted {}", drive_idx, path.display());
@@ -4693,7 +4706,23 @@ impl App {
                 );
                 false
             }
-        }
+        };
+        self.finish_host_io_pause();
+        result
+    }
+
+    fn suspend_live_audio_for_host_io(&mut self) {
+        self.emu.set_live_audio_suspended(true);
+    }
+
+    fn finish_host_io_pause(&mut self) {
+        self.emu.reanchor_realtime_clock();
+        self.sync_live_audio_suspension();
+    }
+
+    fn sync_live_audio_suspension(&mut self) {
+        let suspended = !self.powered_on || self.cpu_halted || self.paused;
+        self.emu.set_live_audio_suspended(suspended);
     }
 
     fn request_redraw(&self) {
@@ -4890,6 +4919,7 @@ impl App {
             self.power_off();
         } else {
             self.powered_on = true;
+            self.sync_live_audio_suspension();
             info!("power button: machine powered on (cold boot)");
         }
         self.request_redraw();
@@ -4900,6 +4930,7 @@ impl App {
     /// held and emulation resumes from the same point when unpaused.
     fn toggle_pause(&mut self) {
         self.paused = !self.paused;
+        self.sync_live_audio_suspension();
         if self.paused {
             info!("pause button: emulation paused");
         } else {
@@ -4913,12 +4944,15 @@ impl App {
     fn power_off(&mut self) {
         self.powered_on = false;
         self.paused = false;
+        self.sync_live_audio_suspension();
         info!("power button: machine powered off (cold boot state)");
         if let Err(e) = self.emu.power_on_reset() {
             error!("cold power-on reset failed: {e:#}");
             self.cpu_halted = true;
+            self.sync_live_audio_suspension();
         } else {
             self.cpu_halted = false;
+            self.sync_live_audio_suspension();
         }
         self.held_rawkeys = [false; 128];
         self.last_rendered_emulated_frame = None;
@@ -4932,8 +4966,10 @@ impl App {
         if let Err(e) = self.emu.keyboard_reset() {
             error!("keyboard reset failed: {e:#}");
             self.cpu_halted = true;
+            self.sync_live_audio_suspension();
         } else {
             self.cpu_halted = false;
+            self.sync_live_audio_suspension();
             self.last_rendered_emulated_frame = None;
             self.last_fdd_track = None;
             if clear_host_keys {
@@ -5432,8 +5468,11 @@ mod tests {
         STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
         TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
     };
+    use crate::audio::{AudioSink, NullSink};
     use crate::bus::FrontPanelStatus;
     use crate::video::{FB_HEIGHT, FB_PIXELS, FB_WIDTH};
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use winit::keyboard::{KeyCode, ModifiersState};
 
     /// A typical session: DF0 connected with a disk in, no CD drive.
@@ -6410,7 +6449,10 @@ mod tests {
     /// debugger window's actions and view builders run against the real
     /// emulator without a host window.
     fn test_app() -> super::App {
-        use crate::audio::NullSink;
+        test_app_with_audio(Box::new(NullSink))
+    }
+
+    fn test_app_with_audio(audio: Box<dyn AudioSink>) -> super::App {
         use crate::chipset::paula::Paula;
         use crate::config::{CpuModel, PacingBudget, SpeedMode};
         use crate::emulator::Emulator;
@@ -6437,7 +6479,7 @@ mod tests {
         };
         let bus = crate::bus::Bus::new(
             mem,
-            Paula::new(Box::new(StdoutSink::new()), Box::new(NullSink)),
+            Paula::new(Box::new(StdoutSink::new()), audio),
             FloppyController::default(),
         );
         let emu = Emulator::new(
@@ -6469,6 +6511,60 @@ mod tests {
             0.0,
             vec!["Machine: test".to_string()],
         )
+    }
+
+    struct SuspensionSink {
+        states: Rc<RefCell<Vec<bool>>>,
+    }
+
+    impl AudioSink for SuspensionSink {
+        fn push(&mut self, _left: f32, _right: f32) {}
+
+        fn flush(&mut self) {}
+
+        fn set_live_output_suspended(&mut self, suspended: bool) {
+            self.states.borrow_mut().push(suspended);
+        }
+    }
+
+    #[test]
+    fn host_pause_states_suspend_live_audio_output() {
+        let states = Rc::new(RefCell::new(Vec::new()));
+        let mut app = test_app_with_audio(Box::new(SuspensionSink {
+            states: Rc::clone(&states),
+        }));
+
+        app.toggle_pause();
+        assert_eq!(states.borrow().last(), Some(&true));
+        app.toggle_pause();
+        assert_eq!(states.borrow().last(), Some(&false));
+
+        app.power_off();
+        assert_eq!(states.borrow().last(), Some(&true));
+        app.toggle_power();
+        assert_eq!(states.borrow().last(), Some(&false));
+
+        app.open_debugger();
+        assert_eq!(states.borrow().last(), Some(&true));
+        app.debugger_toggle_run();
+        assert_eq!(states.borrow().last(), Some(&false));
+    }
+
+    #[test]
+    fn host_io_audio_suspension_restores_current_run_state() {
+        let states = Rc::new(RefCell::new(Vec::new()));
+        let mut app = test_app_with_audio(Box::new(SuspensionSink {
+            states: Rc::clone(&states),
+        }));
+
+        app.suspend_live_audio_for_host_io();
+        app.finish_host_io_pause();
+        assert_eq!(states.borrow().as_slice(), &[true, false]);
+
+        app.toggle_pause();
+        app.suspend_live_audio_for_host_io();
+        app.finish_host_io_pause();
+        assert_eq!(states.borrow().last(), Some(&true));
     }
 
     /// End-to-end recording through the app: start, run emulated frames

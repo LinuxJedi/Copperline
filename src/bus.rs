@@ -1805,6 +1805,10 @@ impl Bus {
         self.paula.live_audio_status()
     }
 
+    pub fn set_live_audio_suspended(&mut self, suspended: bool) {
+        self.paula.set_live_audio_suspended(suspended);
+    }
+
     pub fn output_volume_percent(&self) -> u8 {
         self.paula.output_volume_percent()
     }

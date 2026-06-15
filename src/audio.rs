@@ -55,6 +55,9 @@ pub trait AudioSink {
     /// expected to be in roughly [-1.0, 1.0] though we don't clip.
     fn push(&mut self, left: f32, right: f32);
     fn flush(&mut self);
+    /// Suspend only the host live-output stream while emulation is
+    /// intentionally not producing samples. Offline sinks can ignore this.
+    fn set_live_output_suspended(&mut self, _suspended: bool) {}
     fn live_output_lead_seconds(&self) -> f64 {
         0.0
     }
@@ -98,6 +101,7 @@ pub struct CpalSink {
     total_dropped_old_frames: Arc<AtomicU64>,
     underruns: Arc<AtomicU64>,
     total_underruns: Arc<AtomicU64>,
+    live_output_suspended: Arc<AtomicBool>,
     profile_callbacks: Arc<AtomicU64>,
     profile_callback_frames: Arc<AtomicU64>,
     profile_callback_device_cck: Arc<AtomicU64>,
@@ -150,6 +154,8 @@ impl CpalSink {
         let underruns_for_cb = Arc::clone(&underruns);
         let total_underruns = Arc::new(AtomicU64::new(0));
         let total_underruns_for_cb = Arc::clone(&total_underruns);
+        let live_output_suspended = Arc::new(AtomicBool::new(false));
+        let live_output_suspended_for_cb = Arc::clone(&live_output_suspended);
         let profile_enabled = audio_profile_enabled();
         let profile_callbacks = Arc::new(AtomicU64::new(0));
         let profile_callbacks_for_cb = Arc::clone(&profile_callbacks);
@@ -172,6 +178,13 @@ impl CpalSink {
                             callback_device_cck(frames, output_sample_rate),
                             Ordering::Relaxed,
                         );
+                    }
+                    if live_output_suspended_for_cb.load(Ordering::Relaxed) {
+                        resampler.reset();
+                        for sample in data {
+                            *sample = 0.0;
+                        }
+                        return;
                     }
                     let requested_drop = drop_old_frames_for_cb.swap(0, Ordering::Relaxed);
                     if requested_drop != 0 {
@@ -227,6 +240,7 @@ impl CpalSink {
             total_dropped_old_frames,
             underruns,
             total_underruns,
+            live_output_suspended,
             profile_callbacks,
             profile_callback_frames,
             profile_callback_device_cck,
@@ -373,6 +387,22 @@ impl AudioSink for CpalSink {
     }
 
     fn flush(&mut self) {}
+
+    fn set_live_output_suspended(&mut self, suspended: bool) {
+        let previous = self
+            .live_output_suspended
+            .swap(suspended, Ordering::Relaxed);
+        if previous == suspended {
+            return;
+        }
+        // A deliberate host pause or modal filesystem operation can last
+        // longer than the queued live-audio lead. Do not report those
+        // callback silences as underruns when output resumes.
+        self.underruns.store(0, Ordering::Relaxed);
+        self.dropped_old_frames.store(0, Ordering::Relaxed);
+        self.overruns = 0;
+        self.last_log = Instant::now();
+    }
 
     fn live_output_lead_seconds(&self) -> f64 {
         live_output_lead_seconds_for_state(

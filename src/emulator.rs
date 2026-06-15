@@ -378,6 +378,12 @@ impl Emulator {
         self.machine.bus_mut()
     }
 
+    /// Suspend only host live audio output. Emulated Paula time still
+    /// advances whenever the machine is stepped.
+    pub fn set_live_audio_suspended(&mut self, suspended: bool) {
+        self.bus_mut().set_live_audio_suspended(suspended);
+    }
+
     pub fn keyboard_reset(&mut self) -> Result<()> {
         log::info!("keyboard reset pulse");
         self.bus_mut().reset_for_keyboard_reset();
