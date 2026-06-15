@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Video-with-audio capture to an AVI file. Started and stopped from the
-//! window (Cmd+R or the menu's recording item), so a capture can bracket
-//! exactly the part of a session worth keeping.
+//! window (host shortcut or the menu's recording item), so a capture can
+//! bracket exactly the part of a session worth keeping.
 //!
 //! Video is encoded with ZMBV (the DOSBox capture codec): lossless,
 //! zlib-deflated intra frames plus XOR-delta inter frames, which suits

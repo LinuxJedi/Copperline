@@ -12,7 +12,7 @@ use super::window::{
     draw_rect_bevel, fill_rect, fill_rect_blend, rgba, scale_rect, Rect, BUTTON_EDGE_DARK,
     BUTTON_EDGE_LIGHT, BUTTON_FACE, BUTTON_FACE_HOVER,
 };
-use super::{font, FB_WIDTH, PRESENT_HEIGHT};
+use super::{font, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL, PRESENT_HEIGHT};
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -731,30 +731,44 @@ fn draw_about(frame: &mut [u8], rect: Rect, view: &AboutView, scale: usize) {
     }
 }
 
-const SHORTCUT_ROWS: [(&str, &str); 11] = [
-    ("Cmd+Q", "Quit"),
-    ("Cmd+S", "Save screenshot"),
-    ("Cmd+R", "Record video on/off"),
-    ("Cmd+Shift+R", "Record input on/off"),
-    ("Cmd+Shift+S", "Save state"),
-    ("Cmd+Shift+L", "Load state"),
-    ("Cmd+D", "Swap queued disk"),
-    ("Cmd+G", "Capture mouse"),
-    ("Cmd+B", "Debugger"),
-    ("Esc", "Close menu/window"),
-    ("Ctrl+Ami+Ami", "Keyboard reset"),
+const SHORTCUT_ROWS: [(&str, &str, bool); 11] = [
+    ("Q", "Quit", true),
+    ("S", "Save screenshot", true),
+    ("R", "Record video on/off", true),
+    ("Shift+R", "Record input on/off", true),
+    ("Shift+S", "Save state", true),
+    ("Shift+L", "Load state", true),
+    ("D", "Swap queued disk", true),
+    ("G", "Capture mouse", true),
+    ("B", "Debugger", true),
+    ("Esc", "Close menu/window", false),
+    ("Ctrl+Ami+Ami", "Keyboard reset", false),
 ];
 
 fn draw_shortcuts(frame: &mut [u8], rect: Rect, scale: usize) {
     let mut y = rect.y + TITLE_H + 14;
-    for (key, action) in SHORTCUT_ROWS {
-        draw_panel_text(frame, rect.x + 24, y, key, PANEL_TEXT_ACCENT, 2, scale);
+    for (key, action, host_shortcut) in SHORTCUT_ROWS {
+        let key_label = if host_shortcut {
+            format!("{HOST_SHORTCUT_MODIFIER_LABEL}+{key}")
+        } else {
+            key.to_string()
+        };
+        draw_panel_text(
+            frame,
+            rect.x + 24,
+            y,
+            &key_label,
+            PANEL_TEXT_ACCENT,
+            2,
+            scale,
+        );
         draw_panel_text(frame, rect.x + 248, y, action, PANEL_TEXT, 2, scale);
         y += 22;
     }
     y += 8;
     for line in [
-        "Modifier keys map to Amiga: Alt, Cmd=Amiga, Ctrl",
+        "Shortcuts: Cmd on macOS, Alt on Linux/Windows",
+        "Amiga modifiers: Alt, Cmd/Super=Amiga, Ctrl",
         "In the debugger: S step, F frame, R run/pause",
     ] {
         draw_panel_text(frame, rect.x + 24, y, line, PANEL_TEXT_DIM, 1, scale);

@@ -7,6 +7,11 @@ pub mod font;
 pub mod ui;
 pub mod window;
 
+#[cfg(target_os = "macos")]
+pub const HOST_SHORTCUT_MODIFIER_LABEL: &str = "Cmd";
+#[cfg(not(target_os = "macos"))]
+pub const HOST_SHORTCUT_MODIFIER_LABEL: &str = "Alt";
+
 /// Native hi-res Amiga PAL overscan field = 716x285 emulated pixels.
 /// DiagROM's main menu copperlist sets BPLCON0 to hi-res (bit 15)
 /// with 3 bitplanes, so we size the framebuffer for hi-res by

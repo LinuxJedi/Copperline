@@ -1,8 +1,9 @@
 # The debugger window
 
-Press `Cmd+B` (or pick **Debugger** from the status-bar menu) to pause the
-machine and open the debugger window. Closing it restores the pause state
-from before it opened. Everything the debugger shows comes from
+Press `Cmd+B` on macOS or `Alt+B` on Linux/Windows (or pick **Debugger**
+from the status-bar menu) to pause the machine and open the debugger
+window. Closing it restores the pause state from before it opened.
+Everything the debugger shows comes from
 side-effect-free peeks -- inspecting memory or registers never disturbs the
 emulated machine -- and stepping drives the same cycle-exact core as normal
 execution.

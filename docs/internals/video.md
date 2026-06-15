@@ -120,9 +120,9 @@ completed frame at a breakpoint.
 
 ## Video recording (`recorder.rs`)
 
-The [interactive recording](../guide/ui) (Cmd+R)
-writes an AVI containing lossless ZMBV video -- the DOSBox capture
-codec: zlib-deflated intra frames plus XOR-delta inter frames on a
+The [interactive recording](../guide/ui) shortcut writes an AVI containing
+lossless ZMBV video -- the DOSBox capture codec: zlib-deflated intra frames
+plus XOR-delta inter frames on a
 16x16-block grid, encoded entirely with the `flate2` crate -- and
 16-bit stereo PCM at the 44.1 kHz mixer rate. `recorder.rs` owns both
 the encoder and the AVI muxer, and its unit tests round-trip the stream

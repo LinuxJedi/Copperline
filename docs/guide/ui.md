@@ -6,24 +6,26 @@ The window scales continuously when resized.
 
 ## Keyboard shortcuts
 
-| Shortcut | Action |
-|---|---|
-| `Cmd+Q` | Quit |
-| `Cmd+S` | Save a screenshot (`copperline-screenshot-<unix-ts>.png` in the working directory; the on-screen confirmation overlay is not part of the saved image) |
-| `Cmd+R` | Start / stop a video-with-audio recording (below) |
-| `Cmd+Shift+R` | Start / stop an input recording (below) |
-| `Cmd+Shift+S` | Save a state (`copperline-state-<unix-ts>.clstate` in the working directory) |
-| `Cmd+Shift+L` | Load a save state from a file dialog |
-| `Cmd+D` | Swap to the next disk in a drive's configured playlist |
-| `Cmd+G` | Capture / release the host mouse (clicking the display also captures) |
-| `Cmd+B` | Open the [debugger window](../debugger/window) |
-| `Esc` | Close an open menu or overlay window; otherwise passed through to the Amiga |
-| `Ctrl+Amiga+Amiga` | Keyboard reset (warm reboot) |
+The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
 
-On Linux/Windows the Super/Windows key plays the role of `Cmd`. Host
-modifiers map onto the Amiga keyboard: Alt becomes Amiga Alt, Cmd/Super
-becomes the left/right Amiga keys, and Ctrl becomes Amiga Ctrl, so
-`Ctrl+Amiga+Amiga` is typed naturally.
+| macOS | Linux/Windows | Action |
+|---|---|---|
+| `Cmd+Q` | `Alt+Q` | Quit |
+| `Cmd+S` | `Alt+S` | Save a screenshot (`copperline-screenshot-<unix-ts>.png` in the working directory; the on-screen confirmation overlay is not part of the saved image) |
+| `Cmd+R` | `Alt+R` | Start / stop a video-with-audio recording (below) |
+| `Cmd+Shift+R` | `Alt+Shift+R` | Start / stop an input recording (below) |
+| `Cmd+Shift+S` | `Alt+Shift+S` | Save a state (`copperline-state-<unix-ts>.clstate` in the working directory) |
+| `Cmd+Shift+L` | `Alt+Shift+L` | Load a save state from a file dialog |
+| `Cmd+D` | `Alt+D` | Swap to the next disk in a drive's configured playlist |
+| `Cmd+G` | `Alt+G` | Capture / release the host mouse (clicking the display also captures) |
+| `Cmd+B` | `Alt+B` | Open the [debugger window](../debugger/window) |
+| `Esc` | `Esc` | Close an open menu or overlay window; otherwise passed through to the Amiga |
+| `Ctrl+Amiga+Amiga` | `Ctrl+Amiga+Amiga` | Keyboard reset (warm reboot) |
+
+Host modifiers that are passed through to the emulated keyboard map onto
+the Amiga keyboard: Alt becomes Amiga Alt, Cmd/Super becomes the left/right
+Amiga keys, and Ctrl becomes Amiga Ctrl, so `Ctrl+Amiga+Amiga` is typed
+naturally.
 
 All other keys are sent to the emulated machine through the real path: a
 bit-timed keyboard-MCU model clocks each transition into CIA-A's serial
@@ -50,7 +52,8 @@ The status bar (44 pixels below the display) holds, left to right:
 - **CD controls** on CDTV/CD32 machines: a CD button that loads (or swaps)
   a cue sheet with the proper media-change notification, and a CD eject
   button. These do not appear on machines without a CD drive.
-- **Camera button**: saves a screenshot (same as `Cmd+S`).
+- **Camera button**: saves a screenshot (same as `Cmd+S` on macOS or
+  `Alt+S` on Linux/Windows).
 - **Hamburger menu button**: opens the pop-up menu (below).
 - **Volume slider**: drag, or scroll the mouse wheel over it for 5% steps.
 - **Pause / power / reboot buttons.** Pause freezes emulation while staying
@@ -70,19 +73,20 @@ The menu opens overlay windows drawn over the display. While one is open,
 key presses and display clicks stay in the window instead of reaching the
 Amiga; `Esc` closes it.
 
-- **Debugger** (also `Cmd+B`): pauses the machine and opens the five-tab
-  debugger; see [](../debugger/window).
+- **Debugger** (also `Cmd+B` on macOS or `Alt+B` on Linux/Windows):
+  pauses the machine and opens the five-tab debugger; see
+  [](../debugger/window).
 - **Calibrate Gamepad...**: the guided calibration flow, described below.
 - **Warp Speed**: runs the emulator unpaced, as fast as the host allows.
   Toggling back re-anchors real-time pacing cleanly.
-- **Record Video** (also `Cmd+R`): starts a video-with-audio recording;
-  the same item (or `Cmd+R` again) stops it. See below.
-- **Record Input** (also `Cmd+Shift+R`): records every input event that
-  reaches the emulated machine; stopping writes a script file that
-  `--script` replays deterministically. See below.
-- **Save State** (also `Cmd+Shift+S`) and **Load State...** (also
-  `Cmd+Shift+L`): snapshot the whole emulated machine to a file, or
-  restore one and continue from exactly that point. See below.
+- **Record Video** (also `Cmd+R` / `Alt+R`): starts a video-with-audio
+  recording; the same item (or shortcut again) stops it. See below.
+- **Record Input** (also `Cmd+Shift+R` / `Alt+Shift+R`): records every
+  input event that reaches the emulated machine; stopping writes a script
+  file that `--script` replays deterministically. See below.
+- **Save State** (also `Cmd+Shift+S` / `Alt+Shift+S`) and **Load State...**
+  (also `Cmd+Shift+L` / `Alt+Shift+L`): snapshot the whole emulated machine
+  to a file, or restore one and continue from exactly that point. See below.
 - **Load Kickstart ROM...**: fit a different boot ROM. Pick a 512 KiB
   Kickstart, then optionally a second file for the extended ROM (512 KiB at
   $E00000 or 256 KiB at $F00000; Cancel to skip and remove any fitted
@@ -100,9 +104,10 @@ The Keyboard Shortcuts window.
 
 ## Recording video
 
-`Cmd+R` (or the menu's "Record Video") starts capturing the emulated
-display and sound to `copperline-video-<unix-ts>.avi` in the working
-directory; pressing it again stops and finalizes the file. A red REC
+`Cmd+R` on macOS or `Alt+R` on Linux/Windows (or the menu's "Record Video")
+starts capturing the emulated display and sound to
+`copperline-video-<unix-ts>.avi` in the working directory; pressing it again
+stops and finalizes the file. A red REC
 badge sits in the display's top-right corner while a recording runs --
 like the screenshot overlay, the badge, status bar, and menus are never
 part of the captured video.
@@ -124,11 +129,11 @@ continues.
 
 ## Recording input
 
-`Cmd+Shift+R` (or the menu's "Record Input") starts logging every input
-event that reaches the emulated machine -- key presses with their hold
-times, mouse buttons and motion, port-2 joystick / CD32-pad controls,
-and floppy inserts -- each stamped with its emulated time. Pressing it
-again stops the recording and writes
+`Cmd+Shift+R` on macOS or `Alt+Shift+R` on Linux/Windows (or the menu's
+"Record Input") starts logging every input event that reaches the emulated
+machine -- key presses with their hold times, mouse buttons and motion,
+port-2 joystick / CD32-pad controls, and floppy inserts -- each stamped
+with its emulated time. Pressing it again stops the recording and writes
 `copperline-input-<unix-ts>.clscript` in the working directory: a plain
 text file of scripted-input directives that
 `copperline --script FILE` replays exactly, because the core is
@@ -144,11 +149,12 @@ headless `--record-input` variant are described in
 (save-states)=
 ## Save states
 
-`Cmd+Shift+S` (or the menu's "Save State") writes a snapshot of the whole
-emulated machine to `copperline-state-<unix-ts>.clstate` in the working
-directory: CPU, chip/slow/fast RAM, ROM, the full chipset and CIA state,
-floppy images (including unsaved in-memory changes), expansion boards,
-and CD/NVRAM state. `Cmd+Shift+L` (or "Load State...") restores one; the
+`Cmd+Shift+S` on macOS or `Alt+Shift+S` on Linux/Windows (or the menu's
+"Save State") writes a snapshot of the whole emulated machine to
+`copperline-state-<unix-ts>.clstate` in the working directory: CPU,
+chip/slow/fast RAM, ROM, the full chipset and CIA state, floppy images
+(including unsaved in-memory changes), expansion boards, and CD/NVRAM
+state. `Cmd+Shift+L` / `Alt+Shift+L` (or "Load State...") restores one; the
 machine continues from exactly the saved point, byte-for-byte -- the core
 is deterministic, so a resumed run is indistinguishable from one that was
 never interrupted.
@@ -174,9 +180,9 @@ file format and what exactly is (and is not) captured are specified in
 ## Mouse and joystick
 
 The mouse lives on port 1 and feeds the JOY0DAT counters. Click the display
-(or press `Cmd+G`) to capture the host mouse; `Cmd+G` releases it. While an
-overlay window is open, host cursor motion is not fed to the emulated
-mouse.
+(or press `Cmd+G` on macOS or `Alt+G` on Linux/Windows) to capture the host
+mouse; the same shortcut releases it. While an overlay window is open, host
+cursor motion is not fed to the emulated mouse.
 
 A USB gamepad drives the emulated port-2 digital joystick: directions
 through JOY1DAT, fire through /FIR1, and a second button through

@@ -2,7 +2,7 @@
 
 //! Save the current framebuffer as a PNG. Useful for debugging the
 //! video pipeline from a headless run (--screenshot-after) and for
-//! capturing snapshots interactively (Cmd+S keypress in the window).
+//! capturing snapshots interactively (host screenshot shortcut in the window).
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -143,7 +143,7 @@ pub fn stretch_rows_x(fb: &mut [u32], width: usize, rows: usize, src_num: u32, s
     }
 }
 
-/// Pick a default filename for an interactive (Cmd+S) grab.
+/// Pick a default filename for an interactive screenshot grab.
 pub fn auto_filename() -> PathBuf {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

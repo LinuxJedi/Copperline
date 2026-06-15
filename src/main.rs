@@ -56,6 +56,7 @@ use crate::serial::StdoutSink;
 use crate::video::window::{
     parse_amiga_key, App, DiskInsertSpec, FrameDumpSpec, KeyPressSpec, DEFAULT_KEY_HOLD_MS,
 };
+use crate::video::HOST_SHORTCUT_MODIFIER_LABEL;
 
 #[derive(Debug)]
 pub struct CliArgs {
@@ -94,7 +95,8 @@ pub struct CliArgs {
     pub mouse_after: Vec<(f32, i32, i32)>,
     /// `--record-input PATH`: record every input event that reaches the
     /// emulated machine for the whole run and write the scripted-input
-    /// file to PATH on exit (the windowed toggle is Cmd+Shift+R).
+    /// file to PATH on exit (the windowed toggle is the host shortcut
+    /// modifier plus Shift+R).
     pub record_input: Option<PathBuf>,
     /// Scripted floppy image insertion. This supports both explicit
     /// paths and deferring a disk image already configured in the TOML.
@@ -590,6 +592,7 @@ where
 }
 
 fn print_help() {
+    let shortcut = HOST_SHORTCUT_MODIFIER_LABEL;
     eprintln!(
         "copperline - Amiga emulator\n\
          \n\
@@ -625,7 +628,7 @@ fn print_help() {
          \x20                            and write the script to PATH on exit\n  \
          --script FILE                  run scripted-input directives from FILE (the flag\n  \
          \x20                            syntax without the dashes; # comments allowed);\n  \
-         \x20                            Cmd+Shift+R records a live session into this format\n  \
+         \x20                            {shortcut}+Shift+R records a live session into this format\n  \
          --insert-disk-after SECS DFN PATH\n  \
          \x20                            insert PATH into DFN after SECS seconds\n  \
          --defer-disk-insert SECS DFN   start with configured DFN empty, then insert\n  \
@@ -641,10 +644,10 @@ fn print_help() {
          -h, --help                     show this help and exit\n\
          \n\
          Window keys:\n  \
-         Cmd+S save framebuffer to copperline-screenshot-<unix-ts>.png in cwd\n  \
-         Cmd+D swap to the next disk in a drive's configured playlist\n  \
-         Cmd+G capture/release host mouse; clicking the display also captures\n  \
-         Cmd+Q quit\n\
+         {shortcut}+S save framebuffer to copperline-screenshot-<unix-ts>.png in cwd\n  \
+         {shortcut}+D swap to the next disk in a drive's configured playlist\n  \
+         {shortcut}+G capture/release host mouse; clicking the display also captures\n  \
+         {shortcut}+Q quit\n\
          \n\
          Status bar: every connected floppy drive gets load (multi-select to\n\
          queue a swap playlist), swap, and eject buttons; CDTV/CD32 machines\n\
@@ -917,7 +920,7 @@ fn main() -> Result<()> {
     );
 
     info!(
-        "entering event loop. Cmd+Q to quit, Cmd+S to screenshot, Cmd+G to capture/release mouse."
+        "entering event loop. {HOST_SHORTCUT_MODIFIER_LABEL}+Q to quit, {HOST_SHORTCUT_MODIFIER_LABEL}+S to screenshot, {HOST_SHORTCUT_MODIFIER_LABEL}+G to capture/release mouse."
     );
     app.run()
 }

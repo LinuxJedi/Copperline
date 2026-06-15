@@ -56,6 +56,7 @@ against real hardware.
 ## Requirements
 
 - Rust 1.87+ (stable). Tested with Rust 1.96.
+- Fedora build dependencies: `sudo dnf install alsa-lib-devel systemd-devel`.
 - No SDL2 dependency. Developed and tested on **macOS**; the Linux and
   Windows paths are expected to work but are currently untested.
 
@@ -89,11 +90,12 @@ positional argument, or point at a config file:
 ./target/release/copperline --config path/to/copperline.toml
 ```
 
-Essential shortcuts: `Cmd+Q` closes the window, `Esc` passes through to the
-Amiga (or closes an open menu/window), `Cmd+S` saves a screenshot, and
-`Cmd+B` opens the debugger. The status bar, pop-up menu, overlay windows
-(debugger, gamepad calibration, save/load state, input recording), and the
-full shortcut list are documented in the
+Essential shortcuts use `Cmd` on macOS and `Alt` on Linux/Windows:
+`Cmd+Q` / `Alt+Q` closes the window, `Esc` passes through to the Amiga (or
+closes an open menu/window), `Cmd+S` / `Alt+S` saves a screenshot, and
+`Cmd+B` / `Alt+B` opens the debugger. The status bar, pop-up menu, overlay
+windows (debugger, gamepad calibration, save/load state, input recording),
+and the full shortcut list are documented in the
 [user guide](docs/guide/ui.md).
 
 ## Configuration
@@ -170,7 +172,7 @@ resolved first.
 | Denise BPLCON / COLORxx | Stored and replayed by beam position. |
 | Bitplane renderer | OCS lo-res or hi-res; reads chip RAM via BPLxPT; honours modulos and beam-timed BPLCON1 scroll; EHB, HAM, dual playfield, and CLXDAT collisions. Lo-res pixel-doubles horizontally to match the 716-wide framebuffer. |
 | Display window | winit 0.30 + pixels 0.17 surface; 716x285 framebuffer presented at 4:3 (716x537) plus a 44-pixel status bar with power/disk controls. |
-| Keyboard / mouse / gamepad | Host keyboard/mouse mapped to Amiga input paths; key down and key up events go through CIA-A SDR/ICR with acknowledge + KDAT handshake backpressure and keyboard-MCU pacing; mouse deltas feed JOY0DAT; Cmd+G toggles host mouse capture; a USB gamepad (gilrs) drives the port-2 digital joystick (JOY1DAT directions, /FIR1 fire, POT1Y button 2); Ctrl+Ami+Ami resets. |
+| Keyboard / mouse / gamepad | Host keyboard/mouse mapped to Amiga input paths; key down and key up events go through CIA-A SDR/ICR with acknowledge + KDAT handshake backpressure and keyboard-MCU pacing; mouse deltas feed JOY0DAT; `Cmd+G` on macOS or `Alt+G` on Linux/Windows toggles host mouse capture; a USB gamepad (gilrs) drives the port-2 digital joystick (JOY1DAT directions, /FIR1 fire, POT1Y button 2); Ctrl+Ami+Ami resets. |
 | OCS sprites | 8 DMA/manual 16-pixel sprites, attached sprites, composited over bitplanes with playfield priority. |
 | Chip bus arbitration | Per-colour-clock OCS slot ownership for refresh, display DMA, sprites, disk, audio, Copper, blitter, and CPU chip/custom accesses, with CPU wait states. |
 | ECS | ECS Agnus revisions (8372A/8375) and ECS Denise (8373): up to 2M chip RAM, DIWHIGH, BEAMCON0, SuperHires, ECS blitter (BLTSIZV/BLTSIZH), programmable geometry. |

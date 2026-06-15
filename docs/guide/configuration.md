@@ -226,7 +226,7 @@ hiss during disk DMA.
 ```toml
 [floppy.df0]
 path = "demo.adf"            # single image, or:
-# paths = ["disk1.adf", "disk2.adf"]   # swap playlist (Cmd+D cycles)
+# paths = ["disk1.adf", "disk2.adf"]   # swap playlist (shortcut cycles)
 write_protected = true       # default true
 # enabled = true             # implied by path/paths
 ```
@@ -237,9 +237,10 @@ images. DMS, gzip, and SCP images are decoded at load time and always
 treated as write-protected; set `write_protected = false` on a plain ADF to
 allow write-through updates to the image file.
 
-A `paths` playlist lets multi-disk software that only drives DF0: run without
-a second drive: the first entry is the boot disk and `Cmd+D` (or the
-status-bar swap button) cycles to the next image, wrapping around.
+A `paths` playlist lets multi-disk software that only drives DF0: run
+without a second drive: the first entry is the boot disk and the disk-swap
+shortcut (`Cmd+D` on macOS, `Alt+D` on Linux/Windows) or the status-bar
+swap button cycles to the next image, wrapping around.
 
 ## `[ide]` -- Gayle hard disks
 

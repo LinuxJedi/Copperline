@@ -128,7 +128,7 @@ run is byte-identical to one that was never interrupted.
 
 Scripted input (`--press-after` and friends, or a `--script` file) fires
 at the first frame boundary at-or-after each event's emulated timestamp.
-The input recorder (`Cmd+Shift+R` / `--record-input`) produces those
+The input recorder (window shortcut / `--record-input`) produces those
 scripts from a live session by combining two capture styles: direct
 hooks where event identity matters (the keyboard choke point
 `handle_amiga_key_event`, floppy inserts) and a once-per-quantum diff of

@@ -7,7 +7,8 @@
 use super::deinterlace::Deinterlacer;
 use super::ui::{self, Panel, UiControl, UiState};
 use super::{
-    bitplane, blend_rgba, font, FB_HEIGHT, FB_PIXELS, FB_WIDTH, MAX_FB_PIXELS, PRESENT_HEIGHT,
+    bitplane, blend_rgba, font, FB_HEIGHT, FB_PIXELS, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL,
+    MAX_FB_PIXELS, PRESENT_HEIGHT,
 };
 use crate::bus::{BeamWriteSource, FrontPanelStatus};
 use crate::config::Overscan;
@@ -184,11 +185,6 @@ const STATUS_TEXT: u32 = rgba(174, 170, 154);
 const VOLUME_FILL: u32 = rgba(44, 178, 94);
 const VOLUME_FILL_HIGHLIGHT: u32 = rgba(128, 244, 150);
 const WINDOW_TITLE: &str = concat!("Copperline ", env!("CARGO_PKG_VERSION"));
-const WINDOW_TITLE_MOUSE_CAPTURED: &str = concat!(
-    "Copperline ",
-    env!("CARGO_PKG_VERSION"),
-    " - Mouse captured (Cmd+G releases)"
-);
 const COPPERLINE_LOGO_PNG: &[u8] = include_bytes!("../../assets/brand/copperline-logo.png");
 const COPPERLINE_ICON_PNG: &[u8] = include_bytes!("../../assets/brand/copperline-icon.png");
 const MOUSE_MOTION_SCALE: f64 = 1.0;
@@ -200,6 +196,18 @@ const OSD_TEXT: u32 = rgba(236, 236, 232);
 const OSD_SHADOW: u32 = rgba(0, 0, 0);
 const OSD_BG: u32 = rgba(10, 10, 12);
 const RECORD_DOT: u32 = rgba(229, 56, 48);
+
+fn host_shortcut_modifier_pressed(modifiers: ModifiersState) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.super_key()
+    } else {
+        modifiers.alt_key()
+    }
+}
+
+fn window_title_mouse_captured() -> String {
+    format!("{WINDOW_TITLE} - Mouse captured ({HOST_SHORTCUT_MODIFIER_LABEL}+G releases)")
+}
 
 /// A transient on-screen overlay message drawn over the display (but not
 /// captured in screenshots, since it is painted into the presentation
@@ -292,9 +300,9 @@ pub struct App {
     pending_auto_mouse: Vec<(f32, i32, i32)>,
     auto_disk_inserts: Vec<ScheduledDiskInsert>,
     pending_auto_disk_inserts: Vec<DiskInsertSpec>,
-    /// Live-input recorder (Cmd+Shift+R): logs every input event that
-    /// reaches the emulated machine and writes a --script-replayable
-    /// file on stop. None while not recording.
+    /// Live-input recorder: logs every input event that reaches the
+    /// emulated machine and writes a --script-replayable file on stop.
+    /// None while not recording.
     input_recorder: Option<crate::inputrec::InputRecorder>,
     /// --record-input destination: when set, the recorder runs for the
     /// whole session and the script is written here on exit (the Drop
@@ -313,7 +321,7 @@ pub struct App {
     /// swapped), or None when nothing is being shown.
     osd: Option<Osd>,
     /// Per-drive disk-swap playlists: the ordered image paths the user can
-    /// cycle through for each drive with the disk-swap key (Cmd+D). Lets a
+    /// cycle through for each drive with the disk-swap shortcut. Lets a
     /// multi-disk demo run on a single drive.
     disk_playlists: [Vec<PathBuf>; 4],
     /// Write-protect flag applied to disks swapped in from each playlist.
@@ -342,7 +350,7 @@ pub struct App {
     /// The reason for the last interactive breakpoint/watchpoint stop,
     /// shown on the debugger's Break tab until execution resumes.
     last_debug_stop: Option<String>,
-    /// Active video+audio capture (Cmd+R or the menu's Record Video item),
+    /// Active video+audio capture (shortcut or the menu's Record Video item),
     /// or None when not recording. Frames and the matching mixer audio are
     /// appended on emulated-frame boundaries, so captures stay in sync
     /// even under warp or host stutter.
@@ -528,9 +536,9 @@ impl App {
 
 impl Drop for App {
     /// Flush a whole-run `--record-input` recording on any exit path
-    /// (auto-screenshot exit, window close, Cmd+Q). The interactive
-    /// Cmd+Shift+R toggle writes its file when stopped, so by the time
-    /// the app drops there is nothing left for it here.
+    /// (auto-screenshot exit, window close, shortcut quit). The interactive
+    /// recording toggle writes its file when stopped, so by the time the app
+    /// drops there is nothing left for it here.
     fn drop(&mut self) {
         let (Some(rec), Some(path)) = (self.input_recorder.take(), self.record_input_path.take())
         else {
@@ -753,41 +761,56 @@ impl ApplicationHandler for App {
                     return;
                 }
                 match (code, state) {
-                    (KeyCode::KeyQ, ElementState::Pressed) if self.modifiers.super_key() => {
+                    (KeyCode::KeyQ, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers) =>
+                    {
                         event_loop.exit()
                     }
                     (KeyCode::KeyS, ElementState::Pressed)
-                        if self.modifiers.super_key() && self.modifiers.shift_key() =>
+                        if host_shortcut_modifier_pressed(self.modifiers)
+                            && self.modifiers.shift_key() =>
                     {
                         self.save_state_interactive()
                     }
                     (KeyCode::KeyL, ElementState::Pressed)
-                        if self.modifiers.super_key() && self.modifiers.shift_key() =>
+                        if host_shortcut_modifier_pressed(self.modifiers)
+                            && self.modifiers.shift_key() =>
                     {
                         self.load_state_from_dialog()
                     }
-                    (KeyCode::KeyS, ElementState::Pressed) if self.modifiers.super_key() => {
+                    (KeyCode::KeyS, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers) =>
+                    {
                         self.take_screenshot()
                     }
-                    (KeyCode::KeyD, ElementState::Pressed) if self.modifiers.super_key() => {
+                    (KeyCode::KeyD, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers) =>
+                    {
                         self.cycle_disk()
                     }
-                    (KeyCode::KeyG, ElementState::Pressed) if self.modifiers.super_key() => {
+                    (KeyCode::KeyG, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers) =>
+                    {
                         // Capturing the mouse under an open menu/panel would
                         // hide the cursor the panel needs.
                         if !self.ui.active() {
                             self.toggle_mouse_capture()
                         }
                     }
-                    (KeyCode::KeyB, ElementState::Pressed) if self.modifiers.super_key() => {
+                    (KeyCode::KeyB, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers) =>
+                    {
                         self.toggle_debugger()
                     }
                     (KeyCode::KeyR, ElementState::Pressed)
-                        if self.modifiers.super_key() && self.modifiers.shift_key() =>
+                        if host_shortcut_modifier_pressed(self.modifiers)
+                            && self.modifiers.shift_key() =>
                     {
                         self.toggle_input_recording()
                     }
-                    (KeyCode::KeyR, ElementState::Pressed) if self.modifiers.super_key() => {
+                    (KeyCode::KeyR, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers) =>
+                    {
                         self.toggle_recording()
                     }
                     (other, state) => {
@@ -3624,8 +3647,8 @@ impl App {
                     self.last_display_cursor_pos = None;
                     self.mouse_delta_remainder = (0.0, 0.0);
                     window.set_cursor_visible(false);
-                    window.set_title(WINDOW_TITLE_MOUSE_CAPTURED);
-                    info!("mouse captured; press Cmd+G to release");
+                    window.set_title(&window_title_mouse_captured());
+                    info!("mouse captured; press {HOST_SHORTCUT_MODIFIER_LABEL}+G to release");
                 }
                 Err((locked_err, confined_err)) => {
                     warn!("mouse capture failed (locked: {locked_err}; confined: {confined_err})")
@@ -3854,7 +3877,7 @@ impl App {
     }
 
     /// Open the debugger window (pausing the machine), or close it again
-    /// if it is already open (the Cmd+B toggle).
+    /// if it is already open (the host shortcut toggle).
     fn toggle_debugger(&mut self) {
         if matches!(self.ui.panel, Some(Panel::Debugger(_))) {
             self.close_panel();
@@ -3867,8 +3890,8 @@ impl App {
 
     fn open_debugger(&mut self) {
         if !matches!(self.ui.panel, Some(Panel::Debugger(_))) {
-            // Cmd+B can arrive while the mouse is captured; release it so
-            // the window's controls are reachable.
+            // The debugger shortcut can arrive while the mouse is captured;
+            // release it so the window's controls are reachable.
             self.set_mouse_captured(false);
             self.paused_before_debugger = self.paused;
             self.paused = true;
@@ -3922,7 +3945,7 @@ impl App {
         }
     }
 
-    /// Interactive (Cmd+Shift+S / menu) state save: write the whole
+    /// Interactive shortcut / menu state save: write the whole
     /// emulated machine to an auto-named file in the working directory and
     /// flash the filename on screen. Runs between frames by construction
     /// (the event loop only dispatches input/menu events outside step_frame).
@@ -3940,7 +3963,7 @@ impl App {
         }
     }
 
-    /// Pick a save-state file and restore it (Cmd+Shift+L / menu). On
+    /// Pick a save-state file and restore it (shortcut / menu). On
     /// success the machine continues from the state's timeline: power is
     /// forced on, any CPU halt is cleared, and the display re-renders from
     /// the restored Bus. On failure the running machine is untouched.
@@ -4027,7 +4050,7 @@ impl App {
         self.emu.reanchor_realtime_clock();
     }
 
-    /// Start or stop the video+audio capture (Cmd+R / menu item).
+    /// Start or stop the video+audio capture (shortcut / menu item).
     fn toggle_recording(&mut self) {
         if self.recorder.is_some() {
             self.stop_recording();
@@ -4525,7 +4548,7 @@ impl App {
 
     /// Pick one or more disk images for a drive. The selection replaces
     /// the drive's swap playlist; the first image is inserted right away
-    /// and the rest are queued for the swap button / Cmd+D.
+    /// and the rest are queued for the swap button / shortcut.
     fn load_drive_disks_from_dialog(&mut self, drive_idx: usize) {
         let picked = rfd::FileDialog::new()
             .set_title(format!("Load DF{drive_idx} disk image(s)"))
@@ -4558,7 +4581,7 @@ impl App {
     }
 
     /// Advance the disk-swap playlist of the first drive that has more
-    /// than one image queued (the Cmd+D shortcut). With no multi-disk
+    /// than one image queued (the disk-swap shortcut). With no multi-disk
     /// drive, just shows a notice.
     fn cycle_disk(&mut self) {
         let Some(drive) =
@@ -4698,7 +4721,7 @@ impl App {
         }
     }
 
-    /// Start or stop the input recording (Cmd+Shift+R / menu item). On
+    /// Start or stop the input recording (shortcut / menu item). On
     /// stop, the recorded session is written as a scripted-input file
     /// that `--script FILE` replays.
     fn toggle_input_recording(&mut self) {
@@ -4728,7 +4751,9 @@ impl App {
                 let now = self.emu.bus().emulated_seconds();
                 self.input_recorder = Some(crate::inputrec::InputRecorder::new(now));
                 info!("input recording started at {now:.3}s emulated time");
-                self.show_osd("Recording input (Cmd+Shift+R to stop)");
+                self.show_osd(format!(
+                    "Recording input ({HOST_SHORTCUT_MODIFIER_LABEL}+Shift+R to stop)"
+                ));
             }
         }
         self.request_redraw();
@@ -4762,7 +4787,7 @@ impl App {
         }
     }
 
-    /// Interactive (Cmd+S) screenshot grab: save to an auto-named PNG and
+    /// Interactive screenshot grab: save to an auto-named PNG and
     /// flash the filename on screen. The overlay is painted into the
     /// presentation texture after the frame is captured, so it never
     /// appears in the saved image.
@@ -5395,10 +5420,10 @@ mod tests {
         bar_layout, bitplane, center_present_frame_for_visible_start,
         center_present_frame_horizontally, control_at, copperline_icon_image,
         copperline_logo_image, copy_present_frame, draw_status_bar, fdd_track_counter_rect,
-        fdd_track_digit_rect, host_to_amiga_rawkey, led_row_rect, mask_present_frame_to_tv,
-        paint_test_screen, parse_amiga_key, pause_button_rect, power_button_rect,
-        present_row_sample, presentation_source_y_offset, reboot_button_rect, rgba,
-        shot_button_rect, should_render_emulated_frame, standard_window_top_row,
+        fdd_track_digit_rect, host_shortcut_modifier_pressed, host_to_amiga_rawkey, led_row_rect,
+        mask_present_frame_to_tv, paint_test_screen, parse_amiga_key, pause_button_rect,
+        power_button_rect, present_row_sample, presentation_source_y_offset, reboot_button_rect,
+        rgba, shot_button_rect, should_render_emulated_frame, standard_window_top_row,
         status_with_latched_fdd_track, take_integral_mouse_delta, texture_height, texture_width,
         volume_percent_from_pos, volume_slider_track_rect, BarControl, DriveBar, MediaBar,
         StatusBarView, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF, CD_LED_ON,
@@ -5409,7 +5434,7 @@ mod tests {
     };
     use crate::bus::FrontPanelStatus;
     use crate::video::{FB_HEIGHT, FB_PIXELS, FB_WIDTH};
-    use winit::keyboard::KeyCode;
+    use winit::keyboard::{KeyCode, ModifiersState};
 
     /// A typical session: DF0 connected with a disk in, no CD drive.
     fn single_drive_media() -> MediaBar {
@@ -5452,6 +5477,21 @@ mod tests {
         assert_eq!(host_to_amiga_rawkey(KeyCode::AltRight), Some(0x65));
         assert_eq!(host_to_amiga_rawkey(KeyCode::SuperLeft), Some(0x66));
         assert_eq!(host_to_amiga_rawkey(KeyCode::SuperRight), Some(0x67));
+    }
+
+    #[test]
+    fn host_shortcut_modifier_uses_platform_convention() {
+        #[cfg(target_os = "macos")]
+        {
+            assert!(host_shortcut_modifier_pressed(ModifiersState::SUPER));
+            assert!(!host_shortcut_modifier_pressed(ModifiersState::ALT));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(host_shortcut_modifier_pressed(ModifiersState::ALT));
+            assert!(!host_shortcut_modifier_pressed(ModifiersState::SUPER));
+        }
     }
 
     #[test]
