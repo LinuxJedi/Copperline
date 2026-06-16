@@ -293,7 +293,17 @@ struct BitplaneSlotPlan {
     /// Bit n set when a DMA-enabled plane fetches at within-unit order n
     /// (lores cadence only).
     order_mask: u8,
+    /// Precomputed per-hpos slot pattern: bit `h` is set when `plan_slot_at`
+    /// is true for `hpos == h`. The pattern is purely a function of the fields
+    /// above (vpos-independent), so it is memoized once with the plan and the
+    /// per-color-clock arbiter does a bit test instead of the div/mod math.
+    /// Covers hpos 0..256, which spans every standard/long line; the rare
+    /// programmable line with a slot at hpos >= 256 falls back to `plan_slot_at`.
+    slot_mask: [u64; 4],
 }
+
+/// Width covered by `BitplaneSlotPlan::slot_mask` (hpos 0..SLOT_MASK_BITS).
+const SLOT_MASK_BITS: u32 = 256;
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 struct DisplaySpriteControl {
@@ -5251,7 +5261,17 @@ impl Bus {
         let Some(plan) = self.bitplane_slot_plan() else {
             return false;
         };
-        if hpos < plan.start || hpos > plan.last_fetch_hpos {
+        // Cheap hpos rejection first via the memoized slot bitmask (which also
+        // encodes the start/last_fetch_hpos bounds). The vpos gates below only
+        // matter on color clocks that are actually bitplane slots, so testing
+        // the pattern first lets the off-slot majority skip them entirely.
+        let is_slot = if hpos < SLOT_MASK_BITS {
+            plan.slot_mask[(hpos / 64) as usize] & (1u64 << (hpos % 64)) != 0
+        } else {
+            // Programmable line wider than the bitmask: fall back to the math.
+            Self::plan_slot_at(&plan, hpos)
+        };
+        if !is_slot {
             return false;
         }
         // Bitplane DMA only runs inside the vertical display window (set at
@@ -5271,12 +5291,23 @@ impl Bus {
         if self.bitplane_ddfstart_missed_on_line(vpos, plan.start) {
             return false;
         }
+        true
+    }
+
+    /// Whether `hpos` is a bitplane fetch slot for `plan`, from the fetch
+    /// cadence alone (vpos-independent). This is the exact per-color-clock math
+    /// that `bitplane_slot_active_at` used inline; it is now memoized into
+    /// `BitplaneSlotPlan::slot_mask` and kept here for that precompute and for
+    /// the wide-programmable-line fallback.
+    fn plan_slot_at(plan: &BitplaneSlotPlan, hpos: u32) -> bool {
+        if hpos < plan.start || hpos > plan.last_fetch_hpos {
+            return false;
+        }
         let rel = hpos - plan.start;
         if plan.hires_like {
             return rel.is_multiple_of(plan.period)
                 && (rel / plan.period) * plan.quantum < plan.words_per_row;
         }
-
         if (rel / plan.unit) * plan.quantum >= plan.words_per_row {
             return false;
         }
@@ -5360,7 +5391,7 @@ impl Bus {
         for plane in 0..nplanes.min(8) {
             order_mask |= 1u8 << bitplane_fetch_order(bplcon0, plane);
         }
-        Some(BitplaneSlotPlan {
+        let mut plan = BitplaneSlotPlan {
             start,
             last_fetch_hpos,
             period,
@@ -5369,7 +5400,16 @@ impl Bus {
             words_per_row,
             hires_like: bitplane_hires(bplcon0) || bitplane_shres(bplcon0),
             order_mask,
-        })
+            slot_mask: [0u64; 4],
+        };
+        // Memoize the vpos-independent fetch pattern so the per-color-clock
+        // arbiter does a bit test instead of the div/mod in `plan_slot_at`.
+        for hpos in plan.start..=plan.last_fetch_hpos.min(SLOT_MASK_BITS - 1) {
+            if Self::plan_slot_at(&plan, hpos) {
+                plan.slot_mask[(hpos / 64) as usize] |= 1u64 << (hpos % 64);
+            }
+        }
+        Some(plan)
     }
 
     fn copper_ready_for_slot(&self) -> bool {
