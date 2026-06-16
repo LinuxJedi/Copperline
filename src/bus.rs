@@ -4447,16 +4447,13 @@ impl Bus {
             return;
         }
         self.ensure_current_frame_sprite_collision_sources_for_y(fb_y, vpos);
-        let overlapping_source_count = {
+        let has_overlapping_source_pair = {
             let sources = self.current_frame_sprite_collision_sources[fb_y]
                 .as_deref()
                 .unwrap_or(&[]);
-            sources
-                .iter()
-                .filter(|source| live_sprite_source_may_overlap_x_range(source, x_start, x_stop))
-                .count()
+            live_sprite_sources_have_group_pair_overlap(sources, x_start, x_stop)
         };
-        if overlapping_source_count < 2 {
+        if !has_overlapping_source_pair {
             return;
         }
         self.ensure_current_collision_control_index();
@@ -5269,40 +5266,22 @@ impl Bus {
         if self.bitplane_ddfstart_missed_on_line(vpos, plan.start) {
             return false;
         }
-        let slot_start = hpos;
-        let slot_end = slot_start.saturating_add(CHIP_BUS_SLOT_CCK);
+        let rel = hpos - plan.start;
         if plan.hires_like {
-            for fetch_hpos in slot_start..slot_end {
-                if fetch_hpos < plan.start {
-                    continue;
-                }
-                let rel = fetch_hpos - plan.start;
-                if rel % plan.period == 0 && (rel / plan.period) * plan.quantum < plan.words_per_row
-                {
-                    return true;
-                }
-            }
-            return false;
+            return rel.is_multiple_of(plan.period)
+                && (rel / plan.period) * plan.quantum < plan.words_per_row;
         }
 
-        for fetch_hpos in slot_start..slot_end {
-            if fetch_hpos < plan.start {
-                continue;
-            }
-            let rel = fetch_hpos - plan.start;
-            if (rel / plan.unit) * plan.quantum >= plan.words_per_row {
-                continue;
-            }
-            let unit_off = rel % plan.unit;
-            if !unit_off.is_multiple_of(plan.unit / 8) {
-                continue;
-            }
-            let order = unit_off / (plan.unit / 8);
-            if plan.order_mask & (1u8 << order) != 0 {
-                return true;
-            }
+        if (rel / plan.unit) * plan.quantum >= plan.words_per_row {
+            return false;
         }
-        false
+        let unit_step = plan.unit / 8;
+        let unit_off = rel % plan.unit;
+        if !unit_off.is_multiple_of(unit_step) {
+            return false;
+        }
+        let order = unit_off / unit_step;
+        plan.order_mask & (1u8 << order) != 0
     }
 
     /// The memoized line-invariant part of `bitplane_slot_active_at`. The
@@ -7375,24 +7354,42 @@ fn live_sprite_sprite_collision_bits(
     if sources.len() < 2 {
         return 0;
     }
+    let x_start = x_start.max(0);
+    let x_stop = x_stop.min(RENDER_FRAMEBUFFER_WIDTH);
+    if x_start >= x_stop {
+        return 0;
+    }
 
     let mut clxdat = 0u16;
-    for x in x_start.max(0)..x_stop.min(RENDER_FRAMEBUFFER_WIDTH) {
-        let mut occupied_groups = 0u8;
-        for source in sources {
-            let control = control_replay.control_for_x(x);
-            if !live_sprite_pixel_inside_display_window(control, beam_y, x, display_enable_x) {
+    for (idx, source) in sources.iter().enumerate() {
+        for other in &sources[idx + 1..] {
+            if source.group == other.group {
                 continue;
             }
-            if !live_sprite_source_collision_matches(source, control_replay, control.clxcon, x) {
+            let clx_bit = sprite_sprite_clx_bit(source.group, other.group);
+            if clx_bit == 0 || clxdat & clx_bit != 0 {
                 continue;
             }
-            for other_group in 0..4 {
-                if occupied_groups & (1 << other_group) != 0 && other_group != source.group {
-                    clxdat |= sprite_sprite_clx_bit(source.group, other_group);
+            let Some((pair_x_start, pair_x_stop)) =
+                live_sprite_source_pair_x_range(source, other, x_start, x_stop)
+            else {
+                continue;
+            };
+            for x in pair_x_start..pair_x_stop {
+                let control = control_replay.control_for_x(x);
+                if !live_sprite_pixel_inside_display_window(control, beam_y, x, display_enable_x) {
+                    continue;
                 }
+                if !live_sprite_source_collision_matches(source, control_replay, control.clxcon, x)
+                {
+                    continue;
+                }
+                if !live_sprite_source_collision_matches(other, control_replay, control.clxcon, x) {
+                    continue;
+                }
+                clxdat |= clx_bit;
+                break;
             }
-            occupied_groups |= 1 << source.group;
         }
     }
 
@@ -7699,6 +7696,43 @@ fn live_sprite_source_may_overlap_x_range(
     x_start < source_stop && x_stop > source_start
 }
 
+fn live_sprite_source_pair_x_range(
+    a: &LiveSpriteCollisionSource,
+    b: &LiveSpriteCollisionSource,
+    x_start: i32,
+    x_stop: i32,
+) -> Option<(i32, i32)> {
+    let (a_start, a_stop) = live_sprite_source_framebuffer_bounds(a);
+    let (b_start, b_stop) = live_sprite_source_framebuffer_bounds(b);
+    let start = x_start.max(a_start).max(b_start);
+    let stop = x_stop.min(a_stop).min(b_stop);
+    (start < stop).then_some((start, stop))
+}
+
+fn live_sprite_sources_have_group_pair_overlap(
+    sources: &[LiveSpriteCollisionSource],
+    x_start: i32,
+    x_stop: i32,
+) -> bool {
+    let x_start = x_start.max(0);
+    let x_stop = x_stop.min(RENDER_FRAMEBUFFER_WIDTH);
+    if x_start >= x_stop {
+        return false;
+    }
+
+    for (idx, source) in sources.iter().enumerate() {
+        for other in &sources[idx + 1..] {
+            if source.group == other.group {
+                continue;
+            }
+            if live_sprite_source_pair_x_range(source, other, x_start, x_stop).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_live_manual_sprite_source(
     sources: &mut Vec<LiveManualSpriteCollisionSource>,
@@ -7746,6 +7780,10 @@ fn live_sprite_source_pixel_presence(
     control_replay: &LiveCollisionLineReplay,
     x: i32,
 ) -> LiveSpritePixelPresence {
+    if let Some(control) = control_replay.constant_control() {
+        return live_sprite_source_pixel_presence_with_control(source, control, x);
+    }
+
     let (sprite_base_x, sprite_stop_x) = live_sprite_source_framebuffer_bounds(source);
     if x < sprite_base_x || x >= sprite_stop_x {
         return LiveSpritePixelPresence::default();
@@ -7774,6 +7812,38 @@ fn live_sprite_source_pixel_presence(
         x_cursor = x_stop;
     }
     LiveSpritePixelPresence::default()
+}
+
+fn live_sprite_source_pixel_presence_with_control(
+    source: &LiveSpriteCollisionSource,
+    control: LiveCollisionControl,
+    x: i32,
+) -> LiveSpritePixelPresence {
+    let sprite_base_x = (source.hstart - RENDER_DIW_HSTART_FB0) * 2 + i32::from(source.hsub_70ns);
+    let sprite_pixel_repeat = sprite_pixel_repeat_for_control(control.bplcon0, control.bplcon3);
+    let offset = x - sprite_base_x;
+    if offset < 0 {
+        return LiveSpritePixelPresence::default();
+    }
+    let bit_offset = offset / sprite_pixel_repeat;
+    if !(0..16).contains(&bit_offset) {
+        return LiveSpritePixelPresence::default();
+    }
+    let bit = 15 - bit_offset;
+    let mask = 1 << bit;
+    let low = source.words[0] & mask != 0 || source.words[1] & mask != 0;
+    let high = source.words[2] & mask != 0 || source.words[3] & mask != 0;
+    if source.requires_odd_enable {
+        LiveSpritePixelPresence {
+            even: false,
+            odd: low,
+        }
+    } else {
+        LiveSpritePixelPresence {
+            even: low,
+            odd: high,
+        }
+    }
 }
 
 fn live_sprite_source_collision_matches(
@@ -8040,6 +8110,10 @@ impl LiveCollisionLineReplay {
         }
     }
 
+    fn constant_control(&self) -> Option<LiveCollisionControl> {
+        self.segments.is_empty().then_some(self.line_start)
+    }
+
     fn segment_count(&self) -> usize {
         self.segments.len()
     }
@@ -8086,10 +8160,13 @@ fn live_sprite_playfield_collision_bits_in_range(
 
     let mut clxdat = 0u16;
     for source in sources {
-        if !live_sprite_source_may_overlap_x_range(source, x_start, x_stop) {
+        let (source_start, source_stop) = live_sprite_source_framebuffer_bounds(source);
+        let source_x_start = x_start.max(source_start);
+        let source_x_stop = x_stop.min(source_stop);
+        if source_x_start >= source_x_stop {
             continue;
         }
-        for x in x_start..x_stop {
+        for x in source_x_start..source_x_stop {
             let sprite_control_at_x = sprite_control.control_for_x(x);
             if !live_sprite_pixel_inside_display_window(
                 sprite_control_at_x,
