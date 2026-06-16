@@ -358,6 +358,12 @@ pub struct Akiko {
 
     disc: Option<CdImage>,
     toc: Vec<TocEntry>,
+    /// A disc waiting in the tray after a runtime insert: mounted (and a
+    /// media-status packet volunteered) once `insert_delay_cck` of emulated
+    /// time elapses, so the drive reports the absent->present transition a
+    /// real tray produces instead of an instantaneous swap.
+    pending_disc: Option<CdImage>,
+    insert_delay_cck: i64,
 
     intreq: u32,
     intena: u32,
@@ -429,6 +435,8 @@ impl Default for Akiko {
             nvram: Nvram::new(None),
             disc: None,
             toc: Vec::new(),
+            pending_disc: None,
+            insert_delay_cck: -1,
             intreq: 0,
             intena: 0,
             subcodeoffset: 0,
@@ -492,9 +500,21 @@ impl Akiko {
         self.media_notify = self.cd_initialized != 0;
     }
 
-    /// Whether a disc is mounted.
+    /// Park a disc in the tray and mount it after `secs` of emulated tray
+    /// time. Any disc currently in the drive is ejected first, so the
+    /// controller volunteers a media-absent packet now and a media-present
+    /// packet once the tray settles -- the absent->present transition a real
+    /// drive produces, which the CD32 firmware needs to spot a disc change.
+    pub fn insert_disc_after(&mut self, disc: CdImage, secs: f64) {
+        self.eject_disc();
+        self.pending_disc = Some(disc);
+        self.insert_delay_cck =
+            (secs.max(0.0) * f64::from(crate::chipset::paula::PAULA_CLOCK_HZ)) as i64;
+    }
+
+    /// Whether a disc is mounted or still waiting in the tray.
     pub fn has_disc(&self) -> bool {
-        self.disc.is_some()
+        self.disc.is_some() || self.pending_disc.is_some()
     }
 
     /// Whether the drive is actively working: streaming CD audio, a TOC
@@ -513,7 +533,12 @@ impl Akiko {
     /// Remove the disc: stop playback, drop buffered audio, and volunteer
     /// a media-status packet so the OS notices the removal.
     pub fn eject_disc(&mut self) {
+        // Cancel any disc still waiting in the tray from a delayed insert.
+        self.pending_disc = None;
+        self.insert_delay_cck = -1;
         if self.disc.take().is_none() {
+            // Nothing was mounted (the OS never saw a present disc), so no
+            // removal notification is owed.
             return;
         }
         self.toc.clear();
@@ -715,6 +740,20 @@ impl Akiko {
         self.tx_dma_delay_cck = self.tx_dma_delay_cck.saturating_sub(cck);
         self.rx_dma_delay_cck = self.rx_dma_delay_cck.saturating_sub(cck);
 
+        // Delayed disc insert: once the tray settles, mount the disc and
+        // volunteer a media-status packet (present), like the real drive's
+        // change notification at the end of tray motion.
+        if self.pending_disc.is_some() {
+            self.insert_delay_cck -= i64::from(cck);
+            if self.insert_delay_cck < 0 {
+                let disc = self.pending_disc.take().unwrap();
+                self.toc = build_toc(&disc);
+                self.disc = Some(disc);
+                self.media_notify = self.cd_initialized != 0;
+                log::info!("akiko: disc inserted (delayed), media-status notification queued");
+            }
+        }
+
         self.read_counter_cck -= cck as i32;
         if self.read_counter_cck <= 0 {
             self.read_counter_cck += (CCK_PER_CD_FRAME / self.speed.max(1)) as i32;
@@ -788,8 +827,12 @@ impl Akiko {
             return;
         }
         // Runtime disc insert/eject: push the new media status as soon as
-        // the channel is idle, like the real drive's change notification.
-        if self.media_notify && self.command_active == 0 {
+        // the receive channel is free, like the real drive's change
+        // notification. WinUAE volunteers this even while a command is
+        // active (cdrom_can_return_data only checks the receive length), so
+        // we do not gate on command_active here -- gating on it lets the
+        // boot ROM's status polling starve the notification.
+        if self.media_notify {
             self.media_notify = false;
             let len = self.command_media_status();
             self.start_return_data(len);

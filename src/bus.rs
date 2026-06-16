@@ -1803,7 +1803,10 @@ impl Bus {
             cdtv.eject_disc();
             cdtv.insert_disc_after(image, CDTV_TRAY_SECS);
         } else if let Some(akiko) = self.akiko.as_mut() {
-            akiko.insert_disc(image);
+            // Model tray time on Akiko too: eject (media-absent) then mount
+            // after a delay (media-present), so cd.device sees the
+            // absent->present change instead of an instantaneous swap.
+            akiko.insert_disc_after(image, CDTV_TRAY_SECS);
         }
     }
 
