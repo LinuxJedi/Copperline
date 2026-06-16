@@ -3459,6 +3459,14 @@ fn render_planned_playfield_line(
     // the copper-x position and continue to advance with `control_segment_idx`.
     let mut scroll_bplcon1 = base_scroll_bplcon1;
     let mut scroll_segment_idx = 0usize;
+    // Playfield-collision classification (clxcon_planes_match) depends only on
+    // the bitplane index and the constant control fields (CLXCON/CLXCON2, plane
+    // count, dual-playfield), so memoize it per control run as a 256-entry
+    // table indexed by the sample index. This lifts a per-plane matching loop
+    // out of the per-pixel path; the table is rebuilt only when those control
+    // inputs change.
+    let mut collision_key: Option<(u16, u16, bool, usize)> = None;
+    let mut collision_table = [CollisionPixel::default(); 256];
     // The loop runs in segment-bounded chunks: control, scroll, and palette
     // segments apply at pixel boundaries (x stepping by pixel_repeat), so
     // between two boundaries every control-derived value is constant and is
@@ -3518,6 +3526,26 @@ fn render_planned_playfield_line(
         let nplanes = sample_control.nplanes().min(plan.plane_words.len());
         let delays = std::array::from_fn(|plane| sample_control.scroll_for_plane(plane));
 
+        let collision_dual = pixel_control.dual_playfield();
+        let collision_key_now = (
+            pixel_control.clxcon,
+            pixel_control.clxcon2,
+            collision_dual,
+            nplanes,
+        );
+        if collision_key != Some(collision_key_now) {
+            collision_table = std::array::from_fn(|idx| {
+                collision_pixel(
+                    idx as u8,
+                    nplanes,
+                    pixel_control.clxcon,
+                    pixel_control.clxcon2,
+                    collision_dual,
+                )
+            });
+            collision_key = Some(collision_key_now);
+        }
+
         loop {
             let output_native_x = ((x - plan.x_start) / pixel_repeat) * native_per_pixel;
             let Some(relative_native_x) = output_native_x.checked_sub(pixel_fetch_start_native_x)
@@ -3558,20 +3586,24 @@ fn render_planned_playfield_line(
                     denise_playfield_output(pixel_control, palette, sample.idx, &mut ham_color),
                 )
             };
+            // Collision classification is identical for every framebuffer
+            // pixel of this native sample, so look it up once. CLXDAT only
+            // accumulates set bits, so ORing it here (rather than once per
+            // written pixel) is equivalent: a visible sample writes at least
+            // one in-window pixel.
+            let collision = collision_table[sample.idx as usize];
+            let pf_mask = u8::from(collision.pf1) | (u8::from(collision.pf2) << 1);
+            *clxdat |= collision.clxdat_bits();
             for dx in 0..pixel_repeat {
                 let pixel_x = x + dx;
                 if pixel_x >= plan.x_stop || pixel_x < win_x_start || pixel_x >= win_x_stop {
                     continue;
                 }
                 let fb_idx = plan.y * FB_WIDTH + pixel_x;
-                record_generated_playfield_collision_pixel(
-                    playfield_mask,
-                    collision_pixels,
-                    clxdat,
-                    fb_idx,
-                    sample,
-                    pixel_control,
-                );
+                if pf_mask != 0 {
+                    playfield_mask[fb_idx] = pf_mask;
+                }
+                collision_pixels[fb_idx] = collision;
                 let transparent =
                     pixel_control.genlock_transparent(output.color_latch, Some(sample), false);
                 fb[fb_idx] = rgb24_to_rgba8_alpha(output.color, !transparent);
