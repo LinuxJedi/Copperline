@@ -5323,8 +5323,18 @@ fn dual_playfield_palette_index(idx: u8, control: ControlState) -> usize {
 }
 
 fn dual_playfield_pixel(idx: u8, control: ControlState) -> (u8, usize) {
-    let pf1 = (idx & 0x01) | ((idx >> 1) & 0x02) | ((idx >> 2) & 0x04);
-    let pf2 = ((idx >> 1) & 0x01) | ((idx >> 2) & 0x02) | ((idx >> 3) & 0x04);
+    // OCS/ECS dual playfield splits six bitplanes into two 3-bit fields
+    // (PF1 = planes 1/3/5, PF2 = planes 2/4/6). AGA Lisa extends each field
+    // to four bits with the 7th and 8th bitplanes (PF1 += plane 7, PF2 +=
+    // plane 8), so a 7-8 plane dual playfield addresses palette entries
+    // 8..15 per field. Pre-AGA chips never carry bitplanes 7/8, so the
+    // extra bits are always clear there and the 3-bit decode is preserved.
+    let mut pf1 = (idx & 0x01) | ((idx >> 1) & 0x02) | ((idx >> 2) & 0x04);
+    let mut pf2 = ((idx >> 1) & 0x01) | ((idx >> 2) & 0x02) | ((idx >> 3) & 0x04);
+    if control.aga() {
+        pf1 |= (idx >> 3) & 0x08;
+        pf2 |= (idx >> 4) & 0x08;
+    }
     let pf2_offset = control.pf2_palette_offset();
     match (pf1, pf2) {
         (0, 0) => (0, 0),
@@ -8174,6 +8184,37 @@ mod tests {
             ..ControlState::default()
         };
         assert_eq!(dual_playfield_palette_index(0b000011, pf2_priority), 9);
+    }
+
+    #[test]
+    fn aga_dual_playfield_decodes_bitplane7_into_pf1_fourth_bit() {
+        // AGA Lisa dual playfield gives each field four bits: bitplane 7
+        // becomes PF1's high bit (palette entries 8..15) and bitplane 8
+        // PF2's. Pre-AGA chips decode only three bits per field. Zool
+        // (A1200) draws its sprite-cel character into a 7-plane dual
+        // playfield: the black body lives at PF1 index 11, which collapses
+        // to index 3 (orange) when bitplane 7 is dropped.
+        let aga = ControlState {
+            bplcon0: 0x7400,
+            bplcon3: BPLCON3_PF2OF_DEFAULT,
+            agnus_revision: AgnusRevision::AgaAlice,
+            ..ControlState::default()
+        };
+        assert!(aga.aga() && aga.dual_playfield());
+        // Bitplanes 1,3,7 set -> PF1 = 0b1011 = 11, PF2 empty.
+        assert_eq!(dual_playfield_palette_index(0b0100_0101, aga), 11);
+        // Bitplane 8 set -> PF2 high bit; PF2 = 0b1000 = 8, plus the
+        // default PF2OF offset of 8 -> palette entry 16.
+        assert_eq!(dual_playfield_palette_index(0b1000_0000, aga), 16);
+
+        // The same indices on OCS keep the three-bit decode (bits 6,7 are
+        // never carried by <=6 plane hardware, so they are ignored).
+        let ocs = ControlState {
+            bplcon0: 0x6400,
+            ..ControlState::default()
+        };
+        assert!(!ocs.aga() && ocs.dual_playfield());
+        assert_eq!(dual_playfield_palette_index(0b0100_0101, ocs), 3);
     }
 
     #[test]
