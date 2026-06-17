@@ -36,6 +36,22 @@
 //!                      e.g. "auto:64" or "C00100:200"
 //! ```
 //!
+//! Reverse debugging ("rr"-style) is armed by a separate group of knobs,
+//! parsed by `reverse_config_from_env` and applied to the emulator's snapshot
+//! ring (see `crate::timetravel`). It needs `COPPERLINE_RTC_FIXED_SECS` set
+//! for deterministic replay; see `docs/debugger`.
+//!
+//! ```text
+//! COPPERLINE_DBG_RWATCH  = "last writer" reverse watchpoint, "ADDR" or
+//!                      "ADDR:LEN". At COPPERLINE_DBG_UNTIL (the target time,
+//!                      or run end if unset) it reports the last instruction
+//!                      that wrote the word, then resumes.  e.g. "DE488"
+//! COPPERLINE_DBG_RR      = "1" to arm the snapshot ring without a watchpoint
+//!                      (so reverse-step navigation has history to work from)
+//! COPPERLINE_DBG_RR_BUDGET_MB = snapshot-ring memory cap, MiB (default 512)
+//! COPPERLINE_DBG_RR_INTERVAL  = emulated frames between snapshots (default 5)
+//! ```
+//!
 //! The instruction trace (COPPERLINE_DBG_TRACE) disassembles each executed
 //! instruction (see `crate::disasm`).
 
@@ -556,6 +572,62 @@ fn parse_f64(var: &str) -> Option<f64> {
 
 fn parse_u64(var: &str) -> Option<u64> {
     crate::envcfg::var(var).and_then(|s| s.trim().parse().ok())
+}
+
+/// Default reverse-debug snapshot memory budget, in MiB.
+pub const RR_DEFAULT_BUDGET_MB: usize = 512;
+/// Default emulated-frame gap between reverse-debug snapshots.
+pub const RR_DEFAULT_INTERVAL_FRAMES: u64 = 5;
+
+/// Reverse-debugging configuration parsed from the `COPPERLINE_DBG_*`
+/// environment, used to arm the emulator's snapshot ring and (optionally) a
+/// one-shot "last writer" reverse watchpoint. See `docs/debugger`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReverseConfig {
+    /// Snapshot-ring memory budget, MiB (`COPPERLINE_DBG_RR_BUDGET_MB`).
+    pub budget_mb: usize,
+    /// Frames between snapshots (`COPPERLINE_DBG_RR_INTERVAL`).
+    pub interval_frames: u64,
+    /// Reverse-watchpoint address (`COPPERLINE_DBG_RWATCH=ADDR[:LEN]`); the
+    /// last instruction to write this word before `target_secs` is reported.
+    pub watch_addr: Option<u32>,
+    /// Emulated time at which the reverse watchpoint is evaluated. Reuses
+    /// `COPPERLINE_DBG_UNTIL`; `None` (unset) means evaluate at run end.
+    pub target_secs: Option<f64>,
+}
+
+/// Parse the reverse-debug knobs. Returns `None` unless reverse mode is armed
+/// (`COPPERLINE_DBG_RWATCH` set, or `COPPERLINE_DBG_RR=1` to enable the ring
+/// for reverse-step navigation without a watchpoint).
+pub fn reverse_config_from_env() -> Option<ReverseConfig> {
+    let watch_addr = parse_watch_list("COPPERLINE_DBG_RWATCH")
+        .first()
+        .map(|w| w.addr);
+    let ring_only = crate::envcfg::flag("COPPERLINE_DBG_RR");
+    if watch_addr.is_none() && !ring_only {
+        return None;
+    }
+    let target = parse_f64("COPPERLINE_DBG_UNTIL").filter(|s| s.is_finite());
+    let config = ReverseConfig {
+        budget_mb: parse_u64("COPPERLINE_DBG_RR_BUDGET_MB")
+            .map(|v| v as usize)
+            .unwrap_or(RR_DEFAULT_BUDGET_MB),
+        interval_frames: parse_u64("COPPERLINE_DBG_RR_INTERVAL")
+            .unwrap_or(RR_DEFAULT_INTERVAL_FRAMES),
+        watch_addr,
+        target_secs: target,
+    };
+    log::info!(
+        "reverse debug armed: budget={}MB interval={} frames{}",
+        config.budget_mb,
+        config.interval_frames,
+        match (config.watch_addr, config.target_secs) {
+            (Some(a), Some(t)) => format!(", rwatch ${a:06X} at {t}s"),
+            (Some(a), None) => format!(", rwatch ${a:06X} at run end"),
+            _ => String::new(),
+        }
+    );
+    Some(config)
 }
 
 #[cfg(test)]

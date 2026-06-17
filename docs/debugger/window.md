@@ -74,6 +74,8 @@ message.
 | Step | `S` | Execute exactly one instruction |
 | Frame | `F` | Run to the next video frame and re-render the display |
 | Run to `$` | -- | Run until the PC reaches the address in the box |
+| &lt; Step | -- | Step one instruction *backward* (see [](reverse)) |
+| &lt; Run | -- | Run *backward* to the previous breakpoint hit |
 
 The `R`/`S`/`F` keys work whenever the hex box is unfocused (while it is
 focused they are hex input). **Run to $** is bounded by a 2M-instruction

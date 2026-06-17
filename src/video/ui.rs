@@ -283,6 +283,11 @@ pub enum UiControl {
     DebugStep,
     DebugStepFrame,
     DebugRunTo,
+    /// Reverse-debug: step one instruction backward (reconstructed from the
+    /// snapshot ring).
+    DebugReverseStep,
+    /// Reverse-debug: run backward to the previous breakpoint/watch hit.
+    DebugReverseRun,
     DebugMemPrev,
     DebugMemNext,
     DebugEntry,
@@ -378,7 +383,7 @@ fn debug_tab_rect(rect: Rect, index: usize) -> Rect {
     }
 }
 
-fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 7] {
+fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 9] {
     let y = rect.y + rect.h - DEBUG_BUTTON_H - 6;
     let button = |x: usize, w: usize| Rect {
         x: rect.x + x,
@@ -394,6 +399,9 @@ fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 7] {
         (UiControl::DebugEntry, button(284, 110)),
         (UiControl::DebugMemPrev, button(398, 28)),
         (UiControl::DebugMemNext, button(430, 28)),
+        // Reverse-debug transport, in the free space at the row's right end.
+        (UiControl::DebugReverseStep, button(466, 86)),
+        (UiControl::DebugReverseRun, button(556, 92)),
     ]
 }
 
@@ -471,6 +479,9 @@ impl DbgLine {
 pub struct DebuggerView {
     /// False while the machine is paused (the debugger's usual state).
     pub running: bool,
+    /// Whether reverse debugging is armed (snapshot ring present), gating the
+    /// reverse transport buttons.
+    pub reverse_available: bool,
     /// Status summary drawn in the title bar (frame count, emulated time).
     pub status: String,
     /// Pre-formatted content lines of the active tab.
@@ -946,6 +957,8 @@ fn draw_debugger(
                     UiControl::DebugStep => "Step",
                     UiControl::DebugStepFrame => "Frame",
                     UiControl::DebugRunTo => "Run to $",
+                    UiControl::DebugReverseStep => "< Step",
+                    UiControl::DebugReverseRun => "< Run",
                     UiControl::DebugMemPrev => "<",
                     UiControl::DebugMemNext => ">",
                     _ => "",
@@ -955,6 +968,9 @@ fn draw_debugger(
                         panel.tab == DebugTab::Memory
                     }
                     UiControl::DebugRunTo => panel.entry_addr().is_some(),
+                    UiControl::DebugReverseStep | UiControl::DebugReverseRun => {
+                        view.reverse_available
+                    }
                     _ => true,
                 };
                 draw_text_button(
@@ -1393,6 +1409,7 @@ mod tests {
         }
         let data = PanelViewData::Debugger(DebuggerView {
             running: false,
+            reverse_available: true,
             status: "paused frame 1234 24.68s".to_string(),
             lines,
         });
@@ -1431,6 +1448,7 @@ mod tests {
         lines.push(DbgLine::plain("  DMACON ($096)"));
         let data = PanelViewData::Debugger(DebuggerView {
             running: false,
+            reverse_available: true,
             status: "paused frame 1234 24.68s".to_string(),
             lines,
         });

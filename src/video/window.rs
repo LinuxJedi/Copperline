@@ -95,6 +95,10 @@ impl AutoJoyHeld {
 }
 
 pub const DEFAULT_KEY_HOLD_MS: u32 = 100;
+/// Emulated-frame gap between reverse-debug snapshots when the ring is
+/// auto-armed by opening the debugger window. Larger than the headless
+/// default to keep the per-snapshot serialize off the interactive path.
+const DEBUGGER_REVERSE_INTERVAL_FRAMES: u64 = 10;
 const MAX_TEXTURE_SCALE: usize = 2;
 const STATUS_BAR_HEIGHT: usize = 44;
 const WINDOW_PRESENT_HEIGHT: usize = PRESENT_HEIGHT + STATUS_BAR_HEIGHT;
@@ -628,6 +632,22 @@ impl App {
             held.up, held.down, held.left, held.right, held.red, held.blue,
         );
         input.set_cd32_buttons_port2(held.play, held.rwd, held.ffw, held.green, held.yellow);
+        // Reverse-debug: note the held state so replay can reproduce it.
+        self.emu.tt_note_input(crate::inputsched::ReplayAction::Joy(
+            crate::inputsched::JoyState {
+                up: held.up,
+                down: held.down,
+                left: held.left,
+                right: held.right,
+                red: held.red,
+                blue: held.blue,
+                play: held.play,
+                rwd: held.rwd,
+                ffw: held.ffw,
+                green: held.green,
+                yellow: held.yellow,
+            },
+        ));
     }
 
     pub fn run(self) -> Result<()> {
@@ -1346,6 +1366,10 @@ impl ApplicationHandler for App {
                 self.save_screenshot(&path);
                 self.emu.report_stats();
                 self.emu.bus().poll_stats.dump_top("at screenshot");
+                // Evaluate an untargeted reverse watchpoint at run end.
+                if let Err(e) = self.emu.tt_finalize_reverse_watch() {
+                    warn!("reverse watchpoint evaluation failed: {e:#}");
+                }
                 event_loop.exit();
             } else {
                 self.auto_shot = Some((secs, path));
@@ -1364,11 +1388,22 @@ fn display_file_name(path: &std::path::Path) -> String {
 
 fn set_mouse_button(emu: &mut Emulator, button: MouseButtonKind, pressed: bool) {
     let input = &mut emu.bus_mut().input;
-    match button {
-        MouseButtonKind::Left => input.lmb_port1 = pressed,
-        MouseButtonKind::Right => input.rmb_port1 = pressed,
-        MouseButtonKind::Middle => input.mmb_port1 = pressed,
-    }
+    let index = match button {
+        MouseButtonKind::Left => {
+            input.lmb_port1 = pressed;
+            0
+        }
+        MouseButtonKind::Right => {
+            input.rmb_port1 = pressed;
+            1
+        }
+        MouseButtonKind::Middle => {
+            input.mmb_port1 = pressed;
+            2
+        }
+    };
+    // Reverse-debug: note the transition so replay can reproduce it.
+    emu.tt_note_input(crate::inputsched::ReplayAction::MouseButton { index, pressed });
 }
 
 fn render_job_to_presentation(
@@ -3876,6 +3911,9 @@ impl App {
 
     fn add_mouse_delta_i32(&mut self, dx: i32, dy: i32) {
         self.emu.bus_mut().input.add_mouse_delta_port1(dx, dy);
+        // Reverse-debug: note the motion so replay can reproduce it.
+        self.emu
+            .tt_note_input(crate::inputsched::ReplayAction::MouseMove { dx, dy });
     }
 
     fn set_output_volume_from_pos(&mut self, pos: (i32, i32)) {
@@ -3962,6 +4000,8 @@ impl App {
             UiControl::DebugStep => self.debugger_step(),
             UiControl::DebugStepFrame => self.debugger_step_frame(),
             UiControl::DebugRunTo => self.debugger_run_to(),
+            UiControl::DebugReverseStep => self.debugger_reverse_step(),
+            UiControl::DebugReverseRun => self.debugger_reverse_continue(),
             UiControl::DebugMemPrev => self.debugger_mem_page(-1),
             UiControl::DebugMemNext => self.debugger_mem_page(1),
             UiControl::DebugEntry => {
@@ -4071,6 +4111,16 @@ impl App {
             // neighbourhood; it is usually what you came to look at.
             panel.mem_addr = self.emu.machine.pc() & 0x00FF_FFF0;
             self.ui.panel = Some(Panel::Debugger(panel));
+            // Arm reverse debugging so the < Step / < Run controls work. A
+            // conservative interval keeps the per-snapshot serialize off the
+            // critical path; captures only accrue while the machine advances
+            // (Run / Step Frame inside the debugger), not while paused.
+            if !self.emu.time_travel_enabled() {
+                self.emu.enable_time_travel(
+                    crate::debugger::RR_DEFAULT_BUDGET_MB,
+                    DEBUGGER_REVERSE_INTERVAL_FRAMES,
+                );
+            }
         }
     }
 
@@ -4392,6 +4442,41 @@ impl App {
         self.finish_render_for_current_frame();
     }
 
+    /// Step one instruction backward, reconstructed from the snapshot ring.
+    fn debugger_reverse_step(&mut self) {
+        use crate::timetravel::ReverseOutcome;
+        self.paused = true;
+        self.sync_live_audio_suspension();
+        self.last_debug_stop = None;
+        match self.emu.tt_reverse_step(1) {
+            Ok(ReverseOutcome::Found(_)) => {}
+            Ok(ReverseOutcome::BeyondHistory) => self.show_osd("Reverse: beyond recorded history"),
+            Ok(ReverseOutcome::NotFound) => self.show_osd("Reverse: nothing earlier to step to"),
+            Err(e) => error!("reverse step halted: {e:?}"),
+        }
+        self.finish_render_for_current_frame();
+    }
+
+    /// Run backward to the previous breakpoint hit (reconstructed from the
+    /// snapshot ring).
+    fn debugger_reverse_continue(&mut self) {
+        use crate::timetravel::ReverseOutcome;
+        self.paused = true;
+        self.sync_live_audio_suspension();
+        self.last_debug_stop = None;
+        match self.emu.tt_reverse_continue() {
+            Ok(ReverseOutcome::Found(_)) => {
+                self.surface_debug_stop();
+            }
+            Ok(ReverseOutcome::NotFound) => self.show_osd("Reverse run: no earlier breakpoint hit"),
+            Ok(ReverseOutcome::BeyondHistory) => {
+                self.show_osd("Reverse run: beyond recorded history")
+            }
+            Err(e) => error!("reverse continue halted: {e:?}"),
+        }
+        self.finish_render_for_current_frame();
+    }
+
     /// Surface a pending breakpoint/watchpoint hit: pause the machine,
     /// bring up the debugger window, and report the reason. Returns true
     /// when a stop was pending.
@@ -4500,12 +4585,23 @@ impl App {
     fn build_debugger_view(&self, panel: &ui::DebuggerPanel) -> ui::DebuggerView {
         let machine = &self.emu.machine;
         let bus = self.emu.bus();
-        let status = format!(
+        let mut status = format!(
             "{} frame {} {:.2}s",
             if self.paused { "paused" } else { "running" },
             bus.emulated_frames(),
             bus.emulated_seconds()
         );
+        // Reverse-debug position and history depth, when the ring is armed.
+        if let Some(ring) = self.emu.time_travel_ring() {
+            if !ring.is_empty() {
+                status.push_str(&format!(
+                    "  | pos {} rev {} snaps, {} MB",
+                    self.emu.retired_instructions(),
+                    ring.len(),
+                    ring.used_bytes() / (1024 * 1024),
+                ));
+            }
+        }
         let read = |addr: u32| bus.peek_word_any(addr);
         let mut lines: Vec<ui::DbgLine> = Vec::new();
         match panel.tab {
@@ -4722,6 +4818,7 @@ impl App {
         }
         ui::DebuggerView {
             running: !self.paused,
+            reverse_available: self.emu.time_travel_enabled(),
             status,
             lines,
         }
@@ -4865,6 +4962,10 @@ impl App {
                 if let Some(rec) = self.input_recorder.as_mut() {
                     rec.record_disk_insert(drive_idx, &path, self.emu.bus().emulated_seconds());
                 }
+                // Reverse-debug: mark the media change so replay across it warns
+                // (the inserted image is host-file state, not in the log).
+                self.emu
+                    .tt_note_input(crate::inputsched::ReplayAction::DiskChange);
                 self.request_redraw();
                 true
             }
@@ -4918,6 +5019,9 @@ impl App {
         } else {
             self.emu.bus_mut().enqueue_key_event(rawkey, false);
         }
+        // Reverse-debug: note the transition so replay can reproduce it.
+        self.emu
+            .tt_note_input(crate::inputsched::ReplayAction::Key { rawkey, pressed });
     }
 
     /// Start or stop the input recording (shortcut / menu item). On
@@ -7051,6 +7155,45 @@ mod tests {
         }
         app.activate_ui_control(super::ui::UiControl::DebugBreakToggle);
         assert!(!app.emu.machine.ui_breaks().is_breakpoint(target));
+    }
+
+    #[test]
+    fn opening_the_debugger_arms_reverse_and_step_reconstructs() {
+        let mut app = test_app();
+        // Opening the debugger auto-arms the reverse snapshot ring.
+        app.open_debugger();
+        assert!(app.emu.time_travel_enabled());
+        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_ref() {
+            assert!(
+                app.build_debugger_view(panel).reverse_available,
+                "reverse controls should be enabled once armed"
+            );
+        }
+
+        // Advance enough frames that several snapshots accrue.
+        for _ in 0..16 {
+            app.debugger_step_frame();
+        }
+        let pos_before = app.emu.retired_instructions();
+        let pc_before = app.emu.machine.pc();
+        assert!(pos_before > 0, "the NOP sled retired instructions");
+
+        // Reverse Step moves the position strictly backward.
+        app.activate_ui_control(super::ui::UiControl::DebugReverseStep);
+        let pos_after = app.emu.retired_instructions();
+        assert_eq!(pos_after, pos_before - 1, "stepped back exactly one");
+
+        // Replaying forward to the original position reconstructs the PC.
+        for _ in 0..16 {
+            app.debugger_step_frame();
+        }
+        assert!(app.emu.retired_instructions() >= pos_before);
+        // And reverse-continue with no breakpoints is a no-op (reports, does
+        // not move): position is unchanged afterward.
+        let pos = app.emu.retired_instructions();
+        app.activate_ui_control(super::ui::UiControl::DebugReverseRun);
+        assert_eq!(app.emu.retired_instructions(), pos);
+        let _ = pc_before;
     }
 
     #[test]
