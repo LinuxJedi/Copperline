@@ -580,6 +580,13 @@ pub struct Bus {
     pending_device_tick: AgnusTick,
     audio_pending_cck: u32,
     last_chip_bus_owner: ChipBusOwner,
+    /// Last 16-bit value driven on the chip data bus by a real access (display/
+    /// audio/sprite DMA, or a mapped CPU read). CPU reads of unmapped addresses
+    /// float to this, like the Agnus-arbitrated chip bus on real hardware, which
+    /// is dominated by display DMA (often 0 on a blank screen) -- not a fixed
+    /// all-ones pattern. Transient; re-established by DMA after a state load.
+    #[serde(skip)]
+    pub(crate) data_bus: u16,
     device_clock: DeviceClock,
     emulated_cck: u64,
     emulated_frames: u64,
@@ -1455,6 +1462,7 @@ impl Bus {
             pending_device_tick: AgnusTick::default(),
             audio_pending_cck: 0,
             last_chip_bus_owner: ChipBusOwner::Idle,
+            data_bus: 0,
             device_clock: DeviceClock::default(),
             emulated_cck: 0,
             emulated_frames: 0,
@@ -4890,6 +4898,7 @@ impl Bus {
             return;
         };
         let word = self.read_chip_word_for_audio_dma(request.address);
+        self.data_bus = word;
         let irq = self.paula.grant_audio_dma(channel, word);
         self.paula.latch_interrupt_sources(irq);
     }
@@ -6743,6 +6752,7 @@ impl Bus {
                         let word_idx = word_base + w;
                         let addr = self.display_dma_bplpt[plane] & addr_mask;
                         let fetched = read_chip_word_wrapping(&self.mem.chip_ram, addr);
+                        self.data_bus = fetched;
                         if self.capture_bitplane_fetch_word(
                             fb_y,
                             display_planes,
@@ -6793,6 +6803,7 @@ impl Bus {
                         let word_idx = word_base + w;
                         let addr = self.display_dma_bplpt[plane] & addr_mask;
                         let fetched = read_chip_word_wrapping(&self.mem.chip_ram, addr);
+                        self.data_bus = fetched;
                         if self.capture_bitplane_fetch_word(
                             fb_y,
                             block_display_planes,

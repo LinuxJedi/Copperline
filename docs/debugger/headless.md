@@ -44,6 +44,17 @@ cannot change at runtime (see [](../internals/architecture)).
   is active, with key registers on each line. Capped at 200,000 lines per
   run as a flood guard.
 
+`COPPERLINE_DBG_TRACE_FULL=1`
+: Like `TRACE`, but each line is a fixed-width, all-hex record of the entire
+  register file (`D0`-`D7`/`A0`-`A7`) and the CCR, prefixed `ft`. Intended for
+  diffing Copperline's instruction stream against a reference 68000 (e.g.
+  vAmiga) to isolate a mis-emulated instruction. Implies `TRACE`.
+
+`COPPERLINE_DBG_TRACE_LO=ADDR` / `COPPERLINE_DBG_TRACE_HI=ADDR`
+: Restrict the trace to instructions whose PC is in `[LO, HI]`. This isolates a
+  single routine (e.g. a depacker loop) and, by excluding interrupt handlers,
+  yields a contiguous deterministic stream that lines up across emulators.
+
 `COPPERLINE_DBG_RAMDUMP=ADDR:LEN:FILE`
 : One-shot memory dump the first time the debugger activates: LEN bytes
   from hex address ADDR are written to FILE, read through the CPU's own

@@ -393,28 +393,64 @@ impl M68kMachine {
         self.maybe_dump_ram(secs);
         let pc = self.cpu.pc;
 
-        if self.dbg.as_ref().is_some_and(|d| d.trace) {
+        if let Some((trace_full, lo, hi)) = self
+            .dbg
+            .as_ref()
+            .filter(|d| d.trace)
+            .map(|d| (d.trace_full, d.trace_lo, d.trace_hi))
+        {
+            let in_window = pc >= lo && pc <= hi;
             let trace_lines = self.dbg.as_ref().map(|d| d.trace_lines).unwrap_or(0);
-            if trace_lines < DEBUG_TRACE_LINE_CAP {
+            if in_window && trace_lines < DEBUG_TRACE_LINE_CAP {
                 let bus = &self.bus.bus;
                 let (text, _len) = crate::disasm::disassemble(
                     |addr| bus.peek_word_any(addr),
                     pc,
                     self.cpu.cpu_type,
                 );
-                log::info!(
-                    "dbg trace t={secs:.5} pc={pc:#010X} {text:<30} \
-                     d0={:#X} d1={:#X} d2={:#X} d7={:#X} a0={:#X} a1={:#X} a2={:#X} a4={:#X} a7={:#X}",
-                    self.cpu.d(0),
-                    self.cpu.d(1),
-                    self.cpu.d(2),
-                    self.cpu.d(7),
-                    self.cpu.a(0),
-                    self.cpu.a(1),
-                    self.cpu.a(2),
-                    self.cpu.a(4),
-                    self.cpu.a(7),
-                );
+                if trace_full {
+                    // COPPERLINE_DBG_TRACE_FULL: a fixed-width, all-hex record of
+                    // the full register file and CCR, for line-by-line diffing
+                    // against a reference 68000 trace. `op` is the raw opcode word.
+                    let op = self.bus.bus.peek_word_any(pc);
+                    let d: Vec<String> = (0..8).map(|i| format!("{:08X}", self.cpu.d(i))).collect();
+                    let a: Vec<String> = (0..8).map(|i| format!("{:08X}", self.cpu.a(i))).collect();
+                    log::info!(
+                        "ft pc={pc:06X} op={op:04X} ccr={:02X} \
+                         d={} {} {} {} {} {} {} {} a={} {} {} {} {} {} {} {} | {text}",
+                        self.cpu.get_ccr(),
+                        d[0],
+                        d[1],
+                        d[2],
+                        d[3],
+                        d[4],
+                        d[5],
+                        d[6],
+                        d[7],
+                        a[0],
+                        a[1],
+                        a[2],
+                        a[3],
+                        a[4],
+                        a[5],
+                        a[6],
+                        a[7],
+                    );
+                } else {
+                    log::info!(
+                        "dbg trace t={secs:.5} pc={pc:#010X} {text:<30} \
+                         d0={:#X} d1={:#X} d2={:#X} d7={:#X} a0={:#X} a1={:#X} a2={:#X} a4={:#X} a7={:#X}",
+                        self.cpu.d(0),
+                        self.cpu.d(1),
+                        self.cpu.d(2),
+                        self.cpu.d(7),
+                        self.cpu.a(0),
+                        self.cpu.a(1),
+                        self.cpu.a(2),
+                        self.cpu.a(4),
+                        self.cpu.a(7),
+                    );
+                }
                 if let Some(d) = self.dbg.as_mut() {
                     d.trace_lines += 1;
                 }
@@ -1630,7 +1666,17 @@ impl CpuBus {
             log::info!("float rd {addr:#08X}");
         }
         self.bus.cpu_slow_external_access(1);
-        floating_read(size)
+        // Undriven (unmapped) read: float to the last value the chip data bus
+        // carried (display/audio DMA), as on the Agnus-arbitrated chip bus --
+        // not a fixed all-ones pattern. `size` is always 1 here (size>1 recurses
+        // to byte reads); a 68000 byte read takes the high data-bus byte at even
+        // addresses, the low byte at odd.
+        let data_bus = self.bus.data_bus;
+        if addr & 1 == 0 {
+            u32::from(data_bus >> 8)
+        } else {
+            u32::from(data_bus & 0xFF)
+        }
     }
 
     fn write_sized(&mut self, address: u32, size: usize, value: u32) {
@@ -2516,7 +2562,13 @@ mod tests {
     }
 
     #[test]
-    fn unmapped_cpu_reads_float_high() {
+    fn unmapped_cpu_reads_float_to_chip_data_bus() {
+        // An unmapped CPU read does not return a fixed all-ones pattern; it
+        // floats to the last value the Agnus-arbitrated chip data bus carried
+        // (display/audio DMA), exactly as on real hardware. Returning a constant
+        // can close pathological pointer-chase loops (a program walking a
+        // corrupted list off into unmapped space) that terminate on real silicon
+        // because the floating value keeps changing.
         let mut bus = CpuBus {
             bus: test_bus(reset_rom(0, 0)),
             address_mask: ADDRESS_MASK_24BIT,
@@ -2526,10 +2578,17 @@ mod tests {
             dcache: None,
         };
         let addr = SLOW_RAM_BASE as u32 + 64 * 1024;
-        bus.write_long(addr, 0);
-        assert_eq!(bus.read_byte(addr), 0xFF);
-        assert_eq!(bus.read_word(addr), 0xFFFF);
-        assert_eq!(bus.read_long(addr), 0xFFFF_FFFF);
+        // With nothing yet driven, the bus rests at 0.
+        bus.write_long(addr, 0x1234_5678);
+        assert_eq!(bus.read_long(addr), 0);
+        // Once a real access latches a value, undriven reads float to it; a
+        // 68000 byte read takes the high data-bus byte at even addresses and the
+        // low byte at odd.
+        bus.bus.data_bus = 0xA53C;
+        assert_eq!(bus.read_byte(addr), 0xA5);
+        assert_eq!(bus.read_byte(addr + 1), 0x3C);
+        assert_eq!(bus.read_word(addr), 0xA53C);
+        assert_eq!(bus.read_long(addr), 0xA53C_A53C);
     }
 
     #[test]

@@ -93,6 +93,15 @@ impl Msm6242Rtc {
         if let Some(time) = self.test_time {
             return RtcDateTime::from_system_time(time);
         }
+        // COPPERLINE_RTC_FIXED_SECS pins the clock to a fixed Unix-seconds
+        // value, making RTC reads deterministic across runs (otherwise the
+        // host wall-clock differs run-to-run, which pollutes differential
+        // traces with spurious timestamp divergences).
+        if let Some(secs) = crate::envcfg::var("COPPERLINE_RTC_FIXED_SECS")
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            return RtcDateTime::from_unix_seconds(secs);
+        }
         RtcDateTime::from_system_time(SystemTime::now())
     }
 

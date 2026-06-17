@@ -18,6 +18,13 @@
 //! COPPERLINE_DBG_DUMP    = comma-separated "ADDR:WORDS" memory
 //!                      regions hexdumped on every hit      e.g. "C09580:4"
 //! COPPERLINE_DBG_TRACE   = set to log every executed instruction in the window
+//! COPPERLINE_DBG_TRACE_FULL = like TRACE, but each line is a fixed-width all-hex
+//!                      record of the whole register file (D0-D7/A0-A7) and CCR,
+//!                      for diffing against a reference 68000 (e.g. vAmiga). Implies
+//!                      TRACE. Format: "ft pc=.. op=.. ccr=.. d=.. a=.. | <disasm>"
+//! COPPERLINE_DBG_TRACE_LO/HI = only trace instructions with LO <= pc <= HI, to
+//!                      isolate one routine (e.g. a depacker loop) from the rest
+//!                      of the system     e.g. LO="DE488" HI="DE578"
 //! COPPERLINE_DBG_AFTER   = emulated seconds before which the debugger is inert
 //! COPPERLINE_DBG_UNTIL   = emulated seconds after which the debugger is inert
 //! COPPERLINE_DBG_MAXHITS = stop reporting after this many hits (default 200)
@@ -369,6 +376,15 @@ pub struct Debugger {
     /// `(addr, words)` regions hexdumped (as 16-bit words) on each hit.
     pub dumps: Vec<(u32, u32)>,
     pub trace: bool,
+    /// COPPERLINE_DBG_TRACE_FULL: emit every CPU register (D0-D7/A0-A7) plus the
+    /// CCR flags on each traced instruction, for differential comparison against
+    /// a reference 68000 (vAmiga). Implies `trace`.
+    pub trace_full: bool,
+    /// COPPERLINE_DBG_TRACE_LO/HI: when set, only trace instructions whose PC is
+    /// in `[lo, hi]`. Keeps a focused routine (e.g. a depacker loop) out of the
+    /// noise of the rest of the system. `lo`=0/`hi`=u32::MAX means no filter.
+    pub trace_lo: u32,
+    pub trace_hi: u32,
     pub after_secs: f64,
     pub until_secs: f64,
     pub max_hits: u64,
@@ -392,7 +408,10 @@ impl Debugger {
     pub fn from_env() -> Option<Self> {
         let breakpoints = parse_addr_list("COPPERLINE_DBG_BREAK");
         let watches = parse_watch_list("COPPERLINE_DBG_WATCH");
-        let trace = crate::envcfg::flag("COPPERLINE_DBG_TRACE");
+        let trace_full = crate::envcfg::flag("COPPERLINE_DBG_TRACE_FULL");
+        let trace = trace_full || crate::envcfg::flag("COPPERLINE_DBG_TRACE");
+        let trace_lo = parse_hex_var("COPPERLINE_DBG_TRACE_LO").unwrap_or(0);
+        let trace_hi = parse_hex_var("COPPERLINE_DBG_TRACE_HI").unwrap_or(u32::MAX);
         let copper_dump = parse_copper_dump("COPPERLINE_DBG_COPPER");
         let ram_dump = parse_ram_dump("COPPERLINE_DBG_RAMDUMP");
         if breakpoints.is_empty()
@@ -412,6 +431,9 @@ impl Debugger {
             watches,
             dumps,
             trace,
+            trace_full,
+            trace_lo,
+            trace_hi,
             after_secs: parse_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0),
             until_secs: parse_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY),
             max_hits: parse_u64("COPPERLINE_DBG_MAXHITS").unwrap_or(200),
@@ -481,6 +503,10 @@ fn parse_addr_list(var: &str) -> Vec<u32> {
     crate::envcfg::var(var)
         .map(|v| v.split(',').filter_map(parse_hex).collect())
         .unwrap_or_default()
+}
+
+fn parse_hex_var(var: &str) -> Option<u32> {
+    crate::envcfg::var(var).and_then(|v| parse_hex(v.trim()))
 }
 
 fn parse_watch_list(var: &str) -> Vec<Watch> {
