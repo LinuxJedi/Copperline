@@ -1855,6 +1855,13 @@ impl Bus {
         self.emulated_frames
     }
 
+    /// Total colour clocks emulated since power-on. The monotonic timeline
+    /// coordinate behind `emulated_seconds`; used by reverse debugging to
+    /// label snapshots and report the beam time of a reconstructed event.
+    pub fn emulated_cck(&self) -> u64 {
+        self.emulated_cck
+    }
+
     pub fn live_audio_output_lead_seconds(&self) -> f64 {
         self.paula.live_audio_output_lead_seconds()
     }

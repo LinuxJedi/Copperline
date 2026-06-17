@@ -26,6 +26,7 @@ project:
       children:
         - file: debugger/window.md
         - file: debugger/headless.md
+        - file: debugger/reverse.md
     - title: Internals
       children:
         - file: internals/architecture.md
@@ -49,6 +50,7 @@ project:
         - zorro.md
         - debugger/window.md
         - debugger/headless.md
+        - debugger/reverse.md
         - internals/architecture.md
         - internals/timing.md
         - internals/chipset.md

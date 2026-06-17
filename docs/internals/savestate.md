@@ -174,3 +174,80 @@ The determinism gate lives at three levels:
   `cmp` the PNGs. Verified byte-identical on Kickstart 2.05, State of
   the Art mid-demo (floppy and blitter state in flight), and A1200
   Workbench (AGA, Gayle).
+
+## Reverse debugging (`timetravel.rs`)
+
+Reverse debugging is built directly on this determinism. Where `rr`
+records every nondeterministic syscall and signal to make replay
+reproducible, Copperline already has that for free, so going backwards is
+just *snapshot + replay*: keep a ring of recent machine states, and to
+reach an earlier point restore the nearest one at or before it and replay
+forward. The user-facing surfaces (headless `COPPERLINE_DBG_RWATCH`, the
+window's **&lt; Step** / **&lt; Run**) are documented in
+[](../debugger/reverse.md); this section is the model.
+
+### Snapshot ring
+
+`SnapshotRing` (in `timetravel.rs`) holds `Snapshot { pos, frame, blob }`
+entries, captured by `Emulator::tt_capture_if_due` at frame boundaries --
+the same quiescent point save states require. The `blob` is produced by
+`M68kMachine::write_state` into a `Vec`, **bypassing the zlib + magic +
+version framing** of a file save state: snapshots live and die inside one
+process running one binary, so format compatibility is a non-issue and
+skipping it keeps capture cheap. Captures are taken every
+`COPPERLINE_DBG_RR_INTERVAL` frames and the oldest are evicted once the
+total blob size passes `COPPERLINE_DBG_RR_BUDGET_MB`; the ring never drops
+below one anchor.
+
+### Position coordinate
+
+Reverse ops navigate by `Emulator::retired_instructions`, a monotonic
+count bumped per retired instruction in `execute_cpu_slice`. It lives
+**outside** the serialized state -- paired with each snapshot in the ring,
+not inside the blob -- so it costs nothing to capture and, importantly,
+**does not change the save-state shape**: reverse debugging needs no
+`STATE_VERSION` bump. A reverse step to position *P* restores the nearest
+snapshot with `pos <= P` and single-steps to *P* through `run_one_step`,
+the exact per-instruction body the forward `step_real` loop uses (factored
+out so replay reproduces the forward run instruction-for-instruction,
+including the `STOP`-state idle fast-forward).
+
+### Input replay (`inputsched.rs`)
+
+Replay is only byte-identical if input is reproduced at the position it was
+applied. The live forward run keeps applying input exactly as before; when
+reverse mode is armed it also *records* each action into a position-keyed
+`ReplayInputLog` (`Emulator::tt_note_input`, called from the central
+keyboard / mouse-button / mouse-motion / joystick helpers, through which
+both scripted and window input funnel). During replay the engine re-applies
+logged actions as it reaches their positions. A floppy media change is
+logged as a marker that warns on replay rather than silently diverging (the
+inserted image is host-file state, not in the log).
+
+### Determinism boundaries
+
+The same host boundary as save states applies, plus the requirement that
+*time-dependent* inputs be pinned, since replay re-executes them:
+
+- The guest RTC (`rtc.rs`) reads host wall-clock time unless
+  `COPPERLINE_RTC_FIXED_SECS` is set; reverse mode warns when it is unset.
+- Directory-backed (host-folder) filesystems stamp guest-visible host
+  datestamps with no fixed-time override -- avoid for reverse replay.
+- HDF/CD images reopen by path and are externally mutable, so a guest disk
+  write after a snapshot is not rolled back by restoring it; floppy
+  contents are in-state and safe.
+
+### Verification
+
+- `cpu::tests::reverse_step_reconstructs_earlier_state_and_finds_last_writer`
+  reverse-steps then replays forward to the original position and asserts an
+  exact match, and pins the unique writer of a counter word.
+- `cpu::tests::reverse_replay_reproduces_logged_input` proves a logged mouse
+  motion is re-applied when replayed through from an earlier snapshot.
+- `cpu::tests::reverse_watchpoint_does_not_disturb_the_forward_run` runs the
+  state-mutating query bracketed by snapshot/restore and asserts a run with
+  the watch armed matches one without it.
+- `timetravel::tests` cover the ring's interval/eviction/lookup policy;
+  `inputsched::tests` cover the replay-log cursor and pruning;
+  `window::tests::opening_the_debugger_arms_reverse_and_step_reconstructs`
+  drives the window controls.

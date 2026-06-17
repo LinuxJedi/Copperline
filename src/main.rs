@@ -29,6 +29,7 @@ mod gamepad;
 mod gayle;
 mod harddrive;
 mod inputrec;
+mod inputsched;
 mod memory;
 mod recorder;
 mod romsearch;
@@ -37,6 +38,7 @@ mod savestate;
 mod screenshot;
 mod scsi;
 mod serial;
+mod timetravel;
 mod video;
 mod zorro;
 
@@ -800,6 +802,8 @@ fn run_headless_benchmark(mut emu: Emulator, target_secs: f32) -> Result<()> {
         frames as f64 / elapsed.max(f64::EPSILON)
     );
     emu.report_stats();
+    // Evaluate an untargeted reverse watchpoint at the benchmark's end.
+    emu.tt_finalize_reverse_watch()?;
     Ok(())
 }
 
@@ -1007,6 +1011,21 @@ fn main() -> Result<()> {
             path.display(),
             emu.bus().emulated_seconds()
         );
+    }
+    // Arm reverse debugging (snapshot ring + optional one-shot "last writer"
+    // watchpoint) from the COPPERLINE_DBG_RR*/RWATCH environment.
+    if let Some(rr) = debugger::reverse_config_from_env() {
+        if envcfg::var("COPPERLINE_RTC_FIXED_SECS").is_none() {
+            warn!(
+                "reverse debugging is armed but COPPERLINE_RTC_FIXED_SECS is unset; \
+                 the guest RTC reads host wall-clock time, so replay may diverge. \
+                 Set COPPERLINE_RTC_FIXED_SECS for deterministic reverse debugging."
+            );
+        }
+        emu.enable_time_travel(rr.budget_mb, rr.interval_frames);
+        if let Some(addr) = rr.watch_addr {
+            emu.arm_reverse_watch(addr, rr.target_secs);
+        }
     }
     if let Some(target_secs) = cli.benchmark_until {
         return run_headless_benchmark(emu, target_secs);

@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 
 const INSTRUCTIONS_PER_SLICE: usize = 32_000;
 const INSTRUCTIONS_PER_REALTIME_SLICE: usize = 8_192;
+/// Safety bound on a single reverse-debug replay so a pathological target
+/// (e.g. a permanently halted CPU) cannot spin forever. Far larger than the
+/// instruction distance between two snapshots at any sane capture interval.
+const TT_REPLAY_STEP_CAP: u64 = 100_000_000;
 /// Approximate CPU cycles per emulated M68000 instruction for converting
 /// frame-sized instruction budgets and real-mode device cadence. The
 /// instruction-paced backend is not cycle-exact, so use the 68000's
@@ -53,6 +57,27 @@ pub struct Emulator {
     real_pacing_budget_mode: RealPacingBudgetMode,
     audio_profile: AudioRuntimeProfile,
     real_pacing_profile: RealPacingProfile,
+    /// Monotonic count of retired CPU instructions since power-on -- the
+    /// position coordinate for reverse debugging. Kept outside the
+    /// serialized machine state so capturing it is free and the save-state
+    /// format is unaffected.
+    retired_instructions: u64,
+    /// Reverse-debug snapshot ring, present only when reverse mode is armed.
+    tt_ring: Option<crate::timetravel::SnapshotRing>,
+    /// Position-keyed log of applied input actions, recorded during the
+    /// forward run and re-applied during reverse replay. Present whenever the
+    /// ring is.
+    tt_input: Option<crate::inputsched::ReplayInputLog>,
+    /// One-shot "last writer" reverse watchpoint (`COPPERLINE_DBG_RWATCH`).
+    tt_rwatch: Option<ReverseWatch>,
+}
+
+/// A one-shot headless reverse watchpoint: at `target_secs` (or run end),
+/// report the last instruction that wrote `addr`, then disarm.
+struct ReverseWatch {
+    addr: u32,
+    target_secs: Option<f64>,
+    fired: bool,
 }
 
 struct ExecutedSlice {
@@ -344,6 +369,10 @@ impl Emulator {
             real_pacing_budget_mode,
             audio_profile: AudioRuntimeProfile::new(),
             real_pacing_profile: RealPacingProfile::new(),
+            retired_instructions: 0,
+            tt_ring: None,
+            tt_input: None,
+            tt_rwatch: None,
         })
     }
 
@@ -455,6 +484,402 @@ impl Emulator {
         }
     }
 
+    // ---- Reverse debugging (time travel) ------------------------------
+
+    /// Monotonic count of retired CPU instructions since power-on -- the
+    /// position coordinate reverse-debug ops navigate by.
+    pub fn retired_instructions(&self) -> u64 {
+        self.retired_instructions
+    }
+
+    /// Arm the reverse-debug snapshot ring (replacing any existing ring).
+    /// Captures begin at the next frame boundary; `budget_mb` caps total
+    /// snapshot memory and `interval_frames` is the gap between captures.
+    pub fn enable_time_travel(&mut self, budget_mb: usize, interval_frames: u64) {
+        self.tt_ring = Some(crate::timetravel::SnapshotRing::new(
+            budget_mb,
+            interval_frames,
+        ));
+        self.tt_input = Some(crate::inputsched::ReplayInputLog::new());
+    }
+
+    pub fn time_travel_enabled(&self) -> bool {
+        self.tt_ring.is_some()
+    }
+
+    pub fn time_travel_ring(&self) -> Option<&crate::timetravel::SnapshotRing> {
+        self.tt_ring.as_ref()
+    }
+
+    /// Record an input action at the current position for deterministic
+    /// reverse replay. No-op unless reverse mode is armed; the live forward
+    /// application is unchanged and still done by the caller.
+    pub fn tt_note_input(&mut self, action: crate::inputsched::ReplayAction) {
+        let pos = self.retired_instructions;
+        if let Some(log) = self.tt_input.as_mut() {
+            log.record(pos, action);
+        }
+    }
+
+    /// Position the replay-input cursor for a replay starting at `from_pos`.
+    fn tt_begin_replay_input(&mut self, from_pos: u64) {
+        if let Some(log) = self.tt_input.as_mut() {
+            log.begin_replay(from_pos);
+        }
+    }
+
+    /// Apply any input actions that come due at or before `pos` during replay.
+    fn tt_apply_due_input(&mut self, pos: u64) {
+        let mut due = Vec::new();
+        if let Some(log) = self.tt_input.as_mut() {
+            log.take_due(pos, &mut due);
+        }
+        for action in due {
+            action.apply(self.bus_mut());
+        }
+    }
+
+    /// Serialize the whole machine into an in-memory blob (bincode only, no
+    /// zlib/magic framing -- snapshots are same-process and need no format
+    /// versioning, see `timetravel`).
+    fn snapshot_blob(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.machine.write_state(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Restore a blob produced by `snapshot_blob` and rebase the position
+    /// coordinate to `pos`. The pacing anchor is re-baselined like a normal
+    /// save-state load.
+    fn restore_blob(&mut self, blob: &[u8], pos: u64) -> Result<()> {
+        let mut cursor = std::io::Cursor::new(blob);
+        self.machine.apply_state(&mut cursor)?;
+        self.retired_instructions = pos;
+        self.reanchor_realtime_clock();
+        Ok(())
+    }
+
+    /// Capture a snapshot into the ring if one is due at the current frame.
+    fn tt_capture_if_due(&mut self) -> Result<()> {
+        let frame = self.bus().emulated_frames();
+        let due = match self.tt_ring.as_ref() {
+            Some(ring) => ring.capture_due(frame),
+            None => return Ok(()),
+        };
+        if !due {
+            return Ok(());
+        }
+        let pos = self.retired_instructions;
+        let blob = self.snapshot_blob()?;
+        if let Some(ring) = self.tt_ring.as_mut() {
+            ring.push(crate::timetravel::Snapshot { pos, frame, blob });
+        }
+        // Drop input-log entries older than the oldest retained snapshot: they
+        // can never be replayed again.
+        if let Some(oldest) = self.tt_ring.as_ref().and_then(|r| r.oldest_pos()) {
+            if let Some(log) = self.tt_input.as_mut() {
+                log.prune_before(oldest);
+            }
+        }
+        Ok(())
+    }
+
+    /// Replay forward from the current state up to instruction position
+    /// `target_pos`, single-stepping faithfully (the same `run_one_step` the
+    /// forward run uses). Stops early if the CPU deadlocks (halted with no
+    /// pending wake-up) or the safety step cap is hit.
+    fn tt_replay_to(&mut self, target_pos: u64) -> Result<()> {
+        // Re-apply any input recorded at the anchor position before stepping.
+        self.tt_apply_due_input(self.retired_instructions);
+        let mut cpu_idle = false;
+        let mut guard: u64 = 0;
+        while self.retired_instructions < target_pos {
+            let prev = self.retired_instructions;
+            self.run_one_step(&mut cpu_idle, INSTRUCTIONS_PER_SLICE)?;
+            self.tt_apply_due_input(self.retired_instructions);
+            // No forward progress and not merely idling toward a wake-up means
+            // a permanent halt; bail rather than spin forever.
+            if self.retired_instructions == prev && !cpu_idle {
+                break;
+            }
+            guard += 1;
+            if guard > TT_REPLAY_STEP_CAP {
+                log::warn!(
+                    "reverse-debug replay hit the {TT_REPLAY_STEP_CAP}-step cap before reaching pos {target_pos}"
+                );
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconstruct the machine exactly at instruction position `target_pos`
+    /// by restoring the nearest earlier snapshot and replaying forward. The
+    /// ring is left intact (reverse ops never capture).
+    pub fn tt_restore_to(
+        &mut self,
+        target_pos: u64,
+    ) -> Result<crate::timetravel::ReverseOutcome<()>> {
+        use crate::timetravel::ReverseOutcome;
+        let anchor = match self
+            .tt_ring
+            .as_ref()
+            .and_then(|r| r.nearest_at_or_before(target_pos))
+        {
+            Some(s) => (s.pos, s.blob.clone()),
+            None => return Ok(ReverseOutcome::BeyondHistory),
+        };
+        self.restore_blob(&anchor.1, anchor.0)?;
+        self.tt_begin_replay_input(anchor.0);
+        self.tt_replay_to(target_pos)?;
+        Ok(ReverseOutcome::Found(()))
+    }
+
+    /// Step backward `n` instructions. On success the machine is left exactly
+    /// at the new (earlier) position, returned in `Found`.
+    pub fn tt_reverse_step(&mut self, n: u64) -> Result<crate::timetravel::ReverseOutcome<u64>> {
+        use crate::timetravel::ReverseOutcome;
+        let target = self.retired_instructions.saturating_sub(n);
+        Ok(match self.tt_restore_to(target)? {
+            ReverseOutcome::Found(()) => ReverseOutcome::Found(self.retired_instructions),
+            ReverseOutcome::NotFound => ReverseOutcome::NotFound,
+            ReverseOutcome::BeyondHistory => ReverseOutcome::BeyondHistory,
+        })
+    }
+
+    /// Run backward to the previous interactive breakpoint hit: the latest
+    /// instruction boundary strictly before the current position whose PC is
+    /// an armed breakpoint. On `Found` the machine is left parked there.
+    /// `NotFound` means no breakpoints are set or none fired in retained
+    /// history that starts at power-on; `BeyondHistory` means an earlier hit
+    /// may exist before the oldest snapshot. (Watch-based reverse-continue is
+    /// not yet modelled; breakpoints only.)
+    pub fn tt_reverse_continue(&mut self) -> Result<crate::timetravel::ReverseOutcome<u64>> {
+        use crate::timetravel::ReverseOutcome;
+        let breakpoints = self.machine.ui_breaks().breakpoints.clone();
+        if breakpoints.is_empty() {
+            return Ok(ReverseOutcome::NotFound);
+        }
+        let mut interval_end = self.retired_instructions;
+        loop {
+            let anchor = match self
+                .tt_ring
+                .as_ref()
+                .and_then(|r| r.nearest_before(interval_end))
+            {
+                Some(s) => (s.pos, s.blob.clone()),
+                None => return Ok(ReverseOutcome::BeyondHistory),
+            };
+            let anchor_is_oldest =
+                self.tt_ring.as_ref().and_then(|r| r.oldest_pos()) == Some(anchor.0);
+            self.restore_blob(&anchor.1, anchor.0)?;
+            self.tt_begin_replay_input(anchor.0);
+            if let Some(pos) = self.tt_scan_breakpoint(&breakpoints, interval_end)? {
+                self.tt_restore_to(pos)?;
+                return Ok(ReverseOutcome::Found(pos));
+            }
+            if anchor_is_oldest {
+                return Ok(if anchor.0 == 0 {
+                    ReverseOutcome::NotFound
+                } else {
+                    ReverseOutcome::BeyondHistory
+                });
+            }
+            interval_end = anchor.0;
+        }
+    }
+
+    /// Replay the just-restored interval up to `end_pos`, returning the latest
+    /// boundary (strictly before `end_pos`) whose PC is an armed breakpoint --
+    /// the "about to execute a breakpoint" stop the forward run uses.
+    fn tt_scan_breakpoint(&mut self, breakpoints: &[u32], end_pos: u64) -> Result<Option<u64>> {
+        const PC_MASK: u32 = 0x00FF_FFFF;
+        let is_bp = |pc: u32| breakpoints.contains(&(pc & PC_MASK));
+        self.tt_apply_due_input(self.retired_instructions);
+        let mut best = None;
+        if self.retired_instructions < end_pos && is_bp(self.machine.pc()) {
+            best = Some(self.retired_instructions);
+        }
+        let mut cpu_idle = false;
+        let mut guard: u64 = 0;
+        while self.retired_instructions < end_pos {
+            let before = self.retired_instructions;
+            self.run_one_step(&mut cpu_idle, INSTRUCTIONS_PER_SLICE)?;
+            self.tt_apply_due_input(self.retired_instructions);
+            if self.retired_instructions < end_pos && is_bp(self.machine.pc()) {
+                best = Some(self.retired_instructions);
+            }
+            if self.retired_instructions == before && !cpu_idle {
+                break;
+            }
+            guard += 1;
+            if guard > TT_REPLAY_STEP_CAP {
+                break;
+            }
+        }
+        Ok(best)
+    }
+
+    /// Find the last instruction before position `before_pos` that changed the
+    /// word at `addr`. Walks snapshot intervals backward, replaying each with
+    /// a watch on `addr`, until a change is found or retained history runs
+    /// out. On `Found` the machine is repositioned exactly at the writing
+    /// instruction so the caller can inspect it.
+    pub fn tt_last_writer(
+        &mut self,
+        addr: u32,
+        before_pos: u64,
+    ) -> Result<crate::timetravel::ReverseOutcome<crate::timetravel::WriteRecord>> {
+        use crate::timetravel::ReverseOutcome;
+        let mut interval_end = before_pos;
+        loop {
+            let anchor = match self
+                .tt_ring
+                .as_ref()
+                .and_then(|r| r.nearest_before(interval_end))
+            {
+                Some(s) => (s.pos, s.blob.clone()),
+                None => return Ok(ReverseOutcome::BeyondHistory),
+            };
+            let anchor_is_oldest =
+                self.tt_ring.as_ref().and_then(|r| r.oldest_pos()) == Some(anchor.0);
+            self.restore_blob(&anchor.1, anchor.0)?;
+            self.tt_begin_replay_input(anchor.0);
+            if let Some(rec) = self.tt_scan_writes(addr, interval_end)? {
+                // Leave the machine parked on the writing instruction.
+                self.tt_restore_to(rec.pos)?;
+                return Ok(ReverseOutcome::Found(rec));
+            }
+            // Nothing in this interval; step one interval further back.
+            if anchor_is_oldest {
+                // We scanned the oldest retained interval. If it starts at
+                // power-on the answer is a definitive "never written";
+                // otherwise an earlier write may exist beyond history.
+                return Ok(if anchor.0 == 0 {
+                    ReverseOutcome::NotFound
+                } else {
+                    ReverseOutcome::BeyondHistory
+                });
+            }
+            interval_end = anchor.0;
+        }
+    }
+
+    /// Replay from the current (just-restored) state to `end_pos`, returning
+    /// the last change to the word at `addr` seen along the way. The writer
+    /// PC is the previous-instruction PC, matching the forward
+    /// `COPPERLINE_DBG_WATCH` attribution.
+    fn tt_scan_writes(
+        &mut self,
+        addr: u32,
+        end_pos: u64,
+    ) -> Result<Option<crate::timetravel::WriteRecord>> {
+        // Apply any input recorded at the anchor before observing writes.
+        self.tt_apply_due_input(self.retired_instructions);
+        let mut last: Option<crate::timetravel::WriteRecord> = None;
+        let mut prev = self.machine.bus().peek_word_any(addr);
+        let mut cpu_idle = false;
+        let mut guard: u64 = 0;
+        while self.retired_instructions < end_pos {
+            let before = self.retired_instructions;
+            self.run_one_step(&mut cpu_idle, INSTRUCTIONS_PER_SLICE)?;
+            self.tt_apply_due_input(self.retired_instructions);
+            let cur = self.machine.bus().peek_word_any(addr);
+            if cur != prev {
+                last = Some(crate::timetravel::WriteRecord {
+                    addr,
+                    old: prev,
+                    new: cur,
+                    pc: self.machine.ppc(),
+                    pos: self.retired_instructions,
+                    cck: self.machine.bus().emulated_cck(),
+                    frame: self.machine.bus().emulated_frames(),
+                });
+                prev = cur;
+            }
+            if self.retired_instructions == before && !cpu_idle {
+                break;
+            }
+            guard += 1;
+            if guard > TT_REPLAY_STEP_CAP {
+                break;
+            }
+        }
+        Ok(last)
+    }
+
+    /// Arm a one-shot "last writer" reverse watchpoint on `addr`, evaluated at
+    /// `target_secs` of emulated time (or at run end via
+    /// `tt_finalize_reverse_watch` when `None`). Requires the ring to be armed.
+    pub fn arm_reverse_watch(&mut self, addr: u32, target_secs: Option<f64>) {
+        self.tt_rwatch = Some(ReverseWatch {
+            addr,
+            target_secs,
+            fired: false,
+        });
+    }
+
+    fn tt_poll_reverse_watch(&mut self) -> Result<()> {
+        let due = match self.tt_rwatch.as_ref() {
+            Some(rw) if !rw.fired => match rw.target_secs {
+                Some(t) => self.bus().emulated_seconds() >= t,
+                None => false, // run-end target: see tt_finalize_reverse_watch
+            },
+            _ => false,
+        };
+        if due {
+            self.tt_fire_reverse_watch()?;
+        }
+        Ok(())
+    }
+
+    /// Evaluate a pending reverse watchpoint now (used at run end for an
+    /// untargeted `COPPERLINE_DBG_RWATCH`, and as a safety net if the target
+    /// time was never reached). Idempotent.
+    pub fn tt_finalize_reverse_watch(&mut self) -> Result<()> {
+        self.tt_fire_reverse_watch()
+    }
+
+    /// Run the reverse "last writer" query for the armed watchpoint and report
+    /// it, preserving the live forward state across the (state-mutating)
+    /// query so the run continues unaffected.
+    fn tt_fire_reverse_watch(&mut self) -> Result<()> {
+        use crate::timetravel::ReverseOutcome;
+        let addr = match self.tt_rwatch.as_ref() {
+            Some(rw) if !rw.fired => rw.addr,
+            _ => return Ok(()),
+        };
+        if let Some(rw) = self.tt_rwatch.as_mut() {
+            rw.fired = true;
+        }
+        let pos_now = self.retired_instructions;
+        // Snapshot the live state, run the backward query, then restore so the
+        // forward run resumes exactly where it left off.
+        let saved = self.snapshot_blob()?;
+        let outcome = self.tt_last_writer(addr, pos_now)?;
+        match outcome {
+            ReverseOutcome::Found(rec) => log::info!(
+                "DBG RWATCH last writer of ${:06X}: {:04X}->{:04X} by pc={:#010X} pos={} f={} cck={}",
+                rec.addr,
+                rec.old,
+                rec.new,
+                rec.pc,
+                rec.pos,
+                rec.frame,
+                rec.cck,
+            ),
+            ReverseOutcome::NotFound => log::info!(
+                "DBG RWATCH ${addr:06X}: no write to it found in recorded history"
+            ),
+            ReverseOutcome::BeyondHistory => log::warn!(
+                "DBG RWATCH ${addr:06X}: the last write predates retained snapshots; \
+                 raise COPPERLINE_DBG_RR_BUDGET_MB or lower COPPERLINE_DBG_RR_INTERVAL"
+            ),
+        }
+        self.restore_blob(&saved, pos_now)?;
+        Ok(())
+    }
+
     /// Whether presentation is paced to wall-clock time (false = warp).
     pub fn paced(&self) -> bool {
         self.paced
@@ -533,6 +958,14 @@ impl Emulator {
         }
         self.step_real()?;
         self.stats.frames += 1;
+        // Capture a reverse-debug snapshot at this frame boundary when one is
+        // due (no-op unless reverse mode is armed). Frame boundaries are the
+        // only safe capture points -- mid-frame the renderer capture buffers
+        // are inconsistent (see M68kMachine::write_state).
+        self.tt_capture_if_due()?;
+        // Evaluate a time-targeted reverse watchpoint when its target is
+        // reached (no-op unless armed).
+        self.tt_poll_reverse_watch()?;
         if crate::envcfg::flag("COPPERLINE_DIAG_PCSAMPLE") && self.stats.frames.is_multiple_of(50) {
             log::info!(
                 "pcsample frame={} pc={:#010X} sr={:#06X}",
@@ -557,42 +990,14 @@ impl Emulator {
         // display writes, is cycle-accurate too.
         let mut cpu_idle = false;
         while remaining > 0 {
-            let chunk = if cpu_idle {
-                self.idle_fast_forward_chunk(remaining)
-            } else {
-                1
-            };
-            let run = self.execute_cpu_slice(chunk)?;
-            let accounting = real_slice_accounting(
-                &run,
-                chunk,
-                self.cpu_cycles_per_instruction,
-                self.real_pacing_budget_mode,
-            );
+            let accounting = self.run_one_step(&mut cpu_idle, remaining)?;
             remaining = remaining.saturating_sub(accounting.budget_debit);
-            if run.cpu_stopped {
-                // A stopped CPU performed no bus activity; advance the chipset
-                // and timed devices through the idle period. (A running slice
-                // needs nothing here: the cycle-exact core already advanced
-                // its full device time through sync/grant as it executed.)
-                let idle_cck = accounting.slice_cck.saturating_sub(run.bus_advanced_cck);
-                self.bus_mut().advance_devices(idle_cck);
-            }
-            // `refresh_irq_line` applies any deferred timed-device color clocks
-            // before sampling the interrupt line (see its body), so a device
-            // interrupt that came due during the slice is recognized here.
-            self.machine.refresh_irq_line();
-            self.real_pacing_profile.record_slice(&run, accounting);
             // An interactive breakpoint/watch hit ends the frame early;
             // the window surfaces it and pauses. (Checked after the device
             // advance so a hit during an idle fast-forward is seen too.)
             if self.machine.ui_debug_stop_pending() {
                 break;
             }
-            // Only a single-instruction slice that came back stopped tells
-            // us the CPU is genuinely idle; never batch on the slice right
-            // after a fast-forward, so a wake-up is always stepped.
-            cpu_idle = run.cpu_stopped && chunk == 1;
         }
         // Pace presentation to wall-clock only for the interactive window;
         // headless runs advance the deterministic core unthrottled.
@@ -600,6 +1005,51 @@ impl Emulator {
             self.sleep_until_realtime_device_time();
         }
         Ok(())
+    }
+
+    /// One iteration of the cycle-stepping loop: pick a slice size (a single
+    /// instruction while running, or an idle fast-forward bounded by
+    /// `idle_cap` while the CPU is halted in STOP), execute it, advance idle
+    /// device time, and recognize interrupts. `cpu_idle` carries the
+    /// STOP-state flag across calls. Returns the pacing accounting for the
+    /// slice. Shared by `step_real` (budget-driven) and the reverse-debug
+    /// replay loop (position-driven), so replay reproduces the forward run
+    /// instruction-for-instruction.
+    fn run_one_step(
+        &mut self,
+        cpu_idle: &mut bool,
+        idle_cap: usize,
+    ) -> Result<RealSliceAccounting> {
+        let chunk = if *cpu_idle {
+            self.idle_fast_forward_chunk(idle_cap)
+        } else {
+            1
+        };
+        let run = self.execute_cpu_slice(chunk)?;
+        let accounting = real_slice_accounting(
+            &run,
+            chunk,
+            self.cpu_cycles_per_instruction,
+            self.real_pacing_budget_mode,
+        );
+        if run.cpu_stopped {
+            // A stopped CPU performed no bus activity; advance the chipset
+            // and timed devices through the idle period. (A running slice
+            // needs nothing here: the cycle-exact core already advanced
+            // its full device time through sync/grant as it executed.)
+            let idle_cck = accounting.slice_cck.saturating_sub(run.bus_advanced_cck);
+            self.bus_mut().advance_devices(idle_cck);
+        }
+        // `refresh_irq_line` applies any deferred timed-device color clocks
+        // before sampling the interrupt line (see its body), so a device
+        // interrupt that came due during the slice is recognized here.
+        self.machine.refresh_irq_line();
+        self.real_pacing_profile.record_slice(&run, accounting);
+        // Only a single-instruction slice that came back stopped tells us the
+        // CPU is genuinely idle; never batch on the slice right after a
+        // fast-forward, so a wake-up is always stepped.
+        *cpu_idle = run.cpu_stopped && chunk == 1;
+        Ok(accounting)
     }
 
     /// Largest instruction budget to skip while the CPU is halted in STOP.
@@ -764,6 +1214,11 @@ impl Emulator {
         self.stats.instructions = self
             .stats
             .instructions
+            .saturating_add(actual_instructions as u64);
+        // Reverse-debug position coordinate. Unlike `stats`, this is never
+        // reset by `reset_stats`; it is only rebased by a snapshot restore.
+        self.retired_instructions = self
+            .retired_instructions
             .saturating_add(actual_instructions as u64);
         if self.bus().overlay_disable_pending {
             self.machine.disable_overlay();

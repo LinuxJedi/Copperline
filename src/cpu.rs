@@ -964,6 +964,13 @@ impl M68kMachine {
         self.cpu.pc
     }
 
+    /// PC of the most recently retired instruction (the "previous PC").
+    /// Reverse debugging credits a watched-memory change to this PC, matching
+    /// the `COPPERLINE_DBG_WATCH` writer attribution.
+    pub fn ppc(&self) -> u32 {
+        self.cpu.ppc
+    }
+
     pub fn sr(&self) -> u16 {
         self.cpu.get_sr()
     }
@@ -3310,6 +3317,210 @@ mod tests {
         for path in [&state_t1, &state_t2, &state_t2_replay] {
             let _ = std::fs::remove_file(path);
         }
+        Ok(())
+    }
+
+    /// The reverse-debug snapshot ring reconstructs an earlier instruction
+    /// boundary exactly (reverse step) and pins the last writer of a watched
+    /// word, using the same chip-RAM counter loop as the save-state test.
+    #[test]
+    fn reverse_step_reconstructs_earlier_state_and_finds_last_writer() -> Result<()> {
+        use crate::config::PacingBudget;
+        use crate::emulator::Emulator;
+        use crate::timetravel::ReverseOutcome;
+
+        let mut bus = test_bus_with_pc(0x1000);
+        // addq.w #1,$2000 ; move.w $2000,$DFF180 ; bra back. Only the addq
+        // (at PC $1000) writes $2000, so the last writer is unambiguous.
+        write_program(
+            &mut bus,
+            0x1000,
+            &[
+                0x5279, 0x0000, 0x2000, // addq.w  #1,$2000.l
+                0x33F9, 0x0000, 0x2000, 0x00DF, 0xF180, // move.w $2000.l,$DFF180.l
+                0x60EE, // bra.s   $1000
+            ],
+        );
+        let mut emu = Emulator::new(
+            bus,
+            CpuModel::M68000,
+            false,
+            PacingBudget::Instructions,
+            2,
+            false,
+        )?;
+        emu.enable_time_travel(256, 1);
+
+        // Run a handful of frames so the ring holds several snapshots.
+        while emu.bus().emulated_frames() < 6 {
+            emu.step_frame()?;
+        }
+
+        let pos_now = emu.retired_instructions();
+        let sample = |emu: &Emulator| {
+            (
+                emu.machine.pc(),
+                emu.machine.sr(),
+                emu.bus().emulated_frames(),
+                emu.bus().emulated_cck(),
+                emu.bus().peek_word_any(0x2000),
+            )
+        };
+        let here = sample(&emu);
+        assert!(here.4 > 0, "the counter loop actually ran");
+
+        // Step back 100 instructions, then replay forward to the original
+        // position: the reconstructed state must match exactly.
+        match emu.tt_reverse_step(100)? {
+            ReverseOutcome::Found(pos) => assert_eq!(pos, pos_now - 100),
+            other => panic!("reverse step did not land in history: {other:?}"),
+        }
+        assert_eq!(emu.retired_instructions(), pos_now - 100);
+        match emu.tt_restore_to(pos_now)? {
+            ReverseOutcome::Found(()) => {}
+            other => panic!("restore_to forward replay failed: {other:?}"),
+        }
+        assert_eq!(
+            sample(&emu),
+            here,
+            "replay to the original position diverged"
+        );
+
+        // The last instruction to write $2000 before now is the addq at $1000.
+        match emu.tt_last_writer(0x2000, pos_now)? {
+            ReverseOutcome::Found(rec) => {
+                assert_eq!(rec.addr, 0x2000);
+                assert_eq!(rec.pc, 0x1000, "addq is the only writer of $2000");
+                assert_eq!(rec.new, rec.old.wrapping_add(1), "addq increments by one");
+                assert_eq!(
+                    emu.retired_instructions(),
+                    rec.pos,
+                    "machine parked on the writing instruction"
+                );
+            }
+            other => panic!("last writer not found in history: {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Reverse replay re-applies logged input at its original position: a
+    /// mouse motion noted mid-run is reproduced when replaying through that
+    /// point from an earlier snapshot, so the reconstructed state matches.
+    #[test]
+    fn reverse_replay_reproduces_logged_input() -> Result<()> {
+        use crate::config::PacingBudget;
+        use crate::emulator::Emulator;
+        use crate::inputsched::ReplayAction;
+        use crate::timetravel::ReverseOutcome;
+
+        let mut bus = test_bus_with_pc(0x1000);
+        write_program(
+            &mut bus,
+            0x1000,
+            &[
+                0x5279, 0x0000, 0x2000, // addq.w  #1,$2000.l
+                0x60FA, // bra.s   $1000
+            ],
+        );
+        let mut emu = Emulator::new(
+            bus,
+            CpuModel::M68000,
+            false,
+            PacingBudget::Instructions,
+            2,
+            false,
+        )?;
+        // A huge interval keeps a single early anchor, so every reverse op
+        // replays from before the input below -- exercising re-application.
+        emu.enable_time_travel(256, 100_000);
+
+        while emu.bus().emulated_frames() < 3 {
+            emu.step_frame()?;
+        }
+        // Apply a port-1 mouse motion live and note it for replay, exactly as
+        // the window's add_mouse_delta_i32 does.
+        emu.bus_mut().input.add_mouse_delta_port1(40, 0);
+        emu.tt_note_input(ReplayAction::MouseMove { dx: 40, dy: 0 });
+
+        while emu.bus().emulated_frames() < 6 {
+            emu.step_frame()?;
+        }
+        let pos_now = emu.retired_instructions();
+        let counter_with_input = emu.bus().input.mouse_x_port1;
+        assert_eq!(counter_with_input, 40, "the motion landed");
+
+        // Reverse to before the motion: replaying from the early anchor stops
+        // short of the note, so the counter is back to zero.
+        match emu.tt_reverse_step(pos_now / 2)? {
+            ReverseOutcome::Found(_) => {}
+            other => panic!("reverse step failed: {other:?}"),
+        }
+        assert!(
+            emu.retired_instructions() < pos_now,
+            "actually stepped back"
+        );
+
+        // Replay forward through the note again: the motion is re-applied, so
+        // the reconstructed counter matches the original timeline.
+        match emu.tt_restore_to(pos_now)? {
+            ReverseOutcome::Found(()) => {}
+            other => panic!("restore_to failed: {other:?}"),
+        }
+        assert_eq!(
+            emu.bus().input.mouse_x_port1,
+            counter_with_input,
+            "replay did not reproduce the logged mouse motion"
+        );
+        Ok(())
+    }
+
+    /// A fired reverse watchpoint must not perturb the forward timeline: the
+    /// state-mutating backward query is bracketed by snapshot/restore, so a
+    /// run with the watch armed matches one without it instruction-for-byte.
+    #[test]
+    fn reverse_watchpoint_does_not_disturb_the_forward_run() -> Result<()> {
+        use crate::config::PacingBudget;
+        use crate::emulator::Emulator;
+
+        let program = [
+            0x5279, 0x0000, 0x2000, // addq.w  #1,$2000.l
+            0x60FA, // bra.s   $1000
+        ];
+        let build = || -> Result<Emulator> {
+            let mut bus = test_bus_with_pc(0x1000);
+            write_program(&mut bus, 0x1000, &program);
+            let mut emu = Emulator::new(
+                bus,
+                CpuModel::M68000,
+                false,
+                PacingBudget::Instructions,
+                2,
+                false,
+            )?;
+            emu.enable_time_travel(256, 2);
+            Ok(emu)
+        };
+
+        let mut armed = build()?;
+        // Fire the query partway through the run.
+        armed.arm_reverse_watch(0x2000, Some(0.02));
+        let mut plain = build()?;
+
+        for _ in 0..8 {
+            armed.step_frame()?;
+            plain.step_frame()?;
+        }
+
+        assert_eq!(armed.machine.pc(), plain.machine.pc());
+        assert_eq!(armed.machine.sr(), plain.machine.sr());
+        assert_eq!(armed.bus().emulated_frames(), plain.bus().emulated_frames());
+        assert_eq!(armed.bus().emulated_cck(), plain.bus().emulated_cck());
+        assert_eq!(
+            armed.bus().peek_word_any(0x2000),
+            plain.bus().peek_word_any(0x2000),
+            "the reverse watchpoint corrupted the forward timeline"
+        );
+        assert_eq!(armed.retired_instructions(), plain.retired_instructions());
         Ok(())
     }
 
