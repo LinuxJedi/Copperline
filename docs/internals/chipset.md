@@ -77,8 +77,14 @@ position/control/data registers, and CLXCON/CLXDAT collision detection
 (CLXCON2 extends it to planes 7-8 on Lisa). Denise revisions: OCS 8362,
 ECS 8373, AGA Lisa (DENISEID $00F8). The AGA decode adds 8 bitplanes,
 HAM8, the BPLCON4 BPLAM pixel-index XOR mask, and the OSPRM/ESPRM sprite
-palette banks. Denise state is not rendered live -- writes become beam
-events that the [video pipeline](video) replays.
+palette banks. AGA also widens dual playfield: OCS/ECS split six bitplanes
+into two three-bit fields (PF1 = planes 1/3/5, PF2 = planes 2/4/6), while
+Lisa extends each field to four bits by feeding bitplane 7 into PF1 and
+bitplane 8 into PF2, so a 7-8 plane dual playfield addresses palette
+entries 8..15 per field. The extra bits are gated on the AGA revision;
+pre-AGA chips never carry bitplanes 7/8 and keep the exact three-bit
+decode. Denise state is not rendered live -- writes become beam events
+that the [video pipeline](video) replays.
 
 The ECS DIWHIGH high bits only stay in force until the next DIWSTRT or
 DIWSTOP write, which re-arms the OCS-implicit high bits derived from the

@@ -137,6 +137,26 @@ for those.
   workload; combine with `COPPERLINE_AUDIO_PROFILE=1` for live-audio
   counters (see [](../internals/peripherals)).
 
+## Benchmarking
+
+`--benchmark-until SECS` runs the deterministic core frame by frame with no
+window until the absolute emulated-time target SECS is reached, then reports
+host-CPU counters (emulated seconds advanced, wall-clock elapsed, frame
+count, frames per second) and exits:
+
+```sh
+./target/release/copperline --config sota.example.toml --benchmark-until 30
+```
+
+It is the canonical way to measure host-CPU cost while optimising the
+emulator: the core is deterministic, so the emulated workload is identical
+run to run and only the wall-clock time moves. Audio defaults to the null
+backend (pass `--audio` to keep live audio), and the mode is mutually
+exclusive with anything that needs a window or scheduled work --
+`--screenshot-after`, `--dump-frames`, `--save-state-after`,
+`--profile-live-audio`, `--record-input`, scripted input, and scheduled
+disk inserts are all rejected. `--bench-until` is an accepted alias.
+
 ## Investigating a run
 
 The [headless debugger](../debugger/headless) layers on top of any of

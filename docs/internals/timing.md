@@ -45,6 +45,23 @@ and ROM are external-bus accesses billed at the CPU clock without chip-bus
 arbitration -- so an accelerated CPU speeds up exactly what a real
 accelerator would.
 
+### Deferred timed-device ticks
+
+The chipset and beam advance every colour clock, but the *timed devices*
+the CPU can only observe indirectly -- the CIAs, serial port, pots, audio,
+floppy, Akiko -- are not ticked per CPU bus access (that dominated the host
+profile). Instead their colour clocks accumulate in `pending_device_tick`
+and `flush_timed_devices` applies them in one batch at the next observation
+boundary: a CIA/custom/peripheral register read or write, or an instruction
+boundary for interrupt recognition. Read-only custom registers
+(INTREQR/DSKBYTR/SERDATR/POTxDAT) and writes that change device state
+(INTREQ/INTENA/ADKCON/DSKLEN/AUDxxx/SERDAT) flush first, so a device always
+reflects time right up to the moment it is read or written. The CIA E-clock
+divider and every device tick are exact under batching, so observable timing
+is unchanged -- the accumulator is a host-CPU optimisation only, and it is
+flushed to zero at every frame boundary (so it is never serialized into a
+save state).
+
 ### CPU vs blitter
 
 DMACON's BLTPRI ("blitter nasty") is modelled as on hardware: with BLTPRI
