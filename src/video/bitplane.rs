@@ -2865,12 +2865,16 @@ fn maybe_log_frame_state(
     }
     log::info!(
         "framestate secs={secs:.4} frame={} vline0={visible_line0} dmacon={:#06X} \
-         bplcon0={:#06X} bplcon1={:#06X} diwstrt={:#06X} diwstop={:#06X} \
+         bplcon0={:#06X} bplcon1={:#06X} bplcon2={:#06X} bplcon3={:#06X} \
+         bplcon4={:#06X} diwstrt={:#06X} diwstop={:#06X} \
          ddfstrt={:#06X} ddfstop={:#06X} fmode={:#06X} bpl1mod={} bpl2mod={} bplpt={:08X?}",
         emulated_frames,
         control.dmacon,
         control.bplcon0,
         control.bplcon1,
+        control.bplcon2,
+        control.bplcon3,
+        control.bplcon4,
         control.diwstrt,
         control.diwstop,
         control.ddfstrt,
@@ -2972,7 +2976,7 @@ fn maybe_log_manual_sprite_intervals(
         .filter(|event| {
             matches!(
                 event.offset & 0x01FE,
-                0x096 | 0x10C | 0x140..=0x17E | 0x180..=0x1BE | 0x1FC
+                0x096 | 0x106 | 0x10C | 0x140..=0x17E | 0x180..=0x1BE | 0x1FC
             )
         })
         .count();
@@ -2985,7 +2989,7 @@ fn maybe_log_manual_sprite_intervals(
     for event in events.iter().filter(|event| {
         matches!(
             event.offset & 0x01FE,
-            0x096 | 0x10C | 0x140..=0x17E | 0x180..=0x1BE | 0x1FC
+            0x096 | 0x106 | 0x10C | 0x140..=0x17E | 0x180..=0x1BE | 0x1FC
         )
     }) {
         if !spec.want_all
@@ -3004,6 +3008,14 @@ fn maybe_log_manual_sprite_intervals(
                 event.vpos,
                 event.hpos,
                 beam_x,
+                event.value
+            ),
+            0x106 => log::info!(
+                "manual-sprite event y={} h={} beam_x={} color_x={} BPLCON3={:#06X}",
+                event.vpos,
+                event.hpos,
+                beam_x,
+                color_x,
                 event.value
             ),
             0x10C => log::info!(
@@ -3051,7 +3063,7 @@ fn maybe_log_manual_sprite_intervals(
                 continue;
             }
             log::info!(
-                "manual-sprite line y={} s{} x={}..{} hstart={} hsub={} words={} att={} data={:04X}/{:04X}",
+                "manual-sprite line y={} s{} x={}..{} hstart={} hsub={} words={} att={} A={:04X} {:04X?} B={:04X} {:04X?}",
                 line.beam_y,
                 sprite,
                 line.x_start,
@@ -3061,7 +3073,9 @@ fn maybe_log_manual_sprite_intervals(
                 line.width_words,
                 u8::from(line.attached),
                 line.data,
-                line.datb
+                line.data_ext,
+                line.datb,
+                line.datb_ext
             );
         }
     }
