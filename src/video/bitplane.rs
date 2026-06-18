@@ -556,11 +556,57 @@ impl ControlState {
     }
 
     fn pf1_scroll(&self) -> usize {
+        if self.aga() {
+            return self.aga_bplcon1_scroll_samples(false);
+        }
         (self.bplcon1 & 0x000F) as usize
     }
 
     fn pf2_scroll(&self) -> usize {
+        if self.aga() {
+            return self.aga_bplcon1_scroll_samples(true);
+        }
         ((self.bplcon1 >> 4) & 0x000F) as usize
+    }
+
+    /// AGA Lisa expands BPLCON1 to two 8-bit scroll counters in 35 ns
+    /// super-hires units. The old OCS/ECS nibble bits are renamed to H2..H5,
+    /// preserving old lo-res scroll values, while the new bits provide
+    /// sub-lores positioning and the extra range needed by wide FMODE fetches.
+    fn aga_bplcon1_scroll_samples(&self, pf2: bool) -> usize {
+        let shres_scroll = if pf2 {
+            ((self.bplcon1 >> 12) & 0x0001)
+                | ((self.bplcon1 >> 12) & 0x0002)
+                | ((self.bplcon1 >> 2) & 0x0004)
+                | ((self.bplcon1 >> 2) & 0x0008)
+                | ((self.bplcon1 >> 2) & 0x0010)
+                | ((self.bplcon1 >> 2) & 0x0020)
+                | ((self.bplcon1 >> 8) & 0x0040)
+                | ((self.bplcon1 >> 8) & 0x0080)
+        } else {
+            ((self.bplcon1 >> 8) & 0x0001)
+                | ((self.bplcon1 >> 8) & 0x0002)
+                | ((self.bplcon1 << 2) & 0x0004)
+                | ((self.bplcon1 << 2) & 0x0008)
+                | ((self.bplcon1 << 2) & 0x0010)
+                | ((self.bplcon1 << 2) & 0x0020)
+                | ((self.bplcon1 >> 4) & 0x0040)
+                | ((self.bplcon1 >> 4) & 0x0080)
+        } as usize;
+        let fetch_mask = match self.fetch_quantum() {
+            1 => 0x3F,
+            2 => 0x7F,
+            _ => 0xFF,
+        };
+        let shres_scroll = shres_scroll & fetch_mask;
+        let samples_per_native = if self.shres() {
+            1
+        } else if self.hires() {
+            2
+        } else {
+            4
+        };
+        shres_scroll / samples_per_native
     }
 
     fn scroll_for_plane(&self, plane: usize) -> usize {
@@ -2923,6 +2969,14 @@ struct ManualSpriteDiagSpec {
     until: f64,
 }
 
+#[derive(Clone, Copy)]
+struct SpritePixelDiagSpec {
+    beam_y: i32,
+    step: usize,
+    after: f64,
+    until: f64,
+}
+
 fn manual_sprite_diag_spec() -> Option<ManualSpriteDiagSpec> {
     static SPEC: OnceLock<Option<ManualSpriteDiagSpec>> = OnceLock::new();
     *SPEC.get_or_init(|| {
@@ -2936,6 +2990,28 @@ fn manual_sprite_diag_spec() -> Option<ManualSpriteDiagSpec> {
         Some(ManualSpriteDiagSpec {
             want_all,
             beam_y,
+            after: env_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0),
+            until: env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY),
+        })
+    })
+}
+
+fn sprite_pixel_diag_spec() -> Option<SpritePixelDiagSpec> {
+    static SPEC: OnceLock<Option<SpritePixelDiagSpec>> = OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let raw = crate::envcfg::var("COPPERLINE_DIAG_SPRITE_PIXELS")?;
+        let raw = raw.trim();
+        let (beam_y, step) = if let Some((beam_y, step)) = raw.split_once(',') {
+            (
+                beam_y.trim().parse::<i32>().ok()?,
+                step.trim().parse::<usize>().ok()?.max(1),
+            )
+        } else {
+            (raw.parse::<i32>().ok()?, 32)
+        };
+        Some(SpritePixelDiagSpec {
+            beam_y,
+            step,
             after: env_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0),
             until: env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY),
         })
@@ -3077,6 +3153,121 @@ fn maybe_log_manual_sprite_intervals(
                 line.datb,
                 line.datb_ext
             );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_log_sprite_pixel_samples(
+    emulated_seconds: f64,
+    emulated_frames: u64,
+    state: &RenderState,
+    captured_sprite_lines: &[CapturedSpriteLine],
+    sprite_dma_observed: bool,
+    manual_sprite_lines: &[Vec<SpriteLine>],
+    base_palettes: &[Palette],
+    palette_segments: &[Vec<PaletteSegment>],
+    base_controls: &[ControlState],
+    control_segments: &[Vec<ControlSegment>],
+    visible_line0: i32,
+) {
+    let Some(spec) = sprite_pixel_diag_spec() else {
+        return;
+    };
+    let secs = emulated_seconds;
+    if secs < spec.after || secs >= spec.until {
+        return;
+    }
+    let y = spec.beam_y - visible_line0;
+    if y < 0 || y >= base_controls.len() as i32 {
+        return;
+    }
+    let y = y as usize;
+    let use_captured_sprite_dma = sprite_dma_observed;
+    let sprite_lines: [Vec<SpriteLine>; 8] = std::array::from_fn(|sprite| {
+        collect_sprite_lines(
+            sprite,
+            state,
+            captured_sprite_lines,
+            use_captured_sprite_dma,
+            Some(manual_sprite_lines),
+        )
+    });
+    log::info!(
+        "sprite-pixel samples secs={secs:.4} frame={} y={} step={}",
+        emulated_frames,
+        spec.beam_y,
+        spec.step
+    );
+    for x in (0..FB_WIDTH).step_by(spec.step) {
+        let control = control_at_x(base_controls[y], &control_segments[y], x);
+        let palette = palette_at_x(base_palettes[y], &palette_segments[y], x);
+        for pair in 0..4 {
+            let even_sprite = pair * 2;
+            let odd_sprite = even_sprite + 1;
+            let even_lines = &sprite_lines[even_sprite];
+            let odd_lines = &sprite_lines[odd_sprite];
+            let attached = sprite_pair_attach_active_for_beam(even_lines, odd_lines, spec.beam_y);
+            if attached {
+                let even_idx = sprite_lines_pixel_bits_at(
+                    even_lines,
+                    spec.beam_y,
+                    y,
+                    x as i32,
+                    base_controls,
+                    control_segments,
+                );
+                let odd_idx = sprite_lines_pixel_bits_at(
+                    odd_lines,
+                    spec.beam_y,
+                    y,
+                    x as i32,
+                    base_controls,
+                    control_segments,
+                );
+                let idx = even_idx | (odd_idx << 2);
+                if idx == 0 {
+                    continue;
+                }
+                let color_idx = sprite_color_entry(control, even_sprite, idx, true);
+                log::info!(
+                    "sprite-pixel y={} x={} pair{} att idx={:#04X} color={} rgb={:#08X} BPLCON3={:#06X} BPLCON4={:#06X}",
+                    spec.beam_y,
+                    x,
+                    pair,
+                    idx,
+                    color_idx,
+                    palette.rgb24(color_idx) & 0x00FF_FFFF,
+                    control.bplcon3,
+                    control.bplcon4
+                );
+            } else {
+                for sprite in [even_sprite, odd_sprite] {
+                    let idx = sprite_lines_pixel_bits_at(
+                        &sprite_lines[sprite],
+                        spec.beam_y,
+                        y,
+                        x as i32,
+                        base_controls,
+                        control_segments,
+                    );
+                    if idx == 0 {
+                        continue;
+                    }
+                    let color_idx = sprite_color_entry(control, sprite, idx, false);
+                    log::info!(
+                        "sprite-pixel y={} x={} s{} idx={:#04X} color={} rgb={:#08X} BPLCON3={:#06X} BPLCON4={:#06X}",
+                        spec.beam_y,
+                        x,
+                        sprite,
+                        idx,
+                        color_idx,
+                        palette.rgb24(color_idx) & 0x00FF_FFFF,
+                        control.bplcon3,
+                        control.bplcon4
+                    );
+                }
+            }
         }
     }
 }
@@ -3334,6 +3525,19 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         visible_line0,
     );
     backfill_left_overscan_background(&mut base_palettes, &mut palette_segments);
+    maybe_log_sprite_pixel_samples(
+        input.emulated_seconds,
+        input.emulated_frames,
+        &state,
+        input.captured_sprite_lines.as_slice(),
+        input.sprite_dma_observed,
+        &manual_sprite_lines,
+        &base_palettes,
+        &palette_segments,
+        &base_controls,
+        &control_segments,
+        visible_line0,
+    );
     render_timing.event_nanos = event_started.elapsed().as_nanos();
     render_timing.events = render_events.len() as u64;
     render_timing.control_segments = control_segments
@@ -8802,6 +9006,56 @@ mod tests {
         assert_eq!(control.pf2_scroll(), 10);
         assert_eq!(control.scroll_for_plane(0), 3);
         assert_eq!(control.scroll_for_plane(1), 10);
+    }
+
+    #[test]
+    fn aga_bplcon1_decodes_expanded_scroll_fields() {
+        let control = ControlState {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: 0x0010,
+            bplcon1: 0xC8C2,
+            fmode: 0x0003,
+            ..ControlState::default()
+        };
+
+        // BPLCON1 bit layout on Lisa:
+        // PF1 H0..H7 = bits 8,9,0,1,2,3,10,11.
+        // PF2 H0..H7 = bits 12,13,4,5,6,7,14,15.
+        // This frame uses 136 and 240 super-hires pixels respectively; in
+        // lo-res output those are 34 and 60 native samples.
+        assert_eq!(control.pf1_scroll(), 34);
+        assert_eq!(control.pf2_scroll(), 60);
+        assert_eq!(control.scroll_for_plane(0), 34);
+        assert_eq!(control.scroll_for_plane(1), 60);
+    }
+
+    #[test]
+    fn aga_bplcon1_preserves_classic_lores_scroll_nibbles() {
+        let control = ControlState {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: 0x0010,
+            bplcon1: 0x00A3,
+            fmode: 0,
+            ..ControlState::default()
+        };
+
+        assert_eq!(control.pf1_scroll(), 3);
+        assert_eq!(control.pf2_scroll(), 10);
+    }
+
+    #[test]
+    fn aga_bplcon1_masks_scroll_range_by_fetch_width() {
+        let control = |fmode| ControlState {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: 0x0010,
+            bplcon1: 0xCC00,
+            fmode,
+            ..ControlState::default()
+        };
+
+        assert_eq!(control(0x0000).pf1_scroll(), 0);
+        assert_eq!(control(0x0001).pf1_scroll(), 16);
+        assert_eq!(control(0x0003).pf1_scroll(), 48);
     }
 
     #[test]
