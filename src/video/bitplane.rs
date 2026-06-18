@@ -1285,18 +1285,32 @@ struct BeamSpriteState {
     /// 16-pixel pattern across the 32/64-pixel window (WinUAE model).
     aga: bool,
     fmode: u16,
+    /// Sprites reused with DMA off (SPREN cleared mid-frame): the bus
+    /// established the held pixel data off-screen, and the Copper repositions
+    /// them via SPRxPOS. When present the sprite is armed and displays this
+    /// held data (with its full wide-fetch words, unlike a manual SPRxDATA
+    /// write which only replicates one word) at the current SPRxPOS, clipped
+    /// per reposition interval. SANITY Roots II's "cherries" screen.
+    held: [Option<CapturedSpriteLine>; 8],
 }
 
 impl BeamSpriteState {
-    fn from_render_state(state: &RenderState) -> Self {
+    fn from_render_state(state: &RenderState, held: &[Option<CapturedSpriteLine>; 8]) -> Self {
+        let mut spr_armed = state.spr_armed;
+        for (i, h) in held.iter().enumerate() {
+            if h.is_some() {
+                spr_armed[i] = true;
+            }
+        }
         Self {
             sprpos: state.sprpos,
             sprctl: state.sprctl,
             sprdata: state.sprdata,
             sprdatb: state.sprdatb,
-            spr_armed: state.spr_armed,
+            spr_armed,
             aga: matches!(state.agnus_revision, AgnusRevision::AgaAlice),
             fmode: state.fmode,
+            held: *held,
         }
     }
 
@@ -1340,8 +1354,34 @@ impl BeamSpriteState {
         let ctl = self.sprctl[sprite];
         let vstart = sprite_vstart(pos, ctl);
         let vstop = sprite_vstop(ctl);
-        if beam_y < vstart || beam_y >= vstop {
+        // Normal pair: [vstart, vstop). An inverted pair (vstop <= vstart) is
+        // not "off": the vstop comparator fired before vstart, so the sprite is
+        // on from vstart to the frame end and again from 0 to vstop (the wrap).
+        let in_window = if vstop > vstart {
+            beam_y >= vstart && beam_y < vstop
+        } else {
+            beam_y >= vstart || beam_y < vstop
+        };
+        if !in_window {
             return None;
+        }
+        // A held (DMA-off, Copper-repositioned) sprite carries its full
+        // DMA-fetched words; a plain manual SPRxDATA write replicates one word
+        // across the wide window.
+        if let Some(held) = self.held[sprite] {
+            return Some(SpriteLine {
+                hstart: sprite_hstart(pos, ctl),
+                hsub_70ns: sprite_hsub_70ns(ctl),
+                beam_y,
+                data: held.data,
+                datb: held.datb,
+                data_ext: held.data_ext,
+                datb_ext: held.datb_ext,
+                width_words: held.width_words,
+                attached: ctl & 0x0080 != 0,
+                x_start,
+                x_stop,
+            });
         }
         let width_words = if self.aga {
             sprite_width_words_from_fmode(self.fmode)
@@ -2536,6 +2576,7 @@ fn manual_sprite_lines_from_events(
     manual_sprite_lines_from_events_with_visible_line0(
         initial_state,
         events,
+        &[None; 8],
         PAL_VISIBLE_LINE0,
         FB_HEIGHT,
     )
@@ -2544,10 +2585,11 @@ fn manual_sprite_lines_from_events(
 fn manual_sprite_lines_from_events_with_visible_line0(
     initial_state: &RenderState,
     events: &[BeamRegisterWrite],
+    held: &[Option<CapturedSpriteLine>; 8],
     visible_line0: i32,
     rows: usize,
 ) -> Vec<Vec<SpriteLine>> {
-    let mut regs = BeamSpriteState::from_render_state(initial_state);
+    let mut regs = BeamSpriteState::from_render_state(initial_state, held);
     let mut next_beam = [(visible_line0, 0usize); 8];
     let visible_end = visible_line0 + rows as i32;
     let mut lines = vec![Vec::new(); 8];
@@ -2875,6 +2917,7 @@ pub struct RenderInput {
     chip_ram_writes: Vec<BeamChipRamWrite>,
     captured_bitplane_rows: Vec<Option<CapturedBitplaneRow>>,
     captured_sprite_lines: Vec<CapturedSpriteLine>,
+    held_sprites: [Option<CapturedSpriteLine>; 8],
     sprite_display_enable_x_by_y: Vec<Option<usize>>,
     sprite_dma_observed: bool,
     // Agnus-derived blanking windows, sampled once per frame from the live
@@ -2904,6 +2947,7 @@ impl RenderInput {
             chip_ram_writes: bus.frame_chip_ram_writes().to_vec(),
             captured_bitplane_rows: bus.frame_captured_bitplane_rows().to_vec(),
             captured_sprite_lines: bus.frame_captured_sprite_lines().to_vec(),
+            held_sprites: bus.frame_held_sprites(),
             sprite_display_enable_x_by_y: bus.frame_sprite_display_enable_x_by_y().to_vec(),
             sprite_dma_observed: bus.frame_sprite_dma_observed(),
             frame_lines: bus.agnus.current_frame_lines(),
@@ -3056,6 +3100,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
     let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
         &state,
         render_events,
+        &input.held_sprites,
         visible_line0,
         rows,
     );
@@ -4854,7 +4899,7 @@ fn register_latched_sprite_lines(sprite: usize, state: &RenderState) -> Vec<Spri
     if !state.spr_armed[sprite] {
         return Vec::new();
     }
-    let regs = BeamSpriteState::from_render_state(state);
+    let regs = BeamSpriteState::from_render_state(state, &[None; 8]);
     let pos = regs.sprpos[sprite];
     let ctl = regs.sprctl[sprite];
     (sprite_vstart(pos, ctl)..sprite_vstop(ctl))

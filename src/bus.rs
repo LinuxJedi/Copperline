@@ -521,6 +521,17 @@ pub struct Bus {
     current_frame_sprite_lines_by_y: Vec<Vec<CapturedSpriteLine>>,
     current_frame_sprite_collision_sources: Vec<Option<Vec<LiveSpriteCollisionSource>>>,
     last_frame_sprite_lines: Vec<CapturedSpriteLine>,
+    // Sprites whose data was DMA-fetched (off-screen) and then held with SPREN
+    // cleared, to be repainted by Copper SPRxPOS repositioning during the
+    // visible window. The renderer's manual-sprite path consumes these so it
+    // can clip each repositioned segment to the reposition interval (a
+    // CapturedSpriteLine cannot be clipped); the bus bar path is suppressed for
+    // them. Carries the held pixel data only -- position/window come from the
+    // live SPRxPOS/CTL the manual path tracks.
+    #[serde(skip)]
+    current_frame_held_sprites: [Option<CapturedSpriteLine>; 8],
+    #[serde(skip)]
+    last_frame_held_sprites: [Option<CapturedSpriteLine>; 8],
     #[serde(with = "serde_big_array::BigArray")]
     current_frame_sprite_display_enable_x_by_y: [Option<usize>; MAX_VISIBLE_LINES],
     #[serde(with = "serde_big_array::BigArray")]
@@ -1443,6 +1454,8 @@ impl Bus {
             current_frame_sprite_lines_by_y: empty_captured_sprite_lines_by_y(),
             current_frame_sprite_collision_sources: empty_sprite_collision_sources(),
             last_frame_sprite_lines: Vec::new(),
+            current_frame_held_sprites: [None; 8],
+            last_frame_held_sprites: [None; 8],
             current_frame_sprite_display_enable_x_by_y: empty_sprite_display_enable_x_by_y(),
             last_frame_sprite_display_enable_x_by_y: empty_sprite_display_enable_x_by_y(),
             current_frame_sprite_dma_observed: false,
@@ -1743,6 +1756,8 @@ impl Bus {
         clear_captured_sprite_lines_by_y(&mut self.current_frame_sprite_lines_by_y);
         self.current_frame_sprite_collision_sources = empty_sprite_collision_sources();
         self.last_frame_sprite_lines.clear();
+        self.current_frame_held_sprites = [None; 8];
+        self.last_frame_held_sprites = [None; 8];
         self.current_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
         self.last_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
         self.current_frame_sprite_dma_observed = false;
@@ -2925,6 +2940,17 @@ impl Bus {
             &self.last_frame_sprite_lines
         } else {
             &self.current_frame_sprite_lines
+        }
+    }
+
+    pub fn frame_held_sprites(&self) -> [Option<CapturedSpriteLine>; 8] {
+        if crate::envcfg::flag("COPPERLINE_RENDER_LIVE_CHIP_RAM") {
+            return [None; 8];
+        }
+        if self.last_frame_render_base.is_some() {
+            self.last_frame_held_sprites
+        } else {
+            self.current_frame_held_sprites
         }
     }
 
@@ -4196,10 +4222,7 @@ impl Bus {
                 let reg = (off - 0x140) & 0x0006;
                 if idx < 8 {
                     match reg {
-                        0x0 => {
-                            self.denise.sprpos[idx] = val;
-                            self.emit_repositioned_held_sprite(idx);
-                        }
+                        0x0 => self.denise.sprpos[idx] = val,
                         0x2 => self.denise.write_sprctl(idx, val),
                         0x4 => self.denise.write_sprdata(idx, val),
                         0x6 => self.denise.write_sprdatb(idx, val),
@@ -6168,6 +6191,7 @@ impl Bus {
             empty_captured_bitplane_rows(),
         );
         self.last_frame_sprite_lines = std::mem::take(&mut self.current_frame_sprite_lines);
+        self.last_frame_held_sprites = std::mem::take(&mut self.current_frame_held_sprites);
         clear_captured_sprite_lines_by_y(&mut self.current_frame_sprite_lines_by_y);
         self.current_frame_sprite_collision_sources = empty_sprite_collision_sources();
         self.last_frame_sprite_display_enable_x_by_y = std::mem::replace(
@@ -6233,6 +6257,41 @@ impl Bus {
         self.current_frame_display_snapshot_taken = true;
         self.advance_display_dma_for_clipped_rows();
         self.advance_sprite_dma_to_visible_start();
+        self.capture_held_sprites_for_visible_window();
+    }
+
+    /// After the offscreen sprite-DMA replay, snapshot any sprite that has
+    /// fetched data but whose DMA is now disabled (SPREN cleared): it is being
+    /// "held" and will be repainted by Copper SPRxPOS repositioning across the
+    /// visible window. The renderer's manual-sprite path consumes these (it can
+    /// clip each repositioned segment); the bus bar path is suppressed for them.
+    fn capture_held_sprites_for_visible_window(&mut self) {
+        self.current_frame_held_sprites = [None; 8];
+        if self.agnus.dmacon & (DMACON_DMAEN | DMACON_SPREN) == (DMACON_DMAEN | DMACON_SPREN) {
+            // Sprite DMA is still active: the normal capture path handles it.
+            return;
+        }
+        for sprite in 0..8 {
+            let state = self.display_dma_sprite_state[sprite];
+            if !state.data_dma_active {
+                continue;
+            }
+            let Some(line_data) = state.last_line else {
+                continue;
+            };
+            self.current_frame_held_sprites[sprite] = Some(CapturedSpriteLine {
+                sprite,
+                hstart: line_data.hstart,
+                hsub_70ns: line_data.hsub_70ns,
+                beam_y: 0,
+                data: line_data.data,
+                datb: line_data.datb,
+                data_ext: line_data.data_ext,
+                datb_ext: line_data.datb_ext,
+                width_words: line_data.width_words,
+                attached: line_data.attached,
+            });
+        }
     }
 
     fn capture_same_line_display_start_if_due(&mut self) {
@@ -6704,6 +6763,12 @@ impl Bus {
         sprite: usize,
         vpos: u32,
     ) -> Option<CapturedSpriteLine> {
+        // Sprites captured as "held" at the visible start are repainted by the
+        // renderer's manual-sprite path (which clips each Copper-repositioned
+        // segment), so do not also emit a full-width bar for them here.
+        if self.current_frame_held_sprites[sprite].is_some() {
+            return None;
+        }
         let beam_y = vpos as i32;
         let mut state = self.display_dma_sprite_state[sprite];
         let control = state.control?;
@@ -6742,54 +6807,6 @@ impl Bus {
             width_words: line_data.width_words,
             attached: line_data.attached,
         })
-    }
-
-    /// A sprite reused with DMA off (SPREN cleared mid-frame) holds its last
-    /// fetched data and is repositioned by Copper/CPU SPRxPOS writes; each
-    /// write repaints the held data at the new hstart on the current line.
-    /// SANITY Roots II's AGA copper-chunky "cherries" screen paints its picture
-    /// this way -- two held sprites, recoloured per line via the sprite palette,
-    /// repositioned several times per scanline. When sprite DMA is enabled the
-    /// normal capture path already emits the line, so this only runs DMA-off.
-    fn emit_repositioned_held_sprite(&mut self, sprite: usize) {
-        if self.agnus.dmacon & (DMACON_DMAEN | DMACON_SPREN) == (DMACON_DMAEN | DMACON_SPREN) {
-            return;
-        }
-        let state = self.display_dma_sprite_state[sprite];
-        let (Some(control), Some(line_data)) = (state.control, state.last_line) else {
-            return;
-        };
-        if !state.data_dma_active {
-            return;
-        }
-        let beam_y = self.agnus.vpos as i32;
-        if beam_y < control.vstart || beam_y >= control.vstop {
-            return;
-        }
-        let Some(fb_y) = visible_framebuffer_y(
-            self.agnus.vpos,
-            self.current_frame_visible_start_vpos,
-            self.current_frame_geometry.visible_lines,
-        ) else {
-            return;
-        };
-        let pos = self.denise.sprpos[sprite];
-        let ctl = self.denise.sprctl[sprite];
-        let line = CapturedSpriteLine {
-            sprite,
-            hstart: sprite_hstart_from_words(pos, ctl),
-            hsub_70ns: bitplane_shres(self.denise.bplcon0) && sprite_hsub_70ns_from_ctl(ctl),
-            beam_y,
-            data: line_data.data,
-            datb: line_data.datb,
-            data_ext: line_data.data_ext,
-            datb_ext: line_data.datb_ext,
-            width_words: line_data.width_words,
-            attached: line_data.attached,
-        };
-        self.current_frame_sprite_lines.push(line);
-        self.current_frame_sprite_lines_by_y[fb_y].push(line);
-        self.current_frame_sprite_dma_observed = true;
     }
 
     fn capture_bitplane_dma_words_if_due(
