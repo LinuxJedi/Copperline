@@ -36,6 +36,18 @@ gitignored; rebuild it locally before running the checks.
 Use the same machine on all three: **OCS, PAL, 512K chip + 512K slow RAM**, so
 the slow-RAM ($C00000) tests are meaningful.
 
+### A1200 (no slow RAM)
+
+The disk also boots on a machine with **no slow RAM** -- e.g. a real A1200
+(68EC020, AGA, 2 MB chip). The four slow-RAM rows (0, 1, 9, 13) probe $C00000
+at start-up and, when it is absent, store a `00000000` sentinel instead of
+reading or executing unmapped space (row 13's `jsr $C00000` would otherwise
+trap). Every other row -- including the copper-vs-CPU row 27, which is what the
+020 chase-the-beam effects depend on -- runs normally. Copperline configs:
+`tt-a1200.toml` (KS 3.1, AGA, 2 MB chip, no slow) and `tt-020-noslow.toml`
+(68EC020, ECS, 2 MB chip, no slow, KS 2.05); compare against FS-UAE/vAmiga set
+up the same way.
+
 ## What each row measures
 
 Most values are the elapsed CIA E-clock ticks for the test (8192 iterations
@@ -73,6 +85,20 @@ ticks everywhere.
 | 24 | beam cck while an A->D fill blit (272x22 DESC) runs, display off | `BLTCON0=$09F0 BLTCON1=$0012` |
 | 25 | beam cck while a 64-pixel line blit runs, display off | `BLTCON0=$bb4a BLTCON1=$0003` |
 | 26 | beam cck while the A->D fill (row 24) runs **with a 3-bitplane display + BLTPRI** | beam-vs-blitter race with active display DMA |
+| 27 | VHPOSR when the CPU first sees a COPPER-raised INTREQR.COPER, interrupts off | copper-vs-CPU phase (`vp`<<8 | `hpos`/2); `FFFFFFFF` if it never fired |
+
+### Row 27: the copper-vs-CPU interrupt phase
+
+A copper list waits for line `$64`, MOVEs SET-COPER into INTREQ, then sleeps; the
+CPU (interrupts off) busy-polls INTREQR for the COPER bit and records the beam
+the moment it reads set. Decode it like rows 19/20 (high byte = vpos, low byte =
+hpos/2). This is the mechanism SANITY Roots II's copper-chunky "cherries" screen
+(and similar 020 effects) runs on: a copper-raised interrupt the per-frame work
+spins on, then chases the beam to update the colour list before the copper reads
+it. The value is the copper WAIT-release + MOVE + INTREQR-visibility delay +
+poll-catch latency, so a difference across emulators is a copper-vs-CPU phase
+divergence -- exactly what makes that effect render or scramble. (Copperline
+reads `$6409` on an A1200 at 14 MHz, `$640C` at the 7 MHz reference clock.)
 
 ### Rows 23-26: the blitter-vs-beam race
 
