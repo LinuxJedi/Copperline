@@ -2387,6 +2387,30 @@ impl Bus {
                 self.record_slice_bus_advance(cck, tick);
             }
         }
+        // A 68020+ read also stalls the CPU while the slow chip bus returns the
+        // read data -- a clock-dependent latency the write-posting tail above
+        // does not cover (a write posts and the CPU moves on without the data).
+        // At the stock 2-clock ratio the read stays instruction-bound and this
+        // is hidden, but at 14 MHz (a 3-clock cycle that fits inside a 4-clock
+        // slot, so the tail above bills nothing) the data-return wait is the
+        // dominant read cost, which is what makes a 020 chip/custom read 8 CPU
+        // cycles rather than 6 against the cycle-exact A1200 reference.
+        if matches!(kind, CpuBusAccessKind::Read) {
+            self.bill_020_read_data_wait();
+        }
+    }
+
+    /// 68020+ read data-return wait: one extra colour clock the 020 stalls for
+    /// the slow chip bus to return read data. Billed only for the short (020)
+    /// bus cycle; the 68000/010's full 4-clock cycle already covers it, so this
+    /// is a no-op there and those paths stay byte-identical. Custom-register
+    /// reads call it directly because they share the `Custom` access kind with
+    /// custom writes (which post like any other write and must not wait).
+    fn bill_020_read_data_wait(&mut self) {
+        if self.cpu_short_bus_cycle {
+            let (cck, tick) = self.advance_one_chip_bus_quantum(None);
+            self.record_slice_bus_advance(cck, tick);
+        }
     }
 
     fn note_cpu_missed_chip_bus_cycle(&mut self) {
@@ -3076,6 +3100,11 @@ impl Bus {
 
     pub fn custom_read(&mut self, addr: u64, size: usize) -> u64 {
         self.grant_cpu_bus_access(size, CpuBusAccessKind::Custom);
+        // A custom-register read is a chip-bus read and stalls the 020 for the
+        // data-return wait just like a chip-RAM read; the shared Custom access
+        // kind means grant_cpu_bus_access_at cannot tell a read from a write,
+        // so bill it here. (A custom write posts and must not pay this.)
+        self.bill_020_read_data_wait();
         // Read-only custom registers (INTREQR, DSKBYTR, SERDATR, POTxDAT, ...)
         // reflect timed-device state, so apply the deferred device clocks before
         // reading.
