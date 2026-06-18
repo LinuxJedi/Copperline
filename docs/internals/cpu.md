@@ -87,8 +87,14 @@ Copperline handles this by approximation rather than precision.
 timing from the corrected 68000 counts: the pipeline and cache make most
 instructions cost roughly half their 68000 cycles, with a two-cycle
 floor, and memory-bound work is dominated by the host bus model anyway.
-The scaling is calibrated against a cycle-exact A1200 reference (FS-UAE)
-using the `timing-test/` ADF. This is good enough because Copperline
+The flat scale is wrong for a few instructions whose 020 cost does not
+track the 68000 count, so those carry an explicit 020 cycle value (still
+pre-scale): the barrel-shifter shift/rotate, the fixed-cost MULU/MULS, a
+taken `DBcc`'s pipeline refill, and `MOVE` (register vs memory-source
+read latency). These are calibrated against a cycle-exact A1200 reference
+(FS-UAE) using the `timing-test/` ADF -- with the instruction cache
+enabled, since that is the A1200 default; `timing-test/compare.py` checks
+each row against the reference. This is good enough because Copperline
 paces to wall-clock time and models the CPU:chipset clock ratio and
 chip-bus arbitration exactly; per-instruction 020 cycles matter far less
 than those for Amiga software, which is overwhelmingly 68000. The

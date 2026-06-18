@@ -1263,7 +1263,12 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 if new_counter != 0xFFFF {
                     cpu.pc = target;
                     cpu.full_prefetch(bus);
-                    10
+                    // 68000 DBcc taken = 10. On 020+ a taken branch refills the
+                    // pipeline; the flat scale alone lands the chip-RAM dbra
+                    // loop at 7 clocks/iter where the cycle-exact A1200/FS-UAE
+                    // reference measures 8, so pre-scale to 12 (-> 8 after
+                    // scale_cycles_for_cpu_type) for the post-020 parts.
+                    if cpu.is_pre_68020 { 10 } else { 12 }
                 } else {
                     // Counter expired: the 68000 has already begun the branch;
                     // it reads one word at the target (discarded) before

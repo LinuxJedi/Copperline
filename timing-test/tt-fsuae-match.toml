@@ -1,0 +1,17 @@
+# Match the user's FS-UAE reference: A500+ (ECS), 68EC020 @ 7MHz,
+# 2M chip + 512K slow, KS2.05, PAL.
+rom = "../kickstart205.rom"
+[cpu]
+model = "68EC020"
+clock_mhz = 7.09
+[memory]
+chip = "2M"
+slow = "512K"
+[emulation]
+speed = "real"
+[chipset]
+revision = "ECS"
+video = "PAL"
+[floppy.df0]
+path = "timing-test.adf"
+write_protected = true

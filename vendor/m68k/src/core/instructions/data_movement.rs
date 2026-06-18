@@ -85,7 +85,18 @@ impl CpuCore {
         if self.cpu_type == CpuType::M68000 {
             4 + self.ea_source_cycles(src_mode, size) + self.ea_dest_cycles(dst_mode, size)
         } else {
-            4
+            // 020+: the flat 4 made every MOVE cost the same regardless of
+            // operand, so register moves ran a cycle slow and memory reads a
+            // couple fast. Model the 020 data-return latency on a memory
+            // source. Values are pre-scale (scale_cycles_for_cpu_type applies
+            // 5/8) and calibrated to the cycle-exact A1200/FS-UAE reference:
+            // Dn,Dm = 2; (An),Dn word read = 6; Dn,(An) write stays bus-bound.
+            // (Write-posting, which the bus model lacks, is handled there.)
+            let mut c = 2;
+            if !src_mode.is_register_direct() {
+                c += if size == Size::Long { 11 } else { 7 };
+            }
+            c
         }
     }
 
