@@ -4196,7 +4196,10 @@ impl Bus {
                 let reg = (off - 0x140) & 0x0006;
                 if idx < 8 {
                     match reg {
-                        0x0 => self.denise.sprpos[idx] = val,
+                        0x0 => {
+                            self.denise.sprpos[idx] = val;
+                            self.emit_repositioned_held_sprite(idx);
+                        }
                         0x2 => self.denise.write_sprctl(idx, val),
                         0x4 => self.denise.write_sprdata(idx, val),
                         0x6 => self.denise.write_sprdatb(idx, val),
@@ -6340,20 +6343,52 @@ impl Bus {
     }
 
     fn advance_sprite_dma_to_visible_start(&mut self) {
-        if self.current_frame_visible_start_vpos == 0 {
-            return;
-        }
-        if self.agnus.dmacon & (DMACON_DMAEN | DMACON_SPREN) != (DMACON_DMAEN | DMACON_SPREN) {
+        let visible_start = self.current_frame_visible_start_vpos;
+        if visible_start == 0 {
             return;
         }
 
-        // Sprite DMA runs independently of the bitplane display window. If a
-        // sprite starts in the top border and continues into the rendered area,
-        // Agnus has already fetched its control/data words before the first
-        // framebuffer line. Advance the DMA state for those offscreen lines so
-        // the first visible fetch sees an active descriptor rather than a
-        // descriptor whose VSTART is already in the past.
-        for vpos in 0..self.current_frame_visible_start_vpos {
+        // Sprite DMA runs from the top of the frame, independent of the bitplane
+        // display window: a sprite that starts in the top border has its
+        // control/data words fetched before the first framebuffer line, so
+        // advance the DMA state across those offscreen lines. Crucially, SPREN
+        // can be toggled within the frame -- a title may enable sprite DMA only
+        // briefly off-screen to load reused sprites, then clear it before the
+        // visible window (SANITY Roots II's AGA copper-chunky "cherries" screen
+        // fetches its two reused sprites on lines ~0..28 then clears SPREN at
+        // line 29, repositioning the held sprites per line for the display).
+        // So replay this frame's DMACON writes across the offscreen span and
+        // run the sprite fetch only on lines where SPREN was actually enabled,
+        // rather than sampling DMACON at the (already-cleared) visible start.
+        let base = self.current_frame_render_base;
+        let mut dmacon = base.dmacon;
+        // The sprite control/data slots sit early in the line (hpos
+        // SPRITE_DMA_PAIR_CAPTURE_HPOS); a DMACON write before the last slot
+        // governs that line's fetch, later ones take effect next line.
+        let fetch_gate_hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[SPRITE_DMA_PAIR_CAPTURE_HPOS.len() - 1];
+        let writes: Vec<(u32, u32, u16)> = self
+            .current_render_events()
+            .iter()
+            .filter(|w| (w.offset & 0x01FE) == 0x096 && w.vpos < visible_start)
+            .map(|w| (w.vpos, w.hpos, w.value))
+            .collect();
+        let mut idx = 0;
+        for vpos in 0..visible_start {
+            while idx < writes.len()
+                && (writes[idx].0 < vpos
+                    || (writes[idx].0 == vpos && writes[idx].1 < fetch_gate_hpos))
+            {
+                let value = writes[idx].2;
+                if value & 0x8000 != 0 {
+                    dmacon |= value & 0x7FFF;
+                } else {
+                    dmacon &= !value;
+                }
+                idx += 1;
+            }
+            if dmacon & (DMACON_DMAEN | DMACON_SPREN) != (DMACON_DMAEN | DMACON_SPREN) {
+                continue;
+            }
             for sprite in 0..8 {
                 if sprite_dma_disabled_by_bitplane_ddf(
                     sprite,
@@ -6602,16 +6637,25 @@ impl Bus {
             }
 
             let vstart = sprite_vstart_from_words(pos, ctl);
-            let vstop = sprite_vstop_from_ctl(ctl);
+            let raw_vstop = sprite_vstop_from_ctl(ctl);
+            // An inverted vertical pair (vstop < vstart) does not disable the
+            // sprite. Agnus arms it at vstart; its vstop comparator already
+            // passed for this field, so it does not fire again until the field
+            // wraps, and the sprite keeps fetching data to the bottom of the
+            // frame. Clamp the effective vstop to the frame bottom -- the
+            // per-field VBLANK reset re-fetches this descriptor, which covers
+            // the 0..vstop wrap tail on the next field. SANITY Roots II's AGA
+            // copper-chunky "cherries" screen relies on this: it sets vstop=0 <
+            // vstart and reuses the sprite as a full-height strip, repositioned
+            // every line by the Copper (SPRxPOS). Treating vstop<vstart as
+            // "off" dropped the whole screen.
+            let vstop = if raw_vstop < vstart {
+                self.agnus.current_frame_lines() as i32
+            } else {
+                raw_vstop
+            };
             let height = vstop - vstart;
-            if height < 0 {
-                state.terminated = true;
-                state.data_dma_active = false;
-                state.last_line = None;
-                self.display_dma_sprite_state[sprite] = state;
-                return None;
-            }
-            if height == 0 {
+            if height <= 0 {
                 state.next_ptr = Some(ptr);
                 state.control = None;
                 state.data_dma_active = false;
@@ -6677,10 +6721,19 @@ impl Bus {
         }
         let line_data = state.last_line?;
         self.display_dma_sprite_state[sprite] = state;
+        // Position the held strip at the sprite's *current* SPRxPOS/CTL, not
+        // the fetch-time hstart: with sprite DMA off the Copper (or CPU) can
+        // reposition a reused sprite by rewriting SPRxPOS, so the held data
+        // must follow it. For a sprite left where the DMA fetched it this is
+        // the same value. (SANITY Roots II's "cherries" repositions two held
+        // sprites every line; emit_repositioned_held_sprite adds the extra
+        // mid-line positions on each SPRxPOS write.)
+        let pos = self.denise.sprpos[sprite];
+        let ctl = self.denise.sprctl[sprite];
         Some(CapturedSpriteLine {
             sprite,
-            hstart: line_data.hstart,
-            hsub_70ns: line_data.hsub_70ns,
+            hstart: sprite_hstart_from_words(pos, ctl),
+            hsub_70ns: bitplane_shres(self.denise.bplcon0) && sprite_hsub_70ns_from_ctl(ctl),
             beam_y,
             data: line_data.data,
             datb: line_data.datb,
@@ -6689,6 +6742,54 @@ impl Bus {
             width_words: line_data.width_words,
             attached: line_data.attached,
         })
+    }
+
+    /// A sprite reused with DMA off (SPREN cleared mid-frame) holds its last
+    /// fetched data and is repositioned by Copper/CPU SPRxPOS writes; each
+    /// write repaints the held data at the new hstart on the current line.
+    /// SANITY Roots II's AGA copper-chunky "cherries" screen paints its picture
+    /// this way -- two held sprites, recoloured per line via the sprite palette,
+    /// repositioned several times per scanline. When sprite DMA is enabled the
+    /// normal capture path already emits the line, so this only runs DMA-off.
+    fn emit_repositioned_held_sprite(&mut self, sprite: usize) {
+        if self.agnus.dmacon & (DMACON_DMAEN | DMACON_SPREN) == (DMACON_DMAEN | DMACON_SPREN) {
+            return;
+        }
+        let state = self.display_dma_sprite_state[sprite];
+        let (Some(control), Some(line_data)) = (state.control, state.last_line) else {
+            return;
+        };
+        if !state.data_dma_active {
+            return;
+        }
+        let beam_y = self.agnus.vpos as i32;
+        if beam_y < control.vstart || beam_y >= control.vstop {
+            return;
+        }
+        let Some(fb_y) = visible_framebuffer_y(
+            self.agnus.vpos,
+            self.current_frame_visible_start_vpos,
+            self.current_frame_geometry.visible_lines,
+        ) else {
+            return;
+        };
+        let pos = self.denise.sprpos[sprite];
+        let ctl = self.denise.sprctl[sprite];
+        let line = CapturedSpriteLine {
+            sprite,
+            hstart: sprite_hstart_from_words(pos, ctl),
+            hsub_70ns: bitplane_shres(self.denise.bplcon0) && sprite_hsub_70ns_from_ctl(ctl),
+            beam_y,
+            data: line_data.data,
+            datb: line_data.datb,
+            data_ext: line_data.data_ext,
+            datb_ext: line_data.datb_ext,
+            width_words: line_data.width_words,
+            attached: line_data.attached,
+        };
+        self.current_frame_sprite_lines.push(line);
+        self.current_frame_sprite_lines_by_y[fb_y].push(line);
+        self.current_frame_sprite_dma_observed = true;
     }
 
     fn capture_bitplane_dma_words_if_due(
@@ -13206,6 +13307,37 @@ mod tests {
         assert_eq!(lines[0].datb, 0xBBBB);
     }
 
+    /// An inverted vertical pair (vstop < vstart) does not disable a sprite:
+    /// Agnus arms it at vstart and, since the vstop comparator already passed,
+    /// keeps fetching data to the bottom of the frame instead of terminating.
+    /// SANITY Roots II's AGA copper-chunky "cherries" screen reuses sprites
+    /// this way (vstop=0 < vstart). Previously vstop<vstart killed the sprite.
+    #[test]
+    fn sprite_dma_inverted_vstop_runs_to_frame_bottom() {
+        let mut bus = empty_bus();
+        let sprite_ptr = 0x0100usize;
+        let (pos, ctl) = sprite_control_words(0x2C, 0x20, 0x0083); // vstop < vstart
+        write_chip_word(&mut bus, sprite_ptr, pos);
+        write_chip_word(&mut bus, sprite_ptr + 2, ctl);
+        write_chip_word(&mut bus, sprite_ptr + 4, 0xAAAA);
+        write_chip_word(&mut bus, sprite_ptr + 6, 0xBBBB);
+
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.agnus.vpos = 0x2C;
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.denise.sprpt[0] = sprite_ptr as u32;
+        bus.display_dma_sprpt[0] = sprite_ptr as u32;
+
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert!(bus.frame_sprite_dma_observed());
+        assert_eq!(lines.len(), 1, "inverted-window sprite must still display");
+        assert_eq!(lines[0].beam_y, 0x2C);
+        assert_eq!(lines[0].data, 0xAAAA);
+        assert_eq!(lines[0].datb, 0xBBBB);
+    }
+
     /// Plan 3.4: FMODE SPR32/SPAGEM widen the sprite fetch. The descriptor
     /// strides scale with the quantum (POS in the first word of the first
     /// wide fetch, CTL in the first word of the second) and each line
@@ -13380,6 +13512,11 @@ mod tests {
         write_chip_word(&mut bus, sprite_ptr + 18, 0);
 
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        // The offscreen sprite-DMA replay seeds from the frame-start DMACON
+        // snapshot (and replays $096 writes across the span); mirror what
+        // begin_new_beam_frame records so SPREN is enabled for the offscreen
+        // lines this sprite starts on.
+        bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
         bus.agnus.vpos = RENDER_VISIBLE_START_VPOS;
         bus.agnus.hpos = 0;
         bus.denise.sprpt[0] = sprite_ptr as u32;
