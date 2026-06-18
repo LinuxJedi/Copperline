@@ -1005,11 +1005,13 @@ fn main() -> Result<()> {
         paced,
     )?;
     emu.set_cache_emulation(cfg.cpu_icache, cfg.cpu_dcache);
+    emu.set_machine_descriptor(cfg.descriptor());
     if let Some(path) = &cli.load_state {
-        emu.load_state(path)?;
+        let outcome = emu.load_state(path)?;
         info!(
-            "save state loaded: {} (resuming at {:.1}s emulated time)",
+            "save state loaded: {} ({}, resuming at {:.1}s emulated time)",
             path.display(),
+            outcome.summary,
             emu.bus().emulated_seconds()
         );
     }

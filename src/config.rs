@@ -212,7 +212,7 @@ pub struct FloppyDriveConfig {
     pub write_protected: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CpuModel {
     M68000,
     M68EC020,
@@ -275,7 +275,7 @@ pub fn clocks_per_cck_for_mhz(clock_mhz: f64) -> u32 {
     ((clock_mhz * 1.0e6) / COLOR_CLOCK_HZ).round().max(1.0) as u32
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Chipset {
     Ocs,
     Ecs,
@@ -288,7 +288,7 @@ pub enum Chipset {
 /// compatible; the profile owns what those sections cannot express (Gayle,
 /// RTC presence). With no `[machine]` section the defaults are the legacy
 /// A500-like behaviour, so existing configs are untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MachineModel {
     A500,
     A500Plus,
@@ -302,6 +302,173 @@ pub enum MachineModel {
     /// 512 KiB extended ROM at $E00000. Enables Akiko and the CD32 CD-ROM
     /// path.
     Cd32,
+}
+
+/// Identity of a ROM image: its length and a CRC-32 of its bytes. Enough to
+/// tell two Kickstarts apart (a different revision, or a CDTV/CD32 extended
+/// ROM) without storing the image itself. The CRC is the standard IEEE
+/// polynomial via `flate2::Crc`, so it is stable across builds and platforms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RomId {
+    pub len: usize,
+    pub crc32: u32,
+}
+
+impl RomId {
+    /// Fingerprint a ROM image. The empty slice gives `len 0`, which callers
+    /// use to mean "no such ROM".
+    pub fn of(bytes: &[u8]) -> Self {
+        let mut crc = flate2::Crc::new();
+        crc.update(bytes);
+        Self {
+            len: bytes.len(),
+            crc32: crc.sum(),
+        }
+    }
+
+    /// Compact label for logs/summaries, e.g. "512K:a1b2c3d4".
+    pub fn label(&self) -> String {
+        format!("{}K:{:08x}", self.len / 1024, self.crc32)
+    }
+}
+
+/// The "shape" of a machine plus its ROM identity: the values that, taken
+/// together, decide what kind of Amiga is running and which Kickstart it runs.
+/// Embedded in the save-state header so a load can tell whether the state
+/// belongs to a different machine than the running config and reconfigure the
+/// host to match it.
+///
+/// The serialized `Bus`/`CpuCore` already carry the actual hardware (RAM
+/// contents, ROM bytes, chip revisions, CPU type), so a state always rebuilds
+/// its own machine on load; this descriptor is the compact, human-readable
+/// identity used for the comparison and the log message, plus the machine
+/// profile (`A500`/`A1200`/...), which is a config-level concept the Bus does
+/// not record. The ROM fields fingerprint the boot/extended ROM bytes so a
+/// swapped Kickstart of the same machine shape is still flagged.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MachineDescriptor {
+    pub cpu: CpuModel,
+    pub chip_ram_bytes: usize,
+    pub fast_ram_bytes: usize,
+    pub slow_ram_bytes: usize,
+    pub chipset: Chipset,
+    pub video_standard: VideoStandard,
+    pub machine: Option<MachineModel>,
+    /// Boot ROM identity (the normalized in-memory image).
+    pub rom: RomId,
+    /// Extended ROM identity (CDTV $F00000 / CD32 $E00000), `None` when none
+    /// is fitted.
+    pub extended_rom: Option<RomId>,
+}
+
+impl Default for MachineDescriptor {
+    /// A stock OCS A500 with no ROM fingerprint yet: the shape of the minimal
+    /// machine the headless test fixtures build. Real runs overwrite this from
+    /// the loaded `Config` and the in-memory ROM.
+    fn default() -> Self {
+        Self {
+            cpu: CpuModel::M68000,
+            chip_ram_bytes: 512 * 1024,
+            fast_ram_bytes: 0,
+            slow_ram_bytes: 0,
+            chipset: Chipset::Ocs,
+            video_standard: VideoStandard::Pal,
+            machine: None,
+            rom: RomId::default(),
+            extended_rom: None,
+        }
+    }
+}
+
+impl MachineDescriptor {
+    /// Fill the ROM fields from the live in-memory images. `extended_rom` is an
+    /// empty slice when no extended ROM is fitted. Called once the machine is
+    /// built (the bytes live in the `Bus`, not the `Config`).
+    pub fn set_rom_fingerprint(&mut self, rom: &[u8], extended_rom: &[u8]) {
+        self.rom = RomId::of(rom);
+        self.extended_rom = (!extended_rom.is_empty()).then(|| RomId::of(extended_rom));
+    }
+
+    /// One-line human summary, e.g.
+    /// "A1200 / 68EC020 / AGA / PAL / chip 2048K fast 0K slow 0K / ROM 512K:a1b2c3d4".
+    pub fn summary(&self) -> String {
+        let profile = match self.machine {
+            Some(m) => format!("{m:?}"),
+            None => "custom".to_string(),
+        };
+        let ext = match &self.extended_rom {
+            Some(id) => format!(" +ext {}", id.label()),
+            None => String::new(),
+        };
+        format!(
+            "{profile} / {:?} / {:?} / {:?} / chip {}K fast {}K slow {}K / ROM {}{ext}",
+            self.cpu,
+            self.chipset,
+            self.video_standard,
+            self.chip_ram_bytes / 1024,
+            self.fast_ram_bytes / 1024,
+            self.slow_ram_bytes / 1024,
+            self.rom.label(),
+        )
+    }
+
+    /// Human-readable, field-by-field differences between the running machine
+    /// (`self`) and a state's machine (`other`), for the load-time log when
+    /// they do not match. Empty when the shapes and ROMs are identical.
+    pub fn differences(&self, other: &MachineDescriptor) -> Vec<String> {
+        let mut diffs = Vec::new();
+        if self.machine != other.machine {
+            diffs.push(format!("profile {:?} -> {:?}", self.machine, other.machine));
+        }
+        if self.cpu != other.cpu {
+            diffs.push(format!("cpu {:?} -> {:?}", self.cpu, other.cpu));
+        }
+        if self.chipset != other.chipset {
+            diffs.push(format!("chipset {:?} -> {:?}", self.chipset, other.chipset));
+        }
+        if self.video_standard != other.video_standard {
+            diffs.push(format!(
+                "video {:?} -> {:?}",
+                self.video_standard, other.video_standard
+            ));
+        }
+        if self.chip_ram_bytes != other.chip_ram_bytes {
+            diffs.push(format!(
+                "chip RAM {}K -> {}K",
+                self.chip_ram_bytes / 1024,
+                other.chip_ram_bytes / 1024
+            ));
+        }
+        if self.fast_ram_bytes != other.fast_ram_bytes {
+            diffs.push(format!(
+                "fast RAM {}K -> {}K",
+                self.fast_ram_bytes / 1024,
+                other.fast_ram_bytes / 1024
+            ));
+        }
+        if self.slow_ram_bytes != other.slow_ram_bytes {
+            diffs.push(format!(
+                "slow RAM {}K -> {}K",
+                self.slow_ram_bytes / 1024,
+                other.slow_ram_bytes / 1024
+            ));
+        }
+        if self.rom != other.rom {
+            diffs.push(format!("ROM {} -> {}", self.rom.label(), other.rom.label()));
+        }
+        if self.extended_rom != other.extended_rom {
+            let label = |id: &Option<RomId>| match id {
+                Some(id) => id.label(),
+                None => "none".to_string(),
+            };
+            diffs.push(format!(
+                "extended ROM {} -> {}",
+                label(&self.extended_rom),
+                label(&other.extended_rom)
+            ));
+        }
+        diffs
+    }
 }
 
 /// Which gate array the machine carries. Gayle owns IDE, PCMCIA, and the
@@ -391,6 +558,25 @@ impl Config {
             self.rom_path = p;
         }
         self
+    }
+
+    /// The machine "shape" this config describes, stamped into save states so
+    /// a load can detect a different machine and reconfigure the host to match.
+    /// The ROM fields are left empty here (the `Config` holds only a path); the
+    /// caller fills them from the in-memory ROM via
+    /// [`MachineDescriptor::set_rom_fingerprint`] once the machine is built.
+    pub fn descriptor(&self) -> MachineDescriptor {
+        MachineDescriptor {
+            cpu: self.cpu,
+            chip_ram_bytes: self.chip_ram_bytes,
+            fast_ram_bytes: self.fast_ram_bytes,
+            slow_ram_bytes: self.slow_ram_bytes,
+            chipset: self.chipset,
+            video_standard: self.video_standard,
+            machine: self.machine,
+            rom: RomId::default(),
+            extended_rom: None,
+        }
     }
 
     /// Build the Zorro autoconfig chain this config asks for: the built-in
@@ -1283,6 +1469,36 @@ mod tests {
     fn parse_config(text: &str) -> Result<Config> {
         let raw: RawConfig = toml::from_str(text)?;
         raw.try_into()
+    }
+
+    #[test]
+    fn rom_fingerprint_distinguishes_same_shape_kickstarts() {
+        // Two machines of identical shape but different boot ROMs must compare
+        // as a mismatch (the whole point of fingerprinting the ROM rather than
+        // only the machine shape).
+        let mut a = MachineDescriptor::default();
+        a.set_rom_fingerprint(b"kickstart 3.1 r40.068", b"");
+        let mut b = MachineDescriptor::default();
+        b.set_rom_fingerprint(b"kickstart 3.1.4 r46.143", b"");
+        assert_ne!(a.rom, b.rom);
+        let diffs = a.differences(&b);
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].starts_with("ROM "), "{diffs:?}");
+
+        // The same image fingerprints identically, and an added extended ROM is
+        // flagged on its own (same boot ROM, gained an extended ROM).
+        let mut c = MachineDescriptor::default();
+        c.set_rom_fingerprint(b"kickstart 3.1 r40.068", b"");
+        assert_eq!(a.rom, c.rom);
+        assert!(a.differences(&c).is_empty());
+        let mut d = a.clone();
+        d.set_rom_fingerprint(b"kickstart 3.1 r40.068", b"cd32 extended rom");
+        let ext_diffs = a.differences(&d);
+        assert_eq!(ext_diffs.len(), 1);
+        assert!(
+            ext_diffs[0].starts_with("extended ROM none -> "),
+            "{ext_diffs:?}"
+        );
     }
 
     #[test]

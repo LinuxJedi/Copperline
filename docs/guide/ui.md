@@ -161,7 +161,17 @@ never interrupted.
 
 States are taken at emulated-frame boundaries and are versioned: a file
 from an older, incompatible build is refused with a clear message rather
-than producing a corrupt machine. Two caveats:
+than producing a corrupt machine.
+
+A state is self-contained: it carries its own RAM, ROM, and chipset, so
+loading one always restores the machine it was taken on -- even if you
+launched Copperline with a different config. When the loaded machine
+differs from the running one -- a different model, chipset, video
+standard, RAM size, or even a different Kickstart of the same machine
+(the ROM is fingerprinted) -- the load reconfigures to match the state
+and tells you so (the load message names the restored machine, e.g.
+"reconfigured to A1200 / 68EC020 / AGA / PAL"); your current config is
+not silently mixed in. Two caveats:
 
 - Hard-drive images (HDF files) are referenced by path, not embedded.
   The state reopens the same file on load, so guest writes made to the

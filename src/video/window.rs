@@ -4203,14 +4203,34 @@ impl App {
         // Emulator::load_state.
         if let Some(path) = picked {
             match self.emu.load_state(&path) {
-                Ok(()) => {
-                    info!("save state loaded: {}", path.display());
+                Ok(outcome) => {
+                    info!(
+                        "save state loaded: {} ({})",
+                        path.display(),
+                        outcome.summary
+                    );
                     self.powered_on = true;
                     self.cpu_halted = false;
                     // Force a fresh presentation: the restored frame counter
                     // may equal (or precede) the last rendered one.
                     self.reset_render_pipeline();
-                    self.show_osd(format!("Loaded {}", display_file_name(&path)));
+                    if outcome.reconfigured {
+                        // The state was built on a different machine; the host
+                        // has been reconfigured to match it (see log for the
+                        // specifics). The disk-swap playlists are host-side and
+                        // describe the previous machine's drives, so drop them
+                        // rather than let stale swap affordances show in the
+                        // status bar; the restored drives keep whatever disks
+                        // the state embedded.
+                        self.disk_playlists = std::array::from_fn(|_| Vec::new());
+                        self.show_osd(format!(
+                            "Loaded {} (reconfigured to {})",
+                            display_file_name(&path),
+                            outcome.summary
+                        ));
+                    } else {
+                        self.show_osd(format!("Loaded {}", display_file_name(&path)));
+                    }
                     self.request_redraw();
                 }
                 Err(e) => {

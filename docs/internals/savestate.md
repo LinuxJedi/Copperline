@@ -52,11 +52,46 @@ Deliberately excluded, with the mechanism in parentheses:
 - **Memo caches**: the bitplane slot-plan `Cell` cache and the pending
   debugger-window register hit (skipped; rebuilt or irrelevant).
 
-ROM is embedded rather than fingerprinted: a state is self-contained
-with respect to everything that was in memory, so there is no separate
-config-compatibility check -- restoring the Bus and CPU restores the
-machine model along with them (the CPU bus adapter's address-mask copy
-is re-synced from the restored core's `address_mask`).
+The ROM bytes are embedded in the state, not loaded from a path: a state
+is self-contained with respect to everything that was in memory, so
+loading one always rebuilds *its own* machine -- restoring the Bus and
+CPU restores the machine model along with them (the CPU bus adapter's
+address-mask copy is re-synced from the restored core's `address_mask`).
+A state loaded under a different config therefore does not corrupt
+emulation; it silently *becomes* the machine the state was taken on.
+
+To make that takeover visible and to keep host-side derived values in
+step, the header carries a `MachineDescriptor` (`config.rs`): the
+machine "shape" -- CPU model, chip/fast/slow RAM sizes, chipset
+(OCS/ECS/AGA), video standard, and machine profile -- plus a fingerprint
+of the boot and extended ROM (`RomId` = byte length + CRC-32 via
+`flate2::Crc`). It is *not* a correctness gate (the Bus is authoritative);
+it is the human-readable identity used to detect that a load swapped in
+a different machine. On a mismatch `Emulator::load_state` logs the
+field-by-field difference and **reconfigures the host to match the
+state** rather than the now-stale running config:
+
+- The frame pacer's cost-per-instruction is re-derived from the restored
+  CPU clock (`cpu_clocks_per_cck`, which travels in `MachineRuntimeState`)
+  via `cpu_cycles_per_instruction_for_clock`, so an accelerated or slower
+  restored CPU is paced correctly. Presentation geometry already tracks
+  the restored Bus (the renderer reads `bus().frame_geometry()` per
+  frame), so PAL/NTSC and resolution follow automatically.
+- The window surfaces the reconfiguration in its load OSD; headless runs
+  report the loaded machine summary in the `save state loaded:` log line.
+
+The ROM fingerprint is taken from the *in-memory* image (post
+normalization -- a 256 KiB Kickstart 1.x mirrored up to 512 KiB), so the
+running descriptor matches the bytes a save would embed. It is computed
+from the `Bus`, not the `Config` (which holds only a path): main builds
+the shape with `Config::descriptor()` and `Emulator::set_machine_descriptor`
+fills the ROM fields from the live `Bus` via
+`MachineDescriptor::set_rom_fingerprint`; `reload_rom` refreshes them when
+the Kickstart is hot-swapped. Consequently a state taken on the same
+machine shape but a *different* Kickstart is flagged on load (e.g. "ROM
+512K:f6290043 -> 512K:fc24ae0d"). Storage image paths are deliberately
+*not* fingerprinted, but missing storage is still caught on load: HDF/CD
+images reopen by path and fail the load cleanly if absent (see below).
 
 ### File-backed images
 
@@ -90,8 +125,15 @@ disks travel inside the state, unsaved track writes included.
 offset  size  contents
 0       8     magic, ASCII "CLSSTATE"
 8       4     format version, u32 little-endian (STATE_VERSION)
-12      ...   zlib stream (RFC 1950) containing the payload
+12      ...   MachineDescriptor, bincode (uncompressed)
+...     ...   zlib stream (RFC 1950) containing the payload
 ```
+
+The `MachineDescriptor` sits uncompressed ahead of the zlib stream so a
+load can read it (and detect a machine mismatch) without inflating the
+whole machine; bincode consumes exactly its encoded bytes, leaving the
+reader positioned at the start of the zlib stream. `savestate::load`
+returns the descriptor to `Emulator::load_state` for the comparison.
 
 The payload inside the zlib stream is five bincode values written
 back-to-back by `M68kMachine::write_state`, in this fixed order:
@@ -132,7 +174,8 @@ mismatch fails with a message naming both versions. Because the payload
 is positional bincode of the live structs, **any** shape change to any
 serialized struct -- a field added, removed, reordered, or retyped
 anywhere under `Bus`, the chipset modules, `CpuCore`, floppy or
-expansion state -- silently changes the wire layout. The rule is
+expansion state, *or the header `MachineDescriptor`* -- silently changes
+the wire layout. The rule is
 therefore: bump `STATE_VERSION` whenever such a change lands, so stale
 files are refused with a clear version message instead of failing with a
 confusing decode error (or worse, decoding into nonsense). There is no
@@ -165,9 +208,16 @@ The determinism gate lives at three levels:
   the state again, rewinds to T1, replays the same step pattern, and
   asserts the trace matches **and the re-serialized T2 state file is
   byte-identical** to the original timeline's.
-- `savestate::tests` cover magic/version rejection and the
-  truncated-payload atomicity guarantee; `harddrive::tests` and
-  `cdrom::tests` cover the reopen-by-path round trips and the
+- `savestate::tests` cover magic/version rejection, the
+  truncated-payload atomicity guarantee, the header descriptor round
+  trip (`round_trips_the_machine_descriptor`), and that a CD controller
+  travels in the state so the bar's CD controls appear on load
+  (`cd_controller_travels_in_the_state`);
+  `config::tests::rom_fingerprint_distinguishes_same_shape_kickstarts`
+  covers flagging a swapped same-shape Kickstart;
+  `emulator::tests::pacing_cost_scales_with_cpu_clock` covers the
+  host-pacing re-derivation a mismatched load performs; `harddrive::tests`
+  and `cdrom::tests` cover the reopen-by-path round trips and the
   missing-file error paths.
 - End-to-end: save mid-run plus `--screenshot-after T`, then
   `--load-state` plus `--screenshot-after T` in a fresh process, and

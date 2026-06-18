@@ -17,11 +17,16 @@
 //! state. The emulator wrappers (`Emulator::save_state`/`load_state`) are
 //! called from the frame loop between frames, which satisfies this.
 //!
-//! File format: an 8-byte magic, a little-endian u32 format version, then
-//! a zlib stream of bincode-encoded components in the fixed order written
-//! by `M68kMachine::write_state`.
+//! File format: an 8-byte magic, a little-endian u32 format version, an
+//! (uncompressed) bincode `MachineDescriptor` naming the machine the state was
+//! produced on, then a zlib stream of bincode-encoded components in the fixed
+//! order written by `M68kMachine::write_state`. The descriptor lets a load
+//! detect that the state belongs to a different machine than the running
+//! config and reconfigure the host to match it; the serialized components
+//! already carry the actual hardware, so the machine itself always rebuilds
+//! from the state regardless.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -29,6 +34,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use crate::config::MachineDescriptor;
 use crate::cpu::M68kMachine;
 
 const STATE_MAGIC: &[u8; 8] = b"CLSSTATE";
@@ -44,7 +50,8 @@ const STATE_MAGIC: &[u8; 8] = b"CLSSTATE";
 //   2: keyboard MCU model replaced the Bus kbd_queue byte path
 //   3: keyboard MCU clock-based handshake timing (state shape change)
 //   4: PollStats.custom HashMap replaced by a flat Vec table
-pub const STATE_VERSION: u32 = 4;
+//   5: MachineDescriptor header (machine-shape guard rail)
+pub const STATE_VERSION: u32 = 5;
 
 /// Default state file name, timestamped like the screenshot/recorder names.
 pub fn auto_filename() -> std::path::PathBuf {
@@ -52,14 +59,19 @@ pub fn auto_filename() -> std::path::PathBuf {
     std::path::PathBuf::from(format!("copperline-state-{ts}.clstate"))
 }
 
-/// Write the machine's emulated state to `path`. Call only between
-/// emulated frames.
-pub fn save(machine: &M68kMachine, path: &Path) -> Result<()> {
+/// Write the machine's emulated state to `path`, stamped with `descriptor`
+/// (the shape of the machine that produced it). Call only between emulated
+/// frames.
+pub fn save(machine: &M68kMachine, descriptor: &MachineDescriptor, path: &Path) -> Result<()> {
     let file =
         File::create(path).with_context(|| format!("creating save state {}", path.display()))?;
     let mut writer = BufWriter::new(file);
     writer.write_all(STATE_MAGIC)?;
     writer.write_all(&STATE_VERSION.to_le_bytes())?;
+    // The descriptor sits uncompressed ahead of the zlib stream so it can be
+    // read (and a mismatch detected) without decompressing the whole machine.
+    bincode::serialize_into(&mut writer, descriptor)
+        .map_err(|e| anyhow!("serializing machine descriptor: {e}"))?;
     let mut encoder = ZlibEncoder::new(writer, Compression::fast());
     machine.write_state(&mut encoder)?;
     encoder
@@ -69,12 +81,14 @@ pub fn save(machine: &M68kMachine, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Restore the machine from a state written by `save`. The live machine is
-/// left untouched if the file is unreadable, has the wrong magic/version,
-/// or any referenced disk image cannot be reopened. Call only between
-/// emulated frames, and re-anchor real-time pacing afterwards
-/// (`Emulator::load_state` does both).
-pub fn load(machine: &mut M68kMachine, path: &Path) -> Result<()> {
+/// Restore the machine from a state written by `save`, returning the machine
+/// descriptor the state was stamped with so the caller can compare it against
+/// the running machine and reconfigure the host. The live machine is left
+/// untouched if the file is unreadable, has the wrong magic/version, or any
+/// referenced disk image cannot be reopened. Call only between emulated
+/// frames, and re-anchor real-time pacing afterwards (`Emulator::load_state`
+/// does both).
+pub fn load(machine: &mut M68kMachine, path: &Path) -> Result<MachineDescriptor> {
     let file =
         File::open(path).with_context(|| format!("opening save state {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -97,10 +111,15 @@ pub fn load(machine: &mut M68kMachine, path: &Path) -> Result<()> {
             STATE_VERSION
         );
     }
+    // Read the descriptor straight from the BufReader; bincode consumes exactly
+    // its encoded bytes, leaving the reader positioned at the zlib stream.
+    let descriptor: MachineDescriptor = bincode::deserialize_from(&mut reader)
+        .map_err(|e| anyhow!("reading machine descriptor from {}: {e}", path.display()))?;
     let mut decoder = ZlibDecoder::new(reader);
     machine
         .apply_state(&mut decoder)
-        .with_context(|| format!("loading save state {}", path.display()))
+        .with_context(|| format!("loading save state {}", path.display()))?;
+    Ok(descriptor)
 }
 
 #[cfg(test)]
@@ -177,7 +196,7 @@ mod tests {
         let truncated_path = temp_state("truncated");
         let mut machine = test_machine();
         machine.step_slice(500).unwrap();
-        save(&machine, &save_path).unwrap();
+        save(&machine, &MachineDescriptor::default(), &save_path).unwrap();
         let bytes = std::fs::read(&save_path).unwrap();
         std::fs::write(&truncated_path, &bytes[..bytes.len() / 2]).unwrap();
 
@@ -192,5 +211,52 @@ mod tests {
         load(&mut machine, &save_path).unwrap();
         let _ = std::fs::remove_file(&save_path);
         let _ = std::fs::remove_file(&truncated_path);
+    }
+
+    #[test]
+    fn round_trips_the_machine_descriptor() {
+        let path = temp_state("descriptor");
+        let descriptor = MachineDescriptor {
+            cpu: CpuModel::M68EC020,
+            chip_ram_bytes: 2 * 1024 * 1024,
+            fast_ram_bytes: 8 * 1024 * 1024,
+            slow_ram_bytes: 0,
+            chipset: crate::config::Chipset::Aga,
+            video_standard: crate::chipset::agnus::VideoStandard::Ntsc,
+            machine: Some(crate::config::MachineModel::A1200),
+            rom: crate::config::RomId::of(b"a fake kickstart image"),
+            extended_rom: Some(crate::config::RomId::of(b"a fake extended rom")),
+        };
+        let mut machine = test_machine();
+        save(&machine, &descriptor, &path).unwrap();
+        // The descriptor the load reports is the one the state was stamped
+        // with, not the (default) shape of the machine being loaded into.
+        let loaded = load(&mut machine, &path).unwrap();
+        assert_eq!(loaded, descriptor);
+        assert!(!MachineDescriptor::default().differences(&loaded).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cd_controller_travels_in_the_state() {
+        // A state taken on a CD machine carries its CD controller, so loading
+        // it into a machine that had none makes the CD drive appear. This is
+        // what lets the status bar's CD controls (keyed on
+        // `Bus::cd_drive_present`) show up after loading, e.g., a CD32 state
+        // over an A500 session.
+        let path = temp_state("cd-controller");
+        let mut cd_machine = test_machine();
+        cd_machine
+            .bus_mut()
+            .attach_akiko(crate::akiko::Akiko::new());
+        assert!(cd_machine.bus().cd_drive_present());
+        save(&cd_machine, &MachineDescriptor::default(), &path).unwrap();
+
+        // A fresh machine with no CD controller gains one from the load.
+        let mut plain_machine = test_machine();
+        assert!(!plain_machine.bus().cd_drive_present());
+        load(&mut plain_machine, &path).unwrap();
+        assert!(plain_machine.bus().cd_drive_present());
+        let _ = std::fs::remove_file(&path);
     }
 }

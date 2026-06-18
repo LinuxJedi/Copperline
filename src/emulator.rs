@@ -70,6 +70,23 @@ pub struct Emulator {
     tt_input: Option<crate::inputsched::ReplayInputLog>,
     /// One-shot "last writer" reverse watchpoint (`COPPERLINE_DBG_RWATCH`).
     tt_rwatch: Option<ReverseWatch>,
+    /// Shape of the running machine, stamped into save states and compared
+    /// against a loaded state's stamp so a mismatch can reconfigure the host
+    /// to match the state. Set from the boot `Config`; updated on a load that
+    /// swaps in a different machine.
+    descriptor: crate::config::MachineDescriptor,
+}
+
+/// What a save-state load did, for the caller to surface. A `.clstate` always
+/// rebuilds its own machine, so `reconfigured` reports whether that machine
+/// differed from the one that was running (host pacing was re-derived either
+/// way).
+pub struct StateLoadOutcome {
+    /// True when the loaded state's machine shape differed from the running
+    /// machine, so the host was reconfigured to match the state.
+    pub reconfigured: bool,
+    /// One-line human summary of the loaded machine.
+    pub summary: String,
 }
 
 /// A one-shot headless reverse watchpoint: at `target_secs` (or run end),
@@ -267,6 +284,18 @@ fn real_cpu_cycles_per_instruction() -> f64 {
         .unwrap_or(DEFAULT_CPU_CYCLES_PER_INSTRUCTION)
 }
 
+/// Host pacing cost per retired instruction for a CPU clocked at
+/// `cpu_clocks_per_cck` clocks per colour clock. The pacing math is expressed
+/// against the stock 2-clocks-per-CCK 68000 ratio; an accelerated CPU retires
+/// instructions faster relative to the chipset, which is equivalent to folding
+/// `CPU_CYCLES_PER_COLOR_CLOCK / cpu_clocks_per_cck` into the per-instruction
+/// cost (an identity at the stock ratio of 2). Computed in `Emulator::new` and
+/// recomputed after a save-state load that swaps in a differently-clocked CPU.
+fn cpu_cycles_per_instruction_for_clock(cpu_clocks_per_cck: u32) -> f64 {
+    let speed_factor = CPU_CYCLES_PER_COLOR_CLOCK / cpu_clocks_per_cck.max(1) as f64;
+    real_cpu_cycles_per_instruction() * speed_factor
+}
+
 fn real_pacing_profile_enabled() -> bool {
     crate::envcfg::flag(REAL_PACING_PROFILE_ENV)
 }
@@ -335,17 +364,10 @@ impl Emulator {
         paced: bool,
     ) -> Result<Self> {
         let cpu_clocks_per_cck = cpu_clocks_per_cck.max(1);
-        // The pacing math is expressed against the stock 2-clocks-per-CCK
-        // 68000 ratio. An accelerated CPU runs at `cpu_clocks_per_cck` clocks
-        // per colour clock, i.e. it retires instructions faster relative to
-        // the chipset. That is exactly equivalent, for every pacing formula
-        // (target instructions/sec, instruction<->CCK conversions), to a CPU
-        // with `CPU_CYCLES_PER_COLOR_CLOCK / cpu_clocks_per_cck` as much
-        // per-instruction cost, so fold the speed multiple into the effective
-        // cycles-per-instruction and leave the pacing helpers untouched. With
-        // the stock ratio of 2 this is an identity (factor 1.0).
-        let speed_factor = CPU_CYCLES_PER_COLOR_CLOCK / cpu_clocks_per_cck as f64;
-        let cpu_cycles_per_instruction = real_cpu_cycles_per_instruction() * speed_factor;
+        // Fold the CPU speed multiple into the effective cycles-per-instruction
+        // so the pacing helpers stay expressed against the stock 68000 ratio
+        // (see `cpu_cycles_per_instruction_for_clock`).
+        let cpu_cycles_per_instruction = cpu_cycles_per_instruction_for_clock(cpu_clocks_per_cck);
         if cpu_clocks_per_cck != 2 {
             log::info!(
                 "cpu speed: {:.2} MHz ({}x colour clock), fast RAM at CPU speed",
@@ -373,12 +395,29 @@ impl Emulator {
             tt_ring: None,
             tt_input: None,
             tt_rwatch: None,
+            descriptor: crate::config::MachineDescriptor::default(),
         })
     }
 
     /// Install the opt-in 68020/030 CACR-controlled cache models.
     pub fn set_cache_emulation(&mut self, icache: bool, dcache: bool) {
         self.machine.set_cache_emulation(icache, dcache);
+    }
+
+    /// Record the shape of the running machine (from the boot `Config`) and
+    /// fingerprint its in-memory ROM. The descriptor is stamped into save
+    /// states and compared against a loaded state's stamp.
+    pub fn set_machine_descriptor(&mut self, descriptor: crate::config::MachineDescriptor) {
+        self.descriptor = descriptor;
+        self.refresh_rom_fingerprint();
+    }
+
+    /// Re-fingerprint the descriptor's ROM from the live in-memory images.
+    /// Call whenever the shape descriptor is (re)set or the ROM is swapped.
+    fn refresh_rom_fingerprint(&mut self) {
+        let mem = &self.machine.bus().mem;
+        self.descriptor
+            .set_rom_fingerprint(&mem.rom, &mem.extended_rom);
     }
 
     pub fn bus(&self) -> &Bus {
@@ -439,6 +478,9 @@ impl Emulator {
             Some(image) => mem.attach_extended_rom(image)?,
             None => mem.detach_extended_rom(),
         }
+        // Keep the machine descriptor's ROM fingerprint in step with the
+        // freshly fitted ROM, so a state saved after a swap stamps the new ROM.
+        self.refresh_rom_fingerprint();
         log::info!("boot ROM replaced; cold-resetting");
         self.power_on_reset()
     }
@@ -447,16 +489,45 @@ impl Emulator {
     /// between frames (the event loop and the headless frame loop both run
     /// at frame granularity, so any caller outside step_frame qualifies).
     pub fn save_state(&self, path: &std::path::Path) -> Result<()> {
-        crate::savestate::save(&self.machine, path)
+        crate::savestate::save(&self.machine, &self.descriptor, path)
     }
 
-    /// Restore a save state from `path`. On success emulated time jumps to
-    /// the state's timeline, so the real-time pacing anchor is re-baselined
-    /// to "now"; on failure the running machine is untouched.
-    pub fn load_state(&mut self, path: &std::path::Path) -> Result<()> {
-        crate::savestate::load(&mut self.machine, path)?;
+    /// Restore a save state from `path`. The state carries its own machine
+    /// (RAM, ROM, chip revisions, CPU), so a load fully rebuilds it; when that
+    /// machine differs from the one running, the host is reconfigured to match
+    /// the state (the descriptor is adopted and pacing re-derived) and the
+    /// difference is logged. On success emulated time jumps to the state's
+    /// timeline, so the real-time pacing anchor is re-baselined to "now"; on
+    /// failure the running machine is untouched.
+    pub fn load_state(&mut self, path: &std::path::Path) -> Result<StateLoadOutcome> {
+        let loaded = crate::savestate::load(&mut self.machine, path)?;
+        let reconfigured = loaded != self.descriptor;
+        if reconfigured {
+            let diffs = self.descriptor.differences(&loaded).join(", ");
+            log::warn!(
+                "save state describes a different machine than the running config \
+                 ({diffs}); reconfiguring host to match the state ({})",
+                loaded.summary()
+            );
+            self.descriptor = loaded.clone();
+        }
+        // The CPU clock travels with the state; re-derive the host pacing math
+        // from it so an accelerated/slower restored CPU is paced correctly.
+        self.reconfigure_pacing_for_cpu_clock();
         self.reanchor_realtime_clock();
-        Ok(())
+        Ok(StateLoadOutcome {
+            reconfigured,
+            summary: loaded.summary(),
+        })
+    }
+
+    /// Re-derive the host pacing cost-per-instruction from the machine's
+    /// current CPU-clocks-per-colour-clock. `Emulator::new` computes this once
+    /// from the boot config; a save-state load can swap in a CPU with a
+    /// different clock, so recompute it then. See `new` for the derivation.
+    fn reconfigure_pacing_for_cpu_clock(&mut self) {
+        self.cpu_cycles_per_instruction =
+            cpu_cycles_per_instruction_for_clock(self.machine.cpu_clocks_per_cck());
     }
 
     /// Re-baseline the real-time pacing anchor so the next frame paces from
@@ -1317,13 +1388,29 @@ fn realtime_device_time_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        cck_for_instructions, instructions_for_cck_value, real_slice_accounting, realtime_budget,
-        ExecutedSlice, RealPacingBudgetMode, RealPacingProfile, DEFAULT_CPU_CYCLES_PER_INSTRUCTION,
+        cck_for_instructions, cpu_cycles_per_instruction_for_clock, instructions_for_cck_value,
+        real_cpu_cycles_per_instruction, real_slice_accounting, realtime_budget, ExecutedSlice,
+        RealPacingBudgetMode, RealPacingProfile, DEFAULT_CPU_CYCLES_PER_INSTRUCTION,
     };
     use crate::audio::AudioRuntimeStatus;
 
     use crate::config::PacingBudget;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn pacing_cost_scales_with_cpu_clock() {
+        // Stock 68000 (2 clocks/cck) is the identity. A 7-clocks/cck CPU (an
+        // accelerated 030) retires instructions 3.5x faster relative to the
+        // chipset, so its per-instruction pacing cost is 3.5x smaller. This is
+        // the value a save-state load re-derives when it swaps in a CPU clocked
+        // differently from the running config.
+        let stock = cpu_cycles_per_instruction_for_clock(2);
+        assert_eq!(stock, real_cpu_cycles_per_instruction());
+        let accelerated = cpu_cycles_per_instruction_for_clock(7);
+        assert!((stock / accelerated - 3.5).abs() < 1e-9);
+        // A zero clock is clamped to 1 rather than dividing by zero.
+        assert!(cpu_cycles_per_instruction_for_clock(0).is_finite());
+    }
 
     #[test]
     fn default_real_cpu_timing_maps_cycles_to_color_clocks() {
