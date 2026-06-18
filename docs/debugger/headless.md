@@ -96,6 +96,8 @@ authoritative list. The most useful ones:
 | `COPPERLINE_DIAG_CAPROW` | Per-line bitplane capture state at the DDF start (frame, vpos, BPL1PT, words/row, planes) -- separates wrong-pointer from wrong-decode display bugs |
 | `COPPERLINE_DIAG_SPRITES` | Sprite DMA fetch/render log |
 | `COPPERLINE_DIAG_SPRCAP` | `=BEAMY` or `=all`: log every captured sprite DMA line (frame, channel, hstart, attach, FMODE width, data words) on one beam line or all of them |
+| `COPPERLINE_DIAG_MANUAL_SPRITES` | `=BEAMY` or `=all`: log manually replayed sprite intervals, sprite register writes, BPLCON3/BPLCON4/FMODE/COLOR timing, sprite pointer alignment, and held wide-sprite words |
+| `COPPERLINE_DIAG_SPRITE_PIXELS` | `=BEAMY[,STEP]`: sample non-transparent sprite pixels on one beam line, including sprite or attached-pair index, palette entry, RGB, BPLCON3, and BPLCON4; STEP defaults to 32 framebuffer pixels |
 | `COPPERLINE_DIAG_BLITREGS` | `=START:END` (emulated seconds): log the full blitter register set at every blit start (classic BLTSIZE and ECS BLTSIZH); pairs with `COPPERLINE_DUMP_BLITMEM` snapshots for offline blit verification |
 | `COPPERLINE_DIAG_DISK` | Disk DMA state changes (DSKLEN writes) |
 | `COPPERLINE_DIAG_AUDIO_NOTES` | Paula channel note on/off events |
@@ -110,6 +112,10 @@ Timing-model knobs that pair well with the debugger:
 
 - `COPPERLINE_IRQ_LATENCY_CCK=N` -- override the modelled 68000
   interrupt-recognition latency (default 65 colour clocks; `0` disables).
+- `COPPERLINE_DBG_AFTER=SECS` / `COPPERLINE_DBG_UNTIL=SECS` -- bound
+  debugger and renderer diagnostics to an emulated-time window. Renderer
+  diagnostics parse these bounds once when their diagnostic option is first
+  used.
 - `COPPERLINE_HCENTER=0` -- disable presentation recentring when debugging
   display alignment.
 - `COPPERLINE_SHOT_RAW=1` -- save screenshots as the raw 716x570 woven

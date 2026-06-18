@@ -38,6 +38,14 @@ per-plane scroll delays) is constant and is computed once per run rather
 than per pixel. The per-pixel decisions inside a run are unchanged -- the
 chunking is a host-CPU optimisation, not a model change.
 
+AGA Lisa has one known split control path in this replay: BPLCON4's
+high-byte BPLAM bitplane XOR follows the normal control timeline, but the
+low-byte ESPRM/OSPRM sprite palette-base fields are visible to sprite
+colour lookup at the colour-output-domain x position used by COLOR writes.
+The render event journal therefore creates a sprite-only BPLCON4 segment
+when those two x positions differ, then applies the full BPLCON4 value on
+the normal control segment.
+
 The mapping from beam coordinates to framebuffer x is anchored by
 constants that encode the hardware's fetch-to-display pipeline delays --
 register writes, palette writes, and bitplane data each land at their own
