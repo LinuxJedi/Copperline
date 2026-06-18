@@ -104,13 +104,18 @@ Motorola 68020/030 user-manual timing tables or differential testing
 against Moira/Musashi are the realistic sources.
 
 On the A1200 the 020 chip-bus timing is calibrated against a cycle-exact
-FS-UAE A1200 (the 5/8 scaling above, a 32-bit Alice chip-bus data path, and
-a two-entry longword fetch latch). Three residuals remain: writes are
-posted as a full bus slot (no write-buffer overlap), per-frame throughput
-runs ~0.6 of the reference, and the cycle model does not reflect
-instruction-cache hit/miss timing -- so software that depends on CACR
-cache-on/off *timing* will diverge. MMU-dependent 030/040 accelerator
-setups are a non-goal.
+FS-UAE A1200 (the 6/8 scaling above, a 32-bit Alice chip-bus data path, and
+a two-entry longword fetch latch). The 020's chip-bus cycle is modelled as 3
+CPU clocks, not the 68000's 4: after the granted colour-clock slot the access
+bills only the shorter remaining tail (one clock -- half a cck at the stock
+2-clock ratio, none at 14 MHz where the 3-clock cycle fits inside one slot),
+which is write-posting and the faster 020 read. The tail's fractional cck are
+carried so none are lost; the 68000/010 keep the full 4-clock (2-cck) cycle
+(`Bus::cpu_short_bus_cycle`). Residuals: per-frame throughput still runs below
+the reference, and the cycle model does not reflect instruction-cache
+hit/miss *latency* (only its bus-traffic effect), so software that toggles
+CACR cache-on/off and depends on the exact transition timing can diverge.
+MMU-dependent 030/040 accelerator setups are a non-goal.
 
 ## Interrupts and STOP
 

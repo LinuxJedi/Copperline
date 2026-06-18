@@ -253,6 +253,10 @@ impl M68kMachine {
             dbg_ipl_on: crate::envcfg::flag("COPPERLINE_DIAG_IPL"),
             dbg_spren_on: crate::envcfg::flag("COPPERLINE_DBG_SPREN"),
         };
+        // The 68020+ has a 3-clock chip-bus cycle (vs the 68000's 4); tell the
+        // bus so it bills the shorter post-grant tail (write-posting).
+        let short_bus = !machine.cpu.is_pre_68020;
+        machine.bus.bus.set_cpu_short_bus_cycle(short_bus);
         machine.reset_cpu();
         Ok(machine)
     }
@@ -963,6 +967,10 @@ impl M68kMachine {
         self.sync_cck_on = runtime.sync_cck_on;
         self.cpu_clocks_per_cck = runtime.cpu_clocks_per_cck;
         self.cpu_clock_carry = runtime.cpu_clock_carry;
+        // The short-bus-cycle flag is derived from the (restored) CPU model and
+        // not serialized, so re-establish it here.
+        let short_bus = !self.cpu.is_pre_68020;
+        self.bus.bus.set_cpu_short_bus_cycle(short_bus);
         // apply_state runs outside the per-instruction loop that pushes CACR
         // into the cache models, so force a re-sync now: a cache kept cold from
         // above still holds power-on (disabled) flags until CACR is applied.
@@ -2504,9 +2512,17 @@ mod tests {
         ];
         let steps = 3 + 2 * 11;
         let run = |icache: bool| -> Result<u32> {
-            let mut machine = M68kMachine::new(
+            // Run at the 68EC020's native ~14 MHz (4 CPU clocks per cck): with
+            // the accurate 3-clock 020 chip-bus cycle a word fetch is one cck,
+            // which still bus-bounds the tiny in-loop instructions, so dropping
+            // those fetches to the cache cuts bus traffic. (At the stock 2-clock
+            // ratio the 1.5-cck fetch already fits inside the instruction time,
+            // so cached and uncached totals match and there is nothing to cut.)
+            let mut machine = build(
                 test_bus(reset_rom(0x0007_FFFE, 0x0000_0100)),
                 CpuModel::M68EC020,
+                false,
+                4,
                 false,
             )?;
             machine.set_cache_emulation(icache, false);

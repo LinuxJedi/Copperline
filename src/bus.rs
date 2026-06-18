@@ -551,6 +551,17 @@ pub struct Bus {
     /// hundredths of a CPU clock. At high clock ratios a single word access
     /// costs less than one cck; the carry accumulates so no time is lost.
     ext_clock_carry_x100: u32,
+    /// True for the 68020+: its chip-bus cycle is 3 CPU clocks, not the
+    /// 68000's 4 (2 cck) -- so after the granted slot it bills a shorter tail
+    /// (write-posting and the faster 020 bus). Derived from the CPU model and
+    /// re-set on construction / state load; not serialized.
+    #[serde(skip)]
+    cpu_short_bus_cycle: bool,
+    /// Sub-cck remainder (in CPU clocks) for the 020+ short-bus-cycle tail:
+    /// the 1-clock tail at the stock 2-clock ratio is half a cck, accumulated
+    /// here so the fractional cck are not lost.
+    #[serde(skip)]
+    cpu_bus_tail_carry: u32,
     dbg_bpl_cck: Vec<u32>,
     dbg_slotmap: Vec<Vec<u8>>,
     dbg_slotmap_on: bool,
@@ -1447,6 +1458,8 @@ impl Bus {
             cpu_clock_carry: 0,
             cpu_clocks_per_cck: 2,
             ext_clock_carry_x100: 0,
+            cpu_short_bus_cycle: false,
+            cpu_bus_tail_carry: 0,
             cpu_granted_chip_slots: 0,
             cpu_missed_chip_slots: 0,
             dbg_bpl_cck: vec![0; 340],
@@ -2172,6 +2185,13 @@ impl Bus {
         self.cpu_clocks_per_cck = clocks.max(1);
     }
 
+    /// Select the chip-bus cycle length: the 68020+ completes a word access in
+    /// 3 CPU clocks where the 68000 takes 4, so its post-grant tail is shorter
+    /// (write-posting; faster reads). Derived from the CPU model.
+    pub fn set_cpu_short_bus_cycle(&mut self, enabled: bool) {
+        self.cpu_short_bus_cycle = enabled;
+    }
+
     /// Advance the chipset for CPU-internal (non-bus) clocks reported by the
     /// cycle-exact core via `AddressBus::sync`. The chip bus stays free for
     /// DMA during this time; timed devices tick along. Sub-cck clock counts
@@ -2347,11 +2367,25 @@ impl Bus {
             let (cck, tick) = self.advance_one_chip_bus_quantum(Some(ChipBusOwner::Cpu));
             self.note_cpu_granted_chip_bus_cycle();
             self.record_slice_bus_advance(cck, tick);
-            // The 68000 bus cycle spans 4 CPU clocks (2 cck) per word: one
-            // cck is the granted chip-bus slot above; the other elapses with
-            // the chip bus free for DMA.
-            let (cck, tick) = self.advance_one_chip_bus_quantum(None);
-            self.record_slice_bus_advance(cck, tick);
+            // After the granted slot (one cck), the CPU's bus cycle runs out
+            // its remaining clocks with the chip bus free for DMA. The 68000's
+            // 4-clock cycle leaves one whole cck (2 clocks at the stock ratio);
+            // the 68020+'s 3-clock cycle leaves only one clock -- half a cck at
+            // the stock ratio, and none at all once a slot is >= 3 clocks
+            // (14 MHz), which is the write-posting / faster-020-bus effect.
+            // Bill the 020 tail in CPU clocks through a carry so the fractional
+            // cck are not lost.
+            if self.cpu_short_bus_cycle {
+                self.cpu_bus_tail_carry += 3u32.saturating_sub(self.cpu_clocks_per_cck);
+                while self.cpu_bus_tail_carry >= self.cpu_clocks_per_cck {
+                    self.cpu_bus_tail_carry -= self.cpu_clocks_per_cck;
+                    let (cck, tick) = self.advance_one_chip_bus_quantum(None);
+                    self.record_slice_bus_advance(cck, tick);
+                }
+            } else {
+                let (cck, tick) = self.advance_one_chip_bus_quantum(None);
+                self.record_slice_bus_advance(cck, tick);
+            }
         }
     }
 
