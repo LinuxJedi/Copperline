@@ -30,7 +30,7 @@ What is captured:
 |---|---|
 | `CpuCore` | registers, SR flags, prefetch queue, pending interrupt/stop state, MMU/CACR state, cycle-timing configuration, `cpu_type` and address mask |
 | `MachineRuntimeState` | the `M68kMachine` fields outside the core: `last_cacr`, `sync_cck_on`, `cpu_clocks_per_cck`, `cpu_clock_carry` |
-| `icache` / `dcache` | the opt-in 020/030 cache models (`Option<Box<CpuCache>>`, `None` when not configured) |
+| `icache` / `dcache` | the 020/030 cache models (`Option<Box<CpuCache>>`, `None` when the model has no such cache or it is opted out). A snapshot with `None` for a cache the running CPU has -- an older state, or one taken before the caches defaulted on -- re-establishes that cache cold on load (enable bits re-derived from the restored CACR) instead of dropping it |
 | `Bus` | chip/slow RAM, ROM and extended ROM, Zorro boards (including their RAM), both CIAs, RTC, Agnus/Copper/Denise/Paula/blitter state, floppy controller with in-memory disk images, Gayle IDE, A2091 SCSI, Akiko/CDTV with NVRAM, beam-event capture buffers, DMA pointers, interrupt latches, and the bus-arbitration counters |
 
 Deliberately excluded, with the mechanism in parentheses:

@@ -951,12 +951,25 @@ impl M68kMachine {
         self.bus.address_mask = cpu.address_mask;
         self.cpu = cpu;
         self.bus.bus = bus;
-        self.bus.icache = icache;
-        self.bus.dcache = dcache;
+        // The cache is silicon, not dynamic state: a CPU that has one keeps it
+        // across a restore. Snapshots taken with the cache modelled carry warm
+        // line contents (used as-is for byte-identical replay); ones that
+        // predate cache modelling - or were captured with it disabled - have
+        // None, so we keep the live machine's (cold) cache rather than dropping
+        // it, then re-derive its enable/freeze flags from the restored CACR.
+        self.bus.icache = icache.or_else(|| self.bus.icache.take());
+        self.bus.dcache = dcache.or_else(|| self.bus.dcache.take());
         self.last_cacr = runtime.last_cacr;
         self.sync_cck_on = runtime.sync_cck_on;
         self.cpu_clocks_per_cck = runtime.cpu_clocks_per_cck;
         self.cpu_clock_carry = runtime.cpu_clock_carry;
+        // apply_state runs outside the per-instruction loop that pushes CACR
+        // into the cache models, so force a re-sync now: a cache kept cold from
+        // above still holds power-on (disabled) flags until CACR is applied.
+        if self.bus.icache.is_some() || self.bus.dcache.is_some() {
+            self.last_cacr = !self.cpu.cacr;
+            self.apply_cacr_updates();
+        }
         Ok(())
     }
 
@@ -1260,9 +1273,11 @@ impl M68kMachine {
         cck
     }
 
-    /// Install the opt-in 68020/030 cache models. Until this is called (or
-    /// with both false), CACR writes are tracked but have no effect, which
-    /// is the calibrated default behaviour.
+    /// Install the 68020/030 cache models. These default on for CPUs that have
+    /// them (see `CpuModel::has_instruction_cache`/`has_data_cache`), matching
+    /// real silicon where AmigaOS enables the cache via CACR; `[cpu] icache =
+    /// false`/`dcache = false` opt out. With both false, CACR writes are
+    /// tracked but have no effect.
     pub fn set_cache_emulation(&mut self, icache: bool, dcache: bool) {
         self.bus.icache = icache.then(Box::default);
         self.bus.dcache = dcache.then(Box::default);

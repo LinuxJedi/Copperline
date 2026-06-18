@@ -49,12 +49,27 @@ fall-through) and
 
 ## Caches
 
-By default no cache is modelled on any CPU: CACR/CAAR are stored, and the
-cache-control instructions are privileged no-ops, so self-modifying code
-always executes fresh bytes (the safe direction). The opt-in `[cpu]
-icache`/`dcache` models (020/030) exist for accelerator-style
-configurations; the data cache only covers expansion RAM/ROM because chip
-and slow RAM are DMA-visible and cache-inhibited, as on real machines.
+The on-chip caches are silicon, so they are modelled by default on the parts
+that have them: the instruction cache on the 68020/68EC020/68030 and the data
+cache on the 68030 (`CpuModel::has_instruction_cache`/`has_data_cache`).
+CACR/CAAR are always stored; software (AmigaOS at boot) enables and clears the
+cache through CACR exactly as on hardware. A cache hit costs no bus cycle, so
+a cached instruction fetch does not contend with chip-bus DMA -- which is the
+point: 020/030 code looping out of chip RAM otherwise pays a bitplane-DMA
+arbitration stall on every fetch and runs at roughly half speed, drifting an
+AGA demo's interrupt-driven music or animation to half its intended rate. The
+data cache only covers expansion RAM/ROM because chip and slow RAM are
+DMA-visible and cache-inhibited, as on real machines. A 68000/68010 models no
+cache. `[cpu] icache = false`/`dcache = false` opt a 020/030 back out; with no
+cache modelled, the cache-control instructions are no-ops and self-modifying
+code always executes fresh bytes (the safe direction).
+
+The instruction cache does not snoop writes (authentic 68020 behaviour), so a
+line stays valid until DMA or the CPU rewrites its backing memory, or software
+clears it via CACR. Restoring a save state that predates cache modelling (or
+was captured with the cache disabled) re-establishes the model's cache cold
+and re-derives its enable bits from the restored CACR, so the machine keeps
+the cache its CPU has rather than silently running cacheless after a load.
 
 ## 68020+ timing
 

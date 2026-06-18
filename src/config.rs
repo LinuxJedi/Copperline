@@ -241,6 +241,25 @@ impl CpuModel {
             CpuModel::M68030 | CpuModel::M68040 => 25.0,
         }
     }
+
+    /// Whether this model has the on-chip instruction cache Copperline models.
+    /// The 68020/68EC020/68030 all ship a 256-byte direct-mapped instruction
+    /// cache; AmigaOS enables it (CACR.EI) at boot. Real A1200/A4000 software
+    /// (demos especially) leans on it: code looping out of chip RAM otherwise
+    /// contends with bitplane DMA on every fetch and runs roughly half-speed.
+    /// The 68040 caches exist but are not modelled here, so it reports false.
+    pub fn has_instruction_cache(self) -> bool {
+        matches!(
+            self,
+            CpuModel::M68EC020 | CpuModel::M68020 | CpuModel::M68030
+        )
+    }
+
+    /// Whether this model has the on-chip data cache Copperline models. Only
+    /// the 68030 has one (the 020 has none; the 040's is not modelled).
+    pub fn has_data_cache(self) -> bool {
+        self == CpuModel::M68030
+    }
 }
 
 /// PAL Amiga colour clock (CCK), in Hz. The 68000 bus advances one slot per
@@ -679,8 +698,15 @@ impl TryFrom<RawConfig> for Config {
                  a 68000 cannot drive a 68881/68882"
             );
         }
-        let cpu_icache = raw.cpu.icache.unwrap_or(defaults.cpu_icache);
-        let cpu_dcache = raw.cpu.dcache.unwrap_or(defaults.cpu_dcache);
+        // The on-chip caches are silicon: model them by default whenever the
+        // CPU has them (AmigaOS turns them on via CACR), so a 020/030 matches
+        // real hardware instead of contending with chip-bus DMA on every
+        // instruction fetch. `[cpu] icache`/`dcache` still force either way.
+        let cpu_icache = raw
+            .cpu
+            .icache
+            .unwrap_or_else(|| cpu.has_instruction_cache());
+        let cpu_dcache = raw.cpu.dcache.unwrap_or_else(|| cpu.has_data_cache());
         if cpu_icache
             && !matches!(
                 cpu,
@@ -1655,9 +1681,20 @@ mod tests {
         assert!(cfg.cpu_icache);
         assert!(cfg.cpu_dcache);
 
-        // Defaults stay off.
+        // Caches default on for the silicon that has them: a 68020/68EC020
+        // gets the instruction cache (no data cache); a 68030 gets both.
         let cfg = parse_config("[cpu]\nmodel = \"68020\"")?;
+        assert!(cfg.cpu_icache && !cfg.cpu_dcache);
+        let cfg = parse_config("[cpu]\nmodel = \"68030\"")?;
+        assert!(cfg.cpu_icache && cfg.cpu_dcache);
+
+        // A plain 68000 has neither.
+        let cfg = parse_config("[cpu]\nmodel = \"68000\"")?;
         assert!(!cfg.cpu_icache && !cfg.cpu_dcache);
+
+        // The default is overridable: a 020 can opt out of its instruction cache.
+        let cfg = parse_config("[cpu]\nmodel = \"68020\"\nicache = false")?;
+        assert!(!cfg.cpu_icache);
 
         let err = parse_config("[cpu]\nicache = true").unwrap_err();
         assert!(err.to_string().contains("icache"), "{err:#}");
