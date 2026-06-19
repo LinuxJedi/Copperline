@@ -2698,7 +2698,13 @@ fn manual_sprite_lines_from_events_with_visible_line0(
         if sprite >= 8 {
             continue;
         }
-        let event_beam = manual_sprite_event_beam(event.vpos, event.hpos, visible_line0, rows);
+        let event_beam = manual_sprite_event_beam_for_sprite_write(
+            off,
+            event.vpos,
+            event.hpos,
+            visible_line0,
+            rows,
+        );
         flush_manual_sprite_lines(sprite, &regs, next_beam[sprite], event_beam, &mut lines);
         regs.apply_write(off, event.value);
         next_beam[sprite] = event_beam;
@@ -2717,6 +2723,24 @@ fn manual_sprite_lines_from_events_with_visible_line0(
     lines
 }
 
+fn manual_sprite_event_beam_for_sprite_write(
+    off: u16,
+    vpos: u32,
+    hpos: u32,
+    visible_line0: i32,
+    rows: usize,
+) -> (i32, usize) {
+    match (off - 0x140) & 0x0006 {
+        // SPRxPOS re-arms the sprite horizontal comparator. When the
+        // write happens before the newly programmed HSTART, the sprite can
+        // still begin at HSTART; clipping in the later colour-output register
+        // domain delays attached pairs whose even/odd position writes are
+        // staggered by the Copper.
+        0x0 => manual_sprite_position_event_beam(vpos, hpos, visible_line0, rows),
+        _ => manual_sprite_event_beam(vpos, hpos, visible_line0, rows),
+    }
+}
+
 fn manual_sprite_event_beam(vpos: u32, hpos: u32, visible_line0: i32, rows: usize) -> (i32, usize) {
     let visible_end = visible_line0 + rows as i32;
     let vpos = vpos as i32;
@@ -2727,6 +2751,24 @@ fn manual_sprite_event_beam(vpos: u32, hpos: u32, visible_line0: i32, rows: usiz
         return (visible_end, 0);
     }
     let (_, x) = beam_to_framebuffer_pos_with_visible_line0(vpos as u32, hpos, visible_line0, rows);
+    (vpos, x)
+}
+
+fn manual_sprite_position_event_beam(
+    vpos: u32,
+    hpos: u32,
+    visible_line0: i32,
+    rows: usize,
+) -> (i32, usize) {
+    let visible_end = visible_line0 + rows as i32;
+    let vpos = vpos as i32;
+    if vpos < visible_line0 {
+        return (visible_line0, 0);
+    }
+    if vpos >= visible_end {
+        return (visible_end, 0);
+    }
+    let x = ((hpos as i32 * 2 - DIW_HSTART_FB0) * 2).clamp(0, FB_WIDTH as i32) as usize;
     (vpos, x)
 }
 
@@ -8008,6 +8050,44 @@ mod tests {
         assert_eq!(line.hstart, held_hstart);
         assert!(line.hsub_70ns);
         assert!(line.attached);
+    }
+
+    #[test]
+    fn manual_sprite_position_write_before_hstart_uses_sprite_compare_domain() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let old_hstart = 384;
+        let new_hstart = 192;
+        let (old_pos, old_ctl) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, old_hstart);
+        let (new_pos, _) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, new_hstart);
+        initial_state.sprpos[2] = old_pos;
+        initial_state.sprctl[2] = old_ctl;
+        initial_state.sprdata[2] = 0xFFFF;
+        initial_state.spr_armed[2] = true;
+
+        // hpos 96 reaches the sprite comparator before HSTART 192, but the
+        // colour-output register domain maps it to framebuffer x=224. The
+        // repositioned sprite must not be clipped to that later output x.
+        let event_hpos = 96;
+        let manual_sprite_lines = manual_sprite_lines_from_events(
+            &initial_state,
+            &[cpu_event(beam_y as u32, event_hpos, 0x150, new_pos)],
+        );
+
+        let old_line = manual_sprite_lines[2]
+            .iter()
+            .find(|line| line.beam_y == beam_y && line.hstart == old_hstart as i32)
+            .expect("old position interval");
+        let new_line = manual_sprite_lines[2]
+            .iter()
+            .find(|line| line.beam_y == beam_y && line.hstart == new_hstart as i32)
+            .expect("new position interval");
+        let sprite_compare_x = ((event_hpos as i32 * 2 - DIW_HSTART_FB0) * 2) as usize;
+        let colour_output_x = ((event_hpos as i32 - COPPER_WAIT_HPOS_FB0) * 4) as usize;
+
+        assert_eq!(old_line.x_stop, sprite_compare_x);
+        assert_eq!(new_line.x_start, sprite_compare_x);
+        assert_ne!(new_line.x_start, colour_output_x);
     }
 
     #[test]

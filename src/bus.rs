@@ -7909,8 +7909,7 @@ fn live_manual_sprite_collision_sources(
         let event_x = if event.vpos < beam_y as u32 {
             0
         } else {
-            ((event.hpos.saturating_sub(RENDER_COPPER_WAIT_HPOS_FB0)).saturating_mul(4))
-                .min(RENDER_FRAMEBUFFER_WIDTH as u32) as i32
+            live_manual_sprite_event_x(*event)
         };
         push_live_manual_sprite_source(
             &mut sources,
@@ -7953,6 +7952,16 @@ fn live_manual_sprite_collision_sources(
     }
 
     combine_live_manual_sprite_collision_sources(sources)
+}
+
+fn live_manual_sprite_event_x(event: BeamRegisterWrite) -> i32 {
+    let off = event.offset & 0x01FE;
+    if (0x140..=0x17F).contains(&off) && (off - 0x140) & 0x0006 == 0 {
+        return ((event.hpos as i32 * 2 - RENDER_DIW_HSTART_FB0) * 2)
+            .clamp(0, RENDER_FRAMEBUFFER_WIDTH);
+    }
+    ((event.hpos.saturating_sub(RENDER_COPPER_WAIT_HPOS_FB0)).saturating_mul(4))
+        .min(RENDER_FRAMEBUFFER_WIDTH as u32) as i32
 }
 
 fn apply_live_manual_sprite_event(
@@ -14139,6 +14148,23 @@ mod tests {
                 && source.source.words == [0x2000, 0, 0, 0]
                 && source.source.requires_odd_enable
         }));
+    }
+
+    #[test]
+    fn manual_sprite_position_write_uses_sprite_compare_domain_for_live_sources() {
+        let event_hpos = 96;
+        let event = BeamRegisterWrite {
+            vpos: RENDER_VISIBLE_START_VPOS,
+            hpos: event_hpos,
+            offset: 0x0150,
+            value: 0,
+            source: BeamWriteSource::Cpu,
+        };
+        let sprite_compare_x = (event_hpos as i32 * 2 - RENDER_DIW_HSTART_FB0) * 2;
+        let colour_output_x = (event_hpos as i32 - RENDER_COPPER_WAIT_HPOS_FB0 as i32) * 4;
+
+        assert_eq!(super::live_manual_sprite_event_x(event), sprite_compare_x);
+        assert_ne!(super::live_manual_sprite_event_x(event), colour_output_x);
     }
 
     #[test]

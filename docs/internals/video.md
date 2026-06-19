@@ -46,6 +46,15 @@ The render event journal therefore creates a sprite-only BPLCON4 segment
 when those two x positions differ, then applies the full BPLCON4 value on
 the normal control segment.
 
+Manual and held-sprite replay has a smaller split of its own. SPRxDATA and
+SPRxDATB writes affect only later pixels in the normal register-output
+domain, and SPRxCTL still disarms output at that point. SPRxPOS writes,
+however, re-arm the sprite horizontal comparator: if the write occurs before
+the newly programmed HSTART, the sprite can still begin at that HSTART. The
+replay clips those position intervals in the sprite-comparator domain so
+staggered even/odd attached-pair position writes do not create artificial
+half-pair strips.
+
 The mapping from beam coordinates to framebuffer x is anchored by
 constants that encode the hardware's fetch-to-display pipeline delays --
 register writes, palette writes, and bitplane data each land at their own
