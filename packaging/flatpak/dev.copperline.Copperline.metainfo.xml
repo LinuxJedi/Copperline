@@ -61,6 +61,11 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.4.0" date="2026-06-19">
+      <description>
+        <p>Reverse debugging, keyboard joystick input, opt-in realtime priority, Paula disk-read DMA phase correction, AGA sprite and bitplane timing fixes, and improved 68020/68030 cache and chip-bus timing.</p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-06-17">
       <description>
         <p>Threaded rendering by default, host-CPU optimisations, AGA dual-playfield colour fix, floating-bus modelling, and ECS DIWHIGH revert. The [machine] config key is now "profile" (was "model").</p>
