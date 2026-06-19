@@ -12,22 +12,21 @@ Agnus owns the beam: `vpos`/`hpos` counters advanced per colour clock, PAL
 alternation) geometry, the long-field flag for interlace, and VPOSR/VHPOSR.
 It also owns DMACON and the display-fetch machinery: the bitplane fetch
 plan for the current line is computed from DDFSTRT/DDFSTOP, the plane
-count, and resolution, producing the per-slot fetch pattern the
-[arbitration model](timing) consumes. The fetch sequencer always completes
-whole 8-CCK units at FMODE=0: DDF registers have finer granularity in
-hi-res/super-hi-res (4/2 CCK), so a DDFSTOP landing mid-unit extends the
-fetch through the unit starting at-or-after it
-(`agnus::bitplane_fetch_blocks`; the CDTV trademark screen's hi-res
-$64/$A8 window fetches 20 words per row, not the truncated 18). Wide-FMODE
-fetch units (16/32 CCK) run on the absolute unit grid, so Agnus masks
-DDFSTRT down to the unit boundary before counting units
-(`agnus::anchor_bitplane_fetch_start`, WinUAE's
-`plfstrt = ddfstrt & ~(fetchstart-1)`); the 8-CCK FMODE=0 units already
-divide the standard $38/$3C DDFSTRTs, so only the wider units shift an
-off-grid start. SANITY Roots II's hi-res FMODE=3 256-colour pictures
-program a lo-res-style DDFSTRT $38: anchored to $30 the window runs the
-full 40 words/row its interleaved modulos expect, where the raw $38
-stopped one unit short at 36 words and sheared every row into noise.
+count, resolution, and FMODE, producing the per-slot fetch pattern the
+[arbitration model](timing) consumes. The fetch sequencer starts from the
+DDFSTRT comparator and completes whole fetch units: DDF registers have
+finer granularity than the unit in hi-res/super-hi-res and wide-FMODE
+modes, so a DDFSTOP landing mid-unit extends the fetch through the unit
+starting at-or-after it (`agnus::bitplane_fetch_blocks`; the CDTV
+trademark screen's hi-res $64/$A8 window fetches 20 words per row, not
+the truncated 18). Wide-FMODE units (16/32 CCK) use the same rule rather
+than moving DDFSTRT down to an absolute grid. In lo-res, the plane-order
+slots for a wide unit are packed into the unit's first eight CCKs; the
+remaining CCKs are free for other bus users. SANITY Roots II's AGA
+256-colour effects are regression examples for both sides of this: the
+hi-res FMODE=3 pictures need raw-DDFSTRT unit rounding to preserve their
+40-word rows, and the lo-res FMODE=3 landscape needs packed first-eight
+CCK plane slots instead of spreading those slots across the 32-CCK unit.
 
 Agnus revisions are modelled independently of Denise (machines shipped
 mixed): OCS (8370/8371), ECS 8372A (1M chip RAM reach), ECS 8375 (2M), and
@@ -36,6 +35,13 @@ implemented subset of BEAMCON0 (PAL/VARBEAMEN/LOLDIS/HARDDIS and friends);
 Alice adds the FMODE wide-fetch latch, which scales the bitplane and
 sprite fetch quanta (FMODE=0 stays byte-identical to the OCS/ECS slot
 timing).
+
+Sprite DMA retains its latched POS/CTL descriptor independently from the
+SPRxPT registers. If software fetches a descriptor off-screen, then writes
+SPRxPT before the sprite's VSTART, Agnus retargets the data pointer for
+the retained descriptor instead of requiring a new descriptor at the new
+address. The frame-start replay path mirrors this by replaying off-screen
+DMACON and SPRxPT writes in beam order before rendering the visible field.
 
 A modelling note that catches people out: OCS lo-res with BPU=7 is an
 overprogrammed mode. Denise still decodes six BPLDAT latches, but Agnus
@@ -137,9 +143,9 @@ empty-drive poll click.
 Most ECS and AGA behaviour is implemented (the register notes above and
 [](video)); the chipset gaps that remain are:
 
-- **AGA DDF fine-granularity** is not modelled -- the fetch sequencer still
-  rounds to whole units, pending reference-capture calibration against the
-  wide-FMODE fetch grid.
+- **Sub-unit AGA DDF stop effects** beyond whole-unit completion are not
+  modelled; the current model starts from DDFSTRT and rounds DDFSTOP
+  through complete FMODE units.
 - **Live (beam-timed) collisions** stay on the 6-plane decode: CLXCON2 is
   interpreted in the rendered collision path but not yet in the beam-timed
   `COLLISIONS_AGA_DECODE` path.

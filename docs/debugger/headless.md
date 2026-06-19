@@ -93,9 +93,10 @@ authoritative list. The most useful ones:
 | `COPPERLINE_DIAG_PCHIST` | Full PC history (with `COPPERLINE_DIAG_PCHIST_START=SECS`) |
 | `COPPERLINE_DIAG_COPLEN` | Copper list length (optionally at a given emulated time) |
 | `COPPERLINE_DIAG_DISPLAY` | Display-register change log |
-| `COPPERLINE_DIAG_CAPROW` | Per-line bitplane capture state at the DDF start (frame, vpos, BPL1PT, words/row, planes) -- separates wrong-pointer from wrong-decode display bugs |
+| `COPPERLINE_DIAG_CAPROW` | `=all`, `=V`, or `=START:END`: per-line bitplane capture state at DDF start, including DMACON/BPLCON/FMODE/DIW/DDF, effective fetch window, unit/period/quantum, words/row, modulos, and BPLxPTs -- separates wrong-pointer from wrong-decode display bugs |
+| `COPPERLINE_DIAG_PALETTE_ROW` | `=all`, `=V`, or `=START:END`: log beam-timed COLOR writes for selected beam lines, including source, framebuffer x, palette entry, LOCT, value, and BPLCON3; the setting is cached after first use |
 | `COPPERLINE_DIAG_SPRITES` | Sprite DMA fetch/render log |
-| `COPPERLINE_DIAG_SPRCAP` | `=BEAMY` or `=all`: log every captured sprite DMA line (frame, channel, hstart, attach, FMODE width, data words) on one beam line or all of them |
+| `COPPERLINE_DIAG_SPRCAP` | `=BEAMY` or `=all`: log every captured sprite DMA line (frame, channel, hstart, attach, FMODE width, data words) on one beam line or all of them; also logs SPRxPT retargets of latched sprite descriptors |
 | `COPPERLINE_DIAG_MANUAL_SPRITES` | `=BEAMY` or `=all`: log manually replayed sprite intervals, sprite register writes, BPLCON3/BPLCON4/FMODE/COLOR timing, sprite pointer alignment, and held wide-sprite words |
 | `COPPERLINE_DIAG_SPRITE_PIXELS` | `=BEAMY[,STEP]`: sample non-transparent sprite pixels on one beam line, including sprite or attached-pair index, palette entry, RGB, BPLCON3, and BPLCON4; STEP defaults to 32 framebuffer pixels |
 | `COPPERLINE_DIAG_BLITREGS` | `=START:END` (emulated seconds): log the full blitter register set at every blit start (classic BLTSIZE and ECS BLTSIZH); pairs with `COPPERLINE_DUMP_BLITMEM` snapshots for offline blit verification |

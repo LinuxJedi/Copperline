@@ -109,10 +109,13 @@ a two-entry longword fetch latch). The 020's chip-bus cycle is modelled as 3
 CPU clocks, not the 68000's 4: after the granted colour-clock slot the access
 bills only the shorter remaining tail (one clock -- half a cck at the stock
 2-clock ratio, none at 14 MHz where the 3-clock cycle fits inside one slot),
-which is the whole chip-slot cost at the native 14 MHz ratio. Reads, writes,
-and custom-register reads all consume that granted slot without an additional
-colour-clock bubble; adding one over-stalls 020 chip-RAM read/modify/write
-loops, while the A1200 timing-test chip-read row remains aligned without it.
+which is the whole chip-slot cost at the native 14 MHz ratio. On Alice, reads,
+writes, and custom-register reads all consume that granted slot without an
+additional colour-clock bubble; adding one over-stalls AGA 020 chip-RAM
+read/modify/write loops, while the A1200 timing-test chip-read row remains
+aligned without it. On OCS/ECS machines the 020 still talks to the 16-bit chip
+bus, so chip/slow/custom reads pay a one-CCK data-return wait when the
+3-clock short bus cycle is otherwise hidden inside a single colour-clock slot.
 The tail's fractional cck are carried so none are lost; the 68000/010 keep the
 full 4-clock (2-cck) cycle (`Bus::cpu_short_bus_cycle`). Residuals: per-frame
 throughput still runs below the reference, and the cycle model does not reflect

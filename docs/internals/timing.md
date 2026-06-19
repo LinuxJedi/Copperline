@@ -36,6 +36,9 @@ DDF window, FMODE fetch cadence, and per-plane fetch-order mask live in a
 write or a write-delay expiry changes the key. The vpos-dependent gates
 (vertical display window, DDFSTRT write miss) are still evaluated live, so
 the memoization cannot change behaviour.
+Wide-FMODE lo-res slots are packed into the first eight CCKs of each
+16/32-CCK fetch unit; the rest of the unit remains available to later
+arbitration priorities.
 
 Slow RAM at `$C00000` is arbitrated through Agnus *like chip RAM*: a CPU
 access to slow RAM contends with DMA even though the RAM is outside the

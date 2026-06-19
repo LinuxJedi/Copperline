@@ -60,7 +60,7 @@ const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// upstream bitplane shifter. Treat the left output edge as the first visible
 /// colour-register position rather than the earlier bitplane-control domain.
 /// Moved left by 8 colour clocks alongside the other origin anchors.
-const COLOR_WRITE_HPOS_FB0: i32 = 0x36;
+const COLOR_WRITE_HPOS_FB0: i32 = 0x34;
 /// Framebuffer-x offset between the copper/register coordinate
 /// ([`COPPER_WAIT_HPOS_FB0`], used to place beam-timed register writes) and the
 /// bitplane/DIW coordinate ([`DIW_HSTART_FB0`], used to place fetched bitplane
@@ -165,9 +165,6 @@ const BPLCON3_SPRES_LORES: u16 = 0x0040;
 const BPLCON3_SPRES_HIRES: u16 = 0x0080;
 const BPLCON3_SPRES_SHRES: u16 = 0x00C0;
 const BPLCON3_PF2OF_MASK: u16 = 0x1C00;
-// Sprite DMA enable is checked on the capture side (bus.rs); the renderer keys
-// off observed sprite DMA, so this bit is only needed by renderer unit tests.
-#[cfg(test)]
 const DMACON_SPREN: u16 = 1 << 5;
 const DMACON_BPLEN: u16 = 1 << 8;
 const DMACON_DMAEN: u16 = 1 << 9;
@@ -202,6 +199,64 @@ struct PaletteSegment {
 impl PaletteSegment {
     fn apply(&self, palette: &mut Palette) {
         palette.write_entry(usize::from(self.entry), self.loct, self.value);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PaletteRowDiag {
+    first_vpos: u32,
+    last_vpos: u32,
+}
+
+impl PaletteRowDiag {
+    fn contains(self, vpos: u32) -> bool {
+        (self.first_vpos..=self.last_vpos).contains(&vpos)
+    }
+}
+
+fn parse_diag_u32(raw: &str) -> Option<u32> {
+    let raw = raw.trim();
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        raw.parse::<u32>().ok()
+    }
+}
+
+/// Cached COPPERLINE_DIAG_PALETTE_ROW setting (read once). Accepted forms:
+/// presence/`all` logs every COLOR write, `V` logs one beam line, and
+/// `START:END` logs an inclusive beam-line range.
+fn palette_row_diag() -> Option<PaletteRowDiag> {
+    static SPEC: OnceLock<Option<PaletteRowDiag>> = OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let raw = crate::envcfg::var("COPPERLINE_DIAG_PALETTE_ROW")?;
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+            return Some(PaletteRowDiag {
+                first_vpos: 0,
+                last_vpos: u32::MAX,
+            });
+        }
+        if let Some((first, last)) = raw.split_once(':') {
+            let first_vpos = parse_diag_u32(first).unwrap_or(0);
+            let last_vpos = parse_diag_u32(last).unwrap_or(u32::MAX);
+            return Some(PaletteRowDiag {
+                first_vpos: first_vpos.min(last_vpos),
+                last_vpos: first_vpos.max(last_vpos),
+            });
+        }
+        parse_diag_u32(raw).map(|vpos| PaletteRowDiag {
+            first_vpos: vpos,
+            last_vpos: vpos,
+        })
+    })
+}
+
+fn beam_write_source_label(source: BeamWriteSource) -> &'static str {
+    match source {
+        BeamWriteSource::Cpu => "cpu",
+        BeamWriteSource::CpuCopperIrq => "cpu_copper_irq",
+        BeamWriteSource::Copper => "copper",
     }
 }
 
@@ -681,8 +736,8 @@ impl ControlState {
 
     /// Horizontal extent, in DIWSTRT/DIWSTOP H coordinates, of the bitplane
     /// data this control actually fetches: the display-data-fetch window
-    /// (DDFSTRT/DDFSTOP, quantized to the fetch grid) widened by the fetched
-    /// word count at the current resolution. Calibrated so a standard DDF
+    /// (DDFSTRT/DDFSTOP, rounded to completed fetch units) widened by the
+    /// fetched word count at the current resolution. Calibrated so a standard DDF
     /// window ($38/$D0 lo-res, $3C/$D4 hi-res) yields exactly the standard
     /// DIW edges (`STANDARD_DIW_HSTART`..`STANDARD_DIW_HSTOP`): the picture a
     /// stock display fetches lands on the same beam positions as its DIW
@@ -705,9 +760,10 @@ impl ControlState {
         if words == 0 {
             return None;
         }
-        // DDFSTRT shifts the picture in whole fetch-grid gulps, matching the
-        // renderer's placement (see `fetch_origin_native_shift`). Each colour
-        // clock of DDF shift moves the picture two lo-res H units.
+        // The displayed shifter origin moves in whole fetch gulps, matching
+        // the renderer's placement (see `fetch_origin_native_shift`). This is
+        // separate from the DMA slot positions, which start at raw DDFSTRT.
+        // Each colour clock of DDF shift moves the picture two lo-res H units.
         let gulp = self.fetch_period() as i32;
         let align = |hpos: i32| -> i32 {
             (hpos.div_euclid(gulp) * gulp).max(BITPLANE_DDF_HARD_START as i32)
@@ -751,34 +807,26 @@ impl ControlState {
         } else {
             2
         };
-        // The picture position is quantized to the fetch-period grid (one
-        // FMODE gulp per plane, on absolute colour-clock multiples of the
-        // gulp, matching Agnus's DDFSTRT masking to the fetch-unit
-        // boundary): the shifter takes data in whole 1/2/4-word gulps, so
-        // a DDFSTRT moved within one gulp starts the fetch sequencer
-        // earlier without moving the displayed picture. With FMODE=0 the
-        // gulp equals the DDF granularity and nothing changes (boot-screen
-        // insert-disk art is drawn for the continuous placement: its
-        // negative modulos overlap rows so the hand/disk's right edge
-        // lives in the next row's first bytes - the calibrated FMODE=0
-        // anchors must stay). With wide FMODE fetches system software programs
-        // DDFSTRT $38 or $3C interchangeably (same 16-cck gulp slot,
-        // BPLCON1=0), and its interleaved-bitmap modulos expect exactly
-        // the visible row width in the window - without the quantization,
-        // the fetch overrun displayed inside the window's right edge as
-        // the next plane's row start (visible as a speckled right-edge
-        // columns, the CD32 intro's right-edge noise during the disc
-        // fly-in). The grid anchor is the colour-clock origin, not the
-        // hard DDF start $18: $18 is a multiple of every FMODE=0 period
-        // (so narrow fetches are unaffected either way), but wide-FMODE
-        // gulp slots run on absolute multiples of the gulp - DDFSTRT $30
-        // with a 16-cck gulp is on-grid and shares its slot with the
-        // standard $38, as scrolling dual-playfield
-        // menu screens rely on.
+        // The displayed picture position is quantized to the fetch-period
+        // grid (one FMODE gulp per plane). The DMA sequencer itself starts at
+        // raw DDFSTRT, but the shifter consumes data in whole 1/2/4-word
+        // gulps, so a DDFSTRT moved within one gulp changes how much tail data
+        // is fetched without necessarily moving the visible picture. With
+        // FMODE=0 the gulp equals the DDF granularity and nothing changes
+        // (boot-screen insert-disk art is drawn for the continuous placement:
+        // its negative modulos overlap rows so the hand/disk's right edge
+        // lives in the next row's first bytes - the calibrated FMODE=0 anchors
+        // must stay). With wide FMODE fetches system software programs DDFSTRT
+        // $38 or $3C interchangeably (same 16-cck gulp slot, BPLCON1=0), and
+        // its interleaved-bitmap modulos expect exactly the visible row width
+        // in the window - without the placement quantization, the fetch overrun
+        // displayed inside the window's right edge as the next plane's row
+        // start. The placement grid anchor is the colour-clock origin, not the
+        // hard DDF start $18.
         let align = |hpos: i32| -> i32 {
             let gulp = self.fetch_period() as i32;
-            // Clamped to the DDF hard start: a slot masked to before it fetches
-            // from the first usable position, not from the blanking before it.
+            // Clamped to the DDF hard start: placement before the first usable
+            // fetch position is not visible.
             (hpos.div_euclid(gulp) * gulp).max(BITPLANE_DDF_HARD_START as i32)
         };
         let ddf_native_shift =
@@ -1892,6 +1940,21 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
             } else {
                 color_write_framebuffer_x(event.hpos)
             };
+            if palette_row_diag().is_some_and(|spec| spec.contains(event.vpos)) {
+                log::info!(
+                    "palrow v={} h={} x={} line={} source={} color{:02} entry={} loct={} value={:#06X} bplcon3={:#06X}",
+                    event.vpos,
+                    event.hpos,
+                    x,
+                    line,
+                    beam_write_source_label(event.source),
+                    idx,
+                    entry,
+                    loct,
+                    color_register_value(event.value),
+                    control.bplcon3,
+                );
+            }
             push_palette_segment(
                 palette_segments,
                 line,
@@ -2278,7 +2341,7 @@ fn bitplane_fetch_hpos_for_plane(control: ControlState, word_idx: usize, plane: 
     }
 
     let unit = control.fetch_unit();
-    start + group.saturating_mul(unit) + bitplane_fetch_order(control, plane) * (unit / 8)
+    start + group.saturating_mul(unit) + bitplane_fetch_order(control, plane)
 }
 
 fn fetch_plane_word_active_at_hpos(
@@ -2730,6 +2793,7 @@ fn manual_sprite_lines_from_events(
         &[None; 8],
         PAL_VISIBLE_LINE0,
         FB_HEIGHT,
+        true,
     )
 }
 
@@ -2739,10 +2803,17 @@ fn manual_sprite_lines_from_events_with_visible_line0(
     held: &[Option<HeldSpriteLine>; 8],
     visible_line0: i32,
     rows: usize,
+    include_latched_sprite_state: bool,
 ) -> Vec<Vec<SpriteLine>> {
     let mut regs = BeamSpriteState::from_render_state(initial_state, held);
-    let mut next_beam = [(visible_line0, 0usize); 8];
     let visible_end = visible_line0 + rows as i32;
+    let mut next_beam: [(i32, usize); 8] = std::array::from_fn(|sprite| {
+        if include_latched_sprite_state || held[sprite].is_some() {
+            (visible_line0, 0usize)
+        } else {
+            (visible_end, 0usize)
+        }
+    });
     let mut lines = vec![Vec::new(); 8];
 
     for event in events {
@@ -3320,7 +3391,8 @@ fn maybe_log_sprite_pixel_samples(
         return;
     }
     let y = y as usize;
-    let use_captured_sprite_dma = sprite_dma_observed;
+    let use_captured_sprite_dma = sprite_dma_observed
+        || state.dmacon & (DMACON_DMAEN | DMACON_SPREN) == (DMACON_DMAEN | DMACON_SPREN);
     let sprite_lines: [Vec<SpriteLine>; 8] = std::array::from_fn(|sprite| {
         collect_sprite_lines(
             sprite,
@@ -3612,13 +3684,19 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         visible_line0,
     );
     let event_started = Instant::now();
-    let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
-        &state,
-        render_events,
-        &input.held_sprites,
-        visible_line0,
-        rows,
-    );
+    let manual_sprite_lines = if input.sprite_dma_observed && manual_sprite_diag_spec().is_none() {
+        vec![Vec::new(); 8]
+    } else {
+        manual_sprite_lines_from_events_with_visible_line0(
+            &state,
+            render_events,
+            &input.held_sprites,
+            visible_line0,
+            rows,
+            !input.sprite_dma_observed
+                && state.dmacon & (DMACON_DMAEN | DMACON_SPREN) != (DMACON_DMAEN | DMACON_SPREN),
+        )
+    };
     maybe_log_manual_sprite_intervals(
         input.emulated_seconds,
         input.emulated_frames,
@@ -6692,7 +6770,7 @@ mod tests {
         );
         assert_eq!(
             beam_to_framebuffer_x_unclamped(COLOR_WRITE_HPOS_FB0 as u32),
-            56
+            48
         );
     }
 
@@ -6891,12 +6969,11 @@ mod tests {
         };
         assert_eq!(kickstart_hires.native_x_offset(true, 1), 20);
 
-        // Wide FMODE fetches quantize the picture position to the gulp grid:
-        // AGA system screens program DDFSTRT $38 or $3C interchangeably
+        // Wide FMODE fetches quantize the displayed shifter origin to the gulp
+        // grid: AGA system screens program DDFSTRT $38 or $3C interchangeably
         // (same 16-cck gulp slot) and must display identically; without the
-        // quantization the $38 screens showed the interleaved bitmap's fetch
-        // overrun as a junk
-        // column inside the window's right edge.
+        // quantized placement the $38 screens showed the interleaved bitmap's
+        // fetch overrun as a junk column inside the window's right edge.
         let wb_hires_overscan_fetch = RenderState {
             agnus_revision: AgnusRevision::AgaAlice,
             bplcon0: 0x8000,
@@ -6927,13 +7004,12 @@ mod tests {
         assert_eq!(wb_hires_overscan_fetch.native_x_offset(true, 1), 0);
         assert_eq!(wb_hires_overscan_fetch.fetch_start_native_x(true, 1), 0);
 
-        // The gulp grid runs on absolute colour-clock multiples of the
-        // fetch period (Agnus masks DDFSTRT to the fetch-unit boundary).
-        // Lores FMODE=1 has a 16-cck gulp: DDFSTRT $30 is on-grid and
-        // shares its slot with the standard $38, so both must display at
-        // the same position. A $18-anchored grid put these modes half a gulp
-        // early, shifting the picture left with wrap junk at the window's
-        // right edge.
+        // The placement gulp grid runs on absolute colour-clock multiples of
+        // the fetch period. Lores FMODE=1 has a 16-cck gulp: DDFSTRT $30 is
+        // on-grid and shares its displayed origin with the standard $38, so
+        // both must display at the same position. A $18-anchored grid put
+        // these modes half a gulp early, shifting the picture left with wrap
+        // junk at the window's right edge.
         let pinball_lores_wide_fetch = RenderState {
             agnus_revision: AgnusRevision::AgaAlice,
             bplcon0: 0x0611,
@@ -8005,6 +8081,31 @@ mod tests {
     }
 
     #[test]
+    fn sprite_dma_capture_suppresses_latched_manual_sprite_spans() {
+        let mut initial_state = blank_state();
+        let (pos, ctl) = sprite_control_words(
+            PAL_VISIBLE_LINE0 as u16,
+            PAL_VISIBLE_LINE0 as u16 + 8,
+            DIW_HSTART_FB0 as u16,
+        );
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+        initial_state.sprdata[0] = 0xFFFF;
+        initial_state.spr_armed[0] = true;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0].is_empty());
+    }
+
+    #[test]
     fn held_sprite_after_dma_disable_persists_past_descriptor_vstop() {
         let mut initial_state = blank_state();
         let held_vstart = PAL_VISIBLE_LINE0;
@@ -8046,6 +8147,7 @@ mod tests {
             &held,
             PAL_VISIBLE_LINE0,
             FB_HEIGHT,
+            true,
         );
 
         let line = manual_sprite_lines[0]
@@ -8092,6 +8194,7 @@ mod tests {
             &held,
             PAL_VISIBLE_LINE0,
             FB_HEIGHT,
+            true,
         );
 
         let line = manual_sprite_lines[1]

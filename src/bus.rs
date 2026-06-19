@@ -147,12 +147,58 @@ fn diag_vbi() -> bool {
     *V.get_or_init(|| crate::envcfg::flag("COPPERLINE_DIAG_VBI"))
 }
 
-/// Cached COPPERLINE_DIAG_CAPROW gate (read once). Checked on every bitplane
+#[derive(Clone, Copy)]
+struct CaprowDiag {
+    first_vpos: u32,
+    last_vpos: u32,
+}
+
+impl CaprowDiag {
+    fn contains(self, vpos: u32) -> bool {
+        (self.first_vpos..=self.last_vpos).contains(&vpos)
+    }
+}
+
+fn parse_diag_u32(raw: &str) -> Option<u32> {
+    let raw = raw.trim();
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        raw.parse::<u32>().ok()
+    }
+}
+
+/// Cached COPPERLINE_DIAG_CAPROW setting (read once). Accepted forms:
+/// presence/`all` logs every captured row, `V` logs one beam line, and
+/// `START:END` logs an inclusive beam-line range. Checked on every bitplane
 /// DMA-word capture call (per beam advance), so it must not do a map lookup.
-fn diag_caprow() -> bool {
+fn diag_caprow() -> Option<CaprowDiag> {
     use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| crate::envcfg::flag("COPPERLINE_DIAG_CAPROW"))
+    static V: OnceLock<Option<CaprowDiag>> = OnceLock::new();
+    *V.get_or_init(|| {
+        let Some(raw) = crate::envcfg::var("COPPERLINE_DIAG_CAPROW") else {
+            return None;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+            return Some(CaprowDiag {
+                first_vpos: 0,
+                last_vpos: u32::MAX,
+            });
+        }
+        if let Some((first, last)) = raw.split_once(':') {
+            let first_vpos = parse_diag_u32(first).unwrap_or(0);
+            let last_vpos = parse_diag_u32(last).unwrap_or(u32::MAX);
+            return Some(CaprowDiag {
+                first_vpos: first_vpos.min(last_vpos),
+                last_vpos: first_vpos.max(last_vpos),
+            });
+        }
+        parse_diag_u32(raw).map(|vpos| CaprowDiag {
+            first_vpos: vpos,
+            last_vpos: vpos,
+        })
+    })
 }
 
 /// Cached COPPERLINE_DIAG_SPRCAP setting (read once). Checked per captured
@@ -2436,6 +2482,14 @@ impl Bus {
                 self.record_slice_bus_advance(cck, tick);
             }
         }
+        if self.cpu_short_bus_cycle && !wide_bus && matches!(kind, CpuBusAccessKind::Read) {
+            self.bill_020_read_data_wait();
+        }
+    }
+
+    fn bill_020_read_data_wait(&mut self) {
+        let (cck, tick) = self.advance_one_chip_bus_quantum(None);
+        self.record_slice_bus_advance(cck, tick);
     }
 
     fn note_cpu_missed_chip_bus_cycle(&mut self) {
@@ -3151,6 +3205,9 @@ impl Bus {
 
     pub fn custom_read(&mut self, addr: u64, size: usize) -> u64 {
         self.grant_cpu_bus_access(size, CpuBusAccessKind::Custom);
+        if self.cpu_short_bus_cycle && !self.aga_enabled() {
+            self.bill_020_read_data_wait();
+        }
         // Read-only custom registers (INTREQR, DSKBYTR, SERDATR, POTxDAT, ...)
         // reflect timed-device state, so apply the deferred device clocks before
         // reading.
@@ -4238,7 +4295,9 @@ impl Bus {
                         );
                     }
                     self.display_dma_sprpt[idx] = self.denise.sprpt[idx];
-                    self.display_dma_sprite_state[idx] = DisplaySpriteDmaState::default();
+                    if off & 2 != 0 {
+                        self.retarget_display_sprite_dma_pointer(idx);
+                    }
                 }
                 false
             }
@@ -5492,12 +5551,11 @@ impl Bus {
         if (rel / plan.unit) * plan.quantum >= plan.words_per_row {
             return false;
         }
-        let unit_step = plan.unit / 8;
         let unit_off = rel % plan.unit;
-        if !unit_off.is_multiple_of(unit_step) {
+        if unit_off >= 8 {
             return false;
         }
-        let order = unit_off / unit_step;
+        let order = unit_off;
         plan.order_mask & (1u8 << order) != 0
     }
 
@@ -5549,18 +5607,17 @@ impl Bus {
         let quantum = bitplane_fetch_quantum(fmode);
         let period = bitplane_fetch_period(bplcon0, fmode);
         let unit = bitplane_fetch_unit(bplcon0, fmode);
-        // Wide-FMODE units start on the absolute unit grid, so anchor the
-        // fetch start (and thus the slot positions) down to it, matching
-        // `bitplane_words_per_row` (see agnus::anchor_bitplane_fetch_start).
+        // The DDFSTRT comparator starts the sequencer. Wide FMODE increases
+        // the unit length between fetch groups; it does not move the first
+        // group back to an absolute unit boundary.
         let start = u32::from(crate::chipset::agnus::anchor_bitplane_fetch_start(
             start as u16,
             unit,
         ));
-        // The sequencer completes whole units from the (anchored) fetch start:
+        // The sequencer completes whole units from the DDF start:
         // a DDFSTOP inside a unit extends the fetch to the end of the unit
         // starting at-or-after it (see agnus::bitplane_fetch_blocks), so the
-        // last slot can land past DDFSTOP. The block count is taken from the
-        // anchored start so wide-FMODE slots and `words_per_row` agree.
+        // last slot can land past DDFSTOP.
         let blocks =
             crate::chipset::agnus::bitplane_fetch_blocks(u32::from(stop) - start, unit) as u32;
         let last_fetch_hpos = start + blocks * unit - 1;
@@ -6332,6 +6389,82 @@ impl Bus {
         }
     }
 
+    fn retarget_display_sprite_dma_pointer(&mut self, sprite: usize) {
+        self.retarget_display_sprite_dma_pointer_at(sprite, self.agnus.vpos, self.agnus.hpos);
+    }
+
+    fn retarget_display_sprite_dma_pointer_at(&mut self, sprite: usize, vpos: u32, hpos: u32) {
+        if sprite >= 8 {
+            return;
+        }
+
+        let mut state = self.display_dma_sprite_state[sprite];
+        let Some(mut control) = state.control else {
+            self.display_dma_sprite_state[sprite] = DisplaySpriteDmaState::default();
+            return;
+        };
+
+        let beam_y = vpos as i32;
+        if beam_y >= control.vstop {
+            self.display_dma_sprite_state[sprite] = DisplaySpriteDmaState::default();
+            return;
+        }
+
+        let quantum = sprite_fetch_quantum(self.agnus.fmode());
+        let line_bytes = 4 * quantum;
+        let mut line = if beam_y <= control.vstart {
+            0
+        } else {
+            (beam_y - control.vstart) as u32
+        };
+        if beam_y >= control.vstart && hpos > SPRITE_DMA_PAIR_CAPTURE_HPOS[sprite / 2] {
+            line = line.saturating_add(1);
+        }
+        let line = if sprite_scan_doubled(self.agnus.fmode()) {
+            line.div_ceil(2)
+        } else {
+            line
+        };
+
+        let ptr = self.display_dma_sprpt[sprite] & self.chip_dma_mask & !1;
+        control.data_base =
+            ptr.wrapping_sub(line.saturating_mul(line_bytes)) & self.chip_dma_mask & !1;
+        let height = (control.vstop - control.vstart).max(0) as u32;
+        let data_lines = if sprite_scan_doubled(self.agnus.fmode()) {
+            height.div_ceil(2)
+        } else {
+            height
+        };
+        control.next_ptr = control
+            .data_base
+            .wrapping_add(data_lines.saturating_mul(line_bytes))
+            & self.chip_dma_mask
+            & !1;
+        state.control = Some(control);
+        state.next_ptr = Some(control.next_ptr);
+        state.terminated = false;
+        state.data_dma_active = beam_y >= control.vstart && beam_y < control.vstop;
+        state.last_line = None;
+        self.display_dma_sprite_state[sprite] = state;
+
+        if diag_sprcap().is_some() {
+            log::info!(
+                "sprptr f={} v={} h={} s{} ptr={:06X} vstart={} vstop={} hstart={} line={} data_base={:06X} next={:06X}",
+                self.emulated_frames,
+                vpos,
+                hpos,
+                sprite,
+                ptr,
+                control.vstart,
+                control.vstop,
+                control.hstart,
+                line,
+                control.data_base,
+                control.next_ptr
+            );
+        }
+    }
+
     fn capture_same_line_display_start_if_due(&mut self) {
         if self.current_frame_display_snapshot_taken
             || matches!(self.agnus.revision(), AgnusRevision::Ocs)
@@ -6452,52 +6585,100 @@ impl Bus {
         // can be toggled within the frame -- software may enable sprite DMA
         // only briefly off-screen to load reused sprites, then clear it before
         // the visible window and reposition the held sprites per line.
-        // So replay this frame's DMACON writes across the offscreen span and
-        // run the sprite fetch only on lines where SPREN was actually enabled,
-        // rather than sampling DMACON at the (already-cleared) visible start.
+        // So replay this frame's DMACON and SPRxPT writes across the offscreen
+        // span and run the sprite fetch only on lines where SPREN was actually
+        // enabled, rather than sampling registers at the visible start.
         let base = self.current_frame_render_base;
+        self.display_dma_sprpt = base.sprpt;
+        self.display_dma_sprite_state = [DisplaySpriteDmaState::default(); 8];
         let mut dmacon = base.dmacon;
-        // The sprite control/data slots sit early in the line (hpos
-        // SPRITE_DMA_PAIR_CAPTURE_HPOS); a DMACON write before the last slot
-        // governs that line's fetch, later ones take effect next line.
-        let fetch_gate_hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[SPRITE_DMA_PAIR_CAPTURE_HPOS.len() - 1];
-        let writes: Vec<(u32, u32, u16)> = self
+        let writes: Vec<(u32, u32, u16, u16)> = self
             .current_render_events()
             .iter()
-            .filter(|w| (w.offset & 0x01FE) == 0x096 && w.vpos < visible_start)
-            .map(|w| (w.vpos, w.hpos, w.value))
+            .filter(|w| {
+                let off = w.offset & 0x01FE;
+                w.vpos < visible_start && (off == 0x096 || (0x120..=0x13F).contains(&off))
+            })
+            .map(|w| (w.vpos, w.hpos, w.offset & 0x01FE, w.value))
             .collect();
         let mut idx = 0;
         for vpos in 0..visible_start {
-            while idx < writes.len()
-                && (writes[idx].0 < vpos
-                    || (writes[idx].0 == vpos && writes[idx].1 < fetch_gate_hpos))
-            {
-                let value = writes[idx].2;
-                if value & 0x8000 != 0 {
-                    dmacon |= value & 0x7FFF;
-                } else {
-                    dmacon &= !value;
+            for (pair, &capture_hpos) in SPRITE_DMA_PAIR_CAPTURE_HPOS.iter().enumerate() {
+                while idx < writes.len()
+                    && (writes[idx].0 < vpos
+                        || (writes[idx].0 == vpos && writes[idx].1 < capture_hpos))
+                {
+                    let (event_vpos, event_hpos, offset, value) = writes[idx];
+                    self.apply_sprite_dma_replay_write(
+                        offset,
+                        value,
+                        event_vpos,
+                        event_hpos,
+                        &mut dmacon,
+                    );
+                    idx += 1;
                 }
-                idx += 1;
-            }
-            if dmacon & (DMACON_DMAEN | DMACON_SPREN) != (DMACON_DMAEN | DMACON_SPREN) {
-                continue;
-            }
-            for sprite in 0..8 {
-                if sprite_dma_disabled_by_bitplane_ddf(
-                    sprite,
-                    self.agnus.revision(),
-                    self.effective_bitplane_bplcon0(),
-                    self.effective_bitplane_dmacon(),
-                    self.denise.ddfstrt,
-                    self.denise.ddfstop,
-                    self.harddis_active(),
-                ) {
+
+                if dmacon & (DMACON_DMAEN | DMACON_SPREN) != (DMACON_DMAEN | DMACON_SPREN) {
                     continue;
                 }
-                let _ = self.captured_sprite_line_at(sprite, vpos);
+                for sprite in pair * 2..pair * 2 + 2 {
+                    if sprite_dma_disabled_by_bitplane_ddf(
+                        sprite,
+                        self.agnus.revision(),
+                        self.effective_bitplane_bplcon0(),
+                        self.effective_bitplane_dmacon(),
+                        self.denise.ddfstrt,
+                        self.denise.ddfstop,
+                        self.harddis_active(),
+                    ) {
+                        continue;
+                    }
+                    let _ = self.captured_sprite_line_at(sprite, vpos);
+                }
             }
+            while idx < writes.len() && writes[idx].0 == vpos {
+                let (event_vpos, event_hpos, offset, value) = writes[idx];
+                self.apply_sprite_dma_replay_write(
+                    offset,
+                    value,
+                    event_vpos,
+                    event_hpos,
+                    &mut dmacon,
+                );
+                idx += 1;
+            }
+        }
+    }
+
+    fn apply_sprite_dma_replay_write(
+        &mut self,
+        offset: u16,
+        value: u16,
+        vpos: u32,
+        hpos: u32,
+        dmacon: &mut u16,
+    ) {
+        if offset == 0x096 {
+            if value & 0x8000 != 0 {
+                *dmacon |= value & 0x7FFF;
+            } else {
+                *dmacon &= !value;
+            }
+            return;
+        }
+
+        let idx = ((offset - 0x120) / 4) as usize;
+        if idx >= 8 {
+            return;
+        }
+        if offset & 2 == 0 {
+            let cur = self.display_dma_sprpt[idx];
+            self.display_dma_sprpt[idx] = (cur & 0x0000_FFFF) | ((value as u32 & 0x001F) << 16);
+        } else {
+            let cur = self.display_dma_sprpt[idx];
+            self.display_dma_sprpt[idx] = (cur & 0x00FF_0000) | (value as u32 & 0xFFFE);
+            self.retarget_display_sprite_dma_pointer_at(idx, vpos, hpos);
         }
     }
 
@@ -6875,7 +7056,7 @@ impl Bus {
         if ram_len == 0 {
             return;
         }
-        let Some((ddfstart, _ddfstop)) = effective_ddf_window(
+        let Some((effective_ddfstart, effective_ddfstop)) = effective_ddf_window(
             self.agnus.revision(),
             bplcon0,
             self.denise.ddfstrt,
@@ -6884,7 +7065,8 @@ impl Bus {
         ) else {
             return;
         };
-        let ddfstart = u32::from(ddfstart);
+        let effective_ddfstart = u32::from(effective_ddfstart);
+        let effective_ddfstop = u32::from(effective_ddfstop);
         // AGA FMODE: each fetch slot moves `quantum` consecutive words per
         // plane; the per-plane cadence stretches to `period` colour clocks
         // and the lores slot sequence spreads across the `unit`-cck block.
@@ -6892,24 +7074,11 @@ impl Bus {
         let quantum = bitplane_fetch_quantum(fmode) as usize;
         let period = bitplane_fetch_period(bplcon0, fmode);
         let unit = bitplane_fetch_unit(bplcon0, fmode);
-        // Wide-FMODE fetch units run on absolute colour-clock multiples of
-        // the unit: Agnus masks DDFSTRT down to the unit boundary, so a
-        // DDFSTRT inside a unit starts the whole unit early rather than
-        // shifting the slot pattern. Anchoring the slots at the raw
-        // DDFSTRT pushed the final unit past the end of the line for deep
-        // DDF windows. For example, FMODE=3 tables using $30/$D0 would anchor
-        // the last unit at $D0..$EF, beyond the $E3 line, so the last gulp
-        // never fetched and the row modulo never applied; every following row
-        // walked off by one gulp. FMODE=0 units are 8 cck, matching the DDFSTRT
-        // register granularity, so narrow fetches are already aligned.
-        // ...but never before the DDF hard start: a DDFSTRT inside the
-        // first wide-FMODE unit fetches from the first usable slot, not from
-        // the blanking before it.
-        let ddfstart = if unit > 8 {
-            (ddfstart & !(unit - 1)).max(u32::from(BITPLANE_DDF_HARD_START))
-        } else {
-            ddfstart
-        };
+        // Wide-FMODE units lengthen the gap between groups of fetched words,
+        // but the sequencer is still armed by the DDFSTRT comparator itself.
+        // Lores plane-order slots are packed into the first eight cycles of
+        // that unit; the remaining cycles are free for the blitter/CPU.
+        let ddfstart = effective_ddfstart;
         if self.bitplane_ddfstart_missed_on_line(vpos, ddfstart) {
             return;
         }
@@ -6938,14 +7107,41 @@ impl Bus {
             .map(|plane| bitplane_fetch_order(bplcon0, plane))
             .max()
             .unwrap_or(0);
-        if diag_caprow() && old_hpos <= ddfstart && new_hpos > ddfstart {
+        if diag_caprow().is_some_and(|spec| spec.contains(vpos))
+            && old_hpos <= ddfstart
+            && new_hpos > ddfstart
+        {
             log::info!(
-                "caprow f={} v={} bpl1pt={:#08x} wpr={} planes={}",
+                "caprow f={} v={} h={} dmacon={:#06X} bplcon0={:#06X} bplcon1={:#06X} bplcon2={:#06X} bplcon4={:#06X} fmode={:#06X} diw={:#06X}/{:#06X}/{:?} ddf={:#04X}/{:#04X} eff={:#04X}-{:#04X} anchor={:#04X} unit={} period={} quantum={} wpr={} display_planes={} dma_planes={} mod={}/{} bplpt={:#08X},{:#08X},{:#08X},{:#08X}",
                 self.emulated_frames,
                 vpos,
-                self.display_dma_bplpt[0],
+                self.agnus.hpos,
+                self.effective_bitplane_dmacon(),
+                bplcon0,
+                self.denise.bplcon1,
+                self.denise.bplcon2,
+                self.denise.bplcon4,
+                fmode,
+                self.denise.diwstrt,
+                self.denise.diwstop,
+                self.effective_diwhigh(),
+                self.denise.ddfstrt,
+                self.denise.ddfstop,
+                effective_ddfstart,
+                effective_ddfstop,
+                ddfstart,
+                unit,
+                period,
+                quantum,
                 words_per_row,
+                display_planes,
                 dma_planes,
+                self.denise.bpl1mod,
+                self.denise.bpl2mod,
+                self.display_dma_bplpt[0],
+                self.display_dma_bplpt[1],
+                self.display_dma_bplpt[2],
+                self.display_dma_bplpt[3],
             );
         }
         for hpos in old_hpos..new_hpos {
@@ -7003,10 +7199,10 @@ impl Bus {
                     continue;
                 }
                 let unit_off = rel % unit;
-                if !unit_off.is_multiple_of(unit / 8) {
+                if unit_off >= 8 {
                     continue;
                 }
-                let order = unit_off / (unit / 8);
+                let order = unit_off;
                 // Sample the plane count as Agnus latches it: at the start of
                 // the DDF fetch block that contains this slot. A BPLCON0 write
                 // exactly at the block start (e.g. at DDFSTRT) configures this
@@ -9119,7 +9315,7 @@ mod tests {
 
     const STANDARD_DIW_HSTART: i32 = 0x81;
     const STANDARD_VISIBLE_X0: usize = ((STANDARD_DIW_HSTART - RENDER_DIW_HSTART_FB0) * 2) as usize;
-    const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x36;
+    const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x34;
     static BUS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn render_color_write_x(hpos: u32) -> usize {
@@ -11589,14 +11785,12 @@ mod tests {
     }
 
     #[test]
-    fn wide_fmode_dma_capture_aligns_fetch_units_to_the_unit_grid() {
+    fn wide_fmode_dma_capture_packs_lores_slots_in_fetch_units() {
         // Lores FMODE=3 (32-cck fetch units) with DDFSTRT $30 / DDFSTOP
-        // $D0: Agnus masks the fetch start down to the unit boundary
-        // ($20), so the six units run $20..$DF and finish inside the
-        // line. Anchoring them at the raw $30 pushed the last unit to
-        // $D0..$EF, past the $E3 line end: its words never fetched and
-        // the row modulo never applied, walking every following row off
-        // by one gulp, progressively scrambling the screen.
+        // $D0: Agnus runs six 32-cck units from the DDFSTRT comparator and
+        // packs the lores plane slots into the first eight CCK of each unit.
+        // The final unit still completes before the PAL line edge, so the row
+        // modulo advances after all 24 fetched words.
         let mut bus = empty_bus();
         bus.set_chipset_revisions(AgnusRevision::AgaAlice, DeniseRevision::AgaLisa);
         bus.agnus.write_fmode(0x0003); // BPL32 | BPAGEM = 64-bit fetches
@@ -13365,6 +13559,48 @@ mod tests {
         assert_eq!(lines[0].datb, 0xBBBB);
     }
 
+    #[test]
+    fn sprite_pointer_write_before_vstart_retargets_latched_control_data_fetch() {
+        let mut bus = empty_bus();
+        let control_ptr = 0x0100usize;
+        let data_ptr = 0x0200usize;
+        let (pos, ctl) = sprite_control_words(0x2C, 0x30, 0x0083);
+        write_chip_word(&mut bus, control_ptr, pos);
+        write_chip_word(&mut bus, control_ptr + 2, ctl);
+        write_chip_word(&mut bus, control_ptr + 4, 0x1111);
+        write_chip_word(&mut bus, control_ptr + 6, 0x2222);
+        write_chip_word(&mut bus, data_ptr, 0xAAAA);
+        write_chip_word(&mut bus, data_ptr + 2, 0xBBBB);
+        write_chip_word(&mut bus, data_ptr + 4, 0xCCCC);
+        write_chip_word(&mut bus, data_ptr + 6, 0xDDDD);
+
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.denise.sprpt[0] = control_ptr as u32;
+        bus.display_dma_sprpt[0] = control_ptr as u32;
+        bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.current_frame_render_base.sprpt[0] = control_ptr as u32;
+
+        bus.agnus.vpos = 0x24;
+        bus.agnus.hpos = 0;
+        let _ = bus.write_custom_word_from(0x120, (data_ptr >> 16) as u16, BeamWriteSource::Copper);
+        let _ = bus.write_custom_word_from(0x122, data_ptr as u16, BeamWriteSource::Copper);
+
+        bus.agnus.vpos = 0x2C;
+        bus.agnus.hpos = 0;
+        bus.capture_current_frame_display_start();
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert!(bus.frame_sprite_dma_observed());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].sprite, 0);
+        assert_eq!(lines[0].beam_y, 0x2C);
+        assert_eq!(lines[0].hstart, 0x0083);
+        assert_eq!(lines[0].data, 0xAAAA);
+        assert_eq!(lines[0].datb, 0xBBBB);
+    }
+
     /// An inverted vertical pair (vstop < vstart) does not disable a sprite:
     /// Agnus arms it at vstart and, since the vstop comparator already passed,
     /// keeps fetching data to the bottom of the frame instead of terminating.
@@ -13571,10 +13807,11 @@ mod tests {
 
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
         // The offscreen sprite-DMA replay seeds from the frame-start DMACON
-        // snapshot (and replays $096 writes across the span); mirror what
-        // begin_new_beam_frame records so SPREN is enabled for the offscreen
-        // lines this sprite starts on.
+        // and SPRxPT snapshot (and replays $096/$120..$13F writes across the
+        // span); mirror what begin_new_beam_frame records so SPREN and the
+        // sprite pointer are live for the offscreen lines this sprite starts on.
         bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.current_frame_render_base.sprpt[0] = sprite_ptr as u32;
         bus.agnus.vpos = RENDER_VISIBLE_START_VPOS;
         bus.agnus.hpos = 0;
         bus.denise.sprpt[0] = sprite_ptr as u32;
@@ -15485,6 +15722,31 @@ mod tests {
         let (custom_read_cck, _) = bus.take_slice_bus_advance();
         assert_eq!(custom_read_cck, 1);
         assert_eq!(bus.last_chip_bus_owner(), ChipBusOwner::Cpu);
+    }
+
+    #[test]
+    fn ecs_68020_chip_and_custom_reads_wait_for_16_bit_data_return() {
+        let mut bus = empty_bus();
+        bus.set_chipset_revisions(AgnusRevision::Ecs8375, DeniseRevision::Ecs8373);
+        bus.set_cpu_clocks_per_cck(4);
+        bus.set_cpu_short_bus_cycle(true);
+        bus.set_cpu_bus_arbitration_enabled(true);
+
+        bus.agnus.hpos = 0x20;
+        bus.grant_cpu_bus_access_at(Some(0x0002_0000), 2, CpuBusAccessKind::Read);
+        let (chip_read_cck, _) = bus.take_slice_bus_advance();
+        assert_eq!(chip_read_cck, 2);
+        assert_eq!(bus.last_chip_bus_owner(), ChipBusOwner::Idle);
+
+        bus.grant_cpu_bus_access_at(Some(0x0002_0000), 2, CpuBusAccessKind::Write);
+        let (chip_write_cck, _) = bus.take_slice_bus_advance();
+        assert_eq!(chip_write_cck, 1);
+        assert_eq!(bus.last_chip_bus_owner(), ChipBusOwner::Cpu);
+
+        let _ = bus.custom_read(0x002, 2);
+        let (custom_read_cck, _) = bus.take_slice_bus_advance();
+        assert_eq!(custom_read_cck, 2);
+        assert_eq!(bus.last_chip_bus_owner(), ChipBusOwner::Idle);
     }
 
     #[test]

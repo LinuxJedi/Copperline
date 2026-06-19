@@ -394,38 +394,22 @@ pub fn bitplane_words_per_row(
 }
 
 /// Whole fetch units run for a DDF window spanning `rel` colour clocks.
-/// FMODE=0 DDF registers have 4-cck (hires) / 2-cck (shres) granularity but
-/// the fetch sequencer always completes 8-cck units: a DDFSTOP inside a unit
-/// stops the fetch only after the unit starting at-or-after it completes, so
-/// the partial tail rounds UP (CDTV trademark screen, hires $64/$A8 with
-/// $28 modulos: 10 units = 20 words/row; truncating fetched 18 and sheared
-/// every row). Wide-FMODE units keep the calibrated truncating behaviour:
-/// their absolute-grid last unit must not run past the line end (Pinball
-/// Illusions FMODE=3 $30/$D0 tables).
+/// A DDFSTOP inside a unit stops the fetch only after the unit starting
+/// at-or-after it completes, so the partial tail rounds up (CDTV trademark
+/// screen, hires $64/$A8 with $28 modulos: 10 units = 20 words/row;
+/// truncating fetched 18 and sheared every row). Wide-FMODE units use the
+/// same rule; their 16/32-cck unit is longer, but the active lores plane
+/// slots are still packed into the first eight cycles of the unit.
 pub fn bitplane_fetch_blocks(rel: u32, unit: u32) -> usize {
-    if unit == 8 {
-        (rel.div_ceil(unit) + 1) as usize
-    } else {
-        (rel / unit + 1) as usize
-    }
+    (rel.div_ceil(unit) + 1) as usize
 }
 
-/// Anchor the bitplane fetch start to the fetch-unit grid. Wide-FMODE fetch
-/// units begin on absolute colour-clock multiples of the unit size, so Agnus
-/// masks DDFSTRT down to the unit boundary (WinUAE
-/// `plfstrt = ddfstrt & ~(fetchstart - 1)`). The 8-cck units of FMODE=0 and
-/// hires FMODE=1 already divide the standard $38/$3C DDFSTRTs, so only the
-/// wider 16/32-cck units shift an off-grid DDFSTRT: SANITY Roots II programs a
-/// lores-style DDFSTRT $38 for its hires FMODE=3 (16-cck unit) 256-colour
-/// pictures; anchored to $30 the sequencer runs the full 40 words/row its
-/// interleaved BPL1MOD ($230) expects, where the raw $38 stopped one unit
-/// short at 36 words and sheared every row into noise.
+/// Bitplane fetch starts from the DDFSTRT comparator. The wide-FMODE unit
+/// length controls how far the sequencer runs before the next group, but it
+/// does not move the first active group back to an absolute unit boundary.
 pub fn anchor_bitplane_fetch_start(start: u16, unit: u32) -> u16 {
-    if unit > 8 {
-        (start & !((unit as u16) - 1)).max(BITPLANE_DDF_HARD_START)
-    } else {
-        start
-    }
+    let _ = unit;
+    start
 }
 
 fn bitplane_shres(bplcon0: u16) -> bool {
@@ -554,10 +538,8 @@ fn bitplane_dma_fetch_timings(
     dma_planes: usize,
 ) -> Vec<BitplaneDmaFetchTiming> {
     // FMODE>0 moves `quantum` consecutive words per fetch slot; the words of
-    // one group share the slot's hpos. Lores keeps the OCS slot sequence,
-    // scaled across the wider fetch unit (a documented first cut for the
-    // intra-unit positions; pixel output only depends on word order, and
-    // contention timing is calibrated against reference captures later).
+    // one group share the slot's hpos. Lores keeps the OCS slot sequence
+    // packed into the first eight cycles of the wider fetch unit.
     let quantum = bitplane_fetch_quantum(fmode);
     let period = bitplane_fetch_period(bplcon0, fmode);
     let unit = bitplane_fetch_unit(bplcon0, fmode);
@@ -569,7 +551,7 @@ fn bitplane_dma_fetch_timings(
             let hpos = if bitplane_hires(bplcon0) || bitplane_shres(bplcon0) {
                 ddfstart + group * period
             } else {
-                ddfstart + group * unit + order * (unit / 8)
+                ddfstart + group * unit + order
             };
             timings.push(BitplaneDmaFetchTiming {
                 hpos,
@@ -1982,8 +1964,9 @@ mod tests {
         assert!(plan_bitplane_dma_fetches(config, 0x0038, 0x0040).is_none());
     }
 
-    /// Plan 3.3: FMODE widens the fetch. The DDF window quantizes to the
-    /// fetch unit and each fetch slot moves 1/2/4 consecutive words.
+    /// Plan 3.3: FMODE widens the fetch. The DDF window completes whole
+    /// fetch units from the DDFSTRT comparator and each active slot moves
+    /// 1/2/4 consecutive words.
     #[test]
     fn fmode_scales_words_per_row_and_fetch_plan() {
         let aga = AgnusRevision::AgaAlice;
@@ -1992,16 +1975,15 @@ mod tests {
             bitplane_words_per_row(aga, 0x0000, 0, 0x0038, 0x00D0, false),
             20
         );
-        // FMODE=3 lores: 32-cck units, 4 words per unit. The fetch start
-        // anchors down to the 32-cck unit grid ($38 -> $20), so
-        // ($D0-$20)/32+1 = 6 units -> 24 words. (DDFSTRT $30 anchors to the
-        // same $20, matching the Pinball Illusions tables capture.)
+        // FMODE=3 lores: 32-cck units, 4 words per unit. The raw $38..$D0
+        // DDF span rounds up to 6 units -> 24 words.
         assert_eq!(
             bitplane_words_per_row(aga, 0x0000, 3, 0x0038, 0x00D0, false),
             24
         );
         // A window that does not divide evenly still completes the last
-        // unit: from the anchored $20, ($60-$20)/32+1 = 3 units -> 12 words.
+        // unit: from the raw $38, ($60-$38) rounds up to 2 units, then the
+        // tail unit is completed -> 12 words.
         assert_eq!(
             bitplane_words_per_row(aga, 0x0000, 3, 0x0038, 0x0060, false),
             12
@@ -2013,8 +1995,8 @@ mod tests {
         );
 
         // FMODE=3 lores plan: groups of 4 consecutive words share one slot
-        // hpos; the slot sequence spreads over the 32-cck unit; pointers
-        // advance 2 bytes per word.
+        // hpos; the lores slot sequence is packed into the first 8 cck of the
+        // 32-cck unit; pointers advance 2 bytes per word.
         let config = BitplaneDmaFetchConfig {
             revision: aga,
             dmacon: DMACON_DMAEN | DMACON_BPLEN,
@@ -2029,20 +2011,19 @@ mod tests {
             harddis: false,
         };
         let plan = plan_bitplane_dma_fetches(config, 0x0038, 0x00A0).expect("plan");
-        // DDFSTRT $38 anchors down to the 32-cck unit grid ($20), so
-        // ($60-$20)/32+1 = 3 units -> 12 words.
+        // DDFSTRT $38 arms the sequencer directly; DDFSTOP $60 still rounds
+        // through the final 32-cck unit, so the row is 12 words.
         assert_eq!(plan.words_per_row, 12);
         assert_eq!(plan.slots.len(), 12, "12 words for the single plane");
-        // Plane 1's slot sits at order 7 within the unit, scaled by 4 cck,
-        // measured from the anchored $20 unit start.
-        let unit_offset = 7 * (32 / 8);
-        assert_eq!(plan.slots[0].hpos, 0x20 + unit_offset);
+        // Plane 1's lores order-7 slot is in the first 8 cck of the unit.
+        let unit_offset = 7;
+        assert_eq!(plan.slots[0].hpos, 0x38 + unit_offset);
         assert_eq!(
             plan.slots[3].hpos,
-            0x20 + unit_offset,
+            0x38 + unit_offset,
             "words share the slot"
         );
-        assert_eq!(plan.slots[4].hpos, 0x20 + 32 + unit_offset, "next unit");
+        assert_eq!(plan.slots[4].hpos, 0x38 + 32 + unit_offset, "next unit");
         let addrs: Vec<u32> = plan.slots.iter().map(|slot| slot.addr).collect();
         assert_eq!(
             addrs,
@@ -2054,21 +2035,19 @@ mod tests {
     }
 
     #[test]
-    fn wide_fmode_anchors_off_grid_ddfstrt_to_the_unit_grid() {
+    fn wide_fmode_counts_units_from_raw_ddfstart() {
         let aga = AgnusRevision::AgaAlice;
-        // Hi-res FMODE=3 has 16-CCK fetch units. A lo-res-style DDFSTRT $38 is
-        // not a multiple of 16, so Agnus anchors the fetch start down to the
-        // $30 unit boundary (WinUAE plfstrt = ddfstrt & ~(fetchstart-1)). From
-        // $30, DDFSTOP $C0 spans ($C0-$30)/16 + 1 = 10 units * 4 words = 40
-        // words/row -- the width SANITY Roots II's 256-colour pictures store
-        // (BPL1MOD $230 = 7*80 bytes of an 8-plane interleaved bitmap). At the
-        // raw $38 the window stops one unit short at 36 words, drifting the
-        // per-row modulo and scrambling the picture.
+        // Hi-res FMODE=3 has 16-CCK fetch units. A lo-res-style DDFSTRT $38
+        // starts the sequencer at $38, not at an absolute $30 boundary, while
+        // DDFSTOP $C0 still rounds through the final unit:
+        // ceil(($C0-$38)/16)+1 = 10 units * 4 words = 40 words/row. This is
+        // the width expected by interleaved 8-plane effects using BPLxMOD for
+        // seven skipped planes per row.
         assert_eq!(
             bitplane_words_per_row(aga, 0x8000, 3, 0x0038, 0x00C0, false),
             40
         );
-        // A grid-aligned DDFSTRT is unchanged by the anchoring.
+        // A grid-aligned DDFSTRT gives the same count for this DDFSTOP.
         assert_eq!(
             bitplane_words_per_row(aga, 0x8000, 3, 0x0030, 0x00C0, false),
             40

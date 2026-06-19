@@ -55,13 +55,22 @@ replay clips those position intervals in the sprite-comparator domain so
 staggered even/odd attached-pair position writes do not create artificial
 half-pair strips.
 
+When sprite DMA was observed for the frame, captured DMA lines win over
+manual replay. The renderer then suppresses stale latched SPRxDATA spans
+unless a manual-sprite diagnostic explicitly asks for them. This avoids
+painting old register contents as vertical sprite bars on frames where
+hardware sprite data was already fetched by Agnus.
+
 The mapping from beam coordinates to framebuffer x is anchored by
 constants that encode the hardware's fetch-to-display pipeline delays --
 register writes, palette writes, and bitplane data each land at their own
 documented offset, and the bitplane fetch reference differs between lo-res
-and hi-res. These anchors were calibrated against real-hardware captures
-and other emulators; `COPPERLINE_HCENTER=0` and `COPPERLINE_OVERSCAN=full`
-help when re-checking them.
+and hi-res. Wide-FMODE DMA fetches start from raw DDFSTRT and complete
+whole units, but the displayed shifter origin is still quantized by the
+FMODE fetch gulp; the renderer keeps those two effects separate. These
+anchors were calibrated against real-hardware captures and other
+emulators; `COPPERLINE_HCENTER=0` and `COPPERLINE_OVERSCAN=full` help when
+re-checking them.
 
 The framebuffer is a 716x285 overscan field (lo-res pixels doubled
 horizontally). It captures deep overscan on all sides.
