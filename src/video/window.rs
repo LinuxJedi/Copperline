@@ -63,8 +63,9 @@ impl JoyButtonKind {
 /// Host input source for the emulated port-2 joystick/CD32 pad. Auto keeps
 /// a calibrated physical pad in charge when one is present and otherwise
 /// falls back to keyboard joystick emulation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum JoystickInputMode {
+    #[default]
     Auto,
     Gamepad,
     Keyboard,
@@ -85,12 +86,6 @@ impl JoystickInputMode {
             Self::Gamepad => "gamepad",
             Self::Keyboard => "keyboard",
         }
-    }
-}
-
-impl Default for JoystickInputMode {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 
