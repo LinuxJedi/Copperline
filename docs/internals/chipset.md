@@ -13,11 +13,12 @@ alternation) geometry, the long-field flag for interlace, and VPOSR/VHPOSR.
 It also owns DMACON and the display-fetch machinery: the bitplane fetch
 plan for the current line is computed from DDFSTRT/DDFSTOP, the plane
 count, resolution, and FMODE, producing the per-slot fetch pattern the
-[arbitration model](timing) consumes. The fetch sequencer starts from the
-DDFSTRT comparator and latches the BPLCON0-derived plane count/resolution
-for that scanline's DMA sequence; later BPLCON0 writes can affect display
-decode, but they do not add newly enabled planes to an already-running row
-fetch. The sequence completes whole fetch units: DDF registers have finer
+[arbitration model](timing) consumes. The fetch sequencer is anchored by
+the DDFSTRT comparator, then each fetch block/unit uses the BPLCON0 value
+visible at that block's first cycle. A mid-row BPLCON0 plane-count change
+therefore cannot retroactively fetch earlier words, but it can add or
+remove planes for later blocks in the same row. The sequence completes
+whole fetch units: DDF registers have finer
 granularity than the unit in hi-res/super-hi-res and wide-FMODE modes, so
 a DDFSTOP landing mid-unit extends the fetch through the unit starting
 at-or-after it (`agnus::bitplane_fetch_blocks`; the CDTV trademark
@@ -68,8 +69,10 @@ register writes are recorded as beam events for the renderer.
 ## Blitter (`blitter.rs`)
 
 A scheduled per-DMA-slot engine with the hardware per-word channel
-sequences for normal, line, and fill modes; see [](timing). ECS adds
-BLTSIZV/BLTSIZH for larger blits.
+sequences for normal, line, and fill modes; see [](timing). Normal-mode
+A/B barrel-shifter carry is a datapath latch and survives BLTSIZE row
+boundaries; first/last masks, area-fill state, and modulos remain row
+scoped. ECS adds BLTSIZV/BLTSIZH for larger blits.
 
 ## Paula (`paula.rs`)
 

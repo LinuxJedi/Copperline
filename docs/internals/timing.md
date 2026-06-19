@@ -36,10 +36,11 @@ DDF window, FMODE fetch cadence, and per-plane fetch-order mask live in a
 write or a write-delay expiry changes the key. The vpos-dependent gates
 (vertical display window, DDFSTRT write miss) are still evaluated live, so
 the memoization cannot change behaviour. Once a line reaches DDFSTRT, the
-arbiter uses the BPLCON0 value latched for that line's bitplane DMA
-sequence; a later BPLCON0 plane-count increase can change display decode,
-but it does not claim additional bitplane slots or advance the newly
-enabled plane pointers until the next row.
+arbiter keeps the fetch sequence anchored there but evaluates BPLCON0 at
+each fetch block's first cycle. A later BPLCON0 plane-count increase does
+not claim slots for earlier blocks or advance newly enabled plane pointers
+for those words, but it can claim the matching slots and start advancing
+those pointers on later blocks of the same row.
 Wide-FMODE lo-res slots are packed into the first eight CCKs of each
 16/32-CCK fetch unit; the rest of the unit remains available to later
 arbitration priorities.
@@ -191,12 +192,17 @@ visited, B only when enabled, C when enabled (USEC) *or* in fill mode (an
 idle C slot, no bus access), and D when D is enabled or no C next-word
 state exists. D output is delayed through the hold register, so the first
 destination word is written on the next D slot and the final word in the F
-flush slot. Line blits use L1-L4 phases (L2 latches the C source word, L3
-propagates, L4 stores); line-mode B data loads pass through the current B
-shifter at write time, and at completion the hardware-visible ASH, BSH,
-SIGN, and low-word BLTAPT accumulator state is written back. Tests:
+flush slot. Normal-mode A/B barrel-shifter carry is not cleared by the
+BLTSIZE row counter; it carries from the last source word of one row into
+the first source word of the next, while masks, modulos, and fill carry
+still observe row boundaries. Line blits use L1-L4 phases (L2 latches the
+C source word, L3 propagates, L4 stores); line-mode B data loads pass
+through the current B shifter at write time, and at completion the
+hardware-visible ASH, BSH, SIGN, and low-word BLTAPT accumulator state is
+written back. Tests:
 `scheduled_normal_mode_bbusy_start_delay_precedes_first_source_slot`,
-`scheduled_line_mode_latches_c_source_before_store_phase`.
+`scheduled_line_mode_latches_c_source_before_store_phase`,
+`scheduled_shift_carry_crosses_normal_mode_row_boundary`.
 
 ### Mid-operation register writes
 

@@ -315,13 +315,6 @@ struct BitplaneDdfStartMiss {
     ddfstart: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BitplaneLineDmaLatch {
-    vpos: u32,
-    ddfstart: u32,
-    bplcon0: u16,
-}
-
 /// Cache key for the memoized bitplane slot plan: every register input that
 /// feeds the plan computation. The vpos-dependent gates (vertical display
 /// window, DDFSTRT write miss) are evaluated live in `bitplane_slot_active_at`,
@@ -679,11 +672,6 @@ pub struct Bus {
     bitplane_dmacon_delay: Option<BitplaneDmaconDelay>,
     bitplane_bplcon0_delay: Option<BitplaneBplcon0Delay>,
     bitplane_ddfstart_miss: Option<BitplaneDdfStartMiss>,
-    /// BPLCON0 value that armed the current scanline's bitplane DMA sequencer
-    /// at DDFSTRT. Agnus does not add newly enabled planes to an already
-    /// running fetch sequence later in the same row.
-    #[serde(skip)]
-    bitplane_line_dma_latch: std::cell::Cell<Option<BitplaneLineDmaLatch>>,
     /// Memoized bitplane fetch plan for `bitplane_slot_active_at`, keyed on
     /// the registers that feed it. The arbiter asks for the bitplane slot
     /// owner several times per color clock; recomputing the DDF window and
@@ -1563,7 +1551,6 @@ impl Bus {
             bitplane_dmacon_delay: None,
             bitplane_bplcon0_delay: None,
             bitplane_ddfstart_miss: None,
-            bitplane_line_dma_latch: std::cell::Cell::new(None),
             bitplane_slot_plan_cache: std::cell::Cell::new(None),
             bus_accounting: BusAccounting::from_env(),
             uhres_dual_warned: false,
@@ -4571,7 +4558,6 @@ impl Bus {
         }
         if tick.new_lines != 0 || tick.new_frames != 0 {
             self.bitplane_ddfstart_miss = None;
-            self.bitplane_line_dma_latch.set(None);
         }
         let visible_start = self.visible_start_vpos_for_current_control();
         if tick.new_frames == 0 && old_vpos < visible_start && self.agnus.vpos >= visible_start {
@@ -5498,30 +5484,6 @@ impl Bus {
         self.denise.bplcon0
     }
 
-    fn bitplane_line_dma_bplcon0_or(
-        &self,
-        vpos: u32,
-        ddfstart: u32,
-        ddfstart_cck: Option<i128>,
-        fallback_bplcon0: u16,
-    ) -> u16 {
-        if let Some(latch) = self.bitplane_line_dma_latch.get() {
-            if latch.vpos == vpos && latch.ddfstart == ddfstart {
-                return latch.bplcon0;
-            }
-        }
-
-        let bplcon0 = ddfstart_cck
-            .map(|cck| self.bitplane_bplcon0_for_block(cck))
-            .unwrap_or(fallback_bplcon0);
-        self.bitplane_line_dma_latch.set(Some(BitplaneLineDmaLatch {
-            vpos,
-            ddfstart,
-            bplcon0,
-        }));
-        bplcon0
-    }
-
     fn record_ddfstrt_write_match_miss(&mut self, ddfstrt: u16) {
         let bplcon0 = self.effective_bitplane_bplcon0();
         let ddfstart = u32::from(effective_ddf_hpos(bplcon0, ddfstrt));
@@ -5539,7 +5501,15 @@ impl Bus {
     }
 
     fn bitplane_slot_active_at(&self, vpos: u32, hpos: u32) -> bool {
-        let Some(mut plan) = self.bitplane_slot_plan() else {
+        let mut bplcon0 = self.effective_bitplane_bplcon0();
+        let mut plan = self.bitplane_slot_plan_for_bplcon0(bplcon0);
+        if plan.is_none() {
+            if let Some(delay) = self.bitplane_bplcon0_delay {
+                bplcon0 = delay.previous;
+                plan = self.bitplane_slot_plan_for_bplcon0(bplcon0);
+            }
+        }
+        let Some(mut plan) = plan else {
             return false;
         };
         // Bitplane DMA only runs inside the vertical display window (set at
@@ -5560,22 +5530,26 @@ impl Bus {
             return false;
         }
         if hpos >= plan.start {
-            let ddfstart_cck = self
-                .emulated_cck
-                .checked_sub(u64::from(hpos - plan.start))
-                .map(i128::from);
-            let latched_bplcon0 = self.bitplane_line_dma_bplcon0_or(
-                vpos,
-                plan.start,
-                ddfstart_cck,
-                self.effective_bitplane_bplcon0(),
-            );
-            if latched_bplcon0 != self.effective_bitplane_bplcon0() {
-                let Some(latched_plan) = self.bitplane_slot_plan_for_bplcon0(latched_bplcon0)
-                else {
+            for _ in 0..2 {
+                let block_span = if plan.hires_like {
+                    plan.period
+                } else {
+                    plan.unit
+                }
+                .max(1);
+                let rel = hpos - plan.start;
+                let block_start_hpos = plan.start + (rel / block_span) * block_span;
+                let block_start_cck = i128::from(self.emulated_cck)
+                    - i128::from(hpos.saturating_sub(block_start_hpos));
+                let block_bplcon0 = self.bitplane_bplcon0_for_block(block_start_cck);
+                if block_bplcon0 == bplcon0 {
+                    break;
+                }
+                bplcon0 = block_bplcon0;
+                let Some(block_plan) = self.bitplane_slot_plan_for_bplcon0(bplcon0) else {
                     return false;
                 };
-                plan = latched_plan;
+                plan = block_plan;
                 if hpos < plan.start || self.bitplane_ddfstart_missed_on_line(vpos, plan.start) {
                     return false;
                 }
@@ -5620,15 +5594,6 @@ impl Bus {
         }
         let order = unit_off;
         plan.order_mask & (1u8 << order) != 0
-    }
-
-    /// The memoized line-invariant part of `bitplane_slot_active_at`. The
-    /// arbiter consults the bitplane slot owner several times per color
-    /// clock; the registers it derives from change only on (much rarer)
-    /// Copper/CPU writes or write-delay expiry, so the plan is recomputed
-    /// only when its key of register inputs changes.
-    fn bitplane_slot_plan(&self) -> Option<BitplaneSlotPlan> {
-        self.bitplane_slot_plan_for_bplcon0(self.effective_bitplane_bplcon0())
     }
 
     fn bitplane_slot_plan_for_bplcon0(&self, bplcon0: u16) -> Option<BitplaneSlotPlan> {
@@ -7101,9 +7066,6 @@ impl Bus {
         let display_bplcon0 = self.effective_bitplane_bplcon0_at(old_emulated_cck);
         let mode = BitplaneMode::from_bplcon0(display_bplcon0, self.aga_enabled());
         let display_planes = mode.display_planes();
-        if display_planes == 0 {
-            return;
-        }
         if !display_window_contains_vpos(
             self.denise.diwstrt,
             self.denise.diwstop,
@@ -7160,22 +7122,20 @@ impl Bus {
                 .checked_sub(u64::from(old_hpos - ddfstart))
                 .map(i128::from)
         };
-        let dma_bplcon0 =
-            self.bitplane_line_dma_bplcon0_or(vpos, ddfstart, ddfstart_cck, display_bplcon0);
-        let dma_mode = BitplaneMode::from_bplcon0(dma_bplcon0, self.aga_enabled());
-        let dma_planes = dma_mode.dma_planes();
-        if dma_planes == 0 {
-            return;
-        }
-        let period = bitplane_fetch_period(dma_bplcon0, fmode);
-        let unit = bitplane_fetch_unit(dma_bplcon0, fmode);
+        let anchor_bplcon0 = ddfstart_cck
+            .map(|cck| self.bitplane_bplcon0_for_block(cck))
+            .unwrap_or(display_bplcon0);
+        let anchor_mode = BitplaneMode::from_bplcon0(anchor_bplcon0, self.aga_enabled());
+        let anchor_dma_planes = anchor_mode.dma_planes();
+        let period = bitplane_fetch_period(anchor_bplcon0, fmode);
+        let unit = bitplane_fetch_unit(anchor_bplcon0, fmode);
         let started = VideoPipelineStats::probe_timing_sample(
             &mut self.video_pipeline_stats.bitplane_fetch_probes,
             VIDEO_FETCH_TIMING_SAMPLE_RATE,
         );
         let words_per_row = bitplane_words_per_row(
             self.agnus.revision(),
-            dma_bplcon0,
+            anchor_bplcon0,
             self.agnus.fmode(),
             self.denise.ddfstrt,
             self.denise.ddfstop,
@@ -7184,13 +7144,10 @@ impl Bus {
         let mut rows_started = 0usize;
         let mut slots = 0usize;
         let mut line_complete = false;
+        let mut line_complete_plane_mask = 0u16;
         let addr_mask = self.chip_dma_mask;
-        let hires_like = bitplane_hires(dma_bplcon0) || bitplane_shres(dma_bplcon0);
+        let hires_like = bitplane_hires(anchor_bplcon0) || bitplane_shres(anchor_bplcon0);
         let last_word_idx = words_per_row.saturating_sub(1);
-        let last_order = (0..dma_planes.min(8))
-            .map(|plane| bitplane_fetch_order(dma_bplcon0, plane))
-            .max()
-            .unwrap_or(0);
         if diag_caprow().is_some_and(|spec| spec.contains(vpos))
             && old_hpos <= ddfstart
             && new_hpos > ddfstart
@@ -7202,7 +7159,7 @@ impl Bus {
                 self.agnus.hpos,
                 self.effective_bitplane_dmacon(),
                 display_bplcon0,
-                dma_bplcon0,
+                anchor_bplcon0,
                 self.denise.bplcon1,
                 self.denise.bplcon2,
                 self.denise.bplcon4,
@@ -7220,7 +7177,7 @@ impl Bus {
                 quantum,
                 words_per_row,
                 display_planes,
-                dma_planes,
+                anchor_dma_planes,
                 self.denise.bpl1mod,
                 self.denise.bpl2mod,
                 self.display_dma_bplpt[0],
@@ -7253,9 +7210,17 @@ impl Bus {
                 if word_base >= words_per_row {
                     continue;
                 }
-                for plane in 0..dma_planes.min(8) {
+                let block_start_cck = i128::from(hpos_emulated_cck);
+                let block_bplcon0 = self.bitplane_bplcon0_for_block(block_start_cck);
+                let block_mode = BitplaneMode::from_bplcon0(block_bplcon0, self.aga_enabled());
+                let block_dma_planes = block_mode.dma_planes();
+                if block_dma_planes == 0 {
+                    continue;
+                }
+                let block_display_planes = block_mode.display_planes();
+                for plane in 0..block_dma_planes.min(8) {
                     if plane == 0 {
-                        self.record_sprite_display_enable_for_bitplane_dma(vpos, dma_bplcon0);
+                        self.record_sprite_display_enable_for_bitplane_dma(vpos, block_bplcon0);
                     }
                     for w in 0..quantum.min(words_per_row - word_base) {
                         let word_idx = word_base + w;
@@ -7264,8 +7229,8 @@ impl Bus {
                         self.data_bus = fetched;
                         if self.capture_bitplane_fetch_word(
                             fb_y,
-                            display_planes,
-                            dma_planes,
+                            block_display_planes,
+                            block_dma_planes,
                             words_per_row,
                             plane,
                             word_idx,
@@ -7278,6 +7243,7 @@ impl Bus {
                             self.display_dma_bplpt[plane].wrapping_add(2) & addr_mask;
                         if word_idx == last_word_idx {
                             line_complete = true;
+                            line_complete_plane_mask = plane_mask_for_count(block_dma_planes);
                         }
                     }
                     slots += 1;
@@ -7292,20 +7258,24 @@ impl Bus {
                     continue;
                 }
                 let order = unit_off;
-                // The DMA sequencer was armed at DDFSTRT; later BPLCON0
-                // display changes can alter how captured data is interpreted,
-                // but cannot add newly enabled planes to this row's fetches.
                 let block_start_cck = i128::from(hpos_emulated_cck) - i128::from(unit_off);
-                let block_display_bplcon0 = self.bitplane_bplcon0_for_block(block_start_cck);
-                let block_mode =
-                    BitplaneMode::from_bplcon0(block_display_bplcon0, self.aga_enabled());
+                let block_bplcon0 = self.bitplane_bplcon0_for_block(block_start_cck);
+                let block_mode = BitplaneMode::from_bplcon0(block_bplcon0, self.aga_enabled());
+                let block_dma_planes = block_mode.dma_planes();
+                if block_dma_planes == 0 {
+                    continue;
+                }
                 let block_display_planes = block_mode.display_planes();
-                for plane in 0..dma_planes.min(8) {
-                    if bitplane_fetch_order(dma_bplcon0, plane) != order {
+                let block_last_order = (0..block_dma_planes.min(8))
+                    .map(|plane| bitplane_fetch_order(block_bplcon0, plane))
+                    .max()
+                    .unwrap_or(0);
+                for plane in 0..block_dma_planes.min(8) {
+                    if bitplane_fetch_order(block_bplcon0, plane) != order {
                         continue;
                     }
                     if plane == 0 {
-                        self.record_sprite_display_enable_for_bitplane_dma(vpos, dma_bplcon0);
+                        self.record_sprite_display_enable_for_bitplane_dma(vpos, block_bplcon0);
                     }
                     for w in 0..quantum.min(words_per_row - word_base) {
                         let word_idx = word_base + w;
@@ -7315,7 +7285,7 @@ impl Bus {
                         if self.capture_bitplane_fetch_word(
                             fb_y,
                             block_display_planes,
-                            dma_planes,
+                            block_dma_planes,
                             words_per_row,
                             plane,
                             word_idx,
@@ -7326,8 +7296,9 @@ impl Bus {
                         self.denise.write_bpldat(plane, fetched);
                         self.display_dma_bplpt[plane] =
                             self.display_dma_bplpt[plane].wrapping_add(2) & addr_mask;
-                        if word_idx == last_word_idx && order == last_order {
+                        if word_idx == last_word_idx && order == block_last_order {
                             line_complete = true;
+                            line_complete_plane_mask = plane_mask_for_count(block_dma_planes);
                         }
                     }
                     slots += 1;
@@ -7339,7 +7310,7 @@ impl Bus {
             return;
         }
         if line_complete {
-            self.advance_display_dma_modulos(dma_planes, words_per_row, self.agnus.vpos);
+            self.advance_display_dma_modulos_for_mask(line_complete_plane_mask, self.agnus.vpos);
         }
 
         self.record_bitplane_fetch_timing(
@@ -7429,7 +7400,14 @@ impl Bus {
     }
 
     fn advance_display_dma_modulos(&mut self, nplanes: usize, _words_per_row: usize, vpos: u32) {
-        for plane in 0..nplanes.min(8) {
+        self.advance_display_dma_modulos_for_mask(plane_mask_for_count(nplanes), vpos);
+    }
+
+    fn advance_display_dma_modulos_for_mask(&mut self, plane_mask: u16, vpos: u32) {
+        for plane in 0..8 {
+            if plane_mask & (1u16 << plane) == 0 {
+                continue;
+            }
             let modulo = self.display_dma_modulo_for_plane(plane, vpos);
             self.display_dma_bplpt[plane] = ((self.display_dma_bplpt[plane] as i64)
                 .wrapping_add(modulo as i64) as u32)
@@ -7437,9 +7415,9 @@ impl Bus {
         }
         if crate::envcfg::flag("COPPERLINE_DIAG_FETCH") && (66..76).contains(&self.agnus.vpos) {
             log::info!(
-                "fetch v={} nplanes={} bplpt0={:#08X} (expect 0x03E606+{}*352={:#08X})",
+                "fetch v={} plane_mask={:#04X} bplpt0={:#08X} (expect 0x03E606+{}*352={:#08X})",
                 self.agnus.vpos,
-                nplanes,
+                plane_mask,
                 self.display_dma_bplpt[0],
                 self.agnus.vpos - 66,
                 0x03E606u32 + (self.agnus.vpos - 66 + 1) * 352,
@@ -7780,6 +7758,14 @@ fn bitplane_fetch_period(bplcon0: u16, fmode: u16) -> u32 {
 
 fn bitplane_fetch_unit(bplcon0: u16, fmode: u16) -> u32 {
     bitplane_fetch_period(bplcon0, fmode).max(8)
+}
+
+fn plane_mask_for_count(nplanes: usize) -> u16 {
+    if nplanes >= 8 {
+        0x00FF
+    } else {
+        (1u16 << nplanes) - 1
+    }
 }
 
 /// FMODE SSCAN2 (bit 15, Alice only): sprite scan doubling. Sprite data DMA
@@ -12060,7 +12046,7 @@ mod tests {
     }
 
     #[test]
-    fn bitplane_dma_latches_plane_count_at_ddfstart() {
+    fn bitplane_dma_latches_plane_count_per_fetch_block() {
         let mut bus = empty_bus();
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_BPLEN;
         bus.agnus.vpos = 0x2C;
@@ -12070,6 +12056,7 @@ mod tests {
         bus.denise.ddfstrt = 0x0030;
         bus.denise.ddfstop = 0x0038;
         bus.denise.bplcon0 = 0x5200;
+        bus.denise.bpl2mod = 4;
         for plane in 0..6 {
             let ptr = 0x0100 + plane * 0x0100;
             bus.denise.bplpt[plane] = ptr as u32;
@@ -12086,10 +12073,10 @@ mod tests {
         let row = bus.frame_captured_bitplane_rows()[0].as_ref().unwrap();
         assert_eq!(row.nplanes, 6);
         assert_eq!(row.words_per_row, 2);
-        assert_eq!(row.planes[5], vec![0x0000, 0x0000]);
+        assert_eq!(row.planes[5], vec![0x0000, 0x1005]);
         assert_eq!(bus.display_dma_bplpt[0], 0x0104);
         assert_eq!(bus.display_dma_bplpt[4], 0x0504);
-        assert_eq!(bus.display_dma_bplpt[5], 0x0600);
+        assert_eq!(bus.display_dma_bplpt[5], 0x0606);
     }
 
     #[test]

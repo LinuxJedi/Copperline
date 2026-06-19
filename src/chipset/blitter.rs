@@ -100,9 +100,9 @@ fn minterm(lf: u8, a: u16, b: u16, c: u16) -> u16 {
     d
 }
 
-/// Barrel-shifter combining the previously-processed row word with the
+/// Barrel-shifter combining the previously-processed source word with the
 /// current one. Imagine the source words laid out as pixels MSB-first
-/// across the row: a 4-bit right-shift means the leftmost 4 pixels of
+/// across memory: a 4-bit right-shift means the leftmost 4 pixels of
 /// the second word come from the rightmost 4 pixels of the first word.
 ///
 /// Ascending mode produces (prev:cur) >> n (low 16 bits): the bottom
@@ -618,13 +618,13 @@ impl Blitter {
         let mut cpt = self.bltcpt;
         let mut dpt = self.bltdpt;
 
-        for row in 0..h {
-            let mut a_prev: u16 = 0;
-            let mut b_prev: u16 = if row == 0 && !self.bltbold_init {
-                self.bltbold
-            } else {
-                0
-            };
+        let mut a_prev: u16 = 0;
+        let mut b_prev: u16 = if !self.bltbold_init {
+            self.bltbold
+        } else {
+            0
+        };
+        for _row in 0..h {
             let mut fill_state: u16 = fci;
             // Buffer this row's D words so fill mode can process them
             // in descending bit-order with carry across word boundaries.
@@ -1429,8 +1429,6 @@ impl NormalBlitState {
         }
         self.h_remaining = self.h_remaining.saturating_sub(1);
         self.word_idx = 0;
-        self.a_prev = 0;
-        self.b_prev = 0;
         self.fill_state = self.fci;
     }
 
@@ -1676,7 +1674,7 @@ mod tests {
     }
 
     /// 4-bit right shift of a single source word into the destination.
-    /// The barrel shifter feeds the previous row word in as the new
+    /// The barrel shifter feeds the previous source word in as the new
     /// high bits; for the first word (prev = 0) we get a clean shift.
     #[test]
     fn normal_mode_shift_a() {
@@ -1696,7 +1694,7 @@ mod tests {
         assert_eq!(&ram[0x20..0x22], &[0x0F, 0x00]);
     }
 
-    /// Two-word row with non-zero prev: bits shifted out of the first
+    /// Two-word span with non-zero prev: bits shifted out of the first
     /// word reappear in the high bits of the second.
     #[test]
     fn normal_mode_shift_carry() {
@@ -1718,6 +1716,33 @@ mod tests {
         // Word 0: $1111 >> 4 = $0111. Word 1: ($1111 << 12) | ($2222 >> 4)
         //         = $1000 | $0222 = $1222.
         assert_eq!(&ram[0x20..0x24], &[0x01, 0x11, 0x12, 0x22]);
+    }
+
+    /// Normal-mode A/B barrel shifters are not cleared by the BLTSIZE row
+    /// counter. Masks and modulos still apply per row, but the shifter's
+    /// previous-word latch carries from the last word of one row into the
+    /// first word of the next.
+    #[test]
+    fn scheduled_shift_carry_crosses_normal_mode_row_boundary() {
+        let mut ram = vec![0u8; 256];
+        for (addr, word) in [(0x10, 0x1111), (0x12, 0x2222), (0x14, 0x3333), (0x16, 0x4444)] {
+            write_word(&mut ram, addr, word);
+        }
+
+        let mut b = Blitter::new();
+        b.bltcon0 = (4 << 12) | 0x09F0; // ASH=4, USEA|USED, D=A
+        b.bltcon1 = 0;
+        b.bltafwm = 0xFFFF;
+        b.bltalwm = 0xFFFF;
+        b.bltapt = 0x10;
+        b.bltdpt = 0x20;
+        b.start_scheduled((2u16 << 6) | 2, &ram);
+        while !b.tick_scheduled_slot(&mut ram) {}
+
+        assert_eq!(
+            &ram[0x20..0x28],
+            &[0x01, 0x11, 0x12, 0x22, 0x23, 0x33, 0x34, 0x44]
+        );
     }
 
     /// Verify BZERO surfaces correctly when all output bits are zero.
