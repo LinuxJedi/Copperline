@@ -93,7 +93,7 @@ authoritative list. The most useful ones:
 | `COPPERLINE_DIAG_PCHIST` | Full PC history (with `COPPERLINE_DIAG_PCHIST_START=SECS`) |
 | `COPPERLINE_DIAG_COPLEN` | Copper list length (optionally at a given emulated time) |
 | `COPPERLINE_DIAG_DISPLAY` | Display-register change log |
-| `COPPERLINE_DIAG_CAPROW` | `=all`, `=V`, or `=START:END`: per-line bitplane capture state at DDF start, including DMACON/BPLCON/FMODE/DIW/DDF, effective fetch window, unit/period/quantum, words/row, modulos, and BPLxPTs -- separates wrong-pointer from wrong-decode display bugs |
+| `COPPERLINE_DIAG_CAPROW` | `=all`, `=V`, or `=START:END`: per-line bitplane capture state at DDF start, including DMACON, current and DMA-latched BPLCON0, FMODE/DIW/DDF, effective fetch window, unit/period/quantum, words/row, modulos, and all BPLxPTs -- separates wrong-pointer from wrong-decode display bugs |
 | `COPPERLINE_DIAG_PALETTE_ROW` | `=all`, `=V`, or `=START:END`: log beam-timed COLOR writes for selected beam lines, including source, framebuffer x, palette entry, LOCT, value, and BPLCON3; the setting is cached after first use |
 | `COPPERLINE_DIAG_SPRITES` | Sprite DMA fetch/render log |
 | `COPPERLINE_DIAG_SPRCAP` | `=BEAMY` or `=all`: log every captured sprite DMA line (frame, channel, hstart, attach, FMODE width, data words) on one beam line or all of them; also logs SPRxPT retargets of latched sprite descriptors |

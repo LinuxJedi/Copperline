@@ -35,7 +35,11 @@ DDF window, FMODE fetch cadence, and per-plane fetch-order mask live in a
 (`BitplaneSlotKey`, `src/bus.rs`) and are recomputed only when a register
 write or a write-delay expiry changes the key. The vpos-dependent gates
 (vertical display window, DDFSTRT write miss) are still evaluated live, so
-the memoization cannot change behaviour.
+the memoization cannot change behaviour. Once a line reaches DDFSTRT, the
+arbiter uses the BPLCON0 value latched for that line's bitplane DMA
+sequence; a later BPLCON0 plane-count increase can change display decode,
+but it does not claim additional bitplane slots or advance the newly
+enabled plane pointers until the next row.
 Wide-FMODE lo-res slots are packed into the first eight CCKs of each
 16/32-CCK fetch unit; the rest of the unit remains available to later
 arbitration priorities.

@@ -49,8 +49,9 @@ Deliberately excluded, with the mechanism in parentheses:
   `Emulator::load_state` additionally re-baselines the frame pacer
   (`reanchor_realtime_clock`) so the run does not sprint to "catch up"
   the emulated-time jump.
-- **Memo caches**: the bitplane slot-plan `Cell` cache and the pending
-  debugger-window register hit (skipped; rebuilt or irrelevant).
+- **Memo caches and scanline latches**: the bitplane slot-plan `Cell` cache,
+  the transient bitplane-DMA BPLCON0 latch for the current row, and the
+  pending debugger-window register hit (skipped; rebuilt or irrelevant).
 
 The ROM bytes are embedded in the state, not loaded from a path: a state
 is self-contained with respect to everything that was in memory, so

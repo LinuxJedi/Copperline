@@ -315,6 +315,13 @@ struct BitplaneDdfStartMiss {
     ddfstart: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BitplaneLineDmaLatch {
+    vpos: u32,
+    ddfstart: u32,
+    bplcon0: u16,
+}
+
 /// Cache key for the memoized bitplane slot plan: every register input that
 /// feeds the plan computation. The vpos-dependent gates (vertical display
 /// window, DDFSTRT write miss) are evaluated live in `bitplane_slot_active_at`,
@@ -672,6 +679,11 @@ pub struct Bus {
     bitplane_dmacon_delay: Option<BitplaneDmaconDelay>,
     bitplane_bplcon0_delay: Option<BitplaneBplcon0Delay>,
     bitplane_ddfstart_miss: Option<BitplaneDdfStartMiss>,
+    /// BPLCON0 value that armed the current scanline's bitplane DMA sequencer
+    /// at DDFSTRT. Agnus does not add newly enabled planes to an already
+    /// running fetch sequence later in the same row.
+    #[serde(skip)]
+    bitplane_line_dma_latch: std::cell::Cell<Option<BitplaneLineDmaLatch>>,
     /// Memoized bitplane fetch plan for `bitplane_slot_active_at`, keyed on
     /// the registers that feed it. The arbiter asks for the bitplane slot
     /// owner several times per color clock; recomputing the DDF window and
@@ -1551,6 +1563,7 @@ impl Bus {
             bitplane_dmacon_delay: None,
             bitplane_bplcon0_delay: None,
             bitplane_ddfstart_miss: None,
+            bitplane_line_dma_latch: std::cell::Cell::new(None),
             bitplane_slot_plan_cache: std::cell::Cell::new(None),
             bus_accounting: BusAccounting::from_env(),
             uhres_dual_warned: false,
@@ -4338,7 +4351,7 @@ impl Bus {
                         self.denise.set_bplpt_low(idx, val);
                     }
                     self.display_dma_bplpt[idx] = self.denise.bplpt[idx];
-                    if idx == 0 && off & 2 != 0 && crate::envcfg::flag("COPPERLINE_DIAG_BPLPT") {
+                    if off & 2 != 0 && crate::envcfg::flag("COPPERLINE_DIAG_BPLPT") {
                         log::info!(
                             "bplpt f={} v={} h={} src={} BPL{}PT={:#08X} cop1lc={:#08X} coppc={:#08X}",
                             self.emulated_frames,
@@ -4558,6 +4571,7 @@ impl Bus {
         }
         if tick.new_lines != 0 || tick.new_frames != 0 {
             self.bitplane_ddfstart_miss = None;
+            self.bitplane_line_dma_latch.set(None);
         }
         let visible_start = self.visible_start_vpos_for_current_control();
         if tick.new_frames == 0 && old_vpos < visible_start && self.agnus.vpos >= visible_start {
@@ -5484,6 +5498,30 @@ impl Bus {
         self.denise.bplcon0
     }
 
+    fn bitplane_line_dma_bplcon0_or(
+        &self,
+        vpos: u32,
+        ddfstart: u32,
+        ddfstart_cck: Option<i128>,
+        fallback_bplcon0: u16,
+    ) -> u16 {
+        if let Some(latch) = self.bitplane_line_dma_latch.get() {
+            if latch.vpos == vpos && latch.ddfstart == ddfstart {
+                return latch.bplcon0;
+            }
+        }
+
+        let bplcon0 = ddfstart_cck
+            .map(|cck| self.bitplane_bplcon0_for_block(cck))
+            .unwrap_or(fallback_bplcon0);
+        self.bitplane_line_dma_latch.set(Some(BitplaneLineDmaLatch {
+            vpos,
+            ddfstart,
+            bplcon0,
+        }));
+        bplcon0
+    }
+
     fn record_ddfstrt_write_match_miss(&mut self, ddfstrt: u16) {
         let bplcon0 = self.effective_bitplane_bplcon0();
         let ddfstart = u32::from(effective_ddf_hpos(bplcon0, ddfstrt));
@@ -5501,22 +5539,9 @@ impl Bus {
     }
 
     fn bitplane_slot_active_at(&self, vpos: u32, hpos: u32) -> bool {
-        let Some(plan) = self.bitplane_slot_plan() else {
+        let Some(mut plan) = self.bitplane_slot_plan() else {
             return false;
         };
-        // Cheap hpos rejection first via the memoized slot bitmask (which also
-        // encodes the start/last_fetch_hpos bounds). The vpos gates below only
-        // matter on color clocks that are actually bitplane slots, so testing
-        // the pattern first lets the off-slot majority skip them entirely.
-        let is_slot = if hpos < SLOT_MASK_BITS {
-            plan.slot_mask[(hpos / 64) as usize] & (1u64 << (hpos % 64)) != 0
-        } else {
-            // Programmable line wider than the bitmask: fall back to the math.
-            Self::plan_slot_at(&plan, hpos)
-        };
-        if !is_slot {
-            return false;
-        }
         // Bitplane DMA only runs inside the vertical display window (set at
         // DIWSTRT.V, cleared at DIWSTOP.V), so the top-border and vertical-
         // blank lines are free for the blitter/CPU. Without this gate the
@@ -5532,6 +5557,41 @@ impl Bus {
             return false;
         }
         if self.bitplane_ddfstart_missed_on_line(vpos, plan.start) {
+            return false;
+        }
+        if hpos >= plan.start {
+            let ddfstart_cck = self
+                .emulated_cck
+                .checked_sub(u64::from(hpos - plan.start))
+                .map(i128::from);
+            let latched_bplcon0 = self.bitplane_line_dma_bplcon0_or(
+                vpos,
+                plan.start,
+                ddfstart_cck,
+                self.effective_bitplane_bplcon0(),
+            );
+            if latched_bplcon0 != self.effective_bitplane_bplcon0() {
+                let Some(latched_plan) = self.bitplane_slot_plan_for_bplcon0(latched_bplcon0)
+                else {
+                    return false;
+                };
+                plan = latched_plan;
+                if hpos < plan.start || self.bitplane_ddfstart_missed_on_line(vpos, plan.start) {
+                    return false;
+                }
+            }
+        }
+        // Cheap hpos rejection first via the memoized slot bitmask (which also
+        // encodes the start/last_fetch_hpos bounds). The vpos gates below only
+        // matter on color clocks that are actually bitplane slots, so testing
+        // the pattern first lets the off-slot majority skip them entirely.
+        let is_slot = if hpos < SLOT_MASK_BITS {
+            plan.slot_mask[(hpos / 64) as usize] & (1u64 << (hpos % 64)) != 0
+        } else {
+            // Programmable line wider than the bitmask: fall back to the math.
+            Self::plan_slot_at(&plan, hpos)
+        };
+        if !is_slot {
             return false;
         }
         true
@@ -5568,10 +5628,14 @@ impl Bus {
     /// Copper/CPU writes or write-delay expiry, so the plan is recomputed
     /// only when its key of register inputs changes.
     fn bitplane_slot_plan(&self) -> Option<BitplaneSlotPlan> {
+        self.bitplane_slot_plan_for_bplcon0(self.effective_bitplane_bplcon0())
+    }
+
+    fn bitplane_slot_plan_for_bplcon0(&self, bplcon0: u16) -> Option<BitplaneSlotPlan> {
         let dmacon = self.effective_bitplane_dmacon();
         let key = BitplaneSlotKey {
             bplen: dmacon & (DMACON_DMAEN | DMACON_BPLEN) == (DMACON_DMAEN | DMACON_BPLEN),
-            bplcon0: self.effective_bitplane_bplcon0(),
+            bplcon0,
             ddfstrt: self.denise.ddfstrt,
             ddfstop: self.denise.ddfstop,
             fmode: self.agnus.fmode(),
@@ -7034,10 +7098,9 @@ impl Bus {
         new_hpos: u32,
         old_emulated_cck: u64,
     ) {
-        let bplcon0 = self.effective_bitplane_bplcon0_at(old_emulated_cck);
-        let mode = BitplaneMode::from_bplcon0(bplcon0, self.aga_enabled());
+        let display_bplcon0 = self.effective_bitplane_bplcon0_at(old_emulated_cck);
+        let mode = BitplaneMode::from_bplcon0(display_bplcon0, self.aga_enabled());
         let display_planes = mode.display_planes();
-        let dma_planes = mode.dma_planes();
         if display_planes == 0 {
             return;
         }
@@ -7063,7 +7126,7 @@ impl Bus {
         }
         let Some((effective_ddfstart, effective_ddfstop)) = effective_ddf_window(
             self.agnus.revision(),
-            bplcon0,
+            display_bplcon0,
             self.denise.ddfstrt,
             self.denise.ddfstop,
             self.harddis_active(),
@@ -7077,8 +7140,6 @@ impl Bus {
         // and the lores slot sequence spreads across the `unit`-cck block.
         let fmode = self.agnus.fmode();
         let quantum = bitplane_fetch_quantum(fmode) as usize;
-        let period = bitplane_fetch_period(bplcon0, fmode);
-        let unit = bitplane_fetch_unit(bplcon0, fmode);
         // Wide-FMODE units lengthen the gap between groups of fetched words,
         // but the sequencer is still armed by the DDFSTRT comparator itself.
         // Lores plane-order slots are packed into the first eight cycles of
@@ -7090,13 +7151,31 @@ impl Bus {
         if new_hpos <= ddfstart {
             return;
         }
+        let ddfstart_cck = if old_hpos <= ddfstart {
+            Some(i128::from(
+                old_emulated_cck.saturating_add(u64::from(ddfstart - old_hpos)),
+            ))
+        } else {
+            old_emulated_cck
+                .checked_sub(u64::from(old_hpos - ddfstart))
+                .map(i128::from)
+        };
+        let dma_bplcon0 =
+            self.bitplane_line_dma_bplcon0_or(vpos, ddfstart, ddfstart_cck, display_bplcon0);
+        let dma_mode = BitplaneMode::from_bplcon0(dma_bplcon0, self.aga_enabled());
+        let dma_planes = dma_mode.dma_planes();
+        if dma_planes == 0 {
+            return;
+        }
+        let period = bitplane_fetch_period(dma_bplcon0, fmode);
+        let unit = bitplane_fetch_unit(dma_bplcon0, fmode);
         let started = VideoPipelineStats::probe_timing_sample(
             &mut self.video_pipeline_stats.bitplane_fetch_probes,
             VIDEO_FETCH_TIMING_SAMPLE_RATE,
         );
         let words_per_row = bitplane_words_per_row(
             self.agnus.revision(),
-            bplcon0,
+            dma_bplcon0,
             self.agnus.fmode(),
             self.denise.ddfstrt,
             self.denise.ddfstop,
@@ -7106,10 +7185,10 @@ impl Bus {
         let mut slots = 0usize;
         let mut line_complete = false;
         let addr_mask = self.chip_dma_mask;
-        let hires_like = bitplane_hires(bplcon0) || bitplane_shres(bplcon0);
+        let hires_like = bitplane_hires(dma_bplcon0) || bitplane_shres(dma_bplcon0);
         let last_word_idx = words_per_row.saturating_sub(1);
         let last_order = (0..dma_planes.min(8))
-            .map(|plane| bitplane_fetch_order(bplcon0, plane))
+            .map(|plane| bitplane_fetch_order(dma_bplcon0, plane))
             .max()
             .unwrap_or(0);
         if diag_caprow().is_some_and(|spec| spec.contains(vpos))
@@ -7117,12 +7196,13 @@ impl Bus {
             && new_hpos > ddfstart
         {
             log::info!(
-                "caprow f={} v={} h={} dmacon={:#06X} bplcon0={:#06X} bplcon1={:#06X} bplcon2={:#06X} bplcon4={:#06X} fmode={:#06X} diw={:#06X}/{:#06X}/{:?} ddf={:#04X}/{:#04X} eff={:#04X}-{:#04X} anchor={:#04X} unit={} period={} quantum={} wpr={} display_planes={} dma_planes={} mod={}/{} bplpt={:#08X},{:#08X},{:#08X},{:#08X}",
+                "caprow f={} v={} h={} dmacon={:#06X} bplcon0={:#06X} dma_bplcon0={:#06X} bplcon1={:#06X} bplcon2={:#06X} bplcon4={:#06X} fmode={:#06X} diw={:#06X}/{:#06X}/{:?} ddf={:#04X}/{:#04X} eff={:#04X}-{:#04X} anchor={:#04X} unit={} period={} quantum={} wpr={} display_planes={} dma_planes={} mod={}/{} bplpt={:#08X},{:#08X},{:#08X},{:#08X},{:#08X},{:#08X},{:#08X},{:#08X}",
                 self.emulated_frames,
                 vpos,
                 self.agnus.hpos,
                 self.effective_bitplane_dmacon(),
-                bplcon0,
+                display_bplcon0,
+                dma_bplcon0,
                 self.denise.bplcon1,
                 self.denise.bplcon2,
                 self.denise.bplcon4,
@@ -7147,6 +7227,10 @@ impl Bus {
                 self.display_dma_bplpt[1],
                 self.display_dma_bplpt[2],
                 self.display_dma_bplpt[3],
+                self.display_dma_bplpt[4],
+                self.display_dma_bplpt[5],
+                self.display_dma_bplpt[6],
+                self.display_dma_bplpt[7],
             );
         }
         for hpos in old_hpos..new_hpos {
@@ -7171,7 +7255,7 @@ impl Bus {
                 }
                 for plane in 0..dma_planes.min(8) {
                     if plane == 0 {
-                        self.record_sprite_display_enable_for_bitplane_dma(vpos, bplcon0);
+                        self.record_sprite_display_enable_for_bitplane_dma(vpos, dma_bplcon0);
                     }
                     for w in 0..quantum.min(words_per_row - word_base) {
                         let word_idx = word_base + w;
@@ -7208,21 +7292,20 @@ impl Bus {
                     continue;
                 }
                 let order = unit_off;
-                // Sample the plane count as Agnus latches it: at the start of
-                // the DDF fetch block that contains this slot. A BPLCON0 write
-                // exactly at the block start (e.g. at DDFSTRT) configures this
-                // block, so the earliest-slot plane is not dropped.
+                // The DMA sequencer was armed at DDFSTRT; later BPLCON0
+                // display changes can alter how captured data is interpreted,
+                // but cannot add newly enabled planes to this row's fetches.
                 let block_start_cck = i128::from(hpos_emulated_cck) - i128::from(unit_off);
-                let block_bplcon0 = self.bitplane_bplcon0_for_block(block_start_cck);
-                let block_mode = BitplaneMode::from_bplcon0(block_bplcon0, self.aga_enabled());
-                let block_dma_planes = block_mode.dma_planes();
+                let block_display_bplcon0 = self.bitplane_bplcon0_for_block(block_start_cck);
+                let block_mode =
+                    BitplaneMode::from_bplcon0(block_display_bplcon0, self.aga_enabled());
                 let block_display_planes = block_mode.display_planes();
-                for plane in 0..block_dma_planes.min(8) {
-                    if bitplane_fetch_order(block_bplcon0, plane) != order {
+                for plane in 0..dma_planes.min(8) {
+                    if bitplane_fetch_order(dma_bplcon0, plane) != order {
                         continue;
                     }
                     if plane == 0 {
-                        self.record_sprite_display_enable_for_bitplane_dma(vpos, bplcon0);
+                        self.record_sprite_display_enable_for_bitplane_dma(vpos, dma_bplcon0);
                     }
                     for w in 0..quantum.min(words_per_row - word_base) {
                         let word_idx = word_base + w;
@@ -7232,7 +7315,7 @@ impl Bus {
                         if self.capture_bitplane_fetch_word(
                             fb_y,
                             block_display_planes,
-                            block_dma_planes,
+                            dma_planes,
                             words_per_row,
                             plane,
                             word_idx,
@@ -11974,6 +12057,39 @@ mod tests {
         assert_eq!(row.words_per_row, 2);
         assert_eq!(row.planes[0], vec![0x1111, 0x0000]);
         assert_eq!(bus.display_dma_bplpt[0], 0x0102);
+    }
+
+    #[test]
+    fn bitplane_dma_latches_plane_count_at_ddfstart() {
+        let mut bus = empty_bus();
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_BPLEN;
+        bus.agnus.vpos = 0x2C;
+        bus.agnus.hpos = 0x30;
+        bus.denise.diwstrt = 0x2C81;
+        bus.denise.diwstop = 0x2DC1;
+        bus.denise.ddfstrt = 0x0030;
+        bus.denise.ddfstop = 0x0038;
+        bus.denise.bplcon0 = 0x5200;
+        for plane in 0..6 {
+            let ptr = 0x0100 + plane * 0x0100;
+            bus.denise.bplpt[plane] = ptr as u32;
+            bus.display_dma_bplpt[plane] = ptr as u32;
+            write_chip_word(&mut bus, ptr, 0x1000 | plane as u16);
+            write_chip_word(&mut bus, ptr + 2, 0x2000 | plane as u16);
+        }
+
+        bus.advance_chipset(2);
+        assert_eq!(bus.agnus.hpos, 0x32);
+        assert!(!bus.write_custom_word_from(0x100, 0x6200, BeamWriteSource::Cpu));
+        bus.advance_chipset(0x0040 - 0x0032);
+
+        let row = bus.frame_captured_bitplane_rows()[0].as_ref().unwrap();
+        assert_eq!(row.nplanes, 6);
+        assert_eq!(row.words_per_row, 2);
+        assert_eq!(row.planes[5], vec![0x0000, 0x0000]);
+        assert_eq!(bus.display_dma_bplpt[0], 0x0104);
+        assert_eq!(bus.display_dma_bplpt[4], 0x0504);
+        assert_eq!(bus.display_dma_bplpt[5], 0x0600);
     }
 
     #[test]
