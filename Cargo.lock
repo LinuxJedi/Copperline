@@ -442,6 +442,7 @@ dependencies = [
  "ringbuf",
  "serde",
  "serde-big-array",
+ "thread-priority",
  "toml",
  "winit",
 ]
@@ -2353,6 +2354,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "thread-priority"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b61f78661ff568c3a69890da32f056c54ba191afae3e41065f39cfe9217fa3c"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "libc",
+ "log",
+ "rustversion",
+ "windows 0.62.2",
 ]
 
 [[package]]

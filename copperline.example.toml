@@ -33,6 +33,17 @@ power_on = true
 # one run.
 pacing_budget = "cycles"
 
+# Ask the OS to schedule Copperline's latency-critical threads (the
+# wall-clock pacer and the audio callback) above normal, to reduce frame
+# stutter and audio glitches when the host is under load. Best effort and off
+# by default: on macOS the pacer thread joins the USER_INTERACTIVE QoS class
+# (the audio callback is already real-time under Core Audio); on Windows it is
+# raised via SetThreadPriority; on Linux raising priority needs privilege (an
+# rtprio rlimit, CAP_SYS_NICE, or root) and is otherwise declined without
+# failing the run. The COPPERLINE_REALTIME_PRIORITY env var overrides this for
+# one run (set it to 0/false/off to force it off).
+# realtime_priority = false
+
 
 [cpu]
 

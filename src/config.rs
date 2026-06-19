@@ -153,6 +153,12 @@ pub struct Emulation {
     /// `PacingBudget`. The `COPPERLINE_REAL_PACING_BUDGET` env var overrides
     /// this for one run.
     pub pacing_budget: PacingBudget,
+    /// Ask the OS to schedule the latency-critical threads (the wall-clock
+    /// pacer and the audio callback) above normal, to reduce stutter and audio
+    /// glitches under host load. Best effort and off by default; see
+    /// [`crate::priority`]. The `COPPERLINE_REALTIME_PRIORITY` env var
+    /// overrides this for one run.
+    pub realtime_priority: bool,
 }
 
 /// Real-mode pacing budget model.
@@ -505,6 +511,7 @@ impl Default for Config {
             emulation: Emulation {
                 power_on: true,
                 pacing_budget: PacingBudget::Cycles,
+                realtime_priority: false,
             },
             chip_ram_bytes: 512 * 1024,
             fast_ram_bytes: 0,
@@ -782,6 +789,9 @@ struct RawEmulation {
     speed: Option<String>,
     power_on: Option<bool>,
     pacing_budget: Option<String>,
+    /// Best-effort realtime-like thread priority for the pacer and audio
+    /// threads (default false). See `src/priority.rs`.
+    realtime_priority: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -922,6 +932,10 @@ impl TryFrom<RawConfig> for Config {
                 None => defaults.emulation.pacing_budget,
                 Some(s) => parse_pacing_budget(s)?,
             },
+            realtime_priority: raw
+                .emulation
+                .realtime_priority
+                .unwrap_or(defaults.emulation.realtime_priority),
         };
         let chip_ram_bytes = match raw.memory.chip.as_deref() {
             None => defaults.chip_ram_bytes,

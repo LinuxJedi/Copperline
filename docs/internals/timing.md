@@ -332,6 +332,39 @@ accurate per-instruction costs the CPU's chip-bus slot ratio settles at a
 physically valid value naturally, which (together with the area-fill C-slot
 fix) resolved that blanking regression.
 
+### Thread scheduling priority
+
+Pacing only works if the host actually runs the right thread at the right
+moment. Two threads are latency-critical: the **pacer** (the main thread,
+which advances the core and calls `thread::sleep` in
+`Emulator::sleep_until_realtime_device_time`) and the **cpal audio callback**
+(which drains the sample ring buffer the pacer keeps ~150 ms ahead of the
+device clock). The `copperline-render` worker ([](architecture)) is a
+throughput thread, not a latency one, and is left at normal priority. When the
+host is busy, a scheduler that preempts the pacer shows up as frame stutter,
+and one that preempts the audio callback shows up as an audible underrun.
+
+`[emulation] realtime_priority` (off by default; `COPPERLINE_REALTIME_PRIORITY`
+overrides it for one run) asks the OS to schedule those two threads above
+normal. It is best effort -- `src/priority.rs` logs what it did and never fails
+the run -- and, like all pacing, it never changes emulated behaviour; it only
+changes when host work is scheduled. The implementation is per-platform because
+"real-time priority" is portable in neither API nor semantics:
+
+- **macOS** -- the pacer thread joins the `USER_INTERACTIVE` QoS class
+  (`pthread_set_qos_class_self_np`), the idiomatic unprivileged low-latency
+  request. The audio callback is left untouched: Core Audio already runs it on
+  a real-time thread, and pinning a QoS class onto it would only *demote* it.
+- **Windows** -- both threads are raised to `THREAD_PRIORITY_HIGHEST` via the
+  `thread-priority` crate; no privilege required.
+- **Linux / other Unix** -- raising priority needs privilege (an `rtprio`
+  rlimit, `CAP_SYS_NICE`, or root); without it the request is logged and
+  declined, and the thread keeps normal scheduling.
+
+The pacer sleeps between work chunks rather than spinning, so even the
+strongest scheduling class it can land in still yields the CPU and cannot
+starve the host -- which is why elevating it is safe to offer.
+
 ## Cross-checking against hardware
 
 `timing-test/` is a bootable disk that measures CPU and chip-bus operation

@@ -108,6 +108,7 @@ clock works.
 [emulation]
 power_on = true            # false = start powered off at the test screen
 pacing_budget = "cycles"   # "cycles" (hardware-accurate) or "instructions"
+realtime_priority = false  # true = raise the pacer/audio thread priority
 ```
 
 The deterministic cycle-driven core is the only emulation timing. It is
@@ -126,6 +127,22 @@ carried no information.)
   which is cheaper but runs the CPU faster than hardware.
   `COPPERLINE_REAL_PACING_BUDGET` overrides this for one run. See
   [](../internals/timing) for the full rationale.
+- `realtime_priority = true` asks the OS to schedule Copperline's two
+  latency-critical threads -- the wall-clock pacer and the audio callback --
+  above normal, which reduces frame stutter and audio glitches when the host
+  is busy. It is best effort and off by default, and never fails the run:
+  - **macOS** -- the pacer thread joins the `USER_INTERACTIVE` QoS class. The
+    audio callback is left alone because Core Audio already runs it on a
+    real-time thread (overriding that would only demote it).
+  - **Windows** -- both threads are raised via `SetThreadPriority`; no
+    privilege required.
+  - **Linux/other Unix** -- raising priority needs privilege (an `rtprio`
+    rlimit, `CAP_SYS_NICE`, or root). Without it the request is logged and
+    declined, and the thread keeps normal scheduling.
+
+  `COPPERLINE_REALTIME_PRIORITY` overrides this for one run; set it to
+  `0`/`false`/`off` to force it off, or to any other value (or leave it empty)
+  to force it on.
 
 ## `[cpu]`
 

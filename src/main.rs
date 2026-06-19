@@ -31,6 +31,7 @@ mod harddrive;
 mod inputrec;
 mod inputsched;
 mod memory;
+mod priority;
 mod recorder;
 mod romsearch;
 mod rtc;
@@ -909,11 +910,18 @@ fn main() -> Result<()> {
         None => None,
     };
     let floppy = FloppyController::from_config(&cfg.floppy)?;
+    // Best-effort realtime-like scheduling for the latency-critical threads.
+    // Resolved once here (env var overrides the config) so the audio sink can
+    // promote its callback thread and the pacer thread can be raised below.
+    let realtime_priority = priority::requested(cfg.emulation.realtime_priority);
+    if realtime_priority {
+        info!("priority: realtime-like thread scheduling requested (best effort)");
+    }
     let serial = Box::new(StdoutSink::new());
     let audio: Box<dyn AudioSink> = if let Some(ref wav_path) = cli.audio_wav {
         Box::new(WavSink::new(wav_path)?)
     } else if cli.audio_live {
-        Box::new(CpalSink::new()?)
+        Box::new(CpalSink::new(realtime_priority)?)
     } else {
         Box::new(NullSink)
     };
@@ -1058,6 +1066,12 @@ fn main() -> Result<()> {
         about_machine_lines(&cfg),
     );
 
+    // Elevate the thread that is about to run the event loop and the pacer.
+    // Only when actually pacing to wall-clock time: headless capture advances
+    // the core unthrottled, so priority buys it nothing.
+    if realtime_priority && paced {
+        priority::elevate_pacer_thread();
+    }
     info!(
         "entering event loop. {HOST_SHORTCUT_MODIFIER_LABEL}+Q to quit, {HOST_SHORTCUT_MODIFIER_LABEL}+S to screenshot, {HOST_SHORTCUT_MODIFIER_LABEL}+G to capture/release mouse."
     );
@@ -1099,7 +1113,8 @@ fn run_live_audio_profile(secs: f32) -> Result<()> {
         "audio profile mode: running Paula DMA to cpal for {:.3}s without window rendering",
         secs
     );
-    let audio = Box::new(CpalSink::new()?);
+    // This diagnostic mode loads no config, so the realtime knob is env-only.
+    let audio = Box::new(CpalSink::new(priority::requested(false))?);
     let mut paula = Paula::new(Box::new(StdoutSink::new()), audio);
     paula.set_led_filter_enabled(true);
 

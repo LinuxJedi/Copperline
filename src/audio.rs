@@ -115,7 +115,11 @@ pub struct CpalSink {
 }
 
 impl CpalSink {
-    pub fn new() -> Result<Self> {
+    /// Build the live cpal output sink. When `realtime_priority` is set, the
+    /// audio callback thread promotes itself on its first invocation (see
+    /// [`crate::priority`]); the flag is resolved by the caller from config and
+    /// the `COPPERLINE_REALTIME_PRIORITY` env var.
+    pub fn new(realtime_priority: bool) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -170,6 +174,11 @@ impl CpalSink {
             .build_output_stream(
                 &config,
                 move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                    // Runs on the cpal-owned audio thread. Latched internally,
+                    // so only the first callback does the scheduling syscall.
+                    if realtime_priority {
+                        crate::priority::promote_audio_thread_once();
+                    }
                     let chans = channels as usize;
                     if profile_enabled {
                         let frames = data.len() / chans;

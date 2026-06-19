@@ -36,8 +36,9 @@ ringbuf = "0.4"
 hound = "3.5"
 rfd = "0.17.2"
 gilrs = "0.11"
-# Already pulled in transitively; used directly only for localtime_r, so
-# auto-generated filenames stamp in the host's local time zone.
+# Already pulled in transitively; used directly only for localtime_r (local
+# time-zone filename stamps) and, on macOS, the pthread QoS class used for the
+# optional realtime-priority feature (see src/priority.rs).
 libc = "0.2"
 
 # macOS dock icon: winit's with_window_icon is a no-op on macOS, so the dock
@@ -47,6 +48,13 @@ libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSData"] }
+
+# Optional realtime-priority feature: cross-platform thread scheduling control.
+# Only used off macOS -- the macOS path uses the libc pthread QoS API directly
+# (Core Audio already runs the audio callback real-time), so this crate (and
+# the windows-sys it pulls in) never enters the macOS build.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+thread-priority = "3.1"
 
 [lints.clippy]
 # Chipset pipeline functions take per-signal argument lists that mirror the

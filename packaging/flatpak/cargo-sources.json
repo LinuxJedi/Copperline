@@ -3174,6 +3174,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/thread-priority/thread-priority-3.1.0.crate",
+        "sha256": "6b61f78661ff568c3a69890da32f056c54ba191afae3e41065f39cfe9217fa3c",
+        "dest": "cargo/vendor/thread-priority-3.1.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"6b61f78661ff568c3a69890da32f056c54ba191afae3e41065f39cfe9217fa3c\", \"files\": {}}",
+        "dest": "cargo/vendor/thread-priority-3.1.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/tiny-skia/tiny-skia-0.11.4.crate",
         "sha256": "83d13394d44dae3207b52a326c0c85a8bf87f1541f23b0d143811088497b09ab",
         "dest": "cargo/vendor/tiny-skia-0.11.4"

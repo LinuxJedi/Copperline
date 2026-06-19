@@ -31,6 +31,7 @@ src/
   rtc.rs            # MSM6242-compatible battery RTC
   serial.rs         # Paula serial sink (stdout)
   audio.rs          # AudioSink trait + cpal/WAV/null outputs
+  priority.rs       # opt-in realtime-like thread scheduling (pacer + audio)
   gamepad.rs        # gilrs input + guided calibration
   screenshot.rs     # PNG export helpers
   recorder.rs       # video+audio capture (ZMBV/PCM AVI writer)
@@ -96,6 +97,16 @@ The flow of a frame:
 7. For the interactive window the loop sleeps to pace emulated time to
    wall-clock; for headless captures it does not. The emulated result is
    identical either way -- pacing only schedules host work.
+
+So an interactive run uses three host threads: the **main thread** (event
+loop, core, and pacer), the **`copperline-render` worker**, and the
+**cpal audio callback** that cpal owns. Only the last two cross a thread
+boundary with the main thread, and both do so through owned data (a
+`RenderInput`/presentation buffer over a channel, and a lock-free sample ring
+buffer) rather than shared mutable state. The pacer and the audio callback are
+latency-critical and can optionally be given above-normal scheduling priority
+(`[emulation] realtime_priority`, `src/priority.rs`); see
+[](timing) for what that does per platform.
 
 ## The Bus
 
