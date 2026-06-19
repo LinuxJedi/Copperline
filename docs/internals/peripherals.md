@@ -126,6 +126,26 @@ feed the JOY0DAT quadrature counters. Gamepads are read through raw
 [](../guide/ui); on CD32 machines the pad output is serialized through
 the CD32 pad protocol instead of the plain digital joystick lines.
 
+The window layer has one host-source policy for the emulated port-2
+joystick/CD32 pad: auto, keyboard, or gamepad. Auto is the default. It
+polls the calibrated gamepad first and, when no usable pad state is
+available, resolves the keyboard joystick state instead. Keyboard mode
+skips gamepad polling for port-2 input; gamepad mode disables keyboard
+joystick capture so the mapped keys take the normal Amiga keyboard path.
+All three sources ultimately call the same `InputState::set_joystick_port2`
+and `set_cd32_buttons_port2` helpers, so JOY1DAT, /FIR1, POT1Y/POTGOR, and
+the CD32 serial bits remain hardware-derived.
+
+Keyboard joystick emulation is deliberately a host input source, not a
+guest-keyboard behaviour. When active, the winit key handler consumes the
+mapped host keys before rawkey translation: cursor keys drive directions,
+Right Ctrl/Right Alt drive fire, and the CD32 extras are C/X/D/S/Return/Z/A.
+Each alias is tracked independently before resolving to a single joystick
+state, so releasing one fire alias does not clear fire while another alias
+is still held. Releases for keys already captured as joystick controls are
+also swallowed if the source mode changes before key-up, preventing stray
+Amiga rawkey releases.
+
 ## Audio output (`audio.rs`)
 
 `AudioSink` abstracts the host boundary: a cpal live sink, a WAV-file sink

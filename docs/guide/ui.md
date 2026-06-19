@@ -19,6 +19,7 @@ The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
 | `Cmd+D` | `Alt+D` | Swap to the next disk in a drive's configured playlist |
 | `Cmd+G` | `Alt+G` | Capture / release the host mouse (clicking the display also captures) |
 | `Cmd+B` | `Alt+B` | Open the [debugger window](../debugger/window) |
+| `Cmd+J` | `Alt+J` | Cycle joystick input mode: auto, keyboard, gamepad |
 | `Esc` | `Esc` | Close an open menu or overlay window; otherwise passed through to the Amiga |
 | `Ctrl+Amiga+Amiga` | `Ctrl+Amiga+Amiga` | Keyboard reset (warm reboot) |
 
@@ -77,6 +78,8 @@ Amiga; `Esc` closes it.
   pauses the machine and opens the five-tab debugger; see
   [](../debugger/window).
 - **Calibrate Gamepad...**: the guided calibration flow, described below.
+- **Joystick Input** (also `Cmd+J` / `Alt+J`): cycles between automatic
+  selection, keyboard joystick emulation, and gamepad-only mode.
 - **Warp Speed**: runs the emulator unpaced, as fast as the host allows.
   Toggling back re-anchors real-time pacing cleanly.
 - **Record Video** (also `Cmd+R` / `Alt+R`): starts a video-with-audio
@@ -199,6 +202,24 @@ through JOY1DAT, fire through /FIR1, and a second button through
 POT1Y/POTGOR. On a CD32 machine the pad speaks the CD32 serial button
 protocol instead, including the red/blue/green/yellow and transport
 buttons. Mouse and gamepad coexist because they use different ports.
+
+If no calibrated gamepad is connected, Copperline can emulate the port-2
+joystick from the host keyboard. The default joystick input mode is
+**auto**: a calibrated USB gamepad is used when present, otherwise the
+keyboard mapping is active. Use the menu's **Joystick Input** item, or
+`Cmd+J` on macOS / `Alt+J` on Linux and Windows, to cycle through:
+
+- **auto**: gamepad when available, keyboard fallback otherwise.
+- **keyboard**: always use the keyboard mapping and ignore live gamepad
+  polling.
+- **gamepad**: use only a calibrated gamepad; keyboard keys pass through
+  to the Amiga keyboard.
+
+Keyboard joystick mode uses the FS-UAE-compatible mapping: cursor keys for
+directions, and Right Ctrl or Right Alt for fire. For CD32 pad buttons,
+`C` is red/fire, `X` is blue, `D` is green, `S` is yellow, Return is
+play/pause, `Z` is rewind, and `A` is forward. While keyboard joystick mode
+owns these keys, they are not sent to the Amiga keyboard.
 
 ## Gamepad calibration
 
