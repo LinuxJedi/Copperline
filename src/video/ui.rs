@@ -9,8 +9,8 @@
 //! (register snapshots, disassembly text) the panels render.
 
 use super::window::{
-    draw_rect_bevel, fill_rect, fill_rect_blend, rgba, scale_rect, Rect, BUTTON_EDGE_DARK,
-    BUTTON_EDGE_LIGHT, BUTTON_FACE, BUTTON_FACE_HOVER,
+    draw_rect_bevel, fill_rect, fill_rect_blend, rgba, scale_rect, JoystickInputMode, Rect,
+    BUTTON_EDGE_DARK, BUTTON_EDGE_LIGHT, BUTTON_FACE, BUTTON_FACE_HOVER,
 };
 use super::{font, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL, PRESENT_HEIGHT};
 
@@ -55,6 +55,7 @@ pub enum MenuItem {
     Shortcuts,
     Calibration,
     Debugger,
+    JoystickInput,
     Warp,
     Record,
     RecordInput,
@@ -63,9 +64,10 @@ pub enum MenuItem {
     LoadRom,
 }
 
-pub const MENU_ITEMS: [MenuItem; 10] = [
+pub const MENU_ITEMS: [MenuItem; 11] = [
     MenuItem::Debugger,
     MenuItem::Calibration,
+    MenuItem::JoystickInput,
     MenuItem::Warp,
     MenuItem::Record,
     MenuItem::RecordInput,
@@ -81,21 +83,23 @@ fn menu_item_label(
     warp: bool,
     recording: bool,
     input_recording: bool,
-) -> &'static str {
+    joystick_input_mode: JoystickInputMode,
+) -> String {
     match item {
-        MenuItem::About => "About...",
-        MenuItem::Shortcuts => "Keyboard Shortcuts...",
-        MenuItem::Calibration => "Calibrate Gamepad...",
-        MenuItem::Debugger => "Debugger...",
-        MenuItem::Warp if warp => "Warp Speed      [on]",
-        MenuItem::Warp => "Warp Speed     [off]",
-        MenuItem::Record if recording => "Stop Video Recording",
-        MenuItem::Record => "Record Video",
-        MenuItem::RecordInput if input_recording => "Stop Input Recording",
-        MenuItem::RecordInput => "Record Input",
-        MenuItem::SaveState => "Save State",
-        MenuItem::LoadState => "Load State...",
-        MenuItem::LoadRom => "Load Kickstart ROM...",
+        MenuItem::About => "About...".to_string(),
+        MenuItem::Shortcuts => "Keyboard Shortcuts...".to_string(),
+        MenuItem::Calibration => "Calibrate Gamepad...".to_string(),
+        MenuItem::Debugger => "Debugger...".to_string(),
+        MenuItem::JoystickInput => format!("Joystick Input  [{}]", joystick_input_mode.label()),
+        MenuItem::Warp if warp => "Warp Speed      [on]".to_string(),
+        MenuItem::Warp => "Warp Speed     [off]".to_string(),
+        MenuItem::Record if recording => "Stop Video Recording".to_string(),
+        MenuItem::Record => "Record Video".to_string(),
+        MenuItem::RecordInput if input_recording => "Stop Input Recording".to_string(),
+        MenuItem::RecordInput => "Record Input".to_string(),
+        MenuItem::SaveState => "Save State".to_string(),
+        MenuItem::LoadState => "Load State...".to_string(),
+        MenuItem::LoadRom => "Load Kickstart ROM...".to_string(),
     }
 }
 
@@ -638,6 +642,7 @@ fn draw_menu(
     warp: bool,
     recording: bool,
     input_recording: bool,
+    joystick_input_mode: JoystickInputMode,
     scale: usize,
 ) {
     let rect = menu_rect();
@@ -659,7 +664,7 @@ fn draw_menu(
             frame,
             item_rect.x + 8,
             item_rect.y + (MENU_ITEM_H - 16) / 2,
-            menu_item_label(*item, warp, recording, input_recording),
+            &menu_item_label(*item, warp, recording, input_recording, joystick_input_mode),
             fg,
             2,
             scale,
@@ -742,7 +747,7 @@ fn draw_about(frame: &mut [u8], rect: Rect, view: &AboutView, scale: usize) {
     }
 }
 
-const SHORTCUT_ROWS: [(&str, &str, bool); 11] = [
+const SHORTCUT_ROWS: [(&str, &str, bool); 12] = [
     ("Q", "Quit", true),
     ("S", "Save screenshot", true),
     ("R", "Record video on/off", true),
@@ -752,6 +757,7 @@ const SHORTCUT_ROWS: [(&str, &str, bool); 11] = [
     ("D", "Swap queued disk", true),
     ("G", "Capture mouse", true),
     ("B", "Debugger", true),
+    ("J", "Joystick input mode", true),
     ("Esc", "Close menu/window", false),
     ("Ctrl+Ami+Ami", "Keyboard reset", false),
 ];
@@ -997,6 +1003,7 @@ pub fn draw(
     warp: bool,
     recording: bool,
     input_recording: bool,
+    joystick_input_mode: JoystickInputMode,
 ) {
     if let Some(panel) = &ui.panel {
         draw_panel_chrome(frame, panel, hover, texture_scale);
@@ -1022,6 +1029,7 @@ pub fn draw(
             warp,
             recording,
             input_recording,
+            joystick_input_mode,
             texture_scale,
         );
     }
@@ -1150,6 +1158,12 @@ mod tests {
         let first = menu_item_rect(0);
         let pos = (first.x as i32 + 4, first.y as i32 + 4);
         assert_eq!(ui.control_at(pos), Some(UiControl::MenuItem(MENU_ITEMS[0])));
+        let joystick = menu_item_rect(2);
+        let pos = (joystick.x as i32 + 4, joystick.y as i32 + 4);
+        assert_eq!(
+            ui.control_at(pos),
+            Some(UiControl::MenuItem(MenuItem::JoystickInput))
+        );
         // Outside the menu: nothing (the click closes the menu).
         assert_eq!(ui.control_at((0, 0)), None);
     }
@@ -1304,7 +1318,17 @@ mod tests {
             menu_open: true,
             panel: None,
         };
-        draw(&mut frame, scale, &ui, None, None, true, false, false);
+        draw(
+            &mut frame,
+            scale,
+            &ui,
+            None,
+            None,
+            true,
+            false,
+            false,
+            JoystickInputMode::Auto,
+        );
         let menu = menu_rect();
         let probe = ((menu.y + MENU_PAD + 2) * w + menu.x + 4) * 4;
         assert_eq!(&frame[probe..probe + 4], &MENU_BG.to_le_bytes());
@@ -1334,6 +1358,7 @@ mod tests {
             false,
             false,
             false,
+            JoystickInputMode::Auto,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "about");
@@ -1352,6 +1377,7 @@ mod tests {
             false,
             false,
             false,
+            JoystickInputMode::Auto,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "shortcuts");
@@ -1387,6 +1413,7 @@ mod tests {
             false,
             false,
             false,
+            JoystickInputMode::Auto,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "calibration");
@@ -1429,6 +1456,7 @@ mod tests {
             false,
             false,
             false,
+            JoystickInputMode::Auto,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "debugger");
@@ -1468,6 +1496,7 @@ mod tests {
             false,
             false,
             false,
+            JoystickInputMode::Auto,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "debugger-break");

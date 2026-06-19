@@ -60,6 +60,161 @@ impl JoyButtonKind {
     }
 }
 
+/// Host input source for the emulated port-2 joystick/CD32 pad. Auto keeps
+/// a calibrated physical pad in charge when one is present and otherwise
+/// falls back to keyboard joystick emulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoystickInputMode {
+    Auto,
+    Gamepad,
+    Keyboard,
+}
+
+impl JoystickInputMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Keyboard,
+            Self::Keyboard => Self::Gamepad,
+            Self::Gamepad => Self::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gamepad => "gamepad",
+            Self::Keyboard => "keyboard",
+        }
+    }
+}
+
+impl Default for JoystickInputMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardJoystickKey {
+    Up,
+    Down,
+    Left,
+    Right,
+    FireRightCtrl,
+    FireRightAlt,
+    Red,
+    Blue,
+    Green,
+    Yellow,
+    Play,
+    Rewind,
+    Forward,
+}
+
+/// Host keys currently held for keyboard joystick emulation. Fire has
+/// multiple aliases, so this tracks individual keys and resolves them to
+/// one port state when applied.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct KeyboardJoystickHeld {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+    fire_right_ctrl: bool,
+    fire_right_alt: bool,
+    red: bool,
+    blue: bool,
+    green: bool,
+    yellow: bool,
+    play: bool,
+    rwd: bool,
+    ffw: bool,
+}
+
+impl KeyboardJoystickHeld {
+    fn set(&mut self, key: KeyboardJoystickKey, held: bool) {
+        match key {
+            KeyboardJoystickKey::Up => self.up = held,
+            KeyboardJoystickKey::Down => self.down = held,
+            KeyboardJoystickKey::Left => self.left = held,
+            KeyboardJoystickKey::Right => self.right = held,
+            KeyboardJoystickKey::FireRightCtrl => self.fire_right_ctrl = held,
+            KeyboardJoystickKey::FireRightAlt => self.fire_right_alt = held,
+            KeyboardJoystickKey::Red => self.red = held,
+            KeyboardJoystickKey::Blue => self.blue = held,
+            KeyboardJoystickKey::Green => self.green = held,
+            KeyboardJoystickKey::Yellow => self.yellow = held,
+            KeyboardJoystickKey::Play => self.play = held,
+            KeyboardJoystickKey::Rewind => self.rwd = held,
+            KeyboardJoystickKey::Forward => self.ffw = held,
+        }
+    }
+
+    fn is_set(&self, key: KeyboardJoystickKey) -> bool {
+        match key {
+            KeyboardJoystickKey::Up => self.up,
+            KeyboardJoystickKey::Down => self.down,
+            KeyboardJoystickKey::Left => self.left,
+            KeyboardJoystickKey::Right => self.right,
+            KeyboardJoystickKey::FireRightCtrl => self.fire_right_ctrl,
+            KeyboardJoystickKey::FireRightAlt => self.fire_right_alt,
+            KeyboardJoystickKey::Red => self.red,
+            KeyboardJoystickKey::Blue => self.blue,
+            KeyboardJoystickKey::Green => self.green,
+            KeyboardJoystickKey::Yellow => self.yellow,
+            KeyboardJoystickKey::Play => self.play,
+            KeyboardJoystickKey::Rewind => self.rwd,
+            KeyboardJoystickKey::Forward => self.ffw,
+        }
+    }
+
+    fn joystick_state(&self) -> crate::gamepad::JoystickState {
+        crate::gamepad::JoystickState {
+            up: self.up,
+            down: self.down,
+            left: self.left,
+            right: self.right,
+            fire: self.fire_right_ctrl || self.fire_right_alt || self.red,
+            button2: self.blue,
+            green: self.green,
+            yellow: self.yellow,
+            play: self.play,
+            rwd: self.rwd,
+            ffw: self.ffw,
+        }
+    }
+}
+
+/// FS-UAE-compatible keyboard joystick/gamepad emulation:
+/// cursor keys for directions; Right Ctrl/Right Alt for fire; CD32 extras
+/// on C/X/D/S/Return/Z/A.
+fn keyboard_joystick_key_for(code: KeyCode) -> Option<KeyboardJoystickKey> {
+    Some(match code {
+        KeyCode::ArrowUp => KeyboardJoystickKey::Up,
+        KeyCode::ArrowDown => KeyboardJoystickKey::Down,
+        KeyCode::ArrowLeft => KeyboardJoystickKey::Left,
+        KeyCode::ArrowRight => KeyboardJoystickKey::Right,
+        KeyCode::ControlRight => KeyboardJoystickKey::FireRightCtrl,
+        KeyCode::AltRight => KeyboardJoystickKey::FireRightAlt,
+        KeyCode::KeyC => KeyboardJoystickKey::Red,
+        KeyCode::KeyX => KeyboardJoystickKey::Blue,
+        KeyCode::KeyD => KeyboardJoystickKey::Green,
+        KeyCode::KeyS => KeyboardJoystickKey::Yellow,
+        KeyCode::Enter | KeyCode::NumpadEnter => KeyboardJoystickKey::Play,
+        KeyCode::KeyZ => KeyboardJoystickKey::Rewind,
+        KeyCode::KeyA => KeyboardJoystickKey::Forward,
+        _ => return None,
+    })
+}
+
+fn joystick_mode_uses_keyboard(mode: JoystickInputMode, gamepad_active: bool) -> bool {
+    match mode {
+        JoystickInputMode::Keyboard => true,
+        JoystickInputMode::Auto => !gamepad_active,
+        JoystickInputMode::Gamepad => false,
+    }
+}
+
 /// The port-2 controls currently held by `--joy-after` scripting.
 #[derive(Debug, Default, Clone, Copy)]
 struct AutoJoyHeld {
@@ -356,6 +511,14 @@ pub struct App {
     /// input backend is available (e.g. headless CI) or the pad is not yet
     /// calibrated.
     gamepad: crate::gamepad::GamepadReader,
+    /// Host source policy for the emulated port-2 joystick/CD32 pad.
+    joystick_input_mode: JoystickInputMode,
+    /// Whether the last normal input poll resolved a calibrated physical
+    /// gamepad. Auto mode uses this to decide whether mapped keyboard keys
+    /// should be consumed as joystick controls.
+    last_gamepad_active: bool,
+    /// Mapped host keys currently held for keyboard joystick emulation.
+    keyboard_joy_held: KeyboardJoystickHeld,
     /// Pop-up menu and overlay sub-window (about/debugger/calibration)
     /// state. While a panel is open it consumes pointer and key input.
     ui: UiState,
@@ -589,6 +752,9 @@ impl App {
             hcenter: hcenter_enabled(),
             overscan,
             gamepad: crate::gamepad::GamepadReader::new(),
+            joystick_input_mode: JoystickInputMode::default(),
+            last_gamepad_active: false,
+            keyboard_joy_held: KeyboardJoystickHeld::default(),
             ui: UiState::default(),
             about_machine_lines,
             paused_before_debugger: false,
@@ -598,29 +764,95 @@ impl App {
         }
     }
 
-    /// Poll the calibrated gamepad and drive the emulated port-2 joystick.
-    /// Called once per scheduler quantum; with no pad (or an uncalibrated
-    /// one), port 2 stays a mouse unless --joy-after scripting is active.
-    fn pump_gamepad(&mut self) {
-        let state = self.gamepad.poll();
-        match state {
-            Some(s) => {
-                let input = &mut self.emu.bus_mut().input;
-                input.set_joystick_port2(s.up, s.down, s.left, s.right, s.fire, s.button2);
-                input.set_cd32_buttons_port2(s.play, s.rwd, s.ffw, s.green, s.yellow);
-            }
+    /// Poll the active host joystick source and drive the emulated port-2
+    /// joystick. Called once per scheduler quantum. In Auto mode, a
+    /// calibrated gamepad wins; otherwise the keyboard mapping supplies a
+    /// joystick so port 2 remains usable without a physical controller.
+    fn pump_joystick_input(&mut self) {
+        let gamepad_state = match self.joystick_input_mode {
+            JoystickInputMode::Keyboard => None,
+            JoystickInputMode::Auto | JoystickInputMode::Gamepad => self.gamepad.poll(),
+        };
+        self.last_gamepad_active = gamepad_state.is_some();
+
+        match gamepad_state {
+            Some(state) => self.apply_joystick_state(state),
             // No physical pad but --joy-after scripting has fired: keep
             // asserting the scripted state so it survives this release
             // path and drives the upcoming scheduler quantum.
             None if self.auto_joy_engaged => self.apply_auto_joy_state(),
-            // Pad gone/uncalibrated: release everything so nothing sticks.
+            None if self.keyboard_joystick_enabled() => self.apply_keyboard_joystick_state(),
+            // Pad gone/uncalibrated and keyboard fallback disabled: release
+            // everything so nothing sticks.
             None if self.emu.bus().input.joystick_port2 => {
-                let input = &mut self.emu.bus_mut().input;
-                input.set_joystick_port2(false, false, false, false, false, false);
-                input.set_cd32_buttons_port2(false, false, false, false, false);
+                self.release_port2_joystick();
             }
             None => {}
         }
+    }
+
+    fn keyboard_joystick_enabled(&self) -> bool {
+        joystick_mode_uses_keyboard(self.joystick_input_mode, self.last_gamepad_active)
+    }
+
+    fn apply_joystick_state(&mut self, state: crate::gamepad::JoystickState) {
+        let input = &mut self.emu.bus_mut().input;
+        input.set_joystick_port2(
+            state.up,
+            state.down,
+            state.left,
+            state.right,
+            state.fire,
+            state.button2,
+        );
+        input.set_cd32_buttons_port2(state.play, state.rwd, state.ffw, state.green, state.yellow);
+    }
+
+    fn apply_keyboard_joystick_state(&mut self) {
+        self.apply_joystick_state(self.keyboard_joy_held.joystick_state());
+    }
+
+    fn release_port2_joystick(&mut self) {
+        let input = &mut self.emu.bus_mut().input;
+        input.set_joystick_port2(false, false, false, false, false, false);
+        input.set_cd32_buttons_port2(false, false, false, false, false);
+    }
+
+    fn cycle_joystick_input_mode(&mut self) {
+        self.set_joystick_input_mode(self.joystick_input_mode.next());
+    }
+
+    fn set_joystick_input_mode(&mut self, mode: JoystickInputMode) {
+        if self.joystick_input_mode == mode {
+            return;
+        }
+        self.joystick_input_mode = mode;
+        if mode == JoystickInputMode::Keyboard {
+            self.last_gamepad_active = false;
+        }
+        if !matches!(self.ui.panel, Some(Panel::Calibration(_))) {
+            self.pump_joystick_input();
+        }
+        info!("joystick input mode: {}", mode.label());
+        self.show_osd(format!("Joystick input: {}", mode.label()));
+    }
+
+    /// Consume a mapped host key as joystick input when keyboard joystick
+    /// emulation is active. Releases for previously consumed mapped keys
+    /// are also swallowed, even if a gamepad has taken over meanwhile.
+    fn handle_keyboard_joystick_key(&mut self, code: KeyCode, pressed: bool) -> bool {
+        let Some(key) = keyboard_joystick_key_for(code) else {
+            return false;
+        };
+        let was_held = self.keyboard_joy_held.is_set(key);
+        if !self.keyboard_joystick_enabled() && !was_held {
+            return false;
+        }
+        self.keyboard_joy_held.set(key, pressed);
+        if self.keyboard_joystick_enabled() {
+            self.apply_keyboard_joystick_state();
+        }
+        true
     }
 
     /// Drive the emulated port-2 joystick/CD32 pad from the --joy-after
@@ -930,6 +1162,11 @@ impl ApplicationHandler for App {
                     {
                         self.toggle_debugger()
                     }
+                    (KeyCode::KeyJ, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers) =>
+                    {
+                        self.cycle_joystick_input_mode()
+                    }
                     (KeyCode::KeyR, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers)
                             && self.modifiers.shift_key() =>
@@ -950,6 +1187,9 @@ impl ApplicationHandler for App {
                         // into the emulated machine. Releases still pass so
                         // a key held across opening a panel is not stuck.
                         if pressed && self.ui.panel.is_some() {
+                            return;
+                        }
+                        if self.handle_keyboard_joystick_key(other, pressed) {
                             return;
                         }
                         if let Some(rawkey) = host_to_amiga_rawkey(other) {
@@ -1137,6 +1377,7 @@ impl ApplicationHandler for App {
                         warp,
                         recording,
                         input_recording,
+                        self.joystick_input_mode,
                     );
                     if let Err(e) = r.pixels.render() {
                         error!("pixels.render: {e}");
@@ -1207,7 +1448,7 @@ impl ApplicationHandler for App {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         } else {
-            self.pump_gamepad();
+            self.pump_joystick_input();
         }
         // Run one scheduler quantum. Rebuild the host framebuffer only
         // when Agnus has crossed into a new frame; the expensive renderer
@@ -1285,7 +1526,7 @@ impl ApplicationHandler for App {
             true
         });
         // Fire any scheduled --joy-after events into the port-2
-        // joystick/CD32-pad state, then assert the held set (pump_gamepad
+        // joystick/CD32-pad state, then assert the held set (input polling
         // re-applies it every quantum while scripting is engaged).
         let mut joy_changed = false;
         let held = &mut self.auto_joy_held;
@@ -3975,6 +4216,7 @@ impl App {
                             Some(Panel::Calibration(crate::gamepad::CalibrationSession::new()));
                     }
                     ui::MenuItem::Debugger => self.open_debugger(),
+                    ui::MenuItem::JoystickInput => self.cycle_joystick_input_mode(),
                     ui::MenuItem::Warp => self.toggle_warp(),
                     ui::MenuItem::Record => self.toggle_recording(),
                     ui::MenuItem::RecordInput => self.toggle_input_recording(),
@@ -5874,17 +6116,19 @@ mod tests {
         bar_layout, bitplane, center_present_frame_for_visible_start,
         center_present_frame_horizontally, control_at, copperline_icon_image,
         copperline_logo_image, copy_present_frame, draw_status_bar, fdd_track_counter_rect,
-        fdd_track_digit_rect, host_shortcut_modifier_pressed, host_to_amiga_rawkey, led_row_rect,
+        fdd_track_digit_rect, host_shortcut_modifier_pressed, host_to_amiga_rawkey,
+        joystick_mode_uses_keyboard, keyboard_joystick_key_for, led_row_rect,
         mask_present_frame_to_tv, paint_test_screen, parse_amiga_key, pause_button_rect,
         power_button_rect, present_row_sample, presentation_source_y_offset, reboot_button_rect,
         rgba, shot_button_rect, should_render_emulated_frame, standard_window_top_row,
         status_with_latched_fdd_track, take_integral_mouse_delta, texture_height, texture_width,
-        volume_percent_from_pos, volume_slider_track_rect, BarControl, DriveBar, MediaBar,
-        StatusBarView, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF, CD_LED_ON,
-        DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON,
-        POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
-        STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
-        TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
+        volume_percent_from_pos, volume_slider_track_rect, BarControl, DriveBar, JoystickInputMode,
+        KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar, StatusBarView, BUTTON_GLYPH,
+        BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF, CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW,
+        DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF,
+        POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT, STANDARD_PAL_VISIBLE_LINES,
+        STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON,
+        VOLUME_FILL, VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::FrontPanelStatus;
@@ -5934,6 +6178,98 @@ mod tests {
         assert_eq!(host_to_amiga_rawkey(KeyCode::AltRight), Some(0x65));
         assert_eq!(host_to_amiga_rawkey(KeyCode::SuperLeft), Some(0x66));
         assert_eq!(host_to_amiga_rawkey(KeyCode::SuperRight), Some(0x67));
+    }
+
+    #[test]
+    fn keyboard_joystick_mapping_matches_fsuae_controls() {
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::ArrowUp),
+            Some(KeyboardJoystickKey::Up)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::ArrowDown),
+            Some(KeyboardJoystickKey::Down)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::ArrowLeft),
+            Some(KeyboardJoystickKey::Left)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::ArrowRight),
+            Some(KeyboardJoystickKey::Right)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::ControlRight),
+            Some(KeyboardJoystickKey::FireRightCtrl)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::AltRight),
+            Some(KeyboardJoystickKey::FireRightAlt)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::KeyC),
+            Some(KeyboardJoystickKey::Red)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::KeyX),
+            Some(KeyboardJoystickKey::Blue)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::KeyD),
+            Some(KeyboardJoystickKey::Green)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::KeyS),
+            Some(KeyboardJoystickKey::Yellow)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::Enter),
+            Some(KeyboardJoystickKey::Play)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::KeyZ),
+            Some(KeyboardJoystickKey::Rewind)
+        );
+        assert_eq!(
+            keyboard_joystick_key_for(KeyCode::KeyA),
+            Some(KeyboardJoystickKey::Forward)
+        );
+        assert_eq!(keyboard_joystick_key_for(KeyCode::ControlLeft), None);
+    }
+
+    #[test]
+    fn keyboard_joystick_fire_aliases_release_independently() {
+        let mut held = KeyboardJoystickHeld::default();
+        held.set(KeyboardJoystickKey::FireRightCtrl, true);
+        held.set(KeyboardJoystickKey::Red, true);
+        assert!(held.joystick_state().fire);
+
+        held.set(KeyboardJoystickKey::FireRightCtrl, false);
+        assert!(held.joystick_state().fire);
+
+        held.set(KeyboardJoystickKey::Red, false);
+        assert!(!held.joystick_state().fire);
+    }
+
+    #[test]
+    fn joystick_input_mode_policy_uses_keyboard_as_auto_fallback() {
+        assert_eq!(JoystickInputMode::Auto.next(), JoystickInputMode::Keyboard);
+        assert_eq!(
+            JoystickInputMode::Keyboard.next(),
+            JoystickInputMode::Gamepad
+        );
+        assert_eq!(JoystickInputMode::Gamepad.next(), JoystickInputMode::Auto);
+
+        assert!(joystick_mode_uses_keyboard(JoystickInputMode::Auto, false));
+        assert!(!joystick_mode_uses_keyboard(JoystickInputMode::Auto, true));
+        assert!(joystick_mode_uses_keyboard(
+            JoystickInputMode::Keyboard,
+            true
+        ));
+        assert!(!joystick_mode_uses_keyboard(
+            JoystickInputMode::Gamepad,
+            false
+        ));
     }
 
     #[test]

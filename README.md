@@ -104,9 +104,11 @@ positional argument, or point at a config file:
 Essential shortcuts use `Cmd` on macOS and `Alt` on Linux/Windows:
 `Cmd+Q` / `Alt+Q` closes the window, `Esc` passes through to the Amiga (or
 closes an open menu/window), `Cmd+S` / `Alt+S` saves a screenshot, and
-`Cmd+B` / `Alt+B` opens the debugger. The status bar, pop-up menu, overlay
-windows (debugger, gamepad calibration, save/load state, input recording),
-and the full shortcut list are documented in the
+`Cmd+B` / `Alt+B` opens the debugger. `Cmd+J` / `Alt+J` cycles joystick
+input between automatic selection, keyboard emulation, and gamepad-only.
+The status bar, pop-up menu, overlay windows (debugger, gamepad
+calibration, save/load state, input recording), and the full shortcut list
+are documented in the
 [user guide](docs/guide/ui.md).
 
 ## Configuration
@@ -186,7 +188,7 @@ release needs resolved first. Release steps for every channel are in
 | Denise BPLCON / COLORxx | Stored and replayed by beam position. |
 | Bitplane renderer | OCS lo-res or hi-res; reads chip RAM via BPLxPT; honours modulos and beam-timed BPLCON1 scroll; EHB, HAM, dual playfield, and CLXDAT collisions. Completed frames render on a worker thread by default; `COPPERLINE_THREADED_RENDER=0` forces synchronous rendering. |
 | Display window | winit 0.30 + pixels 0.17 surface; 716x285 framebuffer presented at 4:3 (716x537) plus a 44-pixel status bar with power/disk controls. |
-| Keyboard / mouse / gamepad | Host keyboard/mouse mapped to Amiga input paths; key down and key up events go through CIA-A SDR/ICR with acknowledge + KDAT handshake backpressure and keyboard-MCU pacing; mouse deltas feed JOY0DAT; `Cmd+G` on macOS or `Alt+G` on Linux/Windows toggles host mouse capture; a USB gamepad (gilrs) drives the port-2 digital joystick (JOY1DAT directions, /FIR1 fire, POT1Y button 2); Ctrl+Ami+Ami resets. |
+| Keyboard / mouse / gamepad | Host keyboard/mouse mapped to Amiga input paths; key down and key up events go through CIA-A SDR/ICR with acknowledge + KDAT handshake backpressure and keyboard-MCU pacing; mouse deltas feed JOY0DAT; `Cmd+G` on macOS or `Alt+G` on Linux/Windows toggles host mouse capture; a USB gamepad (gilrs) or keyboard joystick emulation drives the port-2 digital joystick (JOY1DAT directions, /FIR1 fire, POT1Y button 2); Ctrl+Ami+Ami resets. |
 | OCS sprites | 8 DMA/manual 16-pixel sprites, attached sprites, composited over bitplanes with playfield priority. |
 | Chip bus arbitration | Per-colour-clock OCS slot ownership for refresh, display DMA, sprites, disk, audio, Copper, blitter, and CPU chip/custom accesses, with CPU wait states. |
 | ECS | ECS Agnus revisions (8372A/8375) and ECS Denise (8373): up to 2M chip RAM, DIWHIGH, BEAMCON0, SuperHires, ECS blitter (BLTSIZV/BLTSIZH), programmable geometry. |
