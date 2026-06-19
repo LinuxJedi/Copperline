@@ -60,7 +60,7 @@ const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// upstream bitplane shifter. Treat the left output edge as the first visible
 /// colour-register position rather than the earlier bitplane-control domain.
 /// Moved left by 8 colour clocks alongside the other origin anchors.
-const COLOR_WRITE_HPOS_FB0: i32 = 0x34;
+const COLOR_WRITE_HPOS_FB0: i32 = 0x36;
 /// Framebuffer-x offset between the copper/register coordinate
 /// ([`COPPER_WAIT_HPOS_FB0`], used to place beam-timed register writes) and the
 /// bitplane/DIW coordinate ([`DIW_HSTART_FB0`], used to place fetched bitplane
@@ -6804,7 +6804,7 @@ mod tests {
         );
         assert_eq!(
             beam_to_framebuffer_x_unclamped(COLOR_WRITE_HPOS_FB0 as u32),
-            48
+            56
         );
     }
 

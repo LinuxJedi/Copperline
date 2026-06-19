@@ -2525,7 +2525,7 @@ impl Bus {
     fn latch_blitter_completion(&mut self, source: &'static str) {
         let intreq_before = self.paula.intreq;
         self.paula.intreq |= INT_BLIT;
-        self.note_irq_latches_changed();
+        self.note_irq_source_asserted();
         self.trace_blitter_completion(source, intreq_before);
     }
 
@@ -2602,11 +2602,7 @@ impl Bus {
         if setting == 0 {
             return;
         }
-        let pending = if self.paula.intena & crate::chipset::paula::INT_MASTER != 0 {
-            self.paula.intena & self.paula.intreq & IRQ_SOURCE_BITS
-        } else {
-            0
-        };
+        let pending = self.current_enabled_irq_sources();
         let newly = pending & !self.irq_latency_last_pending;
         if newly != 0 {
             self.irq_latency_mask |= newly;
@@ -2617,11 +2613,25 @@ impl Bus {
         self.irq_latency_last_pending = pending;
     }
 
-    /// INTREQ/INTENA changes are edge-sensitive for the interrupt-recognition
-    /// delay. Device ticks call this once after their batched latch updates; CPU
-    /// register writes and synchronous blitter finishes call it immediately so a
-    /// source that is cleared and then reasserted gets a fresh recognition edge.
+    fn current_enabled_irq_sources(&self) -> u16 {
+        if self.paula.intena & crate::chipset::paula::INT_MASTER != 0 {
+            self.paula.intena & self.paula.intreq & IRQ_SOURCE_BITS
+        } else {
+            0
+        }
+    }
+
+    /// CPU INTENA/INTREQ writes change Paula's mask/latch state, but they are
+    /// not new asynchronous interrupt-source edges. Keep the delayed-bit state
+    /// coherent without hiding an already-latched source again; real recognition
+    /// latency is armed where Paula/CIA/blitter sources assert.
     fn note_irq_latches_changed(&mut self) {
+        let pending = self.current_enabled_irq_sources();
+        self.irq_latency_mask &= pending;
+        self.irq_latency_last_pending = pending;
+    }
+
+    fn note_irq_source_asserted(&mut self) {
         self.arm_irq_recognition_latency();
     }
 
@@ -3565,7 +3575,9 @@ impl Bus {
             0x030 => {
                 let irq = self.paula.write_serdat(val);
                 self.paula.intreq |= irq;
-                self.note_irq_latches_changed();
+                if irq != 0 {
+                    self.note_irq_source_asserted();
+                }
                 irq & self.paula.intena != 0
             }
             0x032 => {
@@ -3607,7 +3619,7 @@ impl Bus {
                 }
                 if self.floppy.write_dsklen(val, self.paula.adkcon) {
                     self.paula.intreq |= crate::chipset::paula::INT_DSKBLK;
-                    self.note_irq_latches_changed();
+                    self.note_irq_source_asserted();
                     return self.paula.intena & crate::chipset::paula::INT_DSKBLK != 0;
                 }
                 false
@@ -3947,7 +3959,7 @@ impl Bus {
             0x07E => {
                 if self.floppy.write_dsksync(val) {
                     self.paula.intreq |= INT_DSKSYNC;
-                    self.note_irq_latches_changed();
+                    self.note_irq_source_asserted();
                     return self.paula.intena & INT_DSKSYNC != 0;
                 }
                 false
@@ -3996,14 +4008,18 @@ impl Bus {
                 }
                 let coper_was_pending = self.paula.intreq & INT_COPER != 0;
                 let asserted = self.paula.write_intreq(val);
-                self.note_irq_latches_changed();
-                if matches!(source, BeamWriteSource::Copper)
+                let copper_asserted = matches!(source, BeamWriteSource::Copper)
                     && val & 0x8000 != 0
                     && val & INT_COPER != 0
-                    && !coper_was_pending
-                {
+                    && !coper_was_pending;
+                if copper_asserted {
                     self.pending_copper_irq_beam = Some((self.agnus.vpos, self.agnus.hpos));
                     self.coper_cpu_irq_delay_cck = COPER_CPU_IRQ_DELAY_CCK;
+                }
+                if copper_asserted && asserted {
+                    self.note_irq_source_asserted();
+                } else {
+                    self.note_irq_latches_changed();
                 }
                 if val & 0x8000 == 0 && val & INT_COPER != 0 {
                     self.pending_copper_irq_beam = None;
@@ -4299,7 +4315,7 @@ impl Bus {
                     }
                     self.display_dma_sprpt[idx] = self.denise.sprpt[idx];
                     if off & 2 != 0 {
-                        self.retarget_display_sprite_dma_pointer(idx);
+                        self.apply_display_sprite_pointer_low_write(idx);
                     }
                 }
                 false
@@ -6421,8 +6437,21 @@ impl Bus {
         }
     }
 
-    fn retarget_display_sprite_dma_pointer(&mut self, sprite: usize) {
-        self.retarget_display_sprite_dma_pointer_at(sprite, self.agnus.vpos, self.agnus.hpos);
+    fn apply_display_sprite_pointer_low_write(&mut self, sprite: usize) {
+        self.apply_display_sprite_pointer_low_write_at(sprite, self.agnus.vpos, self.agnus.hpos);
+    }
+
+    fn apply_display_sprite_pointer_low_write_at(&mut self, sprite: usize, vpos: u32, hpos: u32) {
+        if sprite >= 8 {
+            return;
+        }
+        let pair_slot_hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[sprite / 2];
+        let state = self.display_dma_sprite_state[sprite];
+        if hpos > pair_slot_hpos && state.control.is_some() && !state.data_dma_active {
+            self.display_dma_sprite_state[sprite] = DisplaySpriteDmaState::default();
+            return;
+        }
+        self.retarget_display_sprite_dma_pointer_at(sprite, vpos, hpos);
     }
 
     fn retarget_display_sprite_dma_pointer_at(&mut self, sprite: usize, vpos: u32, hpos: u32) {
@@ -6711,7 +6740,7 @@ impl Bus {
         } else {
             let cur = self.display_dma_sprpt[idx];
             self.display_dma_sprpt[idx] = (cur & 0x00FF_0000) | (value as u32 & 0xFFFE);
-            self.retarget_display_sprite_dma_pointer_at(idx, vpos, hpos);
+            self.apply_display_sprite_pointer_low_write_at(idx, vpos, hpos);
         }
     }
 
@@ -9403,7 +9432,7 @@ mod tests {
 
     const STANDARD_DIW_HSTART: i32 = 0x81;
     const STANDARD_VISIBLE_X0: usize = ((STANDARD_DIW_HSTART - RENDER_DIW_HSTART_FB0) * 2) as usize;
-    const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x34;
+    const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x36;
     static BUS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn render_color_write_x(hpos: u32) -> usize {
@@ -10441,6 +10470,20 @@ mod tests {
         assert_eq!(bus.paula.intreq & INT_COPER, 0);
         assert_eq!(bus.cpu_visible_intreq() & INT_COPER, 0);
         assert_eq!(bus.pending_copper_irq_beam, None);
+    }
+
+    #[test]
+    fn intena_unmasks_latched_source_without_new_recognition_delay() {
+        let mut bus = empty_bus();
+        bus.irq_latency_setting = 65;
+        bus.paula.intreq = INT_VERTB;
+
+        assert!(!bus.custom_write(0x09A, 2, u64::from(0x8000 | INT_MASTER | INT_VERTB)));
+
+        assert_ne!(bus.paula.intena & INT_MASTER, 0);
+        assert_ne!(bus.cpu_visible_intreq() & INT_VERTB, 0);
+        assert_eq!(bus.irq_latency_mask & INT_VERTB, 0);
+        assert_eq!(bus.irq_latency_last_pending & INT_VERTB, INT_VERTB);
     }
 
     #[test]
@@ -13761,6 +13804,54 @@ mod tests {
         assert_eq!(lines[0].hstart, 0x0083);
         assert_eq!(lines[0].data, 0xAAAA);
         assert_eq!(lines[0].datb, 0xBBBB);
+    }
+
+    #[test]
+    fn sprite_pointer_write_after_pair_slot_seeds_next_descriptor_fetch() {
+        let mut bus = empty_bus();
+        bus.set_chipset_revisions(AgnusRevision::AgaAlice, DeniseRevision::AgaLisa);
+        bus.agnus.write_fmode(0x000C); // SPR32 | SPAGEM: 64-bit sprite fetches.
+
+        let old_ptr = 0x0100usize;
+        let new_ptr = 0x0200usize;
+        let (old_pos, old_ctl) = sprite_control_words(0x2C, 0x30, 0x0083);
+        let (new_pos, new_ctl) = sprite_control_words(0x2C, 0x30, 0x00C1);
+        write_chip_word(&mut bus, old_ptr, old_pos);
+        write_chip_word(&mut bus, old_ptr + 8, old_ctl);
+        write_chip_word(&mut bus, old_ptr + 16, 0x1111);
+        write_chip_word(&mut bus, old_ptr + 24, 0x2222);
+        write_chip_word(&mut bus, new_ptr, new_pos);
+        write_chip_word(&mut bus, new_ptr + 8, new_ctl);
+        for w in 0..4 {
+            write_chip_word(&mut bus, new_ptr + 16 + w * 2, 0xA000 + w as u16);
+            write_chip_word(&mut bus, new_ptr + 24 + w * 2, 0xB000 + w as u16);
+        }
+
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.denise.sprpt[2] = old_ptr as u32;
+        bus.display_dma_sprpt[2] = old_ptr as u32;
+
+        let slot = SPRITE_DMA_PAIR_CAPTURE_HPOS[1];
+        bus.agnus.vpos = 0;
+        bus.agnus.hpos = slot - 1;
+        bus.advance_chipset(2);
+        let _ = bus.write_custom_word_from(0x128, (new_ptr >> 16) as u16, BeamWriteSource::Copper);
+        let _ = bus.write_custom_word_from(0x12A, new_ptr as u16, BeamWriteSource::Copper);
+
+        bus.agnus.vpos = 0x2C;
+        bus.agnus.hpos = slot - 1;
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert!(bus.frame_sprite_dma_observed());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].sprite, 2);
+        assert_eq!(lines[0].beam_y, 0x2C);
+        assert_eq!(lines[0].hstart, 0x00C1);
+        assert_eq!(lines[0].data, 0xA000);
+        assert_eq!(lines[0].data_ext, [0xA001, 0xA002, 0xA003]);
+        assert_eq!(lines[0].datb, 0xB000);
+        assert_eq!(lines[0].datb_ext, [0xB001, 0xB002, 0xB003]);
     }
 
     /// An inverted vertical pair (vstop < vstart) does not disable a sprite:
