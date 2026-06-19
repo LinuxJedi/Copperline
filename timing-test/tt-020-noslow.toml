@@ -1,0 +1,17 @@
+# 68EC020 + ECS + 2M chip + NO slow RAM, KS2.05 (matches the user's FS-UAE
+# reference config minus the slow RAM).
+rom = "../kickstart205.rom"
+[cpu]
+model = "68EC020"
+clock_mhz = 7.09
+[memory]
+chip = "2M"
+slow = "0"
+[emulation]
+speed = "real"
+[chipset]
+revision = "ECS"
+video = "PAL"
+[floppy.df0]
+path = "timing-test.adf"
+write_protected = true

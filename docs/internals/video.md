@@ -38,13 +38,39 @@ per-plane scroll delays) is constant and is computed once per run rather
 than per pixel. The per-pixel decisions inside a run are unchanged -- the
 chunking is a host-CPU optimisation, not a model change.
 
+AGA Lisa has one known split control path in this replay: BPLCON4's
+high-byte BPLAM bitplane XOR follows the normal control timeline, but the
+low-byte ESPRM/OSPRM sprite palette-base fields are visible to sprite
+colour lookup at the colour-output-domain x position used by COLOR writes.
+The render event journal therefore creates a sprite-only BPLCON4 segment
+when those two x positions differ, then applies the full BPLCON4 value on
+the normal control segment.
+
+Manual and held-sprite replay has a smaller split of its own. SPRxDATA and
+SPRxDATB writes affect only later pixels in the normal register-output
+domain, and SPRxCTL still disarms output at that point. SPRxPOS writes,
+however, re-arm the sprite horizontal comparator: if the write occurs before
+the newly programmed HSTART, the sprite can still begin at that HSTART. The
+replay clips those position intervals in the sprite-comparator domain so
+staggered even/odd attached-pair position writes do not create artificial
+half-pair strips.
+
+When sprite DMA was observed for the frame, captured DMA lines win over
+manual replay. The renderer then suppresses stale latched SPRxDATA spans
+unless a manual-sprite diagnostic explicitly asks for them. This avoids
+painting old register contents as vertical sprite bars on frames where
+hardware sprite data was already fetched by Agnus.
+
 The mapping from beam coordinates to framebuffer x is anchored by
 constants that encode the hardware's fetch-to-display pipeline delays --
 register writes, palette writes, and bitplane data each land at their own
 documented offset, and the bitplane fetch reference differs between lo-res
-and hi-res. These anchors were calibrated against real-hardware captures
-and other emulators; `COPPERLINE_HCENTER=0` and `COPPERLINE_OVERSCAN=full`
-help when re-checking them.
+and hi-res. Wide-FMODE DMA fetches start from raw DDFSTRT and complete
+whole units, but the displayed shifter origin is still quantized by the
+FMODE fetch gulp; the renderer keeps those two effects separate. These
+anchors were calibrated against real-hardware captures and other
+emulators; `COPPERLINE_HCENTER=0` and `COPPERLINE_OVERSCAN=full` help when
+re-checking them.
 
 The framebuffer is a 716x285 overscan field (lo-res pixels doubled
 horizontally). It captures deep overscan on all sides.
@@ -137,7 +163,11 @@ Two presentation-only adjustments (they never alter the emulated
 framebuffer):
 
 - **Overscan mask**: `[display] overscan = "tv"` masks deep-overscan
-  margins in black like a CRT bezel; `"full"` shows the entire field.
+  margins in black like a CRT bezel; `"full"` shows the entire field. The
+  default TV mask is presentation-only and asymmetric vertically: it keeps a
+  little top overscan but crops the lower edge one source row inside the
+  standard display bottom, matching the common case where lower-border
+  sprite/effect junk is hidden by the display crop.
 - **Horizontal recentring**: a standard (non-overscan) display is recentred
   for presentation, since the framebuffer captures a deep slab of left
   overscan that would otherwise push the picture right of centre compared

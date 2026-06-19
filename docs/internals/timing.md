@@ -36,6 +36,9 @@ DDF window, FMODE fetch cadence, and per-plane fetch-order mask live in a
 write or a write-delay expiry changes the key. The vpos-dependent gates
 (vertical display window, DDFSTRT write miss) are still evaluated live, so
 the memoization cannot change behaviour.
+Wide-FMODE lo-res slots are packed into the first eight CCKs of each
+16/32-CCK fetch unit; the rest of the unit remains available to later
+arbitration priorities.
 
 Slow RAM at `$C00000` is arbitrated through Agnus *like chip RAM*: a CPU
 access to slow RAM contends with DMA even though the RAM is outside the
@@ -227,8 +230,9 @@ clock the waiting CPU misses increments the counter; after
 one slot, matching the HRM "one bus cycle in four" rule and vAmiga's ~2:1
 blitter:CPU split on a blitter-heavy 3D-scene regression. Idle blit pipeline cycles
 (slots that do not need the bus) never claim the bus and stay
-CPU-available even with BLTPRI set. The counter resets when the CPU gets
-the bus, when BLTPRI is set, or when blitter DMA cannot run.
+CPU-available even with BLTPRI set, but fixed DMA slots still stall those
+idle phases. The counter resets when the CPU gets the bus, when BLTPRI is
+set, or when blitter DMA cannot run.
 
 A 68000 `TAS` read-modify-write is unsafe on chip RAM (the HRM warns
 against it); the `m68k` backend exposes it as a byte read then a byte
@@ -249,7 +253,9 @@ carry datapath (`apply_fill` in `finish_source_word`) is not what adds the
 cycle -- the C-channel slot in the controller sequence is. Cross-emulator
 validated: FS-UAE and vAmiga both time the `bltcon0=0x09F0` A->D fill at 3
 CCK/word (timing-test rows 23/24/26). Implemented as `c_phase = use_c ||
-fill` with `current_slot_needs_bus` false for the fill C slot. (An earlier
+fill` with `current_slot_needs_bus` false for the fill C slot; the idle fill
+phase advances on CPU/Copper/idle arbitration slots but not through fixed
+DMA (bitplane/sprite/disk/audio/refresh) slots. (An earlier
 experiment dropped this to 2 CCK/word to improve one capture, but that made
 the blitter faster than hardware and broke a separate blitter-heavy
 regression.) Test:
@@ -268,16 +274,17 @@ Tests: `ecs_bltsizv_bltsizh_start_extended_blit`,
 
 ### Known residuals
 
-Cross-emulator timing-test comparisons (rows 25/26, corroborated in
-`timing-test/README.md`) leave two open gaps that are tracked separately:
+Cross-emulator timing-test comparisons (corroborated in
+`timing-test/README.md`) leave one open blitter gap that is tracked
+separately:
 
-- **Line blits run slow**: a 64-pixel line measures 386 beam-CCK in
-  Copperline vs ~345 on hardware-aligned emulators (and 258 predicted by
-  `line_total_slots`), roughly 11% too slow.
-- **Blitter-vs-display contention is low**: on a 3-plane lores display the
-  blitter loses ~3833 CCK/frame to bitplane DMA vs ~6740 on hardware. The
-  bitplane slot count is correct; the gap is phase alignment between the
-  blitter's A/D bus slots and the bitplane fetch offsets.
+- **Line blits run slow**: a 64-pixel line measures ~317 beam-CCK in
+  Copperline vs 262 on the FS-UAE reference (and 258 predicted by
+  `line_total_slots`), roughly 21% too slow.
+
+The previous row-26 display-DMA contention residual is closed: with fixed DMA
+stalling idle fill phases, Copperline measures ~25074 CCK for the 3-plane
+display fill vs 25208 on the FS-UAE reference.
 
 References: HRM [Blitter
 Hardware](https://www.theflatnet.de/pub/cbm/amiga/AmigaDevDocs/hard_6.html).

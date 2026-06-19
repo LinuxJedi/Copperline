@@ -87,8 +87,14 @@ Copperline handles this by approximation rather than precision.
 timing from the corrected 68000 counts: the pipeline and cache make most
 instructions cost roughly half their 68000 cycles, with a two-cycle
 floor, and memory-bound work is dominated by the host bus model anyway.
-The scaling is calibrated against a cycle-exact A1200 reference (FS-UAE)
-using the `timing-test/` ADF. This is good enough because Copperline
+The flat scale is wrong for a few instructions whose 020 cost does not
+track the 68000 count, so those carry an explicit 020 cycle value (still
+pre-scale): the barrel-shifter shift/rotate, the fixed-cost MULU/MULS, a
+taken `DBcc`'s pipeline refill, and `MOVE` (register vs memory-source
+read latency). These are calibrated against a cycle-exact A1200 reference
+(FS-UAE) using the `timing-test/` ADF -- with the instruction cache
+enabled, since that is the A1200 default; `timing-test/compare.py` checks
+each row against the reference. This is good enough because Copperline
 paces to wall-clock time and models the CPU:chipset clock ratio and
 chip-bus arbitration exactly; per-instruction 020 cycles matter far less
 than those for Amiga software, which is overwhelmingly 68000. The
@@ -98,13 +104,25 @@ Motorola 68020/030 user-manual timing tables or differential testing
 against Moira/Musashi are the realistic sources.
 
 On the A1200 the 020 chip-bus timing is calibrated against a cycle-exact
-FS-UAE A1200 (the 5/8 scaling above, a 32-bit Alice chip-bus data path, and
-a two-entry longword fetch latch). Three residuals remain: writes are
-posted as a full bus slot (no write-buffer overlap), per-frame throughput
-runs ~0.6 of the reference, and the cycle model does not reflect
-instruction-cache hit/miss timing -- so software that depends on CACR
-cache-on/off *timing* will diverge. MMU-dependent 030/040 accelerator
-setups are a non-goal.
+FS-UAE A1200 (the 6/8 scaling above, a 32-bit Alice chip-bus data path, and
+a two-entry longword fetch latch). The 020's chip-bus cycle is modelled as 3
+CPU clocks, not the 68000's 4: after the granted colour-clock slot the access
+bills only the shorter remaining tail (one clock -- half a cck at the stock
+2-clock ratio, none at 14 MHz where the 3-clock cycle fits inside one slot),
+which is the whole chip-slot cost at the native 14 MHz ratio. On Alice, reads,
+writes, and custom-register reads all consume that granted slot without an
+additional colour-clock bubble; adding one over-stalls AGA 020 chip-RAM
+read/modify/write loops, while the A1200 timing-test chip-read row remains
+aligned without it. On OCS/ECS machines the 020 still talks to the 16-bit chip
+bus, so chip/slow/custom reads pay a one-CCK data-return wait when the
+3-clock short bus cycle is otherwise hidden inside a single colour-clock slot.
+The tail's fractional cck are carried so none are lost; the 68000/010 keep the
+full 4-clock (2-cck) cycle (`Bus::cpu_short_bus_cycle`). Residuals: per-frame
+throughput still runs below the reference, and the cycle model does not reflect
+instruction-cache hit/miss *latency* (only its bus-traffic effect), so software
+that toggles CACR cache-on/off and depends on the exact transition timing can
+diverge.
+MMU-dependent 030/040 accelerator setups are a non-goal.
 
 ## Interrupts and STOP
 

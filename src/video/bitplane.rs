@@ -13,7 +13,7 @@ use super::FB_PIXELS;
 use super::{FB_HEIGHT, FB_WIDTH, MAX_VISIBLE_LINES};
 use crate::bus::{
     BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus, CapturedBitplaneRow,
-    CapturedSpriteLine, RenderRegisterSnapshot, VideoRenderFrameTiming,
+    CapturedSpriteLine, HeldSpriteLine, RenderRegisterSnapshot, VideoRenderFrameTiming,
 };
 use crate::chipset::agnus::{ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, AgnusRevision};
 #[cfg(test)]
@@ -23,6 +23,7 @@ use crate::chipset::denise::{
     Palette, COLOR_RGB_MASK, COLOR_TRANSPARENCY_BIT,
 };
 use std::borrow::Cow;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 // Beam-to-framebuffer conversion anchors for the pragmatic renderer.
@@ -59,7 +60,7 @@ const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// upstream bitplane shifter. Treat the left output edge as the first visible
 /// colour-register position rather than the earlier bitplane-control domain.
 /// Moved left by 8 colour clocks alongside the other origin anchors.
-const COLOR_WRITE_HPOS_FB0: i32 = 0x36;
+const COLOR_WRITE_HPOS_FB0: i32 = 0x34;
 /// Framebuffer-x offset between the copper/register coordinate
 /// ([`COPPER_WAIT_HPOS_FB0`], used to place beam-timed register writes) and the
 /// bitplane/DIW coordinate ([`DIW_HSTART_FB0`], used to place fetched bitplane
@@ -164,9 +165,6 @@ const BPLCON3_SPRES_LORES: u16 = 0x0040;
 const BPLCON3_SPRES_HIRES: u16 = 0x0080;
 const BPLCON3_SPRES_SHRES: u16 = 0x00C0;
 const BPLCON3_PF2OF_MASK: u16 = 0x1C00;
-// Sprite DMA enable is checked on the capture side (bus.rs); the renderer keys
-// off observed sprite DMA, so this bit is only needed by renderer unit tests.
-#[cfg(test)]
 const DMACON_SPREN: u16 = 1 << 5;
 const DMACON_BPLEN: u16 = 1 << 8;
 const DMACON_DMAEN: u16 = 1 << 9;
@@ -201,6 +199,64 @@ struct PaletteSegment {
 impl PaletteSegment {
     fn apply(&self, palette: &mut Palette) {
         palette.write_entry(usize::from(self.entry), self.loct, self.value);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PaletteRowDiag {
+    first_vpos: u32,
+    last_vpos: u32,
+}
+
+impl PaletteRowDiag {
+    fn contains(self, vpos: u32) -> bool {
+        (self.first_vpos..=self.last_vpos).contains(&vpos)
+    }
+}
+
+fn parse_diag_u32(raw: &str) -> Option<u32> {
+    let raw = raw.trim();
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        raw.parse::<u32>().ok()
+    }
+}
+
+/// Cached COPPERLINE_DIAG_PALETTE_ROW setting (read once). Accepted forms:
+/// presence/`all` logs every COLOR write, `V` logs one beam line, and
+/// `START:END` logs an inclusive beam-line range.
+fn palette_row_diag() -> Option<PaletteRowDiag> {
+    static SPEC: OnceLock<Option<PaletteRowDiag>> = OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let raw = crate::envcfg::var("COPPERLINE_DIAG_PALETTE_ROW")?;
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+            return Some(PaletteRowDiag {
+                first_vpos: 0,
+                last_vpos: u32::MAX,
+            });
+        }
+        if let Some((first, last)) = raw.split_once(':') {
+            let first_vpos = parse_diag_u32(first).unwrap_or(0);
+            let last_vpos = parse_diag_u32(last).unwrap_or(u32::MAX);
+            return Some(PaletteRowDiag {
+                first_vpos: first_vpos.min(last_vpos),
+                last_vpos: first_vpos.max(last_vpos),
+            });
+        }
+        parse_diag_u32(raw).map(|vpos| PaletteRowDiag {
+            first_vpos: vpos,
+            last_vpos: vpos,
+        })
+    })
+}
+
+fn beam_write_source_label(source: BeamWriteSource) -> &'static str {
+    match source {
+        BeamWriteSource::Cpu => "cpu",
+        BeamWriteSource::CpuCopperIrq => "cpu_copper_irq",
+        BeamWriteSource::Copper => "copper",
     }
 }
 
@@ -555,11 +611,57 @@ impl ControlState {
     }
 
     fn pf1_scroll(&self) -> usize {
+        if self.aga() {
+            return self.aga_bplcon1_scroll_samples(false);
+        }
         (self.bplcon1 & 0x000F) as usize
     }
 
     fn pf2_scroll(&self) -> usize {
+        if self.aga() {
+            return self.aga_bplcon1_scroll_samples(true);
+        }
         ((self.bplcon1 >> 4) & 0x000F) as usize
+    }
+
+    /// AGA Lisa expands BPLCON1 to two 8-bit scroll counters in 35 ns
+    /// super-hires units. The old OCS/ECS nibble bits are renamed to H2..H5,
+    /// preserving old lo-res scroll values, while the new bits provide
+    /// sub-lores positioning and the extra range needed by wide FMODE fetches.
+    fn aga_bplcon1_scroll_samples(&self, pf2: bool) -> usize {
+        let shres_scroll = if pf2 {
+            ((self.bplcon1 >> 12) & 0x0001)
+                | ((self.bplcon1 >> 12) & 0x0002)
+                | ((self.bplcon1 >> 2) & 0x0004)
+                | ((self.bplcon1 >> 2) & 0x0008)
+                | ((self.bplcon1 >> 2) & 0x0010)
+                | ((self.bplcon1 >> 2) & 0x0020)
+                | ((self.bplcon1 >> 8) & 0x0040)
+                | ((self.bplcon1 >> 8) & 0x0080)
+        } else {
+            ((self.bplcon1 >> 8) & 0x0001)
+                | ((self.bplcon1 >> 8) & 0x0002)
+                | ((self.bplcon1 << 2) & 0x0004)
+                | ((self.bplcon1 << 2) & 0x0008)
+                | ((self.bplcon1 << 2) & 0x0010)
+                | ((self.bplcon1 << 2) & 0x0020)
+                | ((self.bplcon1 >> 4) & 0x0040)
+                | ((self.bplcon1 >> 4) & 0x0080)
+        } as usize;
+        let fetch_mask = match self.fetch_quantum() {
+            1 => 0x3F,
+            2 => 0x7F,
+            _ => 0xFF,
+        };
+        let shres_scroll = shres_scroll & fetch_mask;
+        let samples_per_native = if self.shres() {
+            1
+        } else if self.hires() {
+            2
+        } else {
+            4
+        };
+        shres_scroll / samples_per_native
     }
 
     fn scroll_for_plane(&self, plane: usize) -> usize {
@@ -634,8 +736,8 @@ impl ControlState {
 
     /// Horizontal extent, in DIWSTRT/DIWSTOP H coordinates, of the bitplane
     /// data this control actually fetches: the display-data-fetch window
-    /// (DDFSTRT/DDFSTOP, quantized to the fetch grid) widened by the fetched
-    /// word count at the current resolution. Calibrated so a standard DDF
+    /// (DDFSTRT/DDFSTOP, rounded to completed fetch units) widened by the
+    /// fetched word count at the current resolution. Calibrated so a standard DDF
     /// window ($38/$D0 lo-res, $3C/$D4 hi-res) yields exactly the standard
     /// DIW edges (`STANDARD_DIW_HSTART`..`STANDARD_DIW_HSTOP`): the picture a
     /// stock display fetches lands on the same beam positions as its DIW
@@ -658,9 +760,10 @@ impl ControlState {
         if words == 0 {
             return None;
         }
-        // DDFSTRT shifts the picture in whole fetch-grid gulps, matching the
-        // renderer's placement (see `fetch_origin_native_shift`). Each colour
-        // clock of DDF shift moves the picture two lo-res H units.
+        // The displayed shifter origin moves in whole fetch gulps, matching
+        // the renderer's placement (see `fetch_origin_native_shift`). This is
+        // separate from the DMA slot positions, which start at raw DDFSTRT.
+        // Each colour clock of DDF shift moves the picture two lo-res H units.
         let gulp = self.fetch_period() as i32;
         let align = |hpos: i32| -> i32 {
             (hpos.div_euclid(gulp) * gulp).max(BITPLANE_DDF_HARD_START as i32)
@@ -704,34 +807,26 @@ impl ControlState {
         } else {
             2
         };
-        // The picture position is quantized to the fetch-period grid (one
-        // FMODE gulp per plane, on absolute colour-clock multiples of the
-        // gulp, matching Agnus's DDFSTRT masking to the fetch-unit
-        // boundary): the shifter takes data in whole 1/2/4-word gulps, so
-        // a DDFSTRT moved within one gulp starts the fetch sequencer
-        // earlier without moving the displayed picture. With FMODE=0 the
-        // gulp equals the DDF granularity and nothing changes (boot-screen
-        // insert-disk art is drawn for the continuous placement: its
-        // negative modulos overlap rows so the hand/disk's right edge
-        // lives in the next row's first bytes - the calibrated FMODE=0
-        // anchors must stay). With wide FMODE fetches system software programs
-        // DDFSTRT $38 or $3C interchangeably (same 16-cck gulp slot,
-        // BPLCON1=0), and its interleaved-bitmap modulos expect exactly
-        // the visible row width in the window - without the quantization,
-        // the fetch overrun displayed inside the window's right edge as
-        // the next plane's row start (visible as a speckled right-edge
-        // columns, the CD32 intro's right-edge noise during the disc
-        // fly-in). The grid anchor is the colour-clock origin, not the
-        // hard DDF start $18: $18 is a multiple of every FMODE=0 period
-        // (so narrow fetches are unaffected either way), but wide-FMODE
-        // gulp slots run on absolute multiples of the gulp - DDFSTRT $30
-        // with a 16-cck gulp is on-grid and shares its slot with the
-        // standard $38, as scrolling dual-playfield
-        // menu screens rely on.
+        // The displayed picture position is quantized to the fetch-period
+        // grid (one FMODE gulp per plane). The DMA sequencer itself starts at
+        // raw DDFSTRT, but the shifter consumes data in whole 1/2/4-word
+        // gulps, so a DDFSTRT moved within one gulp changes how much tail data
+        // is fetched without necessarily moving the visible picture. With
+        // FMODE=0 the gulp equals the DDF granularity and nothing changes
+        // (boot-screen insert-disk art is drawn for the continuous placement:
+        // its negative modulos overlap rows so the hand/disk's right edge
+        // lives in the next row's first bytes - the calibrated FMODE=0 anchors
+        // must stay). With wide FMODE fetches system software programs DDFSTRT
+        // $38 or $3C interchangeably (same 16-cck gulp slot, BPLCON1=0), and
+        // its interleaved-bitmap modulos expect exactly the visible row width
+        // in the window - without the placement quantization, the fetch overrun
+        // displayed inside the window's right edge as the next plane's row
+        // start. The placement grid anchor is the colour-clock origin, not the
+        // hard DDF start $18.
         let align = |hpos: i32| -> i32 {
             let gulp = self.fetch_period() as i32;
-            // Clamped to the DDF hard start: a slot masked to before it fetches
-            // from the first usable position, not from the blanking before it.
+            // Clamped to the DDF hard start: placement before the first usable
+            // fetch position is not visible.
             (hpos.div_euclid(gulp) * gulp).max(BITPLANE_DDF_HARD_START as i32)
         };
         let ddf_native_shift =
@@ -798,11 +893,78 @@ impl SpriteLine {
     }
 }
 
+const SPRITE_LINE_MAX_BITS: usize = 64;
+
+struct SpriteLineSampler<'a> {
+    line: &'a SpriteLine,
+    bit_stops: [i32; SPRITE_LINE_MAX_BITS + 1],
+    bit_values: [u8; SPRITE_LINE_MAX_BITS],
+    bit_count: usize,
+}
+
+impl<'a> SpriteLineSampler<'a> {
+    fn new(
+        line: &'a SpriteLine,
+        base_control: ControlState,
+        control_segments: &[ControlSegment],
+    ) -> Self {
+        let base_x =
+            sprite_base_framebuffer_x(line.hstart, line.hsub_70ns, base_control, control_segments);
+        let mut bit_stops = [0i32; SPRITE_LINE_MAX_BITS + 1];
+        let mut bit_values = [0u8; SPRITE_LINE_MAX_BITS];
+        let mut bit_count = 0usize;
+        let mut x_cursor = base_x;
+        bit_stops[0] = base_x;
+
+        for w in 0..line.width_words() {
+            let (data, datb) = line.word(w);
+            for bit in (0..16).rev() {
+                let sample_x = x_cursor.clamp(0, FB_WIDTH.saturating_sub(1) as i32) as usize;
+                let sprite_pixel_repeat =
+                    control_at_x(base_control, control_segments, sample_x).sprite_pixel_repeat();
+                let lo = u8::from(data & (1 << bit) != 0);
+                let hi = u8::from(datb & (1 << bit) != 0);
+                bit_values[bit_count] = lo | (hi << 1);
+                x_cursor += sprite_pixel_repeat;
+                bit_count += 1;
+                bit_stops[bit_count] = x_cursor;
+            }
+        }
+
+        Self {
+            line,
+            bit_stops,
+            bit_values,
+            bit_count,
+        }
+    }
+
+    fn framebuffer_range(&self) -> Option<(i32, i32)> {
+        let start = self.bit_stops[0].max(self.line.x_start as i32).max(0);
+        let stop = self.bit_stops[self.bit_count]
+            .min(self.line.x_stop as i32)
+            .min(FB_WIDTH as i32);
+        (start < stop).then_some((start, stop))
+    }
+
+    fn pixel_bits_at(&self, x: i32) -> u8 {
+        if x < self.line.x_start as i32
+            || x >= self.line.x_stop as i32
+            || x < self.bit_stops[0]
+            || x >= self.bit_stops[self.bit_count]
+        {
+            return 0;
+        }
+        let bit_idx = self.bit_stops[1..=self.bit_count].partition_point(|stop| *stop <= x);
+        self.bit_values[bit_idx]
+    }
+}
+
 /// Sprite colour entry in the palette store. AGA bases the lookup on the
-/// BPLCON4 OSPRM (odd sprites / attached pairs) or ESPRM (even sprites)
-/// nibble; pre-AGA uses the classic 16..31 block. Attached pairs use the
-/// 4-bit pixel index directly; unattached sprites add the pair's 4-colour
-/// offset.
+/// BPLCON4 ESPRM low nibble (even sprites / attached pairs) or OSPRM high
+/// nibble (odd sprites); pre-AGA uses the classic 16..31 block. Attached pairs
+/// use the 4-bit pixel index directly; unattached sprites add the pair's
+/// 4-colour offset.
 fn sprite_color_entry(control: ControlState, sprite: usize, idx: u8, attached: bool) -> usize {
     let offset = if attached {
         idx as usize
@@ -810,10 +972,10 @@ fn sprite_color_entry(control: ControlState, sprite: usize, idx: u8, attached: b
         (sprite / 2) * 4 + idx as usize
     };
     if control.aga() {
-        let nibble = if attached || sprite & 1 != 0 {
-            (control.bplcon4 >> 4) & 0x0F
-        } else {
+        let nibble = if attached || sprite & 1 == 0 {
             control.bplcon4 & 0x0F
+        } else {
+            (control.bplcon4 >> 4) & 0x0F
         } as usize;
         (nibble << 4) + offset
     } else {
@@ -1285,18 +1447,45 @@ struct BeamSpriteState {
     /// 16-pixel pattern across the 32/64-pixel window (WinUAE model).
     aga: bool,
     fmode: u16,
+    /// Sprites reused with DMA off (SPREN cleared mid-frame): the bus
+    /// established the held pixel data off-screen, and the Copper repositions
+    /// them via SPRxPOS. When present the sprite is armed and displays this
+    /// held data (with its full wide-fetch words, unlike a manual SPRxDATA
+    /// write which only replicates one word) at the current SPRxPOS, clipped
+    /// per reposition interval. The held state is captured only after sprite
+    /// DMA has already made the channel active; once SPREN is off, the DMA
+    /// descriptor's later VSTOP no longer clears that latched display data.
+    held: [Option<HeldSpriteLine>; 8],
 }
 
 impl BeamSpriteState {
-    fn from_render_state(state: &RenderState) -> Self {
+    fn from_render_state(state: &RenderState, held: &[Option<HeldSpriteLine>; 8]) -> Self {
+        let mut sprpos = state.sprpos;
+        let mut sprctl = state.sprctl;
+        let mut spr_armed = state.spr_armed;
+        for (i, h) in held.iter().enumerate() {
+            if let Some(held) = h {
+                let (pos, ctl) = sprite_control_words_from_parts(
+                    held.vstart,
+                    held.vstop,
+                    held.line.hstart,
+                    held.line.hsub_70ns,
+                    held.line.attached,
+                );
+                sprpos[i] = pos;
+                sprctl[i] = ctl;
+                spr_armed[i] = true;
+            }
+        }
         Self {
-            sprpos: state.sprpos,
-            sprctl: state.sprctl,
+            sprpos,
+            sprctl,
             sprdata: state.sprdata,
             sprdatb: state.sprdatb,
-            spr_armed: state.spr_armed,
+            spr_armed,
             aga: matches!(state.agnus_revision, AgnusRevision::AgaAlice),
             fmode: state.fmode,
+            held: *held,
         }
     }
 
@@ -1338,9 +1527,38 @@ impl BeamSpriteState {
         }
         let pos = self.sprpos[sprite];
         let ctl = self.sprctl[sprite];
+        let held = self.held[sprite];
+        let hstart = sprite_hstart(pos, ctl);
+        let hsub_70ns = sprite_hsub_70ns(ctl);
+        // A held sprite was already active when SPREN was cleared. With no
+        // sprite DMA slot running, the DMA descriptor's stop comparator cannot
+        // retire the latched data; later SPRxPOS writes simply reposition it.
+        if let Some(held) = held {
+            return Some(SpriteLine {
+                hstart,
+                hsub_70ns,
+                beam_y,
+                data: held.line.data,
+                datb: held.line.datb,
+                data_ext: held.line.data_ext,
+                datb_ext: held.line.datb_ext,
+                width_words: held.line.width_words,
+                attached: ctl & 0x0080 != 0,
+                x_start,
+                x_stop,
+            });
+        }
         let vstart = sprite_vstart(pos, ctl);
         let vstop = sprite_vstop(ctl);
-        if beam_y < vstart || beam_y >= vstop {
+        // Normal pair: [vstart, vstop). An inverted pair (vstop <= vstart) is
+        // not "off": the vstop comparator fired before vstart, so the sprite is
+        // on from vstart to the frame end and again from 0 to vstop (the wrap).
+        let in_window = if vstop > vstart {
+            beam_y >= vstart && beam_y < vstop
+        } else {
+            beam_y >= vstart || beam_y < vstop
+        };
+        if !in_window {
             return None;
         }
         let width_words = if self.aga {
@@ -1356,8 +1574,8 @@ impl BeamSpriteState {
             ([0; 3], [0; 3])
         };
         Some(SpriteLine {
-            hstart: sprite_hstart(pos, ctl),
-            hsub_70ns: sprite_hsub_70ns(ctl),
+            hstart,
+            hsub_70ns,
             beam_y,
             data,
             datb,
@@ -1722,6 +1940,21 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
             } else {
                 color_write_framebuffer_x(event.hpos)
             };
+            if palette_row_diag().is_some_and(|spec| spec.contains(event.vpos)) {
+                log::info!(
+                    "palrow v={} h={} x={} line={} source={} color{:02} entry={} loct={} value={:#06X} bplcon3={:#06X}",
+                    event.vpos,
+                    event.hpos,
+                    x,
+                    line,
+                    beam_write_source_label(event.source),
+                    idx,
+                    entry,
+                    loct,
+                    color_register_value(event.value),
+                    control.bplcon3,
+                );
+            }
             push_palette_segment(
                 palette_segments,
                 line,
@@ -1741,6 +1974,7 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
             }
         }
 
+        let previous_control = control;
         apply_move(state, off, event.value);
         if matches!(
             off,
@@ -1761,7 +1995,27 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
                 | 0x1E4
                 | 0x1FC
         ) {
-            control = ControlState::from_render_state(state);
+            let next_control = ControlState::from_render_state(state);
+            if off == 0x10C && previous_control.aga() && !before_visible_lines {
+                // Lisa applies BPLCON4's sprite palette-base byte earlier
+                // than its bitplane XOR byte. Keep BPLAM on the normal
+                // control timeline while letting sprite colour lookup see the
+                // new ESPRM/OSPRM byte in the colour-output domain.
+                let sprite_x = color_write_framebuffer_x(event.hpos);
+                if sprite_x < beam_x {
+                    let mut sprite_control = previous_control;
+                    sprite_control.bplcon4 =
+                        (previous_control.bplcon4 & 0xFF00) | (next_control.bplcon4 & 0x00FF);
+                    push_control_segment(
+                        control_segments,
+                        line,
+                        sprite_x,
+                        base_controls[line],
+                        sprite_control,
+                    );
+                }
+            }
+            control = next_control;
             push_control_segment(control_segments, line, beam_x, base_controls[line], control);
             if matches!(off, 0x102 | 0x108 | 0x10A) {
                 if let Some(events_by_line) = display_line_events.as_deref_mut() {
@@ -2087,7 +2341,7 @@ fn bitplane_fetch_hpos_for_plane(control: ControlState, word_idx: usize, plane: 
     }
 
     let unit = control.fetch_unit();
-    start + group.saturating_mul(unit) + bitplane_fetch_order(control, plane) * (unit / 8)
+    start + group.saturating_mul(unit) + bitplane_fetch_order(control, plane)
 }
 
 fn fetch_plane_word_active_at_hpos(
@@ -2536,20 +2790,30 @@ fn manual_sprite_lines_from_events(
     manual_sprite_lines_from_events_with_visible_line0(
         initial_state,
         events,
+        &[None; 8],
         PAL_VISIBLE_LINE0,
         FB_HEIGHT,
+        true,
     )
 }
 
 fn manual_sprite_lines_from_events_with_visible_line0(
     initial_state: &RenderState,
     events: &[BeamRegisterWrite],
+    held: &[Option<HeldSpriteLine>; 8],
     visible_line0: i32,
     rows: usize,
+    include_latched_sprite_state: bool,
 ) -> Vec<Vec<SpriteLine>> {
-    let mut regs = BeamSpriteState::from_render_state(initial_state);
-    let mut next_beam = [(visible_line0, 0usize); 8];
+    let mut regs = BeamSpriteState::from_render_state(initial_state, held);
     let visible_end = visible_line0 + rows as i32;
+    let mut next_beam: [(i32, usize); 8] = std::array::from_fn(|sprite| {
+        if include_latched_sprite_state || held[sprite].is_some() {
+            (visible_line0, 0usize)
+        } else {
+            (visible_end, 0usize)
+        }
+    });
     let mut lines = vec![Vec::new(); 8];
 
     for event in events {
@@ -2572,7 +2836,13 @@ fn manual_sprite_lines_from_events_with_visible_line0(
         if sprite >= 8 {
             continue;
         }
-        let event_beam = manual_sprite_event_beam(event.vpos, event.hpos, visible_line0, rows);
+        let event_beam = manual_sprite_event_beam_for_sprite_write(
+            off,
+            event.vpos,
+            event.hpos,
+            visible_line0,
+            rows,
+        );
         flush_manual_sprite_lines(sprite, &regs, next_beam[sprite], event_beam, &mut lines);
         regs.apply_write(off, event.value);
         next_beam[sprite] = event_beam;
@@ -2591,6 +2861,24 @@ fn manual_sprite_lines_from_events_with_visible_line0(
     lines
 }
 
+fn manual_sprite_event_beam_for_sprite_write(
+    off: u16,
+    vpos: u32,
+    hpos: u32,
+    visible_line0: i32,
+    rows: usize,
+) -> (i32, usize) {
+    match (off - 0x140) & 0x0006 {
+        // SPRxPOS re-arms the sprite horizontal comparator. When the
+        // write happens before the newly programmed HSTART, the sprite can
+        // still begin at HSTART; clipping in the later colour-output register
+        // domain delays attached pairs whose even/odd position writes are
+        // staggered by the Copper.
+        0x0 => manual_sprite_position_event_beam(vpos, hpos, visible_line0, rows),
+        _ => manual_sprite_event_beam(vpos, hpos, visible_line0, rows),
+    }
+}
+
 fn manual_sprite_event_beam(vpos: u32, hpos: u32, visible_line0: i32, rows: usize) -> (i32, usize) {
     let visible_end = visible_line0 + rows as i32;
     let vpos = vpos as i32;
@@ -2601,6 +2889,24 @@ fn manual_sprite_event_beam(vpos: u32, hpos: u32, visible_line0: i32, rows: usiz
         return (visible_end, 0);
     }
     let (_, x) = beam_to_framebuffer_pos_with_visible_line0(vpos as u32, hpos, visible_line0, rows);
+    (vpos, x)
+}
+
+fn manual_sprite_position_event_beam(
+    vpos: u32,
+    hpos: u32,
+    visible_line0: i32,
+    rows: usize,
+) -> (i32, usize) {
+    let visible_end = visible_line0 + rows as i32;
+    let vpos = vpos as i32;
+    if vpos < visible_line0 {
+        return (visible_line0, 0);
+    }
+    if vpos >= visible_end {
+        return (visible_end, 0);
+    }
+    let x = ((hpos as i32 * 2 - DIW_HSTART_FB0) * 2).clamp(0, FB_WIDTH as i32) as usize;
     (vpos, x)
 }
 
@@ -2806,12 +3112,16 @@ fn maybe_log_frame_state(
     }
     log::info!(
         "framestate secs={secs:.4} frame={} vline0={visible_line0} dmacon={:#06X} \
-         bplcon0={:#06X} bplcon1={:#06X} diwstrt={:#06X} diwstop={:#06X} \
+         bplcon0={:#06X} bplcon1={:#06X} bplcon2={:#06X} bplcon3={:#06X} \
+         bplcon4={:#06X} diwstrt={:#06X} diwstop={:#06X} \
          ddfstrt={:#06X} ddfstop={:#06X} fmode={:#06X} bpl1mod={} bpl2mod={} bplpt={:08X?}",
         emulated_frames,
         control.dmacon,
         control.bplcon0,
         control.bplcon1,
+        control.bplcon2,
+        control.bplcon3,
+        control.bplcon4,
         control.diwstrt,
         control.diwstop,
         control.ddfstrt,
@@ -2852,6 +3162,325 @@ fn maybe_log_frame_state(
     );
 }
 
+#[derive(Clone, Copy)]
+struct ManualSpriteDiagSpec {
+    want_all: bool,
+    beam_y: Option<i32>,
+    after: f64,
+    until: f64,
+}
+
+#[derive(Clone, Copy)]
+struct SpritePixelDiagSpec {
+    beam_y: i32,
+    step: usize,
+    after: f64,
+    until: f64,
+}
+
+fn manual_sprite_diag_spec() -> Option<ManualSpriteDiagSpec> {
+    static SPEC: OnceLock<Option<ManualSpriteDiagSpec>> = OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let raw = crate::envcfg::var("COPPERLINE_DIAG_MANUAL_SPRITES")?;
+        let raw = raw.trim();
+        let (want_all, beam_y) = if raw.eq_ignore_ascii_case("all") {
+            (true, None)
+        } else {
+            (false, Some(raw.parse::<i32>().ok()?))
+        };
+        Some(ManualSpriteDiagSpec {
+            want_all,
+            beam_y,
+            after: env_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0),
+            until: env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY),
+        })
+    })
+}
+
+fn sprite_pixel_diag_spec() -> Option<SpritePixelDiagSpec> {
+    static SPEC: OnceLock<Option<SpritePixelDiagSpec>> = OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let raw = crate::envcfg::var("COPPERLINE_DIAG_SPRITE_PIXELS")?;
+        let raw = raw.trim();
+        let (beam_y, step) = if let Some((beam_y, step)) = raw.split_once(',') {
+            (
+                beam_y.trim().parse::<i32>().ok()?,
+                step.trim().parse::<usize>().ok()?.max(1),
+            )
+        } else {
+            (raw.parse::<i32>().ok()?, 32)
+        };
+        Some(SpritePixelDiagSpec {
+            beam_y,
+            step,
+            after: env_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0),
+            until: env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY),
+        })
+    })
+}
+
+fn maybe_log_manual_sprite_intervals(
+    emulated_seconds: f64,
+    emulated_frames: u64,
+    state: &RenderState,
+    events: &[BeamRegisterWrite],
+    held: &[Option<HeldSpriteLine>; 8],
+    lines: &[Vec<SpriteLine>],
+) {
+    let Some(spec) = manual_sprite_diag_spec() else {
+        return;
+    };
+    let secs = emulated_seconds;
+    if secs < spec.after || secs >= spec.until {
+        return;
+    }
+
+    let held_summary: Vec<_> = held
+        .iter()
+        .map(|line| {
+            line.map(|line| {
+                (
+                    line.vstart,
+                    line.vstop,
+                    line.line.hstart,
+                    line.line.width_words,
+                    line.line.attached,
+                    line.line.data,
+                    line.line.data_ext,
+                    line.line.datb,
+                    line.line.datb_ext,
+                )
+            })
+        })
+        .collect();
+    let sprpt_align: Vec<_> = state.sprpt.iter().map(|ptr| ptr & 7).collect();
+    let event_count = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.offset & 0x01FE,
+                0x096 | 0x106 | 0x10C | 0x140..=0x17E | 0x180..=0x1BE | 0x1FC
+            )
+        })
+        .count();
+    log::info!(
+        "manual-sprite intervals secs={secs:.4} frame={} events={} sprpt={:08X?} sprpt_align={sprpt_align:?} held={held_summary:?}",
+        emulated_frames,
+        event_count,
+        state.sprpt,
+    );
+
+    for event in events.iter().filter(|event| {
+        matches!(
+            event.offset & 0x01FE,
+            0x096 | 0x106 | 0x10C | 0x140..=0x17E | 0x180..=0x1BE | 0x1FC
+        )
+    }) {
+        if !spec.want_all
+            && spec
+                .beam_y
+                .is_some_and(|beam_y| event.vpos as i32 != beam_y)
+        {
+            continue;
+        }
+        let off = event.offset & 0x01FE;
+        let beam_x = beam_to_framebuffer_x_unclamped(event.hpos);
+        let color_x = color_write_framebuffer_x(event.hpos);
+        match off {
+            0x096 => log::info!(
+                "manual-sprite event y={} h={} beam_x={} DMACON={:#06X}",
+                event.vpos,
+                event.hpos,
+                beam_x,
+                event.value
+            ),
+            0x106 => log::info!(
+                "manual-sprite event y={} h={} beam_x={} color_x={} BPLCON3={:#06X}",
+                event.vpos,
+                event.hpos,
+                beam_x,
+                color_x,
+                event.value
+            ),
+            0x10C => log::info!(
+                "manual-sprite event y={} h={} beam_x={} color_x={} BPLCON4={:#06X}",
+                event.vpos,
+                event.hpos,
+                beam_x,
+                color_x,
+                event.value
+            ),
+            0x1FC => log::info!(
+                "manual-sprite event y={} h={} beam_x={} FMODE={:#06X}",
+                event.vpos,
+                event.hpos,
+                beam_x,
+                event.value
+            ),
+            0x180..=0x1BE => log::info!(
+                "manual-sprite event y={} h={} color_x={} COLOR{}={:#06X}",
+                event.vpos,
+                event.hpos,
+                color_x,
+                (off - 0x180) / 2,
+                event.value
+            ),
+            0x140..=0x17E => {
+                let sprite = ((off - 0x140) / 8) as usize;
+                log::info!(
+                    "manual-sprite event y={} h={} beam_x={} s{} reg={:#05X} val={:#06X}",
+                    event.vpos,
+                    event.hpos,
+                    beam_x,
+                    sprite,
+                    off,
+                    event.value
+                );
+            }
+            _ => {}
+        }
+    }
+
+    for (sprite, sprite_lines) in lines.iter().enumerate() {
+        for line in sprite_lines {
+            if !spec.want_all && spec.beam_y.is_some_and(|beam_y| line.beam_y != beam_y) {
+                continue;
+            }
+            log::info!(
+                "manual-sprite line y={} s{} x={}..{} hstart={} hsub={} words={} att={} A={:04X} {:04X?} B={:04X} {:04X?}",
+                line.beam_y,
+                sprite,
+                line.x_start,
+                line.x_stop,
+                line.hstart,
+                u8::from(line.hsub_70ns),
+                line.width_words,
+                u8::from(line.attached),
+                line.data,
+                line.data_ext,
+                line.datb,
+                line.datb_ext
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_log_sprite_pixel_samples(
+    emulated_seconds: f64,
+    emulated_frames: u64,
+    state: &RenderState,
+    captured_sprite_lines: &[CapturedSpriteLine],
+    sprite_dma_observed: bool,
+    manual_sprite_lines: &[Vec<SpriteLine>],
+    base_palettes: &[Palette],
+    palette_segments: &[Vec<PaletteSegment>],
+    base_controls: &[ControlState],
+    control_segments: &[Vec<ControlSegment>],
+    visible_line0: i32,
+) {
+    let Some(spec) = sprite_pixel_diag_spec() else {
+        return;
+    };
+    let secs = emulated_seconds;
+    if secs < spec.after || secs >= spec.until {
+        return;
+    }
+    let y = spec.beam_y - visible_line0;
+    if y < 0 || y >= base_controls.len() as i32 {
+        return;
+    }
+    let y = y as usize;
+    let use_captured_sprite_dma = sprite_dma_observed
+        || state.dmacon & (DMACON_DMAEN | DMACON_SPREN) == (DMACON_DMAEN | DMACON_SPREN);
+    let sprite_lines: [Vec<SpriteLine>; 8] = std::array::from_fn(|sprite| {
+        collect_sprite_lines(
+            sprite,
+            state,
+            captured_sprite_lines,
+            use_captured_sprite_dma,
+            Some(manual_sprite_lines),
+        )
+    });
+    log::info!(
+        "sprite-pixel samples secs={secs:.4} frame={} y={} step={}",
+        emulated_frames,
+        spec.beam_y,
+        spec.step
+    );
+    for x in (0..FB_WIDTH).step_by(spec.step) {
+        let control = control_at_x(base_controls[y], &control_segments[y], x);
+        let palette = palette_at_x(base_palettes[y], &palette_segments[y], x);
+        for pair in 0..4 {
+            let even_sprite = pair * 2;
+            let odd_sprite = even_sprite + 1;
+            let even_lines = &sprite_lines[even_sprite];
+            let odd_lines = &sprite_lines[odd_sprite];
+            let attached = sprite_pair_attach_active_for_beam(even_lines, odd_lines, spec.beam_y);
+            if attached {
+                let even_idx = sprite_lines_pixel_bits_at(
+                    even_lines,
+                    spec.beam_y,
+                    y,
+                    x as i32,
+                    base_controls,
+                    control_segments,
+                );
+                let odd_idx = sprite_lines_pixel_bits_at(
+                    odd_lines,
+                    spec.beam_y,
+                    y,
+                    x as i32,
+                    base_controls,
+                    control_segments,
+                );
+                let idx = even_idx | (odd_idx << 2);
+                if idx == 0 {
+                    continue;
+                }
+                let color_idx = sprite_color_entry(control, even_sprite, idx, true);
+                log::info!(
+                    "sprite-pixel y={} x={} pair{} att idx={:#04X} color={} rgb={:#08X} BPLCON3={:#06X} BPLCON4={:#06X}",
+                    spec.beam_y,
+                    x,
+                    pair,
+                    idx,
+                    color_idx,
+                    palette.rgb24(color_idx) & 0x00FF_FFFF,
+                    control.bplcon3,
+                    control.bplcon4
+                );
+            } else {
+                for sprite in [even_sprite, odd_sprite] {
+                    let idx = sprite_lines_pixel_bits_at(
+                        &sprite_lines[sprite],
+                        spec.beam_y,
+                        y,
+                        x as i32,
+                        base_controls,
+                        control_segments,
+                    );
+                    if idx == 0 {
+                        continue;
+                    }
+                    let color_idx = sprite_color_entry(control, sprite, idx, false);
+                    log::info!(
+                        "sprite-pixel y={} x={} s{} idx={:#04X} color={} rgb={:#08X} BPLCON3={:#06X} BPLCON4={:#06X}",
+                        spec.beam_y,
+                        x,
+                        sprite,
+                        idx,
+                        color_idx,
+                        palette.rgb24(color_idx) & 0x00FF_FFFF,
+                        control.bplcon3,
+                        control.bplcon4
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn env_f64(var: &str) -> Option<f64> {
     crate::envcfg::var(var).and_then(|s| s.trim().parse::<f64>().ok())
 }
@@ -2875,6 +3504,7 @@ pub struct RenderInput {
     chip_ram_writes: Vec<BeamChipRamWrite>,
     captured_bitplane_rows: Vec<Option<CapturedBitplaneRow>>,
     captured_sprite_lines: Vec<CapturedSpriteLine>,
+    held_sprites: [Option<HeldSpriteLine>; 8],
     sprite_display_enable_x_by_y: Vec<Option<usize>>,
     sprite_dma_observed: bool,
     // Agnus-derived blanking windows, sampled once per frame from the live
@@ -2904,6 +3534,7 @@ impl RenderInput {
             chip_ram_writes: bus.frame_chip_ram_writes().to_vec(),
             captured_bitplane_rows: bus.frame_captured_bitplane_rows().to_vec(),
             captured_sprite_lines: bus.frame_captured_sprite_lines().to_vec(),
+            held_sprites: bus.frame_held_sprites(),
             sprite_display_enable_x_by_y: bus.frame_sprite_display_enable_x_by_y().to_vec(),
             sprite_dma_observed: bus.frame_sprite_dma_observed(),
             frame_lines: bus.agnus.current_frame_lines(),
@@ -3053,11 +3684,26 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         visible_line0,
     );
     let event_started = Instant::now();
-    let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+    let manual_sprite_lines = if input.sprite_dma_observed && manual_sprite_diag_spec().is_none() {
+        vec![Vec::new(); 8]
+    } else {
+        manual_sprite_lines_from_events_with_visible_line0(
+            &state,
+            render_events,
+            &input.held_sprites,
+            visible_line0,
+            rows,
+            !input.sprite_dma_observed
+                && state.dmacon & (DMACON_DMAEN | DMACON_SPREN) != (DMACON_DMAEN | DMACON_SPREN),
+        )
+    };
+    maybe_log_manual_sprite_intervals(
+        input.emulated_seconds,
+        input.emulated_frames,
         &state,
         render_events,
-        visible_line0,
-        rows,
+        &input.held_sprites,
+        &manual_sprite_lines,
     );
     let mut base_palettes = vec![state.palette; rows];
     let mut palette_segments = vec![Vec::new(); rows];
@@ -3095,6 +3741,19 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         visible_line0,
     );
     backfill_left_overscan_background(&mut base_palettes, &mut palette_segments);
+    maybe_log_sprite_pixel_samples(
+        input.emulated_seconds,
+        input.emulated_frames,
+        &state,
+        input.captured_sprite_lines.as_slice(),
+        input.sprite_dma_observed,
+        &manual_sprite_lines,
+        &base_palettes,
+        &palette_segments,
+        &base_controls,
+        &control_segments,
+        visible_line0,
+    );
     render_timing.event_nanos = event_started.elapsed().as_nanos();
     render_timing.events = render_events.len() as u64;
     render_timing.control_segments = control_segments
@@ -4494,16 +5153,21 @@ fn render_attached_sprite_pair_lines(
             continue;
         }
 
+        let even_beam_lines: Vec<SpriteLineSampler<'_>> = even_lines
+            .iter()
+            .filter(|line| line.beam_y == beam_y)
+            .map(|line| SpriteLineSampler::new(line, base_controls[y], &control_segments[y]))
+            .collect();
+        let odd_beam_lines: Vec<SpriteLineSampler<'_>> = odd_lines
+            .iter()
+            .filter(|line| line.beam_y == beam_y)
+            .map(|line| SpriteLineSampler::new(line, base_controls[y], &control_segments[y]))
+            .collect();
+
         let mut x_start = FB_WIDTH as i32;
         let mut x_stop = 0i32;
-        for line in even_lines
-            .iter()
-            .chain(odd_lines.iter())
-            .filter(|line| line.beam_y == beam_y)
-        {
-            if let Some((start, stop)) =
-                sprite_line_framebuffer_range(line, base_controls[y], &control_segments[y])
-            {
+        for line in even_beam_lines.iter().chain(odd_beam_lines.iter()) {
+            if let Some((start, stop)) = line.framebuffer_range() {
                 x_start = x_start.min(start);
                 x_stop = x_stop.max(stop);
             }
@@ -4516,22 +5180,8 @@ fn render_attached_sprite_pair_lines(
 
         for x in x_start..x_stop {
             let x_usize = x as usize;
-            let even_idx = sprite_lines_pixel_bits_at(
-                even_lines,
-                beam_y,
-                y,
-                x,
-                base_controls,
-                control_segments,
-            );
-            let odd_idx = sprite_lines_pixel_bits_at(
-                odd_lines,
-                beam_y,
-                y,
-                x,
-                base_controls,
-                control_segments,
-            );
+            let even_idx = sprite_line_samplers_pixel_bits_at(&even_beam_lines, x);
+            let odd_idx = sprite_line_samplers_pixel_bits_at(&odd_beam_lines, x);
             let idx = even_idx | (odd_idx << 2);
             if idx == 0 {
                 continue;
@@ -4586,23 +5236,6 @@ fn sprite_pair_attach_active_for_beam(
         .any(|line| line.beam_y == beam_y && line.attached)
 }
 
-fn sprite_line_framebuffer_range(
-    line: &SpriteLine,
-    base_control: ControlState,
-    control_segments: &[ControlSegment],
-) -> Option<(i32, i32)> {
-    let base_x =
-        sprite_base_framebuffer_x(line.hstart, line.hsub_70ns, base_control, control_segments);
-    let mut x_cursor = base_x;
-    for _ in 0..(16 * line.width_words()) {
-        let sample_x = x_cursor.clamp(0, FB_WIDTH.saturating_sub(1) as i32) as usize;
-        x_cursor += control_at_x(base_control, control_segments, sample_x).sprite_pixel_repeat();
-    }
-    let start = base_x.max(line.x_start as i32).max(0);
-    let stop = x_cursor.min(line.x_stop as i32).min(FB_WIDTH as i32);
-    (start < stop).then_some((start, stop))
-}
-
 fn sprite_lines_pixel_bits_at(
     lines: &[SpriteLine],
     beam_y: i32,
@@ -4616,6 +5249,16 @@ fn sprite_lines_pixel_bits_at(
         .filter(|line| line.beam_y == beam_y)
         .find_map(|line| {
             let idx = sprite_line_pixel_bits_at(line, x, base_controls[y], &control_segments[y]);
+            (idx != 0).then_some(idx)
+        })
+        .unwrap_or(0)
+}
+
+fn sprite_line_samplers_pixel_bits_at(lines: &[SpriteLineSampler<'_>], x: i32) -> u8 {
+    lines
+        .iter()
+        .find_map(|line| {
+            let idx = line.pixel_bits_at(x);
             (idx != 0).then_some(idx)
         })
         .unwrap_or(0)
@@ -4854,7 +5497,7 @@ fn register_latched_sprite_lines(sprite: usize, state: &RenderState) -> Vec<Spri
     if !state.spr_armed[sprite] {
         return Vec::new();
     }
-    let regs = BeamSpriteState::from_render_state(state);
+    let regs = BeamSpriteState::from_render_state(state, &[None; 8]);
     let pos = regs.sprpos[sprite];
     let ctl = regs.sprctl[sprite];
     (sprite_vstart(pos, ctl)..sprite_vstop(ctl))
@@ -5012,6 +5655,30 @@ fn sprite_hstart(pos: u16, ctl: u16) -> i32 {
 
 fn sprite_hsub_70ns(ctl: u16) -> bool {
     ctl & 0x0010 != 0
+}
+
+fn sprite_control_words_from_parts(
+    vstart: i32,
+    vstop: i32,
+    hstart: i32,
+    hsub_70ns: bool,
+    attached: bool,
+) -> (u16, u16) {
+    let vstart = vstart as u16;
+    let vstop = vstop as u16;
+    let hstart = hstart as u16;
+    let pos = ((vstart & 0x00FF) << 8) | ((hstart >> 1) & 0x00FF);
+    let mut ctl = ((vstop & 0x00FF) << 8)
+        | ((vstart & 0x0100) >> 6)
+        | ((vstop & 0x0100) >> 7)
+        | (hstart & 0x0001);
+    if hsub_70ns {
+        ctl |= 0x0010;
+    }
+    if attached {
+        ctl |= 0x0080;
+    }
+    (pos, ctl)
 }
 
 fn read_chip_word_wrapping(ram: &[u8], addr: u32) -> u16 {
@@ -5590,7 +6257,7 @@ mod tests {
         assert_eq!(row(&fb, 0x120 - 0x2C), 0xFF00_0000, "VBSTRT asserts again");
     }
 
-    /// Plan 3.4: AGA sprite colours come from the BPLCON4 OSPRM/ESPRM
+    /// Plan 3.4: AGA sprite colours come from the BPLCON4 ESPRM/OSPRM
     /// banks; pre-AGA stays on the classic 16..31 block.
     #[test]
     fn sprite_color_entry_follows_bplcon4_on_aga() {
@@ -5608,16 +6275,16 @@ mod tests {
         assert_eq!(sprite_color_entry(aga_default, 0, 1, false), 17);
         assert_eq!(sprite_color_entry(aga_default, 1, 1, false), 17);
 
-        // Distinct odd/even banks: ESPRM=2 (even sprites at 32..),
-        // OSPRM=7 (odd sprites and attached pairs at 112..).
+        // Distinct even/odd banks: ESPRM=7 (even sprites and attached
+        // pairs at 112..), OSPRM=2 (odd sprites at 32..).
         let aga = ControlState {
             agnus_revision: AgnusRevision::AgaAlice,
-            bplcon4: 0x0072,
+            bplcon4: 0x0027,
             ..ControlState::default()
         };
-        assert_eq!(sprite_color_entry(aga, 0, 1, false), 32 + 1);
-        assert_eq!(sprite_color_entry(aga, 1, 1, false), 112 + 1);
-        assert_eq!(sprite_color_entry(aga, 4, 2, false), 32 + 8 + 2);
+        assert_eq!(sprite_color_entry(aga, 0, 1, false), 112 + 1);
+        assert_eq!(sprite_color_entry(aga, 1, 1, false), 32 + 1);
+        assert_eq!(sprite_color_entry(aga, 4, 2, false), 112 + 8 + 2);
         assert_eq!(sprite_color_entry(aga, 2, 9, true), 112 + 9);
     }
 
@@ -6103,7 +6770,7 @@ mod tests {
         );
         assert_eq!(
             beam_to_framebuffer_x_unclamped(COLOR_WRITE_HPOS_FB0 as u32),
-            56
+            48
         );
     }
 
@@ -6302,12 +6969,11 @@ mod tests {
         };
         assert_eq!(kickstart_hires.native_x_offset(true, 1), 20);
 
-        // Wide FMODE fetches quantize the picture position to the gulp grid:
-        // AGA system screens program DDFSTRT $38 or $3C interchangeably
+        // Wide FMODE fetches quantize the displayed shifter origin to the gulp
+        // grid: AGA system screens program DDFSTRT $38 or $3C interchangeably
         // (same 16-cck gulp slot) and must display identically; without the
-        // quantization the $38 screens showed the interleaved bitmap's fetch
-        // overrun as a junk
-        // column inside the window's right edge.
+        // quantized placement the $38 screens showed the interleaved bitmap's
+        // fetch overrun as a junk column inside the window's right edge.
         let wb_hires_overscan_fetch = RenderState {
             agnus_revision: AgnusRevision::AgaAlice,
             bplcon0: 0x8000,
@@ -6338,13 +7004,12 @@ mod tests {
         assert_eq!(wb_hires_overscan_fetch.native_x_offset(true, 1), 0);
         assert_eq!(wb_hires_overscan_fetch.fetch_start_native_x(true, 1), 0);
 
-        // The gulp grid runs on absolute colour-clock multiples of the
-        // fetch period (Agnus masks DDFSTRT to the fetch-unit boundary).
-        // Lores FMODE=1 has a 16-cck gulp: DDFSTRT $30 is on-grid and
-        // shares its slot with the standard $38, so both must display at
-        // the same position. A $18-anchored grid put these modes half a gulp
-        // early, shifting the picture left with wrap junk at the window's
-        // right edge.
+        // The placement gulp grid runs on absolute colour-clock multiples of
+        // the fetch period. Lores FMODE=1 has a 16-cck gulp: DDFSTRT $30 is
+        // on-grid and shares its displayed origin with the standard $38, so
+        // both must display at the same position. A $18-anchored grid put
+        // these modes half a gulp early, shifting the picture left with wrap
+        // junk at the window's right edge.
         let pinball_lores_wide_fetch = RenderState {
             agnus_revision: AgnusRevision::AgaAlice,
             bplcon0: 0x0611,
@@ -7416,6 +8081,170 @@ mod tests {
     }
 
     #[test]
+    fn sprite_dma_capture_suppresses_latched_manual_sprite_spans() {
+        let mut initial_state = blank_state();
+        let (pos, ctl) = sprite_control_words(
+            PAL_VISIBLE_LINE0 as u16,
+            PAL_VISIBLE_LINE0 as u16 + 8,
+            DIW_HSTART_FB0 as u16,
+        );
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+        initial_state.sprdata[0] = 0xFFFF;
+        initial_state.spr_armed[0] = true;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0].is_empty());
+    }
+
+    #[test]
+    fn held_sprite_after_dma_disable_persists_past_descriptor_vstop() {
+        let mut initial_state = blank_state();
+        let held_vstart = PAL_VISIBLE_LINE0;
+        let held_vstop = PAL_VISIBLE_LINE0 + 4;
+        let live_vstart = PAL_VISIBLE_LINE0 + 32;
+        let live_vstop = PAL_VISIBLE_LINE0 + 40;
+        let live_hstart = DIW_HSTART_FB0 + 8;
+        let (pos, ctl) =
+            sprite_control_words(live_vstart as u16, live_vstop as u16, live_hstart as u16);
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+
+        let mut held = [None; 8];
+        held[0] = Some(HeldSpriteLine {
+            line: CapturedSpriteLine {
+                sprite: 0,
+                hstart: DIW_HSTART_FB0,
+                hsub_70ns: false,
+                beam_y: held_vstart,
+                data: 0x8000,
+                datb: 0,
+                data_ext: [0; 3],
+                datb_ext: [0; 3],
+                width_words: 1,
+                attached: false,
+            },
+            vstart: held_vstart,
+            vstop: held_vstop,
+        });
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[cpu_event(
+                held_vstart as u32,
+                COPPER_WAIT_HPOS_FB0 as u32,
+                0x140,
+                pos,
+            )],
+            &held,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            true,
+        );
+
+        let line = manual_sprite_lines[0]
+            .iter()
+            .find(|line| line.beam_y == held_vstart)
+            .expect("held sprite remains visible in its DMA vertical window");
+        assert_eq!(line.hstart, live_hstart);
+        assert_eq!(line.x_start, 0);
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .any(|line| line.beam_y == held_vstop && line.hstart == live_hstart));
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .any(|line| line.beam_y > held_vstop && line.hstart == live_hstart));
+    }
+
+    #[test]
+    fn held_sprite_starts_from_dma_loaded_position_and_control() {
+        let initial_state = blank_state();
+        let held_vstart = PAL_VISIBLE_LINE0;
+        let held_hstart = DIW_HSTART_FB0 + 16;
+
+        let mut held = [None; 8];
+        held[1] = Some(HeldSpriteLine {
+            line: CapturedSpriteLine {
+                sprite: 1,
+                hstart: held_hstart,
+                hsub_70ns: true,
+                beam_y: held_vstart,
+                data: 0x8000,
+                datb: 0,
+                data_ext: [0; 3],
+                datb_ext: [0; 3],
+                width_words: 1,
+                attached: true,
+            },
+            vstart: held_vstart,
+            vstop: held_vstart + 1,
+        });
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[],
+            &held,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            true,
+        );
+
+        let line = manual_sprite_lines[1]
+            .iter()
+            .find(|line| line.beam_y == held_vstart)
+            .expect("held sprite keeps DMA-loaded position without a register write");
+        assert_eq!(line.hstart, held_hstart);
+        assert!(line.hsub_70ns);
+        assert!(line.attached);
+    }
+
+    #[test]
+    fn manual_sprite_position_write_before_hstart_uses_sprite_compare_domain() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let old_hstart = 384;
+        let new_hstart = 192;
+        let (old_pos, old_ctl) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, old_hstart);
+        let (new_pos, _) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, new_hstart);
+        initial_state.sprpos[2] = old_pos;
+        initial_state.sprctl[2] = old_ctl;
+        initial_state.sprdata[2] = 0xFFFF;
+        initial_state.spr_armed[2] = true;
+
+        // hpos 96 reaches the sprite comparator before HSTART 192, but the
+        // colour-output register domain maps it to framebuffer x=224. The
+        // repositioned sprite must not be clipped to that later output x.
+        let event_hpos = 96;
+        let manual_sprite_lines = manual_sprite_lines_from_events(
+            &initial_state,
+            &[cpu_event(beam_y as u32, event_hpos, 0x150, new_pos)],
+        );
+
+        let old_line = manual_sprite_lines[2]
+            .iter()
+            .find(|line| line.beam_y == beam_y && line.hstart == old_hstart as i32)
+            .expect("old position interval");
+        let new_line = manual_sprite_lines[2]
+            .iter()
+            .find(|line| line.beam_y == beam_y && line.hstart == new_hstart as i32)
+            .expect("new position interval");
+        let sprite_compare_x = ((event_hpos as i32 * 2 - DIW_HSTART_FB0) * 2) as usize;
+        let colour_output_x = ((event_hpos as i32 - COPPER_WAIT_HPOS_FB0) * 4) as usize;
+
+        assert_eq!(old_line.x_stop, sprite_compare_x);
+        assert_eq!(new_line.x_start, sprite_compare_x);
+        assert_ne!(new_line.x_start, colour_output_x);
+    }
+
+    #[test]
     fn manual_sprite_data_writes_affect_only_later_pixels_on_same_line() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
@@ -8440,6 +9269,56 @@ mod tests {
         assert_eq!(control.pf2_scroll(), 10);
         assert_eq!(control.scroll_for_plane(0), 3);
         assert_eq!(control.scroll_for_plane(1), 10);
+    }
+
+    #[test]
+    fn aga_bplcon1_decodes_expanded_scroll_fields() {
+        let control = ControlState {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: 0x0010,
+            bplcon1: 0xC8C2,
+            fmode: 0x0003,
+            ..ControlState::default()
+        };
+
+        // BPLCON1 bit layout on Lisa:
+        // PF1 H0..H7 = bits 8,9,0,1,2,3,10,11.
+        // PF2 H0..H7 = bits 12,13,4,5,6,7,14,15.
+        // This frame uses 136 and 240 super-hires pixels respectively; in
+        // lo-res output those are 34 and 60 native samples.
+        assert_eq!(control.pf1_scroll(), 34);
+        assert_eq!(control.pf2_scroll(), 60);
+        assert_eq!(control.scroll_for_plane(0), 34);
+        assert_eq!(control.scroll_for_plane(1), 60);
+    }
+
+    #[test]
+    fn aga_bplcon1_preserves_classic_lores_scroll_nibbles() {
+        let control = ControlState {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: 0x0010,
+            bplcon1: 0x00A3,
+            fmode: 0,
+            ..ControlState::default()
+        };
+
+        assert_eq!(control.pf1_scroll(), 3);
+        assert_eq!(control.pf2_scroll(), 10);
+    }
+
+    #[test]
+    fn aga_bplcon1_masks_scroll_range_by_fetch_width() {
+        let control = |fmode| ControlState {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: 0x0010,
+            bplcon1: 0xCC00,
+            fmode,
+            ..ControlState::default()
+        };
+
+        assert_eq!(control(0x0000).pf1_scroll(), 0);
+        assert_eq!(control(0x0001).pf1_scroll(), 16);
+        assert_eq!(control(0x0003).pf1_scroll(), 48);
     }
 
     #[test]
@@ -9517,6 +10396,48 @@ mod tests {
         assert_eq!(base_controls[ham_line + 1].bplcon0, 0x6800);
         assert_eq!(control_segments[direct_line][0].control.bplcon0, 0x4000);
         assert_eq!(base_controls[direct_line + 1].bplcon0, 0x4000);
+    }
+
+    #[test]
+    fn aga_bplcon4_splits_sprite_base_from_bitplane_xor_timing() {
+        let mut state = blank_state();
+        state.agnus_revision = AgnusRevision::AgaAlice;
+        state.bplcon4 = 0xAA09;
+        let mut base_palettes = [state.palette; FB_HEIGHT];
+        let mut palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut base_controls = [ControlState::from_render_state(&state); FB_HEIGHT];
+        let mut control_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut manual_bpl_segments = Vec::new();
+        let hpos = (COPPER_WAIT_HPOS_FB0 + 20) as u32;
+        let events = [beam_event(0x50, hpos, 0x010C, 0x5507)];
+
+        apply_render_events(
+            &mut state,
+            &events,
+            &mut base_palettes,
+            &mut palette_segments,
+            &mut base_controls,
+            &mut control_segments,
+            &mut manual_bpl_segments,
+        );
+
+        let line = (0x50 - 0x2C) as usize;
+        let sprite_x = color_write_framebuffer_x(hpos);
+        let beam_x = beam_to_framebuffer_x_unclamped(hpos) as usize;
+        assert!(sprite_x < beam_x);
+        assert_eq!(control_segments[line].len(), 2);
+        assert_eq!(control_segments[line][0].x, sprite_x);
+        assert_eq!(control_segments[line][0].control.bplcon4, 0xAA07);
+        assert_eq!(control_segments[line][1].x, beam_x);
+        assert_eq!(control_segments[line][1].control.bplcon4, 0x5507);
+        assert_eq!(
+            control_at_x(base_controls[line], &control_segments[line], beam_x - 1).bplcon4,
+            0xAA07
+        );
+        assert_eq!(
+            control_at_x(base_controls[line], &control_segments[line], beam_x).bplcon4,
+            0x5507
+        );
     }
 
     #[test]

@@ -101,11 +101,14 @@ impl CpuCore {
         self.c_flag = 0;
 
         // MC68000: MULU.W = 38 + 2 * (ones in the 16-bit source) + EA.
+        // 020+ has a fixed-cost multiplier; the cycle-exact A1200/FS-UAE
+        // reference measures MULU.W at ~27 cycles, so pre-scale to 42
+        // (-> 27 after scale_cycles_for_cpu_type).
         if self.cpu_type == CpuType::M68000 {
             38 + 2 * (src & 0xFFFF).count_ones() as i32
                 + self.ea_source_cycles(mode, Size::Word)
         } else {
-            38
+            42
         }
     }
 
@@ -135,11 +138,12 @@ impl CpuCore {
         self.c_flag = 0;
 
         // MC68000: MULS.W = 38 + 2 * (bit transitions in source<<1) + EA.
+        // 020+ fixed-cost multiplier (~27 cycles measured); pre-scale 42.
         if self.cpu_type == CpuType::M68000 {
             38 + 2 * muls_transitions(src as u16) as i32
                 + self.ea_source_cycles(mode, Size::Word)
         } else {
-            38
+            42
         }
     }
 

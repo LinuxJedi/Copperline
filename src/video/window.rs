@@ -5449,7 +5449,10 @@ impl App {
 /// active line carries ~370 lo-res pixels; consumer sets overscan a few
 /// percent per side) and are needed in full: the CD32 boot logo's leading
 /// "A" starts 13 lo-res pixels into the left overscan, and the previous
-/// 16-pixel margin clipped its serif. `h_shift` is the horizontal centring
+/// 16-pixel margin clipped its serif. Vertically the default TV view keeps
+/// top overscan but uses a tight lower bezel: software can leave active
+/// border sprites or unfinished effects below the standard window, and a
+/// consumer crop normally hides that. `h_shift` is the horizontal centring
 /// shift already applied to the frame, so the bezel tracks the shifted
 /// picture instead of clipping its left edge; `standard_top_row` is the
 /// framebuffer row where the standard window's first line sits after
@@ -5462,16 +5465,19 @@ fn mask_present_frame_to_tv(fb: &mut [u32], h_shift: usize, standard_top_row: us
     // overscan on each side of the standard window.
     const TV_VISIBLE_WIDTH: usize = 360 * 2;
     const TV_OVERSCAN_MARGIN: usize = 20 * 2;
-    // 8 lines of overscan above and below the standard window.
-    const TV_V_OVERSCAN_MARGIN: usize = 8;
+    // Keep a little top overscan, but crop the bottom just inside the
+    // standard window so lower-border junk stays behind the bezel by default.
+    const TV_TOP_OVERSCAN_MARGIN: usize = 8;
+    const TV_BOTTOM_CROP_ROWS: usize = 1;
     let black = rgba(0, 0, 0);
     let left = bitplane::STANDARD_VISIBLE_X0
         .saturating_sub(TV_OVERSCAN_MARGIN)
         .saturating_sub(h_shift);
     let right = (left + TV_VISIBLE_WIDTH).min(FB_WIDTH);
-    let top = standard_top_row.saturating_sub(TV_V_OVERSCAN_MARGIN);
-    let bottom =
-        (standard_top_row + STANDARD_PAL_VISIBLE_LINES + TV_V_OVERSCAN_MARGIN).min(FB_HEIGHT);
+    let top = standard_top_row.saturating_sub(TV_TOP_OVERSCAN_MARGIN);
+    let bottom = (standard_top_row + STANDARD_PAL_VISIBLE_LINES)
+        .saturating_sub(TV_BOTTOM_CROP_ROWS)
+        .min(FB_HEIGHT);
     for (y, row) in fb.chunks_mut(FB_WIDTH).enumerate() {
         if y < top || y >= bottom {
             row.fill(black);
@@ -6782,17 +6788,14 @@ mod tests {
         // The deep-left junk margin stays hidden.
         assert_eq!(fb[mid_row * FB_WIDTH], rgba(0, 0, 0));
         // The vertical TV window tracks the centred standard window: 8
-        // lines of overscan visible above and below it, bezel beyond.
+        // lines of top overscan remain visible, while the bottom is cropped
+        // one source row inside the standard window like a tight lower bezel.
         let top = std_top - 8;
         assert_eq!(fb[(top - 1) * FB_WIDTH + left], rgba(0, 0, 0));
         assert_eq!(fb[top * FB_WIDTH + left], marker);
-        let bottom = std_top + STANDARD_PAL_VISIBLE_LINES + 8;
+        let bottom = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
         assert_eq!(fb[(bottom - 1) * FB_WIDTH + left], marker);
         assert_eq!(fb[bottom * FB_WIDTH + left], rgba(0, 0, 0));
-        // In particular the standard window's own last line stays visible
-        // (a fixed 264-line count from row 0 used to clip it).
-        let last_std = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
-        assert_eq!(fb[last_std * FB_WIDTH + left], marker);
     }
 
     #[test]
@@ -6830,7 +6833,7 @@ mod tests {
         let left = bitplane::STANDARD_VISIBLE_X0 - 40;
         assert_eq!(fb[(std_top - 8 - 1) * FB_WIDTH + left], rgba(0, 0, 0));
         assert_eq!(fb[(std_top - 8) * FB_WIDTH + left], marker);
-        let bottom = std_top + STANDARD_PAL_VISIBLE_LINES + 8;
+        let bottom = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
         assert_eq!(fb[(bottom - 1) * FB_WIDTH + left], marker);
         if bottom < FB_HEIGHT {
             assert_eq!(fb[bottom * FB_WIDTH + left], rgba(0, 0, 0));

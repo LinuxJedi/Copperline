@@ -176,6 +176,9 @@ struct CpuBus {
     icache: Option<Box<crate::cache::CpuCache>>,
     /// 68030 data cache model (`[cpu] dcache`).
     dcache: Option<Box<crate::cache::CpuCache>>,
+    /// COPPERLINE_DBG_IRQ cached time window. Interrupt acknowledge can be hot
+    /// during IRQ storms, so parse the environment once at construction.
+    dbg_irq_window: Option<(f64, f64)>,
 }
 
 pub fn build(
@@ -213,6 +216,7 @@ impl M68kMachine {
                 dbg_memw_hit: None,
                 icache: None,
                 dcache: None,
+                dbg_irq_window: debug_irq_window_setting(),
             },
             hle: NoOpHleHandler,
             fpu_enabled,
@@ -253,6 +257,10 @@ impl M68kMachine {
             dbg_ipl_on: crate::envcfg::flag("COPPERLINE_DIAG_IPL"),
             dbg_spren_on: crate::envcfg::flag("COPPERLINE_DBG_SPREN"),
         };
+        // The 68020+ has a 3-clock chip-bus cycle (vs the 68000's 4); tell the
+        // bus so it bills the shorter post-grant tail (write-posting).
+        let short_bus = !machine.cpu.is_pre_68020;
+        machine.bus.bus.set_cpu_short_bus_cycle(short_bus);
         machine.reset_cpu();
         Ok(machine)
     }
@@ -963,6 +971,10 @@ impl M68kMachine {
         self.sync_cck_on = runtime.sync_cck_on;
         self.cpu_clocks_per_cck = runtime.cpu_clocks_per_cck;
         self.cpu_clock_carry = runtime.cpu_clock_carry;
+        // The short-bus-cycle flag is derived from the (restored) CPU model and
+        // not serialized, so re-establish it here.
+        let short_bus = !self.cpu.is_pre_68020;
+        self.bus.bus.set_cpu_short_bus_cycle(short_bus);
         // apply_state runs outside the per-instruction loop that pushes CACR
         // into the cache models, so force a re-sync now: a cache kept cold from
         // above still holds power-on (disabled) flags until CACR is applied.
@@ -1957,16 +1969,10 @@ impl AddressBus for CpuBus {
         );
         // COPPERLINE_DBG_IRQ: log every serviced interrupt (level + the enabled
         // pending source bits) with emulated time, to measure handler rates
-        // (VERTB=0x20, SOFT=0x04, COPER=0x10, PORTS=0x08, EXTER=0x2000).
+        // (VERTB=0x20, BLIT=0x40, SOFT=0x04, COPER=0x10, PORTS=0x08, EXTER=0x2000).
         // Bounded by COPPERLINE_DBG_AFTER/UNTIL.
-        if crate::envcfg::flag("COPPERLINE_DBG_IRQ") {
+        if let Some((after, until)) = self.dbg_irq_window {
             let secs = self.bus.emulated_seconds();
-            let after = crate::envcfg::var("COPPERLINE_DBG_AFTER")
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let until = crate::envcfg::var("COPPERLINE_DBG_UNTIL")
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .unwrap_or(f64::INFINITY);
             if secs >= after && secs < until {
                 log::info!(
                     "irq lvl={level} pending={pending:#06X} secs={secs:.5} f={}",
@@ -2001,6 +2007,19 @@ fn address_mask_for_model(model: CpuModel) -> u32 {
 
 fn positive_cpu_cycles(cycles: i32) -> u32 {
     cycles.max(0) as u32
+}
+
+fn debug_irq_window_setting() -> Option<(f64, f64)> {
+    if !crate::envcfg::flag("COPPERLINE_DBG_IRQ") {
+        return None;
+    }
+    let after = crate::envcfg::var("COPPERLINE_DBG_AFTER")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let until = crate::envcfg::var("COPPERLINE_DBG_UNTIL")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(f64::INFINITY);
+    Some((after, until))
 }
 
 fn is_fpu_instruction_family(opword: u16) -> bool {
@@ -2352,6 +2371,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: None,
+            dbg_irq_window: None,
         };
 
         assert_eq!(bus.read_long(0), 0x1111_4EF9);
@@ -2374,6 +2394,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: None,
+            dbg_irq_window: None,
         };
         bus.bus.set_cpu_bus_arbitration_enabled(true);
         // Start on a refresh slot (0x003) so the fetch both waits for and then
@@ -2403,6 +2424,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: None,
+            dbg_irq_window: None,
         };
         bus.bus.set_cpu_bus_arbitration_enabled(true);
 
@@ -2504,9 +2526,17 @@ mod tests {
         ];
         let steps = 3 + 2 * 11;
         let run = |icache: bool| -> Result<u32> {
-            let mut machine = M68kMachine::new(
+            // Run at the 68EC020's native ~14 MHz (4 CPU clocks per cck): with
+            // the accurate 3-clock 020 chip-bus cycle a word fetch is one cck,
+            // which still bus-bounds the tiny in-loop instructions, so dropping
+            // those fetches to the cache cuts bus traffic. (At the stock 2-clock
+            // ratio the 1.5-cck fetch already fits inside the instruction time,
+            // so cached and uncached totals match and there is nothing to cut.)
+            let mut machine = build(
                 test_bus(reset_rom(0x0007_FFFE, 0x0000_0100)),
                 CpuModel::M68EC020,
+                false,
+                4,
                 false,
             )?;
             machine.set_cache_emulation(icache, false);
@@ -2541,6 +2571,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: Some(Box::new(dcache)),
+            dbg_irq_window: None,
         };
         bus.bus.set_cpu_bus_arbitration_enabled(true);
         let fast = FAST_RAM_BASE as u32 + 0x40;
@@ -2584,6 +2615,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: None,
+            dbg_irq_window: None,
         };
         let before = bus.read_long(ROM_BASE as u32);
         bus.write_long(ROM_BASE as u32, 0xDEAD_BEEF);
@@ -2605,6 +2637,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: None,
+            dbg_irq_window: None,
         };
         let addr = SLOW_RAM_BASE as u32 + 64 * 1024;
         // With nothing yet driven, the bus rests at 0.

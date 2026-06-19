@@ -39,6 +39,13 @@
 ;   row 26 BEAM cck advanced while the A->D fill (as 24) runs WITH a 3-bitplane
 ;          display active and BLTPRI set (26-24 = display contention on the
 ;          blitter; this is the active-display beam-vs-blitter race condition)
+;   row 27 VHPOSR when the CPU first sees a COPPER-raised INTREQR.COPER (copper
+;          waits for line $64 then MOVEs SET-COPER into INTREQ; CPU polls with
+;          interrupts off). The copper-vs-CPU phase the 020 chase-the-beam
+;          copper-chunky effects depend on. FFFFFFFF if the copper never fired.
+;
+; Rows 0/1/9/13 use slow RAM ($C00000); on a machine without it (A1200) they
+; store a 0 sentinel. All other rows -- including 27 -- run regardless.
 ;
 ; Rows 23-26 measure blitter cycle timing in raster (beam) units, the dimension
 ; the CPU/contention rows above cannot see: whether a beam-raced blitter draw
@@ -58,6 +65,8 @@ SLOWT   equ     $c00000
 CHAINEN equ     $4f000          ; beam (VHPOSR) at VERTB-handler entry
 CHAINND equ     $4f004          ; beam (VHPOSR) at the SOFTINT task-switch end
 SAVESP  equ     $4f008          ; SP save slot for the mimic task switch
+SLOWPRES equ    $4f00c          ; word: 1 if slow RAM ($C00000) is present, else 0
+COPLIST equ     $50000          ; scratch copper list for the copper-phase row (27)
 
 ; This is the main program. It is loaded to $30000 by boot.asm (the boot block)
 ; and entered here. The code is position-independent (PC-relative + fixed scratch
@@ -81,7 +90,24 @@ boot:
 
         lea     RESULTS,a3      ; result write pointer
 
+        ; Probe slow RAM ($C00000). It is absent on the A1200 (no trapdoor RAM
+        ; there), so the slow-RAM rows (0,1,9,13) would otherwise read or -- for
+        ; row 13's jsr -- EXECUTE unmapped space and trap. Write two distinct
+        ; words and read them back: a real RAM keeps both, a floating bus cannot
+        ; match both. When absent those rows store a 0 sentinel instead.
+        move.w  #$a5a5,SLOWT
+        move.w  #$5a5a,SLOWT+2
+        moveq   #0,d0
+        cmp.w   #$a5a5,SLOWT
+        bne     .noslow
+        cmp.w   #$5a5a,SLOWT+2
+        bne     .noslow
+        moveq   #1,d0
+.noslow move.w  d0,SLOWPRES
+
         ; row 0: slow-RAM read
+        tst.w   SLOWPRES
+        beq     .r0skip
         lea     SLOWT,a0
         bsr     tstart
         move.w  #ITERS-1,d6
@@ -89,8 +115,13 @@ boot:
         dbra    d6,.t0
         bsr     tread
         move.l  d0,(a3)+
+        bra     .r0done
+.r0skip clr.l   (a3)+
+.r0done
 
         ; row 1: slow-RAM write
+        tst.w   SLOWPRES
+        beq     .r1skip
         lea     SLOWT,a0
         bsr     tstart
         move.w  #ITERS-1,d6
@@ -98,6 +129,9 @@ boot:
         dbra    d6,.t1
         bsr     tread
         move.l  d0,(a3)+
+        bra     .r1done
+.r1skip clr.l   (a3)+
+.r1done
 
         ; row 2: chip-RAM read
         lea     CHIPT,a0
@@ -159,6 +193,8 @@ boot:
         move.w  #$000f,$180(a6) ; phase marker: frame-length test done (blue)
 
         ; row 9: slow-RAM reads from frame top until beam reaches vpos 280
+        tst.w   SLOWPRES
+        beq     .r9skip
         bsr     syncframe       ; sync to a frame start (vpos near 0)
         moveq   #0,d7
         lea     SLOWT,a0
@@ -173,6 +209,9 @@ boot:
         cmp.w   #280,d1
         blo     .t9b            ; keep counting until the beam nears frame bottom
         move.l  d7,(a3)+
+        bra     .r9done
+.r9skip clr.l   (a3)+
+.r9done
 
         ; row 10: chip-RAM write, N=1024, NO display DMA (contention baseline)
         lea     CHIPT,a0
@@ -251,12 +290,19 @@ boot:
         ; and from a second chip address (row 14). With DMA off both regions are
         ; 2 cck/word with no contention, so on real hardware rows 7, 13 and 14
         ; should all match; a difference is an Copperline code-location timing bug.
-        lea     SLOWT,a1        ; row 13: loop executed from slow RAM ($C00000)
+        ; row 13: loop executed from slow RAM ($C00000) -- skip if no slow RAM
+        ; (jsr to unmapped space would execute floating-bus garbage and trap).
+        tst.w   SLOWPRES
+        beq     .r13skip
+        lea     SLOWT,a1
         bsr     copytmpl
         bsr     tstart
         jsr     SLOWT
         bsr     tread
         move.l  d0,(a3)+
+        bra     .r13done
+.r13skip clr.l  (a3)+
+.r13done
 
         lea     CHIPT,a1        ; row 14: loop executed from chip RAM ($060000)
         bsr     copytmpl
@@ -604,6 +650,41 @@ boot:
         move.l  d0,(a3)+        ; row 26
         move.w  #$7fff,$096(a6) ; all DMA off again
 
+        ; row 27: COPPER vs CPU interrupt phase. A copper list waits for line
+        ; $64 then MOVEs SET-COPER into INTREQ; the CPU (interrupts off) busy-
+        ; polls INTREQR for the COPER bit and records the beam (VHPOSR, high byte
+        ; vpos / low byte hpos/2). This is the SANITY Roots II copper-chunky
+        ; mechanism -- a copper-raised interrupt the per-frame work spins on -- so
+        ; the raise+catch beam position is exactly what decides whether that
+        ; effect renders or scrambles. A difference across emulators is a
+        ; copper-WAIT-release / MOVE / poll-catch phase divergence.
+        move.w  #$7fff,$096(a6) ; all DMA off
+        move.w  #$7fff,$09a(a6) ; INTENA off (poll, no exception)
+        move.w  #$7fff,$09c(a6) ; clear all pending
+        lea     copperlist(pc),a0
+        move.l  a0,d0
+        move.w  d0,$082(a6)     ; COP1LCL (low word) -- NOT $084 (that is COP2LCH)
+        swap    d0
+        move.w  d0,$080(a6)     ; COP1LCH (high word)
+        bsr     syncframe       ; sync to frame top with the copper DMA still off
+        move.w  #$0010,$09c(a6) ; clear COPER before the copper raises it
+        move.w  #$8280,$096(a6) ; DMACON: DMAEN | COPEN
+        move.w  #$0000,$088(a6) ; COPJMP1: start the copper at COP1LC (beam ~line 0)
+        move.l  #$100000,d1     ; timeout guard (so a non-firing copper cannot hang)
+.w27    move.w  $01e(a6),d0     ; INTREQR
+        btst    #4,d0           ; COPER raised yet?
+        bne     .w27ok          ; caught it
+        subq.l  #1,d1
+        bne     .w27            ; spin until the copper sets it (or timeout)
+        moveq   #-1,d0          ; never fired -> $FFFFFFFF sentinel
+        move.l  d0,CHAINEN
+        bra     .w27st
+.w27ok  clr.w   CHAINEN
+        move.w  $006(a6),CHAINEN+2 ; beam at the copper-IRQ catch
+.w27st  move.l  CHAINEN,(a3)+   ; row 27
+        move.w  #$7fff,$096(a6) ; all DMA off
+        move.w  #$7fff,$09c(a6) ; clear pending
+
         move.w  #$0ff0,$180(a6) ; phase marker: all tests done (yellow)
 
         ;------------------------------------------------ render + show
@@ -614,7 +695,7 @@ boot:
         ; the serial port to a file, giving a screenshot-free way to compare.
         move.w  #$0170,$032(a6) ; SERPER ~9600 baud
         lea     RESULTS,a2
-        moveq   #27-1,d4
+        moveq   #28-1,d4
 .sl     move.l  (a2)+,d3
         moveq   #8-1,d6
 .sh     rol.l   #4,d3
@@ -708,6 +789,15 @@ slowtmpl:
 .l      dbra    d6,.l
         rts
 slowtmpl_end:
+
+;------------------------------------------------ copper list for the row-27 phase
+; WAIT for line $64, raise the copper interrupt, then sleep. Read by the copper
+; via DMA (it lives in chip RAM with the rest of the loaded program).
+        even
+copperlist:
+        dc.w    $6401,$ff00     ; WAIT vp=$64, hp any (BFD set, VP fully compared)
+        dc.w    $009c,$8010     ; MOVE #$8010,INTREQ -> SET COPER (raise IRQ)
+        dc.w    $ffff,$fffe     ; WAIT forever (copper sleeps to end of frame)
 
 ;------------------------------------------------ send one char (d0.b) on serial
 ; Waits for SERDATR TBE (transmit buffer empty, bit 13) then writes SERDAT with
@@ -822,7 +912,7 @@ render:
         addq.w  #1,d2
         dbra    d6,.rd
         addq.w  #1,d4
-        cmp.w   #27,d4
+        cmp.w   #28,d4
         bne     .rr
         rts
 
