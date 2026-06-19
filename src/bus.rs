@@ -2644,7 +2644,11 @@ impl Bus {
         if self.current_frame_geometry.programmable {
             return self.current_frame_geometry.visible_start_vpos;
         }
-        visible_start_vpos_for_diw(self.denise.diwstrt, self.effective_diwhigh())
+        visible_start_vpos_for_diw(
+            self.denise.diwstrt,
+            self.denise.diwstop,
+            self.effective_diwhigh(),
+        )
     }
 
     /// Display geometry for the frame that is just starting, computed once
@@ -6467,8 +6471,7 @@ impl Bus {
     fn capture_same_line_display_start_if_due(&mut self) {
         if self.current_frame_display_snapshot_taken
             || matches!(self.agnus.revision(), AgnusRevision::Ocs)
-            || self.denise.diwstrt == 0
-            || self.denise.diwstop == 0
+            || display_window_unprogrammed(self.denise.diwstrt, self.denise.diwstop)
         {
             return;
         }
@@ -6494,6 +6497,7 @@ impl Bus {
         let visible_start = self.current_frame_visible_start_vpos;
         let rows = clipped_display_rows_before_visible(
             self.denise.diwstrt,
+            self.denise.diwstop,
             self.effective_diwhigh(),
             visible_start,
         );
@@ -6626,6 +6630,7 @@ impl Bus {
                         sprite,
                         self.agnus.revision(),
                         self.effective_bitplane_bplcon0(),
+                        self.agnus.fmode(),
                         self.effective_bitplane_dmacon(),
                         self.denise.ddfstrt,
                         self.denise.ddfstop,
@@ -6727,6 +6732,7 @@ impl Bus {
                     sprite,
                     self.agnus.revision(),
                     bitplane_bplcon0,
+                    self.agnus.fmode(),
                     bitplane_dmacon,
                     self.denise.ddfstrt,
                     self.denise.ddfstop,
@@ -7586,8 +7592,12 @@ fn diw_v_stop(diwstop: u16, diwhigh: DiwHigh) -> u16 {
     diwhigh.v_stop(diwstop)
 }
 
-fn visible_start_vpos_for_diw(diwstrt: u16, diwhigh: DiwHigh) -> u32 {
-    if diwstrt == 0 {
+fn display_window_unprogrammed(diwstrt: u16, diwstop: u16) -> bool {
+    diwstrt == 0 && diwstop == 0
+}
+
+fn visible_start_vpos_for_diw(diwstrt: u16, diwstop: u16, diwhigh: DiwHigh) -> u32 {
+    if display_window_unprogrammed(diwstrt, diwstop) {
         return RENDER_VISIBLE_START_VPOS;
     }
     u32::from(diw_v_start(diwstrt, diwhigh))
@@ -7596,10 +7606,11 @@ fn visible_start_vpos_for_diw(diwstrt: u16, diwhigh: DiwHigh) -> u32 {
 
 fn clipped_display_rows_before_visible(
     diwstrt: u16,
+    diwstop: u16,
     diwhigh: DiwHigh,
     visible_start_vpos: u32,
 ) -> usize {
-    if diwstrt == 0 {
+    if display_window_unprogrammed(diwstrt, diwstop) {
         return 0;
     }
     (visible_start_vpos as i32 - diw_v_start(diwstrt, diwhigh) as i32).max(0) as usize
@@ -7616,7 +7627,7 @@ fn visible_framebuffer_y(
 }
 
 fn display_window_contains_vpos(diwstrt: u16, diwstop: u16, diwhigh: DiwHigh, vpos: u32) -> bool {
-    if diwstrt == 0 || diwstop == 0 {
+    if display_window_unprogrammed(diwstrt, diwstop) {
         return (RENDER_VISIBLE_START_VPOS
             ..RENDER_VISIBLE_START_VPOS + RENDER_VISIBLE_LINES as u32)
             .contains(&vpos);
@@ -7738,6 +7749,10 @@ fn next_chip_bus_quantum_at(hpos: u32, line_cck: u32) -> u32 {
 }
 
 fn effective_ddf_hpos(bplcon0: u16, raw: u16) -> u16 {
+    effective_ddf_start_hpos_raw(bplcon0, raw)
+}
+
+fn effective_ddf_start_hpos_raw(bplcon0: u16, raw: u16) -> u16 {
     if bitplane_hires_like_ddf(bplcon0) {
         raw & 0x00FC
     } else {
@@ -7745,8 +7760,12 @@ fn effective_ddf_hpos(bplcon0: u16, raw: u16) -> u16 {
     }
 }
 
+fn effective_ddf_stop_hpos(_bplcon0: u16, raw: u16) -> u16 {
+    raw & 0x00FC
+}
+
 fn effective_ddf_start_hpos(bplcon0: u16, raw: u16) -> u16 {
-    let start = effective_ddf_hpos(bplcon0, raw);
+    let start = effective_ddf_start_hpos_raw(bplcon0, raw);
     if start == 0 {
         0
     } else {
@@ -7762,8 +7781,8 @@ fn effective_ddf_window(
     harddis: bool,
 ) -> Option<(u16, u16)> {
     let (hard_start, hard_stop) = ddf_hard_bounds(harddis);
-    let start = effective_ddf_hpos(bplcon0, ddfstrt);
-    let mut stop = effective_ddf_hpos(bplcon0, ddfstop);
+    let start = effective_ddf_start_hpos_raw(bplcon0, ddfstrt);
+    let mut stop = effective_ddf_stop_hpos(bplcon0, ddfstop);
     if start == 0 || start > hard_stop {
         return None;
     }
@@ -9183,7 +9202,7 @@ fn live_display_window_contains_x(
 }
 
 fn live_display_window_x(diwstrt: u16, diwstop: u16, diwhigh: DiwHigh) -> (i32, i32) {
-    if diwstrt == 0 {
+    if display_window_unprogrammed(diwstrt, diwstop) {
         return (0, RENDER_FRAMEBUFFER_WIDTH);
     }
     let start = diw_h_start(diwstrt, diwhigh) as i32;
@@ -9275,11 +9294,12 @@ fn palette_event_sequences_equivalent(a: &[BeamRegisterWrite], b: &[BeamRegister
 #[cfg(test)]
 mod tests {
     use super::{
-        bitplane_words_per_row, diw_h_start, diw_h_stop, diw_v_start, diw_v_stop,
-        framebuffer_x_for_live_collision_hpos, live_bitplane_collision_bits, live_display_window_x,
-        live_manual_sprite_collision_sources, live_sprite_playfield_collision_bits_in_range,
-        live_sprite_sprite_collision_bits, BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource,
-        Bus, CapturedBitplaneRow, CapturedSpriteLine, ChipBusOwner, CpuBusAccessKind, DeviceClock,
+        bitplane_words_per_row, clipped_display_rows_before_visible, display_window_contains_vpos,
+        diw_h_start, diw_h_stop, diw_v_start, diw_v_stop, framebuffer_x_for_live_collision_hpos,
+        live_bitplane_collision_bits, live_display_window_x, live_manual_sprite_collision_sources,
+        live_sprite_playfield_collision_bits_in_range, live_sprite_sprite_collision_bits,
+        visible_start_vpos_for_diw, BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus,
+        CapturedBitplaneRow, CapturedSpriteLine, ChipBusOwner, CpuBusAccessKind, DeviceClock,
         LiveCollisionControl, LiveCollisionLineReplay, LiveSpriteCollisionSource,
         RenderRegisterSnapshot, BLITTER_SLOWDOWN_CPU_MISS_LIMIT, BLTCON1_DOFF, BPLCON0_ECSENA,
         BPLCON3_BRDSPRT, BPLCON3_SPRES_HIRES, COPPER_BUS_LOCKOUT_HPOS, DENISE_HPOS_LAG_CCK,
@@ -10081,6 +10101,13 @@ mod tests {
         assert_eq!(
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x003C, 0x0040, false),
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0038, 0x0040, false)
+        );
+        // Low-res DDFSTOP bit 2 is still inside the fetch-unit span: $B6
+        // extends through the $B4 unit, yielding the 30-byte row expected by
+        // five interleaved bitplanes.
+        assert_eq!(
+            bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x004A, 0x00B6, false),
+            15
         );
         // Hires DDF has 4-cck granularity: the start's low bits shift the
         // window by half a fetch unit. The sequencer still runs whole 8-cck
@@ -12180,6 +12207,39 @@ mod tests {
     }
 
     #[test]
+    fn ocs_display_window_zero_start_opens_from_beam_zero() {
+        let implicit = DiwHigh::ocs_implicit();
+
+        assert_eq!(
+            visible_start_vpos_for_diw(0x0000, 0x2CC1, implicit),
+            RENDER_MIN_OVERSCAN_START_VPOS
+        );
+        assert_eq!(
+            clipped_display_rows_before_visible(
+                0x0000,
+                0x2CC1,
+                implicit,
+                RENDER_MIN_OVERSCAN_START_VPOS
+            ),
+            RENDER_MIN_OVERSCAN_START_VPOS as usize
+        );
+        assert!(display_window_contains_vpos(
+            0x0000,
+            0x2CC1,
+            implicit,
+            RENDER_MIN_OVERSCAN_START_VPOS,
+        ));
+        assert_eq!(
+            live_display_window_x(0x0000, 0x2CC1, implicit),
+            (0, (0x01C1 - RENDER_DIW_HSTART_FB0) * 2)
+        );
+        assert_eq!(
+            visible_start_vpos_for_diw(0x0000, 0x0000, implicit),
+            RENDER_VISIBLE_START_VPOS
+        );
+    }
+
+    #[test]
     fn ecs_diwhigh_write_zero_selects_direct_display_window_msbs() {
         let mut bus = empty_bus();
         bus.set_agnus_revision(AgnusRevision::Ecs8372Rev4);
@@ -14049,7 +14109,7 @@ mod tests {
         bus.agnus.vpos = 0x2C;
         bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[3] - 1;
         bus.denise.bplcon0 = 0x1000;
-        bus.denise.ddfstrt = 0x0030;
+        bus.denise.ddfstrt = 0x0028;
         bus.denise.ddfstop = 0x0038;
         bus.denise.sprpt[6] = sprite6_ptr as u32;
         bus.denise.sprpt[7] = sprite7_ptr as u32;

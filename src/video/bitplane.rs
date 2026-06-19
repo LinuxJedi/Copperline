@@ -307,6 +307,10 @@ struct ControlState {
     bpl2mod: i16,
 }
 
+fn display_window_unprogrammed(diwstrt: u16, diwstop: u16) -> bool {
+    diwstrt == 0 && diwstop == 0
+}
+
 impl ControlState {
     fn from_render_state(state: &RenderState) -> Self {
         Self {
@@ -431,7 +435,7 @@ impl ControlState {
     }
 
     fn display_window_contains_line(&self, line: usize, visible_line0: i32) -> bool {
-        if self.diwstrt == 0 || self.diwstop == 0 {
+        if display_window_unprogrammed(self.diwstrt, self.diwstop) {
             return true;
         }
         let start = self.diw_v_start() as i32;
@@ -447,7 +451,7 @@ impl ControlState {
     }
 
     fn display_window_x(&self) -> (usize, usize) {
-        if self.diwstrt == 0 {
+        if display_window_unprogrammed(self.diwstrt, self.diwstop) {
             return (0, FB_WIDTH);
         }
         let start = self.diw_h_start() as i32;
@@ -468,7 +472,7 @@ impl ControlState {
     }
 
     fn clipped_display_rows_before_frame(&self, visible_line0: i32) -> usize {
-        if self.diwstrt == 0 || self.diwstop == 0 {
+        if display_window_unprogrammed(self.diwstrt, self.diwstop) {
             return 0;
         }
         (visible_line0 - self.diw_v_start() as i32).max(0) as usize
@@ -721,8 +725,8 @@ impl ControlState {
 
     fn has_valid_ddf_window(&self) -> bool {
         let hires_like = self.hires() || self.shres();
-        let start = effective_ddf_hpos(hires_like, self.ddfstrt);
-        let stop = effective_ddf_hpos(hires_like, self.ddfstop);
+        let start = effective_ddf_start_hpos_raw(hires_like, self.ddfstrt);
+        let stop = effective_ddf_stop_hpos(hires_like, self.ddfstop);
         (start == 0 && stop == 0)
             || effective_ddf_window(
                 self.agnus_revision,
@@ -1667,7 +1671,7 @@ impl RenderState {
 
     #[cfg(test)]
     fn display_window_y(&self) -> (usize, usize) {
-        if self.diwstrt == 0 || self.diwstop == 0 {
+        if display_window_unprogrammed(self.diwstrt, self.diwstop) {
             return (0, FB_HEIGHT);
         }
         let start = self.diw_v_start() as i32;
@@ -1682,7 +1686,7 @@ impl RenderState {
 
     #[cfg(test)]
     fn clipped_display_rows_before_frame(&self) -> usize {
-        if self.diwstrt == 0 || self.diwstop == 0 {
+        if display_window_unprogrammed(self.diwstrt, self.diwstop) {
             return 0;
         }
         (PAL_VISIBLE_LINE0 - self.diw_v_start() as i32).max(0) as usize
@@ -1690,7 +1694,7 @@ impl RenderState {
 
     #[cfg(test)]
     fn display_window_x(&self) -> (usize, usize) {
-        if self.diwstrt == 0 {
+        if display_window_unprogrammed(self.diwstrt, self.diwstop) {
             return (0, FB_WIDTH);
         }
         let start = self.diw_h_start() as i32;
@@ -1712,7 +1716,7 @@ impl RenderState {
 
     #[cfg(test)]
     fn clipped_display_pixels_before_frame(&self) -> usize {
-        if self.diwstrt == 0 {
+        if display_window_unprogrammed(self.diwstrt, self.diwstop) {
             return 0;
         }
         ((DIW_HSTART_FB0 - self.diw_h_start() as i32).max(0) as usize * 2).min(FB_WIDTH)
@@ -5467,6 +5471,7 @@ fn collect_sprite_lines(
         sprite,
         state.agnus_revision,
         state.bplcon0,
+        state.fmode,
         state.dmacon,
         state.ddfstrt,
         state.ddfstop,
@@ -5687,7 +5692,7 @@ fn read_chip_word_wrapping(ram: &[u8], addr: u32) -> u16 {
     u16::from_be_bytes([ram[a], ram[(a + 1) & mask]])
 }
 
-fn effective_ddf_hpos(hires: bool, raw: u16) -> u16 {
+fn effective_ddf_start_hpos_raw(hires: bool, raw: u16) -> u16 {
     if hires {
         raw & 0x00FC
     } else {
@@ -5695,8 +5700,12 @@ fn effective_ddf_hpos(hires: bool, raw: u16) -> u16 {
     }
 }
 
+fn effective_ddf_stop_hpos(_hires: bool, raw: u16) -> u16 {
+    raw & 0x00FC
+}
+
 fn effective_ddf_start_hpos(hires: bool, raw: u16) -> u16 {
-    let start = effective_ddf_hpos(hires, raw);
+    let start = effective_ddf_start_hpos_raw(hires, raw);
     if start == 0 {
         0
     } else {
@@ -5712,8 +5721,8 @@ fn effective_ddf_window(
     harddis: bool,
 ) -> Option<(u16, u16)> {
     let (hard_start, hard_stop) = ddf_hard_bounds(harddis);
-    let start = effective_ddf_hpos(hires, ddfstrt);
-    let mut stop = effective_ddf_hpos(hires, ddfstop);
+    let start = effective_ddf_start_hpos_raw(hires, ddfstrt);
+    let mut stop = effective_ddf_stop_hpos(hires, ddfstop);
     if start == 0 || start > hard_stop {
         return None;
     }
@@ -6606,6 +6615,31 @@ mod tests {
     }
 
     #[test]
+    fn display_window_zero_start_uses_denise_comparator() {
+        let state = RenderState {
+            diwstrt: 0x0000,
+            diwstop: 0x2CC1,
+            ..blank_state()
+        };
+
+        assert_eq!(state.diw_v_start(), 0);
+        assert_eq!(state.diw_h_start(), 0);
+        assert_eq!(state.display_window_y(), (0, 256));
+        assert_eq!(
+            state.display_window_x(),
+            (0, ((0x01C1 - DIW_HSTART_FB0) * 2) as usize)
+        );
+        assert_eq!(
+            state.clipped_display_rows_before_frame(),
+            PAL_VISIBLE_LINE0 as usize
+        );
+        assert_eq!(
+            state.clipped_display_pixels_before_frame(),
+            (DIW_HSTART_FB0 as usize) * 2
+        );
+    }
+
+    #[test]
     fn display_window_maps_pal_horizontal_overscan_to_full_framebuffer_width() {
         let state = RenderState {
             diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | DIW_HSTART_FB0 as u16,
@@ -7259,6 +7293,13 @@ mod tests {
         };
         assert_eq!(ocs_equal.words_per_row(false, 320), 21);
 
+        let lores_partial_stop = RenderState {
+            ddfstrt: 0x004A,
+            ddfstop: 0x00B6,
+            ..blank_state()
+        };
+        assert_eq!(lores_partial_stop.words_per_row(false, 320), 15);
+
         let ecs_equal = RenderState {
             agnus_revision: AgnusRevision::Ecs8372Rev4,
             ddfstrt: 0x0038,
@@ -7530,7 +7571,7 @@ mod tests {
         let mut state = blank_state();
         state.dmacon = DMACON_DMAEN | DMACON_SPREN | DMACON_BPLEN;
         state.bplcon0 = 0x1000;
-        state.ddfstrt = 0x0030;
+        state.ddfstrt = 0x0028;
         state.ddfstop = 0x0038;
         state.palette.write_ocs(29, 0x0F00);
         let ram = vec![0; 64];

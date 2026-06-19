@@ -83,6 +83,10 @@ Two vertical edge cases the replay honours:
   BPLCON0/DMACON writes line by line, so only lines where bitplane DMA
   was actually enabled consume a row -- the CDTV boot screen opens its
   window at line 5 but raises BPLCON0 from 0 to 6 planes at line 24.
+- DIWSTRT=0 is not a sentinel. If DIWSTOP is non-zero, the replay opens the
+  display window at beam zero and clips the overscan rows/pixels that fall
+  before the captured framebuffer; only DIWSTRT=DIWSTOP=0 falls back to the
+  reset/default visible window.
 - Canvas rows whose beam line lies at or past the frame wrap (the fixed
   285-row field is taller than a standard PAL scan) are forced to black:
   the beam never produces those lines, and a deep-overscan window would

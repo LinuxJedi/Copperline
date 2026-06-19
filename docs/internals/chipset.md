@@ -19,14 +19,21 @@ finer granularity than the unit in hi-res/super-hi-res and wide-FMODE
 modes, so a DDFSTOP landing mid-unit extends the fetch through the unit
 starting at-or-after it (`agnus::bitplane_fetch_blocks`; the CDTV
 trademark screen's hi-res $64/$A8 window fetches 20 words per row, not
-the truncated 18). Wide-FMODE units (16/32 CCK) use the same rule rather
-than moving DDFSTRT down to an absolute grid. In lo-res, the plane-order
-slots for a wide unit are packed into the unit's first eight CCKs; the
-remaining CCKs are free for other bus users. SANITY Roots II's AGA
-256-colour effects are regression examples for both sides of this: the
-hi-res FMODE=3 pictures need raw-DDFSTRT unit rounding to preserve their
-40-word rows, and the lo-res FMODE=3 landscape needs packed first-eight
-CCK plane slots instead of spreading those slots across the 32-CCK unit.
+the truncated 18). Lo-res OCS has an extra asymmetry: DDFSTRT is rounded
+to the 8-CCK fetch-block start, but DDFSTOP keeps its 4-CCK comparator
+granularity, so a stop in the second half of a block still includes that
+block. A $4A/$B6 window therefore fetches 15 words per row, matching five
+30-byte interleaved planes. Wide-FMODE units (16/32 CCK) use the same rule
+rather than moving DDFSTRT down to an absolute grid. In lo-res, the
+plane-order slots for a wide unit are packed into the unit's first eight
+CCKs; the remaining CCKs are free for other bus users. If a bitplane fetch
+block occupies sprite 7's late DMA slot at $30, sprite 7 DMA is blocked
+for that line; the condition is derived from the fetch-block sequence, not
+from a single DDFSTRT value. SANITY Roots II's AGA 256-colour effects are
+regression examples for both sides of this: the hi-res FMODE=3 pictures
+need raw-DDFSTRT unit rounding to preserve their 40-word rows, and the
+lo-res FMODE=3 landscape needs packed first-eight CCK plane slots instead
+of spreading those slots across the 32-CCK unit.
 
 Agnus revisions are modelled independently of Denise (machines shipped
 mixed): OCS (8370/8371), ECS 8372A (1M chip RAM reach), ECS 8375 (2M), and
@@ -108,6 +115,11 @@ low DIWSTRT/DIWSTOP values. Software that programmed a wide window through
 DIWHIGH and then touches DIWSTRT/DIWSTOP falls back to the implicit
 window, so the replay must drop the stale DIWHIGH on those writes rather
 than hold it.
+
+DIWSTRT value zero is still a real Denise comparator position. The emulator
+only treats the display window as unprogrammed when DIWSTRT and DIWSTOP are
+both zero; a zero start paired with a non-zero stop opens the window at beam
+zero and can expose deep overscan.
 
 ## CIA (`cia.rs`)
 

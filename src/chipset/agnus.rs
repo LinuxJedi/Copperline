@@ -456,12 +456,16 @@ fn bitplane_fetch_unit(bplcon0: u16, fmode: u16) -> u32 {
     bitplane_fetch_period(bplcon0, fmode).max(8)
 }
 
-pub fn effective_bitplane_ddf_hpos(bplcon0: u16, raw: u16) -> u16 {
+pub fn effective_bitplane_ddf_start_hpos(bplcon0: u16, raw: u16) -> u16 {
     if bitplane_hires_like_ddf(bplcon0) {
         raw & 0x00FC
     } else {
         raw & 0x00F8
     }
+}
+
+pub fn effective_bitplane_ddf_stop_hpos(_bplcon0: u16, raw: u16) -> u16 {
+    raw & 0x00FC
 }
 
 pub fn effective_bitplane_ddf_window(
@@ -472,8 +476,8 @@ pub fn effective_bitplane_ddf_window(
     harddis: bool,
 ) -> Option<(u16, u16)> {
     let (hard_start, hard_stop) = ddf_hard_bounds(harddis);
-    let start = effective_bitplane_ddf_hpos(bplcon0, ddfstrt);
-    let mut stop = effective_bitplane_ddf_hpos(bplcon0, ddfstop);
+    let start = effective_bitplane_ddf_start_hpos(bplcon0, ddfstrt);
+    let mut stop = effective_bitplane_ddf_stop_hpos(bplcon0, ddfstop);
     if start == 0 || start > hard_stop {
         return None;
     }
@@ -489,6 +493,7 @@ pub fn sprite_dma_disabled_by_bitplane_ddf(
     sprite: usize,
     revision: AgnusRevision,
     bplcon0: u16,
+    fmode: u16,
     dmacon: u16,
     ddfstrt: u16,
     ddfstop: u16,
@@ -500,14 +505,19 @@ pub fn sprite_dma_disabled_by_bitplane_ddf(
     if bitplane_dma_planes(bplcon0, matches!(revision, AgnusRevision::AgaAlice)) == 0 {
         return false;
     }
-    if effective_bitplane_ddf_window(revision, bplcon0, ddfstrt, ddfstop, harddis).is_none() {
+    let Some((ddfstart, ddfstop)) =
+        effective_bitplane_ddf_window(revision, bplcon0, ddfstrt, ddfstop, harddis)
+    else {
         return false;
-    }
-    let ddfstart = effective_bitplane_ddf_hpos(bplcon0, ddfstrt);
-    // Sprite 7 loses its late DMA slot to the lowres bitplane fetch block that
-    // starts at $30. Earlier DDF starts occupy earlier fixed-DMA slots; they do
-    // not by themselves collide with sprite 7.
-    ddfstart == 0x0030
+    };
+    let unit = bitplane_fetch_unit(bplcon0, fmode);
+    let ddfstart = u32::from(anchor_bitplane_fetch_start(ddfstart, unit));
+    let blocks = bitplane_fetch_blocks(u32::from(ddfstop) - ddfstart, unit) as u32;
+    let last_block_start = ddfstart + blocks.saturating_sub(1) * unit;
+    let sprite7_block_start = 0x0030;
+    ddfstart <= sprite7_block_start
+        && last_block_start >= sprite7_block_start
+        && (sprite7_block_start - ddfstart).is_multiple_of(unit)
 }
 
 pub fn bitplane_dma_planes(bplcon0: u16, aga: bool) -> usize {
@@ -1583,6 +1593,7 @@ mod tests {
             7,
             AgnusRevision::Ocs,
             0x1000,
+            0,
             DMACON_DMAEN | DMACON_BPLEN,
             0x0030,
             0x0038,
@@ -1592,15 +1603,17 @@ mod tests {
             6,
             AgnusRevision::Ocs,
             0x1000,
+            0,
             DMACON_DMAEN | DMACON_BPLEN,
             0x0030,
             0x0038,
             false,
         ));
-        assert!(!sprite_dma_disabled_by_bitplane_ddf(
+        assert!(sprite_dma_disabled_by_bitplane_ddf(
             7,
             AgnusRevision::Ocs,
             0x1000,
+            0,
             DMACON_DMAEN | DMACON_BPLEN,
             0x0028,
             0x0028,
@@ -1610,6 +1623,7 @@ mod tests {
             7,
             AgnusRevision::Ocs,
             0x1000,
+            0,
             DMACON_DMAEN | DMACON_BPLEN,
             0x0038,
             0x0038,
@@ -1619,6 +1633,7 @@ mod tests {
             7,
             AgnusRevision::Ocs,
             0x0000,
+            0,
             DMACON_DMAEN | DMACON_BPLEN,
             0x0030,
             0x0038,
@@ -1628,6 +1643,7 @@ mod tests {
             7,
             AgnusRevision::Ocs,
             0x1000,
+            0,
             DMACON_DMAEN,
             0x0030,
             0x0038,
@@ -1711,6 +1727,14 @@ mod tests {
         assert_eq!(plan.slots.last().unwrap().hpos, 0x00DF);
         assert!(plan.line_complete);
         assert_eq!(plan.ptrs_after_range[0], 0x012A);
+    }
+
+    #[test]
+    fn lores_ddfstop_bit_two_extends_partial_fetch_unit() {
+        assert_eq!(
+            bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x004A, 0x00B6, false),
+            15
+        );
     }
 
     #[test]
