@@ -940,7 +940,6 @@ impl FloppyController {
         })
     }
 
-    #[cfg(test)]
     pub fn dskpt(&self) -> u32 {
         self.dskpt
     }
@@ -973,9 +972,11 @@ impl FloppyController {
                 (self.drives[idx].rotation_bit % 16) as u8,
             )
         } else {
-            // A read frames words from the current head position; if it waits
-            // for sync, framing realigns to the sync bit phase when it locks.
-            self.read_shifter.reset_framing();
+            // A read drains Paula's live serial-to-parallel shifter on its
+            // recovered disk word phase. If it waits for sync, framing
+            // realigns to the sync bit phase when it locks.
+            self.read_shifter
+                .reset_framing_to_phase((self.drives[idx].rotation_bit % 16) as u8);
             (0, 0)
         };
         self.dma = Some(DiskDma {
@@ -3019,10 +3020,11 @@ impl PaulaDiskReadDpllFifo {
         }
     }
 
-    /// Reset framing and FIFO for a fresh DMA (keeps no stale words). The bit
-    /// shifter itself keeps running on the live stream.
-    fn reset_framing(&mut self) {
-        self.bit_offset = 0;
+    /// Reset queued DMA words for a fresh transfer while preserving Paula's
+    /// recovered 16-bit disk word phase. The bit shifter itself keeps running
+    /// on the live stream; DMA start must not re-phase it to the CPU write.
+    fn reset_framing_to_phase(&mut self, bit_phase: u8) {
+        self.bit_offset = bit_phase & 15;
         self.fifo_len = 0;
         self.fifo_overflow = false;
     }
@@ -3368,6 +3370,13 @@ mod tests {
             tick_index_flag_sync(ctrl);
         }
         ctrl.take_index_pulse();
+    }
+
+    fn bytes_to_words(bytes: &[u8]) -> Vec<u16> {
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect()
     }
 
     fn drive_select_prb(idx: usize, motor_on: bool) -> u8 {
@@ -6921,6 +6930,66 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn non_wordsync_full_track_dma_uses_recovered_disk_word_phase() -> Result<()> {
+        let mut adf = vec![0u8; ADF_SIZE];
+        let boot = b"DOS\0";
+        adf[0..boot.len()].copy_from_slice(boot);
+        for (idx, byte) in adf[4..BYTES_PER_SECTOR].iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(3).wrapping_add(0x19);
+        }
+        let path = temp_path("full-track-dma-checksum.adf");
+        fs::write(&path, &adf)?;
+        let cfg = FloppyConfig {
+            drives: [
+                Some(FloppyDriveConfig {
+                    path: path.clone(),
+                    write_protected: true,
+                }),
+                None,
+                None,
+                None,
+            ],
+        };
+        let mut ctrl = FloppyController::from_config(&cfg)?;
+        let mut chip_ram = vec![0u8; 7358 * 2];
+        ctrl.write_prb(!CIAB_DSKMOTOR & !CIAB_DSKSEL0);
+        ctrl.tick(MOTOR_READY_CCK, 0, &mut chip_ram);
+        ctrl.ensure_track(0, 0);
+        // Arm just before a natural 16-bit MFM word boundary. Trackdisk-style
+        // full-track reads do not always use WORDSYNC, so DMA must still drain
+        // Paula's recovered word phase rather than starting a new phase on the
+        // CPU's DSKLEN write.
+        ctrl.drives[0].set_rotation_bit(3904);
+        ctrl.drives[0].rotation_acc_cck = 0;
+        let lead_in = ctrl.drives[0].head_cck_for_bits(15) as u32;
+        ctrl.tick(lead_in, 0, &mut chip_ram);
+        assert_eq!(ctrl.drives[0].rotation_bit % 16, 15);
+        ctrl.set_dskpt_low(0);
+
+        let len = DSKLEN_DMAEN | 7358;
+        assert!(!ctrl.write_dsklen(len, 0));
+        assert!(!ctrl.write_dsklen(len, 0));
+        let dmacon = DMACON_DMAEN | DMACON_DISK;
+        while !ctrl.tick(ctrl.word_cck(), dmacon, &mut chip_ram) {}
+
+        let sectors = decode_track_write(0, &bytes_to_words(&chip_ram))?;
+        let sector0 = sectors.iter().find(|(sector, _)| *sector == 0);
+        let Some((_, sector0)) = sector0 else {
+            panic!(
+                "full-track DMA should include sector 0; decoded sectors: {:?}",
+                sectors
+                    .iter()
+                    .map(|(sector, _)| *sector)
+                    .collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(&sector0[..], &adf[0..BYTES_PER_SECTOR]);
+
+        let _ = fs::remove_file(path);
         Ok(())
     }
 

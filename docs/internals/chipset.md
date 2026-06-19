@@ -130,7 +130,10 @@ and data under the head right now is what disk DMA sees. Track stepping
 pays settle time, direction reversals cost more, and the index pulse fires
 once per revolution into CIA-B FLAG. Reads assemble MFM bitstreams from
 the 11-sector AmigaDOS track layout; DSKSYNC matching, word-at-a-time
-DSKDAT, and DMA into chip RAM behave as Paula documents. Supported image
+DSKDAT, and DMA into chip RAM behave as Paula documents. Non-WORDSYNC read
+DMA drains Paula's recovered 16-bit disk word phase even when DSKLEN is
+armed between disk-word boundaries; WORDSYNC is the explicit mode that
+realigns framing to a matched sync word before transfer. Supported image
 formats: ADF (read/write), gzip ADZ, DMS (decompressed by `dms.rs`), UAE
 extended ADF, and read-only SCP flux images.
 

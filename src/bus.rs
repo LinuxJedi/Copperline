@@ -3590,10 +3590,11 @@ impl Bus {
                 // activity with scene/animation timing.
                 if crate::envcfg::flag("COPPERLINE_DBG_DSKLEN") {
                     log::info!(
-                        "dsklen f={} secs={:.4} v={} write={:#06X} dma={} wr={} words={}",
+                        "dsklen f={} secs={:.4} v={} dskpt={:#08X} write={:#06X} dma={} wr={} words={}",
                         self.emulated_frames,
                         self.emulated_seconds(),
                         self.agnus.vpos,
+                        self.floppy.dskpt(),
                         val,
                         (val >> 15) & 1,
                         (val >> 14) & 1,
