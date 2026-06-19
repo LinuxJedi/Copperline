@@ -26,11 +26,11 @@ pub struct Config {
     /// ([`CpuModel::default_clock_mhz`]); overridable via `[cpu] clock_mhz`.
     pub cpu_clock_mhz: f64,
     /// Model the 68020/030 on-chip instruction cache (CACR-controlled).
-    /// Off by default: the calibrated 020 timing assumes no cache model,
-    /// so enabling this makes chip-RAM-resident code run faster.
+    /// Defaults on for the parts that have one (68EC020/68020/68030), as on
+    /// real silicon; `[cpu] icache = false` opts a 020/030 back out.
     pub cpu_icache: bool,
-    /// Model the 68030 on-chip data cache (CACR-controlled). Off by
-    /// default. Only caches expansion RAM and ROM (chip/slow RAM get
+    /// Model the 68030 on-chip data cache (CACR-controlled). Defaults on for
+    /// the 68030. Only caches expansion RAM and ROM (chip/slow RAM get
     /// cache inhibit, as on real Amigas, because DMA writes them).
     pub cpu_dcache: bool,
     pub emulation: Emulation,
@@ -724,7 +724,7 @@ struct RawConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDisplay {
-    /// "full" (default) or "tv" (mask deep overscan like a CRT bezel).
+    /// "tv" (default, mask deep overscan like a CRT bezel) or "full".
     overscan: Option<String>,
     /// CRT phosphor persistence fraction, 0.0 (off, default) to 0.95.
     phosphor: Option<f32>,
@@ -834,8 +834,9 @@ struct RawChipset {
     video: Option<String>,
     /// Fine-grained chip overrides on top of the `revision` preset, for the
     /// mixed machines that really shipped (e.g. late A500: ECS Agnus with an
-    /// OCS Denise). `agnus` accepts OCS / 8370 / 8371 / 8372 / 8372A / 8375;
-    /// `denise` accepts OCS / 8362 / ECS / 8373.
+    /// OCS Denise). `agnus` accepts OCS / 8370 / 8371 / 8372 / 8372A / 8372B /
+    /// 8374 / 8375 / ALICE; `denise` accepts OCS / 8362 / ECS / 8373 / LISA /
+    /// 4203.
     agnus: Option<String>,
     denise: Option<String>,
 }

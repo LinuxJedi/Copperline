@@ -16,15 +16,19 @@ src/
   debugger.rs       # env-driven headless debugger
   disasm.rs         # 68000 + Copper-list disassemblers
   cpu.rs            # m68k core wrapper and CPU-visible bus adapter
+  cache.rs          # 68020/030 on-chip instruction/data cache model
   bus.rs            # shared RAM, ROM, chipset, CIA, RTC, and I/O state
   memory.rs         # chip/slow RAM, ROM, extended ROM containers
+  romsearch.rs      # locate the bundled AROS default boot ROM
   zorro.rs          # Zorro II/III autoconfig chain and boards
   floppy.rs         # disk images + timed disk DMA controller
   dms.rs            # DMS archive decompression
+  drive_sounds.rs   # synthesized floppy-drive sound effects
   gayle.rs          # A600/A1200 Gayle gate array + IDE
   a2091.rs          # A2091 SCSI controller board (DMAC + boot ROM)
   scsi.rs           # WD33C93A SBIC + SCSI-2 disk targets
   harddrive.rs      # shared hard-drive image backend (IDE + SCSI)
+  dirfs.rs          # host directory -> in-memory FFS partition image
   cdrom.rs          # CD image (BIN/CUE) parsing
   cdtv.rs           # CDTV DMAC + Matshita drive model
   akiko.rs          # CD32 Akiko (C2P, NVRAM, Chinon drive)
@@ -36,7 +40,10 @@ src/
   screenshot.rs     # PNG export helpers
   recorder.rs       # video+audio capture (ZMBV/PCM AVI writer)
   inputrec.rs       # live-input recording to the scripted-input format
+  inputsched.rs     # deterministic input replay for reverse debugging
   savestate.rs      # whole-machine snapshot/restore (versioned file format)
+  timetravel.rs     # reverse-debugging snapshot ring + replay
+  timestamp.rs      # compact wall-clock stamps for generated filenames
   chipset/
     agnus.rs        # beam counters, DMACON, display fetch, arbitration data
     copper.rs       # Copper decode + cycle-stepped execution
@@ -44,6 +51,7 @@ src/
     paula.rs        # interrupts, audio DMA, serial, disk regs
     denise.rs       # palette + bitplane/sprite control registers
     cia.rs          # 8520 CIA model (CIA-A and CIA-B)
+    keyboard.rs     # bit-timed 6500/1 keyboard MCU into CIA-A
   video/
     beam.rs         # beam-position event index for the renderer
     bitplane.rs     # event replay + planar->RGBA renderer

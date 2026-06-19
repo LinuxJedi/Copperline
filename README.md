@@ -192,7 +192,7 @@ release needs resolved first. Release steps for every channel are in
 | OCS sprites | 8 DMA/manual 16-pixel sprites, attached sprites, composited over bitplanes with playfield priority. |
 | Chip bus arbitration | Per-colour-clock OCS slot ownership for refresh, display DMA, sprites, disk, audio, Copper, blitter, and CPU chip/custom accesses, with CPU wait states. |
 | ECS | ECS Agnus revisions (8372A/8375) and ECS Denise (8373): up to 2M chip RAM, DIWHIGH, BEAMCON0, SuperHires, ECS blitter (BLTSIZV/BLTSIZH), programmable geometry. |
-| AGA | Alice/Lisa: 8 bitplanes, 256-entry 25-bit palette with BANK/LOCT, HAM8, FMODE wide bitplane/sprite fetch, BPLCON4, CLXCON2; A1200/CD32 profiles. Remaining gaps (e.g. 35 ns SHRES sprites) recorded in the internals docs. |
+| AGA | Alice/Lisa: 8 bitplanes, 256-entry 24-bit palette (plus the genlock T bit) with BANK/LOCT, HAM8, FMODE wide bitplane/sprite fetch, BPLCON4, CLXCON2; A1200/CD32 profiles. Remaining gaps (e.g. 35 ns SHRES sprites) recorded in the internals docs. |
 
 The detailed architecture (source layout, the bus, the replay renderer) and
 timing model live in the [internals docs](docs/internals/architecture.md).

@@ -143,6 +143,15 @@ Progressive content is line-doubled without history.
 In the default threaded pipeline the worker owns this history; the
 synchronous fallback keeps it on the window `App`.
 
+The deinterlacer also hosts the optional CRT phosphor-persistence stage
+(`[display] phosphor` / `COPPERLINE_PHOSPHOR`, off by default, clamped to
+0.95): when on, `present_with_phosphor` blends each presented frame over a
+retained copy of the previous one, keeping `phosphor`/256 of the old value
+per channel for an exponential trail. This is what fuses field-rate flicker
+(alternate-field dither transparency, flicker-dithered animation) the way a
+real tube does. Like the rest of the deinterlacer it operates on the
+presentation buffer only and never touches the emulated framebuffer.
+
 ## Known display gaps
 
 - **31 kHz horizontal layout** (DblPAL / DblNTSC / Productivity): at

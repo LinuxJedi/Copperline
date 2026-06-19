@@ -96,8 +96,9 @@ modelled 68000 recognition latency), serial, and audio:
 ## Denise (`denise.rs`)
 
 Palette (32 12-bit entries as seen by OCS/ECS; the store is the AGA
-256-entry layout of high/low nibble-plane pairs giving 25-bit colour, with
-Lisa COLORxx writes routed through BPLCON3 BANK/LOCT banking), BPLCON0-4,
+256-entry layout of high/low nibble-plane pairs giving 24-bit colour plus
+the genlock transparency (T) bit, with Lisa COLORxx writes routed through
+BPLCON3 BANK/LOCT banking), BPLCON0-4,
 display window (DIWSTRT/DIWSTOP, ECS DIWHIGH), sprite
 position/control/data registers, and CLXCON/CLXDAT collision detection
 (CLXCON2 extends it to planes 7-8 on Lisa). Denise revisions: OCS 8362,

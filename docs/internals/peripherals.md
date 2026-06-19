@@ -152,8 +152,8 @@ Amiga rawkey releases.
 (`--audio-wav`), and a null sink (`--noaudio`). Paula renders in emulated
 time; the live sink resamples and buffers against wall-clock. The
 `CPAL_*` lead/prebuffer/stale-drop targets in `audio.rs` are fixed rather
-than adaptive (currently a 131072-frame ring, ~80 ms prebuffer, ~150 ms
-steady lead, ~300 ms stale-drop threshold at 44.1 kHz).
+than adaptive (currently a 131072-frame ring, a ~150 ms prebuffer equal to
+the ~150 ms steady lead, and a ~300 ms stale-drop threshold at 44.1 kHz).
 
 Two profiling knobs cover the audio/pacing boundary, both emitting one
 `info` line per second:

@@ -680,7 +680,8 @@ fn print_help() {
          \n\
          If ROM is given on the command line it overrides the rom path from\n\
          the config. If no config file exists, built-in defaults are used:\n  \
-         CPU: 68000   chip RAM: 512K   fast RAM: 0   slow RAM: 0   chipset: OCS   ROM: diagrom.rom"
+         CPU: 68000   chip RAM: 512K   fast RAM: 0   chipset: OCS   ROM: bundled AROS\n  \
+         (the bundled AROS default also fits 512K slow RAM for a 1 MB A500)"
     );
 }
 
