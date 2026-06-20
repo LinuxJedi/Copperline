@@ -1554,10 +1554,11 @@ impl BeamSpriteState {
         }
         let vstart = sprite_vstart(pos, ctl);
         let vstop = sprite_vstop(ctl);
-        // Normal pair: [vstart, vstop). An inverted pair (vstop <= vstart) is
-        // not "off": the vstop comparator fired before vstart, so the sprite is
-        // on from vstart to the frame end and again from 0 to vstop (the wrap).
-        let in_window = if vstop > vstart {
+        // Normal pair: [vstart, vstop). Equal start/stop is an empty window;
+        // only a strictly inverted pair wraps through the frame boundary.
+        let in_window = if vstop == vstart {
+            false
+        } else if vstop > vstart {
             beam_y >= vstart && beam_y < vstop
         } else {
             beam_y >= vstart || beam_y < vstop
@@ -3691,14 +3692,18 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
     let manual_sprite_lines = if input.sprite_dma_observed && manual_sprite_diag_spec().is_none() {
         vec![Vec::new(); 8]
     } else {
+        // Seed replay from beam-timed SPRx writes, not frame-start data
+        // latches. The SPRxDATA latch can persist across frames, but by itself
+        // it does not tell us whether the sprite vertical comparators are
+        // active this field. DMA-established held sprites seed through
+        // `input.held_sprites` instead.
         manual_sprite_lines_from_events_with_visible_line0(
             &state,
             render_events,
             &input.held_sprites,
             visible_line0,
             rows,
-            !input.sprite_dma_observed
-                && state.dmacon & (DMACON_DMAEN | DMACON_SPREN) != (DMACON_DMAEN | DMACON_SPREN),
+            false,
         )
     };
     maybe_log_manual_sprite_intervals(
@@ -8038,6 +8043,25 @@ mod tests {
     }
 
     #[test]
+    fn manual_sprite_vstart_equal_vstop_is_empty() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let (pos, ctl) = sprite_control_words(beam_y as u16, beam_y as u16, DIW_HSTART_FB0 as u16);
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+
+        let events = [cpu_event(
+            beam_y as u32,
+            COPPER_WAIT_HPOS_FB0 as u32,
+            0x144,
+            0xFFFF,
+        )];
+        let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
+
+        assert!(manual_sprite_lines[0].is_empty());
+    }
+
+    #[test]
     fn manual_sprite_data_write_replicates_words_across_fmode_wide_register() {
         let mut initial_state = blank_state();
         initial_state.agnus_revision = AgnusRevision::AgaAlice;
@@ -8144,6 +8168,57 @@ mod tests {
         );
 
         assert!(manual_sprite_lines[0].is_empty());
+    }
+
+    #[test]
+    fn manual_sprite_replay_does_not_seed_from_frame_start_data_latch() {
+        let mut initial_state = blank_state();
+        let (pos, ctl) = sprite_control_words(PAL_VISIBLE_LINE0 as u16, 0, DIW_HSTART_FB0 as u16);
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+        initial_state.sprdata[0] = 0xFFFF;
+        initial_state.spr_armed[0] = true;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0].is_empty());
+    }
+
+    #[test]
+    fn manual_sprite_replay_starts_from_beam_timed_data_write() {
+        let mut initial_state = blank_state();
+        let (pos, ctl) = sprite_control_words(
+            PAL_VISIBLE_LINE0 as u16,
+            PAL_VISIBLE_LINE0 as u16 + 4,
+            DIW_HSTART_FB0 as u16,
+        );
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[cpu_event(
+                PAL_VISIBLE_LINE0 as u32,
+                COPPER_WAIT_HPOS_FB0 as u32,
+                0x144,
+                0xFFFF,
+            )],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .any(|line| line.beam_y == PAL_VISIBLE_LINE0));
     }
 
     #[test]

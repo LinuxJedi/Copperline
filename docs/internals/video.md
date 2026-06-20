@@ -56,10 +56,12 @@ staggered even/odd attached-pair position writes do not create artificial
 half-pair strips.
 
 When sprite DMA was observed for the frame, captured DMA lines win over
-manual replay. The renderer then suppresses stale latched SPRxDATA spans
-unless a manual-sprite diagnostic explicitly asks for them. This avoids
-painting old register contents as vertical sprite bars on frames where
-hardware sprite data was already fetched by Agnus.
+manual replay. Manual replay is seeded by beam-timed SPRx register writes,
+not by frame-start SPRxDATA latches alone: the data latch can persist across
+frames without proving that the sprite vertical comparators are active in
+the current field. Sprites whose data was established by DMA before SPREN
+was cleared are carried separately as held sprites and can still be
+repositioned by later SPRxPOS/CTL writes.
 
 The mapping from beam coordinates to framebuffer x is anchored by
 constants that encode the hardware's fetch-to-display pipeline delays --
