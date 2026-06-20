@@ -11,7 +11,9 @@ use super::{
     bitplane, blend_rgba, font, FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH,
     HOST_SHORTCUT_MODIFIER_LABEL, MAX_FB_PIXELS, PRESENT_HEIGHT,
 };
-use crate::bus::{BeamWriteSource, FrontPanelStatus, VideoRenderFrameTiming};
+use crate::bus::{
+    BeamWriteSource, FrontPanelStatus, RenderRegisterSnapshot, VideoRenderFrameTiming,
+};
 use crate::config::Overscan;
 use crate::emulator::Emulator;
 use crate::screenshot;
@@ -294,6 +296,7 @@ const VOLUME_SLIDER_H: usize = 8;
 const VOLUME_KNOB_W: usize = 8;
 const VOLUME_KNOB_H: usize = 16;
 const VOLUME_GLYPH_X: usize = VOLUME_SLIDER_X - 16;
+const STANDARD_PAL_VISIBLE_WIDTH: usize = 320 * 2;
 const STANDARD_PAL_VISIBLE_LINES: usize = 256;
 const STANDARD_PAL_VISIBLE_START_VPOS: u32 = 0x2C;
 const STATUS_BG: u32 = rgba(28, 28, 26);
@@ -5584,7 +5587,7 @@ impl App {
 
         let input = bitplane::RenderInput::from_bus(self.emu.bus());
         let h_shift = if self.hcenter {
-            bitplane::present_h_shift_for(&input.render_base())
+            presentation_h_shift_for(&input.render_base(), self.overscan)
         } else {
             0
         };
@@ -5641,7 +5644,7 @@ impl App {
 
         let visible_start_vpos = self.emu.bus().frame_visible_start_vpos();
         let h_shift = if self.hcenter {
-            bitplane::present_h_shift_for(&self.emu.bus().frame_render_base())
+            presentation_h_shift_for(&self.emu.bus().frame_render_base(), self.overscan)
         } else {
             0
         };
@@ -5677,40 +5680,33 @@ impl App {
 /// it and so does this mask. The emulated framebuffer itself always carries
 /// the full field; this runs on the presentation copy only.
 ///
-/// The window is the realistic PAL TV visible area -- about 360x272 lo-res
-/// centred on the standard 320x256 window -- rather than the bare standard
-/// window: real sets show a margin of overscan, which intentional overscan
-/// displays rely on (the CD32 boot screen's full-width logo), while the
-/// deep-overscan junk the mask exists to hide sits further out. The 20
-/// lo-res pixels of margin per side stay within real CRT behaviour (a PAL
-/// active line carries ~370 lo-res pixels; consumer sets overscan a few
-/// percent per side) and are needed in full: the CD32 boot logo's leading
-/// "A" starts 13 lo-res pixels into the left overscan, and the previous
-/// 16-pixel margin clipped its serif. Vertically the default TV view keeps
-/// top overscan but uses a tight lower bezel: software can leave active
-/// border sprites or unfinished effects below the standard window, and a
-/// consumer crop normally hides that. `h_shift` is the horizontal centring
-/// shift already applied to the frame, so the bezel tracks the shifted
-/// picture instead of clipping its left edge; `standard_top_row` is the
-/// framebuffer row where the standard window's first line sits after
-/// vertical centring, so the bezel tracks the centred picture vertically
-/// too (a fixed line count from row 0 clipped the bottom of every
-/// standard 256-line screen by the centring margin).
+/// The window is a realistic PAL TV visible area rather than the bare
+/// standard window: real sets show a margin of overscan, which intentional
+/// overscan displays rely on, while the deep-overscan junk the mask exists
+/// to hide sits further out. Default TV presentation treats the standard PAL
+/// window as the bezel edge on both sides; full overscan remains available
+/// through `Overscan::Full`. Vertically the default TV view keeps top overscan
+/// but uses a tight lower bezel: software can leave active border sprites or
+/// unfinished effects below the standard window, and a consumer crop normally
+/// hides that. `h_shift` is the horizontal centring shift already applied to
+/// the frame, so the bezel tracks the shifted picture instead of clipping its
+/// left edge; `standard_top_row` is the framebuffer row where the standard
+/// window's first line sits after vertical centring, so the bezel tracks the
+/// centred picture vertically too (a fixed line count from row 0 clipped the
+/// bottom of every standard 256-line screen by the centring margin).
 fn mask_present_frame_to_tv(fb: &mut [u32], h_shift: usize, standard_top_row: usize) {
     debug_assert!(fb.len() >= FB_PIXELS);
-    // 360 lo-res pixels = 720 framebuffer pixels, 20 lo-res pixels of
-    // overscan on each side of the standard window.
-    const TV_VISIBLE_WIDTH: usize = 360 * 2;
-    const TV_OVERSCAN_MARGIN: usize = 20 * 2;
     // Keep a little top overscan, but crop the bottom just inside the
     // standard window so lower-border junk stays behind the bezel by default.
     const TV_TOP_OVERSCAN_MARGIN: usize = 8;
     const TV_BOTTOM_CROP_ROWS: usize = 1;
     let black = rgba(0, 0, 0);
-    let left = bitplane::STANDARD_VISIBLE_X0
-        .saturating_sub(TV_OVERSCAN_MARGIN)
-        .saturating_sub(h_shift);
-    let right = (left + TV_VISIBLE_WIDTH).min(FB_WIDTH);
+    let left = bitplane::STANDARD_VISIBLE_X0.saturating_sub(h_shift);
+    let right = bitplane::STANDARD_VISIBLE_X0
+        .saturating_add(STANDARD_PAL_VISIBLE_WIDTH)
+        .saturating_sub(h_shift)
+        .min(FB_WIDTH)
+        .max(left);
     let top = standard_top_row.saturating_sub(TV_TOP_OVERSCAN_MARGIN);
     let bottom = (standard_top_row + STANDARD_PAL_VISIBLE_LINES)
         .saturating_sub(TV_BOTTOM_CROP_ROWS)
@@ -5797,6 +5793,21 @@ fn presentation_source_y_offset(visible_start_vpos: u32) -> usize {
     let overscan_rows_already_visible =
         STANDARD_PAL_VISIBLE_START_VPOS.saturating_sub(visible_start_vpos) as usize;
     standard_offset.saturating_sub(overscan_rows_already_visible)
+}
+
+fn presentation_h_shift_for(snapshot: &RenderRegisterSnapshot, overscan: Overscan) -> usize {
+    match overscan {
+        // TV mode now masks to the standard PAL aperture, so center that
+        // aperture in the presentation texture even if the raw frame fetches
+        // into horizontal overscan.
+        Overscan::Tv => tv_standard_h_shift(),
+        Overscan::Full => bitplane::present_h_shift_for(snapshot),
+    }
+}
+
+fn tv_standard_h_shift() -> usize {
+    let centered_left = FB_WIDTH.saturating_sub(STANDARD_PAL_VISIBLE_WIDTH) / 2;
+    bitplane::STANDARD_VISIBLE_X0.saturating_sub(centered_left)
 }
 
 fn should_render_emulated_frame(last_rendered: Option<u64>, current: u64) -> bool {
@@ -6117,13 +6128,13 @@ mod tests {
         power_button_rect, present_row_sample, presentation_source_y_offset, reboot_button_rect,
         rgba, shot_button_rect, should_render_emulated_frame, standard_window_top_row,
         status_with_latched_fdd_track, take_integral_mouse_delta, texture_height, texture_width,
-        volume_percent_from_pos, volume_slider_track_rect, BarControl, DriveBar, JoystickInputMode,
-        KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar, StatusBarView, BUTTON_GLYPH,
-        BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF, CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW,
-        DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF,
-        POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT, STANDARD_PAL_VISIBLE_LINES,
-        STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON,
-        VOLUME_FILL, VOLUME_GLYPH_X,
+        tv_standard_h_shift, volume_percent_from_pos, volume_slider_track_rect, BarControl,
+        DriveBar, JoystickInputMode, KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar,
+        StatusBarView, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF, CD_LED_ON,
+        DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON,
+        POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
+        STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STANDARD_PAL_VISIBLE_WIDTH,
+        STATUS_BG, TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::FrontPanelStatus;
@@ -7085,6 +7096,19 @@ mod tests {
     }
 
     #[test]
+    fn tv_horizontal_centering_centers_the_standard_pal_aperture() {
+        let shift = tv_standard_h_shift();
+        let centered_left = (FB_WIDTH - STANDARD_PAL_VISIBLE_WIDTH) / 2;
+        let centered_right = centered_left + STANDARD_PAL_VISIBLE_WIDTH;
+
+        assert_eq!(bitplane::STANDARD_VISIBLE_X0 - shift, centered_left);
+        assert_eq!(
+            bitplane::STANDARD_VISIBLE_X0 + STANDARD_PAL_VISIBLE_WIDTH - shift,
+            centered_right
+        );
+    }
+
+    #[test]
     fn standard_pal_frame_centering_preserves_horizontal_margin() {
         let offset = presentation_source_y_offset(STANDARD_PAL_VISIBLE_START_VPOS);
         let mut fb = vec![rgba(0, 0, 0); FB_PIXELS];
@@ -7108,15 +7132,17 @@ mod tests {
         let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
         mask_present_frame_to_tv(&mut fb, 0, std_top);
 
-        // The TV window is 360 lo-res pixels: the standard window plus 20
-        // lo-res pixels of overscan each side (the right side is clamped
-        // by the framebuffer, which carries little right overscan).
-        let left = bitplane::STANDARD_VISIBLE_X0 - 40;
+        // The TV window crops both horizontal sides at the standard PAL
+        // window; full overscan remains available through Overscan::Full.
+        let left = bitplane::STANDARD_VISIBLE_X0;
+        let right = bitplane::STANDARD_VISIBLE_X0 + STANDARD_PAL_VISIBLE_WIDTH;
         let mid_row = std_top + 100;
         assert_eq!(fb[mid_row * FB_WIDTH + left - 1], rgba(0, 0, 0));
         assert_eq!(fb[mid_row * FB_WIDTH + left], marker);
-        assert_eq!(fb[mid_row * FB_WIDTH + FB_WIDTH - 1], marker);
-        // The deep-left junk margin stays hidden.
+        assert_eq!(fb[mid_row * FB_WIDTH + right - 1], marker);
+        assert_eq!(fb[mid_row * FB_WIDTH + right], rgba(0, 0, 0));
+        assert_eq!(fb[mid_row * FB_WIDTH + FB_WIDTH - 1], rgba(0, 0, 0));
+        // The left overscan margin stays hidden.
         assert_eq!(fb[mid_row * FB_WIDTH], rgba(0, 0, 0));
         // The vertical TV window tracks the centred standard window: 8
         // lines of top overscan remain visible, while the bottom is cropped
@@ -7139,13 +7165,14 @@ mod tests {
         let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
         mask_present_frame_to_tv(&mut fb, 16, std_top);
 
-        let left = bitplane::STANDARD_VISIBLE_X0 - 40 - 16;
+        let left = bitplane::STANDARD_VISIBLE_X0 - 16;
+        let right = bitplane::STANDARD_VISIBLE_X0 + STANDARD_PAL_VISIBLE_WIDTH - 16;
         let mid_row = std_top + 100;
         assert_eq!(fb[mid_row * FB_WIDTH + left - 1], rgba(0, 0, 0));
         assert_eq!(fb[mid_row * FB_WIDTH + left], marker);
-        // The bezel's right edge lies beyond the framebuffer (which carries
-        // little right overscan), so the right side stays visible.
-        assert_eq!(fb[mid_row * FB_WIDTH + FB_WIDTH - 1], marker);
+        assert_eq!(fb[mid_row * FB_WIDTH + right - 1], marker);
+        assert_eq!(fb[mid_row * FB_WIDTH + right], rgba(0, 0, 0));
+        assert_eq!(fb[mid_row * FB_WIDTH + FB_WIDTH - 1], rgba(0, 0, 0));
     }
 
     #[test]
@@ -7161,7 +7188,7 @@ mod tests {
         let mut fb = vec![marker; FB_PIXELS];
         mask_present_frame_to_tv(&mut fb, 0, std_top);
 
-        let left = bitplane::STANDARD_VISIBLE_X0 - 40;
+        let left = bitplane::STANDARD_VISIBLE_X0;
         assert_eq!(fb[(std_top - 8 - 1) * FB_WIDTH + left], rgba(0, 0, 0));
         assert_eq!(fb[(std_top - 8) * FB_WIDTH + left], marker);
         let bottom = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
