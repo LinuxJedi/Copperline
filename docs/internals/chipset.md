@@ -156,6 +156,14 @@ realigns framing to a matched sync word before transfer. Supported image
 formats: ADF (read/write), gzip ADZ, DMS (decompressed by `dms.rs`), UAE
 extended ADF, and read-only SCP flux images.
 
+Standard ADF and AmigaDOS tracks are synthesized as one PAL-sized
+revolution: 11 sectors occupy 5984 MFM words, and the generated revolution
+is 6334 16-bit MFM words so the index gap matches normal Amiga floppy
+timing. This matters for raw loaders that DMA a fixed-size window and make
+their own assumptions about the post-sector gap. UAE extended raw tracks
+and SCP flux captures keep their stored track length and per-revolution
+timing instead of using this synthetic geometry.
+
 The synthesized drive sounds ([](../guide/configuration)) are driven by
 this model's real state transitions -- motor spin-up, seeks, the
 empty-drive poll click.

@@ -72,12 +72,17 @@ const SEEK_STEP_SETTLE_CCK: u32 = PAULA_CLOCK_HZ / 1_000 * 3; // ~3 ms per step
 const SEEK_REVERSAL_SETTLE_CCK: u32 = PAULA_CLOCK_HZ / 1_000 * 18; // ~18 ms on reversal
                                                                    // 300 RPM.
 const ROTATION_HZ: u32 = 5;
-// 11 AmigaDOS sectors occupy 5984 MFM words. A 300 RPM DD track has
-// roughly 6250 MFM words per revolution, leaving a few hundred words
-// of gap. Keeping generated ADF streams near that physical length is
-// important for fixed-size raw trackloaders.
-const TRACK_GAP_LONGS: usize = 132;
-const TRACK_TRAILER_WORDS: usize = 1;
+// 11 AmigaDOS sectors occupy 5984 MFM words. PAL Amiga floppy read timing is
+// slightly faster than nominal 250 kbit/s, so a normal 300 RPM revolution is
+// about 12668 raw bytes (6334 16-bit MFM words). Keeping generated ADF streams
+// at that physical length leaves a realistic index gap for raw trackloaders
+// that read fixed-size windows rather than using trackdisk.device.
+const STANDARD_ADF_TRACK_WORDS: usize = 6334;
+const AMIGADOS_SECTOR_MFM_WORDS: usize = 2 + 2 + (2 + 8 + 2 + 2 + 256) * 2;
+const TRACK_GAP_WORDS: usize =
+    STANDARD_ADF_TRACK_WORDS - SECTORS_PER_TRACK * AMIGADOS_SECTOR_MFM_WORDS;
+const TRACK_TRAILER_WORDS: usize = 2;
+const TRACK_GAP_LONGS: usize = (TRACK_GAP_WORDS - TRACK_TRAILER_WORDS) / 2;
 const MFM_MASK: u32 = 0x5555_5555;
 // Paula's disk write shifter does not emit the final three bits of a write.
 const DISK_WRITE_LOST_BITS: usize = 3;
@@ -3145,9 +3150,7 @@ fn disk_bit_phase(rotation_acc_cck: u32, word_cck: u32) -> u8 {
 }
 
 fn encoded_track_words() -> usize {
-    TRACK_GAP_LONGS * 2
-        + SECTORS_PER_TRACK * (2 + 2 + (2 + 8 + 2 + 2 + 256) * 2)
-        + TRACK_TRAILER_WORDS
+    TRACK_GAP_LONGS * 2 + SECTORS_PER_TRACK * AMIGADOS_SECTOR_MFM_WORDS + TRACK_TRAILER_WORDS
 }
 
 fn encode_adf_track(track: usize, adf: &[u8]) -> Vec<u16> {
@@ -3161,19 +3164,31 @@ fn encode_amigados_track(track: usize, track_data: &[u8]) -> Vec<u16> {
     for sector in 0..sectors_per_track {
         push_sector(track, sector, sectors_per_track, track_data, &mut longs);
     }
-    let trailer = if longs.last().copied().unwrap_or(0) & 1 != 0 {
-        0x2AA8
-    } else {
-        0xAAA8
-    };
-
     let mut words = Vec::with_capacity(encoded_track_words());
     for long in longs {
         words.push((long >> 16) as u16);
         words.push(long as u16);
     }
-    words.push(trailer);
+    push_track_trailer(&mut words);
     words
+}
+
+fn push_track_trailer(words: &mut Vec<u16>) {
+    for trailer_idx in 0..TRACK_TRAILER_WORDS {
+        let last_bit_set = words.last().copied().unwrap_or(0) & 1 != 0;
+        let word = if trailer_idx + 1 == TRACK_TRAILER_WORDS {
+            if last_bit_set {
+                0x2AA8
+            } else {
+                0xAAA8
+            }
+        } else if last_bit_set {
+            0x2AAA
+        } else {
+            0xAAAA
+        };
+        words.push(word);
+    }
 }
 
 fn push_sector(
@@ -6929,6 +6944,55 @@ mod tests {
                 assert_eq!(&data[..], &adf[off..off + BYTES_PER_SECTOR]);
             }
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn standard_adf_pal_revolution_leaves_index_gap_after_last_sector() -> Result<()> {
+        let adf = vec![0u8; ADF_SIZE];
+        let words = encode_adf_track(0, &adf);
+        assert_eq!(words.len(), STANDARD_ADF_TRACK_WORDS);
+
+        let mut sector_sync = [None; SECTORS_PER_TRACK];
+        let mut pos = 0usize;
+        while pos < words.len() {
+            if words[pos] != DEFAULT_DSKSYNC {
+                pos += 1;
+                continue;
+            }
+
+            let sync_pos = pos;
+            while pos < words.len() && words[pos] == DEFAULT_DSKSYNC {
+                pos += 1;
+            }
+            let Some((info, _)) = decode_block(&words, pos, 4) else {
+                continue;
+            };
+            if info[0] == 0xFF && info[1] == 0 && usize::from(info[2]) < SECTORS_PER_TRACK {
+                sector_sync[usize::from(info[2])] = Some(sync_pos);
+            }
+        }
+
+        let sector10_sync = sector_sync[10].context("sector 10 sync")?;
+        let sector0_sync = sector_sync[0].context("sector 0 sync")?;
+        let distance_to_sector0_second_sync =
+            (sector0_sync + 1 + words.len() - sector10_sync) % words.len();
+
+        // After decoding the sector whose AmigaDOS "sectors until gap" byte is
+        // 1, some raw loaders skip a fixed 0x258-byte index gap before looking
+        // for sector 0. The synthetic PAL track must leave enough physical gap
+        // for that skip to land before sector 0's second sync word.
+        let sector10_sync_to_even_data_end = AMIGADOS_SECTOR_MFM_WORDS - 2;
+        let fixed_index_gap_skip_words = 0x258 / 2;
+        let scan_restart_lead_words = 3;
+        let fixed_skip_restart =
+            sector10_sync_to_even_data_end + fixed_index_gap_skip_words + scan_restart_lead_words;
+
+        assert!(
+            distance_to_sector0_second_sync >= fixed_skip_restart,
+            "sector 0 sync is {distance_to_sector0_second_sync} words after sector 10 sync; fixed post-gap skip restarts at {fixed_skip_restart}"
+        );
 
         Ok(())
     }
