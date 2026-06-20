@@ -55,13 +55,16 @@ replay clips those position intervals in the sprite-comparator domain so
 staggered even/odd attached-pair position writes do not create artificial
 half-pair strips.
 
-When sprite DMA was observed for the frame, captured DMA lines win over
-manual replay. Manual replay is seeded by beam-timed SPRx register writes,
-not by frame-start SPRxDATA latches alone: the data latch can persist across
-frames without proving that the sprite vertical comparators are active in
-the current field. Sprites whose data was established by DMA before SPREN
-was cleared are carried separately as held sprites and can still be
-repositioned by later SPRxPOS/CTL writes.
+When sprite DMA was observed for the frame, captured DMA lines are the
+authoritative data source for DMA-fetched spans. Manual replay is seeded by
+beam-timed SPRx register writes, not by frame-start SPRxDATA latches alone:
+the data latch can persist across frames without proving that the sprite
+vertical comparators are active in the current field. A same-line SPRxPOS
+write after the sprite DMA slot can re-arm the horizontal comparator and
+reuse the line data DMA already loaded, so the renderer seeds those POS-only
+reuse spans from the captured DMA line. Sprites whose data was established
+by DMA before SPREN was cleared are carried separately as held sprites and
+can still be repositioned by later SPRxPOS/CTL writes.
 
 The mapping from beam coordinates to framebuffer x is anchored by
 constants that encode the hardware's fetch-to-display pipeline delays --

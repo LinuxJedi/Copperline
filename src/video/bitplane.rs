@@ -2866,6 +2866,107 @@ fn manual_sprite_lines_from_events_with_visible_line0(
     lines
 }
 
+fn manual_sprite_lines_from_captured_dma_reuse(
+    initial_state: &RenderState,
+    events: &[BeamRegisterWrite],
+    captured_sprite_lines: &[CapturedSpriteLine],
+    visible_line0: i32,
+    rows: usize,
+) -> Vec<Vec<SpriteLine>> {
+    let mut lines = vec![Vec::new(); 8];
+    if captured_sprite_lines.is_empty() || events.is_empty() {
+        return lines;
+    }
+
+    let visible_end = visible_line0 + rows as i32;
+    let mut events_by_sprite: [Vec<BeamRegisterWrite>; 8] = std::array::from_fn(|_| Vec::new());
+    for event in events {
+        let off = event.offset & 0x01FE;
+        if !(0x140..=0x17F).contains(&off) {
+            continue;
+        }
+        let sprite = ((off - 0x140) / 8) as usize;
+        if sprite < events_by_sprite.len() {
+            events_by_sprite[sprite].push(*event);
+        }
+    }
+
+    for captured in captured_sprite_lines {
+        let sprite = captured.sprite;
+        if sprite >= 8 || events_by_sprite[sprite].is_empty() {
+            continue;
+        }
+        let beam_y = captured.beam_y;
+        if beam_y < visible_line0 || beam_y >= visible_end {
+            continue;
+        }
+
+        let mut held = [None; 8];
+        held[sprite] = Some(HeldSpriteLine {
+            line: *captured,
+            vstart: beam_y,
+            vstop: beam_y + 1,
+        });
+        let mut regs = BeamSpriteState::from_render_state(initial_state, &held);
+        let mut next_beam = (visible_end, 0usize);
+        let dma_hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[sprite / 2];
+
+        for event in events_by_sprite[sprite]
+            .iter()
+            .filter(|event| event.vpos as i32 == beam_y && event.hpos >= dma_hpos)
+        {
+            let off = event.offset & 0x01FE;
+            let event_beam = manual_sprite_event_beam_for_sprite_write(
+                off,
+                event.vpos,
+                event.hpos,
+                visible_line0,
+                rows,
+            );
+
+            match (off - 0x140) & 0x0006 {
+                // SPRxPOS re-arms the horizontal comparator. If sprite DMA has
+                // already loaded this scanline's data, a later POS write can
+                // reuse that data without another SPRxDATA write.
+                0x0 => {
+                    flush_manual_sprite_lines(sprite, &regs, next_beam, event_beam, &mut lines);
+                    regs.apply_write(off, event.value);
+                    next_beam = event_beam;
+                }
+                // DATA/CTL writes leave the DMA-seeded reuse model. The normal
+                // beam-timed manual replay handles explicitly written data;
+                // CTL disarms output until DATA arms it again.
+                _ => {
+                    flush_manual_sprite_lines(sprite, &regs, next_beam, event_beam, &mut lines);
+                    next_beam = (visible_end, 0);
+                }
+            }
+        }
+
+        flush_manual_sprite_lines(sprite, &regs, next_beam, (beam_y + 1, 0), &mut lines);
+    }
+
+    lines
+}
+
+fn merge_dma_seeded_manual_sprite_lines(
+    manual_lines: &mut [Vec<SpriteLine>],
+    mut dma_seeded_lines: Vec<Vec<SpriteLine>>,
+) {
+    for (sprite, seeded) in dma_seeded_lines.iter_mut().enumerate() {
+        if seeded.is_empty() {
+            continue;
+        }
+        let mut seeded_beams: Vec<i32> = seeded.iter().map(|line| line.beam_y).collect();
+        seeded_beams.sort_unstable();
+        seeded_beams.dedup();
+        let target = &mut manual_lines[sprite];
+        target.retain(|line| seeded_beams.binary_search(&line.beam_y).is_err());
+        target.append(seeded);
+        target.sort_by_key(|line| (line.beam_y, line.x_start, line.x_stop));
+    }
+}
+
 fn manual_sprite_event_beam_for_sprite_write(
     off: u16,
     vpos: u32,
@@ -3689,23 +3790,28 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         visible_line0,
     );
     let event_started = Instant::now();
-    let manual_sprite_lines = if input.sprite_dma_observed && manual_sprite_diag_spec().is_none() {
-        vec![Vec::new(); 8]
-    } else {
-        // Seed replay from beam-timed SPRx writes, not frame-start data
-        // latches. The SPRxDATA latch can persist across frames, but by itself
-        // it does not tell us whether the sprite vertical comparators are
-        // active this field. DMA-established held sprites seed through
-        // `input.held_sprites` instead.
-        manual_sprite_lines_from_events_with_visible_line0(
+    // Seed replay from beam-timed SPRx writes, not frame-start data latches.
+    // The SPRxDATA latch can persist across frames, but by itself it does not
+    // tell us whether the sprite vertical comparators are active this field.
+    // DMA-established held sprites seed through `input.held_sprites` instead.
+    let mut manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+        &state,
+        render_events,
+        &input.held_sprites,
+        visible_line0,
+        rows,
+        false,
+    );
+    if input.sprite_dma_observed {
+        let dma_seeded_lines = manual_sprite_lines_from_captured_dma_reuse(
             &state,
             render_events,
-            &input.held_sprites,
+            &input.captured_sprite_lines,
             visible_line0,
             rows,
-            false,
-        )
-    };
+        );
+        merge_dma_seeded_manual_sprite_lines(&mut manual_sprite_lines, dma_seeded_lines);
+    }
     maybe_log_manual_sprite_intervals(
         input.emulated_seconds,
         input.emulated_frames,
@@ -9229,6 +9335,91 @@ mod tests {
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
         assert_eq!(fb[1], rgb12_to_rgba8(0x0F00));
+    }
+
+    #[test]
+    fn dma_loaded_sprite_data_rearms_on_same_line_position_write() {
+        let mut state = blank_state();
+        state.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        state.palette.write_ocs(17, 0x0F00);
+        let ram = vec![0; 64];
+        let base_palettes = [state.palette; FB_HEIGHT];
+        let palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let base_controls = [ControlState::from_render_state(&state); FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let playfield_mask = vec![0u8; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut fb = vec![rgb12_to_rgba8(0); FB_PIXELS];
+        let beam_y = PAL_VISIBLE_LINE0;
+        let initial_hstart = DIW_HSTART_FB0 as u16;
+        let reused_hstart = initial_hstart + 64;
+        let (reused_pos, _) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, reused_hstart);
+        let captured = [CapturedSpriteLine {
+            sprite: 0,
+            hstart: i32::from(initial_hstart),
+            hsub_70ns: false,
+            beam_y,
+            data: 0x8000,
+            datb: 0,
+            attached: false,
+            data_ext: [0; 3],
+            datb_ext: [0; 3],
+            width_words: 1,
+        }];
+        let events = [beam_event(
+            beam_y as u32,
+            (COPPER_WAIT_HPOS_FB0 + 4) as u32,
+            0x0140,
+            reused_pos,
+        )];
+        let mut manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &state,
+            &events,
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0].is_empty());
+
+        let dma_seeded_lines = manual_sprite_lines_from_captured_dma_reuse(
+            &state,
+            &events,
+            &captured,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
+        assert!(dma_seeded_lines[0].iter().any(|line| {
+            line.beam_y == beam_y && line.hstart == i32::from(reused_hstart) && line.data == 0x8000
+        }));
+        merge_dma_seeded_manual_sprite_lines(&mut manual_sprite_lines, dma_seeded_lines);
+
+        render_sprites_with_manual_lines(
+            &state,
+            &ram,
+            &mut fb,
+            SpriteClip {
+                x_start: 0,
+                x_stop: FB_WIDTH,
+                y_start: 0,
+                y_stop: FB_HEIGHT,
+            },
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &playfield_mask,
+            &mut collision_pixels,
+            sprite_pointer_refreshes_from_mask([false; 8]),
+            &captured,
+            true,
+            Some(&manual_sprite_lines),
+        );
+
+        let reused_x =
+            sprite_base_framebuffer_x(i32::from(reused_hstart), false, base_controls[0], &[]);
+        assert_eq!(fb[reused_x as usize], rgb12_to_rgba8(0x0F00));
     }
 
     #[test]
