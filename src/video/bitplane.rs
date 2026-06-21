@@ -60,7 +60,12 @@ const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// upstream bitplane shifter. Treat the left output edge as the first visible
 /// colour-register position rather than the earlier bitplane-control domain.
 /// Moved left by 8 colour clocks alongside the other origin anchors.
-const COLOR_WRITE_HPOS_FB0: i32 = 0x36;
+const COLOR_WRITE_HPOS_FB0: i32 = 0x34;
+/// AGA BPLCON4's low sprite-palette byte follows Lisa's sprite colour lookup
+/// path, which reaches sprite output earlier than ordinary COLORxx palette
+/// writes. Keep it separate from COLOR replay so copper palette gradients stay
+/// in the Denise palette-output phase on OCS/ECS.
+const SPRITE_PALETTE_CONTROL_HPOS_FB0: i32 = 0x36;
 /// SPRxPOS writes update the Denise horizontal comparator seven CCK ahead of
 /// the normal register/output beam domain. Manual sprite replays use this
 /// earlier domain so adjacent position writes can abut at their programmed
@@ -2036,8 +2041,8 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
                 // Lisa applies BPLCON4's sprite palette-base byte earlier
                 // than its bitplane XOR byte. Keep BPLAM on the normal
                 // control timeline while letting sprite colour lookup see the
-                // new ESPRM/OSPRM byte in the colour-output domain.
-                let sprite_x = color_write_framebuffer_x(event.hpos);
+                // new ESPRM/OSPRM byte in its earlier sprite-palette domain.
+                let sprite_x = sprite_palette_control_framebuffer_x(event.hpos);
                 if sprite_x < beam_x {
                     let mut sprite_control = previous_control;
                     sprite_control.bplcon4 =
@@ -2144,6 +2149,10 @@ fn beam_to_framebuffer_x_unclamped(hpos: u32) -> i32 {
 
 fn color_write_framebuffer_x(hpos: u32) -> usize {
     ((hpos as i32 - COLOR_WRITE_HPOS_FB0) * 4).clamp(0, FB_WIDTH as i32) as usize
+}
+
+fn sprite_palette_control_framebuffer_x(hpos: u32) -> usize {
+    ((hpos as i32 - SPRITE_PALETTE_CONTROL_HPOS_FB0) * 4).clamp(0, FB_WIDTH as i32) as usize
 }
 
 fn fill_base_palettes(
@@ -7270,7 +7279,15 @@ mod tests {
         );
         assert_eq!(
             beam_to_framebuffer_x_unclamped(COLOR_WRITE_HPOS_FB0 as u32),
-            56
+            48
+        );
+        assert_eq!(
+            sprite_palette_control_framebuffer_x(SPRITE_PALETTE_CONTROL_HPOS_FB0 as u32),
+            0
+        );
+        assert_eq!(
+            sprite_palette_control_framebuffer_x((SPRITE_PALETTE_CONTROL_HPOS_FB0 + 4) as u32),
+            16
         );
     }
 
@@ -11365,7 +11382,8 @@ mod tests {
         );
 
         let line = (0x50 - 0x2C) as usize;
-        let sprite_x = color_write_framebuffer_x(hpos);
+        let sprite_x = sprite_palette_control_framebuffer_x(hpos);
+        assert_eq!(sprite_x, color_write_framebuffer_x(hpos).saturating_sub(8));
         let beam_x = beam_to_framebuffer_x_unclamped(hpos) as usize;
         assert!(sprite_x < beam_x);
         assert_eq!(control_segments[line].len(), 2);

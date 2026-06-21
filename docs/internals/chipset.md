@@ -115,8 +115,9 @@ ECS 8373, AGA Lisa (DENISEID $00F8). The AGA decode adds 8 bitplanes,
 HAM8, the BPLCON4 BPLAM pixel-index XOR mask, and the OSPRM/ESPRM sprite
 palette banks. The two BPLCON4 fields are on different Lisa timing paths:
 the low byte that selects sprite palette bases (ESPRM/OSPRM) reaches sprite
-colour lookup in the colour-output domain, while the high-byte BPLAM XOR
-continues on the normal bitplane/control path. AGA also widens dual
+colour lookup on an earlier sprite palette-control path than ordinary COLORxx
+palette writes, while the high-byte BPLAM XOR continues on the normal
+bitplane/control path. AGA also widens dual
 playfield: OCS/ECS split six bitplanes into two three-bit fields (PF1 =
 planes 1/3/5, PF2 = planes 2/4/6), while Lisa extends each field to four
 bits by feeding bitplane 7 into PF1 and bitplane 8 into PF2, so a 7-8

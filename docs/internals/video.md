@@ -54,7 +54,10 @@ chunking is a host-CPU optimisation, not a model change.
 AGA Lisa has one known split control path in this replay: BPLCON4's
 high-byte BPLAM bitplane XOR follows the normal control timeline, but the
 low-byte ESPRM/OSPRM sprite palette-base fields are visible to sprite
-colour lookup at the colour-output-domain x position used by COLOR writes.
+colour lookup at Lisa's earlier sprite palette-control x position. Ordinary
+COLORxx palette writes stay on the Denise palette-output timeline; sharing
+the sprite path shifts copper palette gradients horizontally and
+turns smooth per-line colour ramps into bands.
 The render event journal therefore creates a sprite-only BPLCON4 segment
 when those two x positions differ, then applies the full BPLCON4 value on
 the normal control segment.

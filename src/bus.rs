@@ -9615,7 +9615,7 @@ mod tests {
 
     const STANDARD_DIW_HSTART: i32 = 0x81;
     const STANDARD_VISIBLE_X0: usize = ((STANDARD_DIW_HSTART - RENDER_DIW_HSTART_FB0) * 2) as usize;
-    const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x36;
+    const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x34;
     static BUS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn render_color_write_x(hpos: u32) -> usize {
