@@ -853,7 +853,21 @@ impl ControlState {
         // and lost its right edge off the framebuffer.
         let clamped_window_native =
             ((DIW_HSTART_FB0 - diw_h_start as i32).max(0) * 2) / pixel_repeat as i32;
-        display_native_shift - ddf_native_shift + clamped_window_native
+        let mut origin_shift = display_native_shift - ddf_native_shift + clamped_window_native;
+        let ddf_start = effective_ddf_start_hpos(self.hires() || self.shres(), self.ddfstrt);
+        if !self.hires()
+            && !self.shres()
+            && self.fetch_quantum() == 1
+            && i32::from(ddf_start) < standard_ddf
+            && origin_shift > 0
+        {
+            // Single-word lo-res fetches that start before the standard $38
+            // slot expose whole 16-pixel groups. The standard one-sample
+            // lo-res phase bias must not push a standard-width DIW one sample
+            // past that completed early-DDF row at the right edge.
+            origin_shift -= 1;
+        }
+        origin_shift
     }
 }
 
@@ -1016,6 +1030,7 @@ struct SpritePointerRefresh {
 struct DeniseBitplaneSample {
     idx: u8,
     nplanes: usize,
+    active: bool,
 }
 
 struct DenisePlannedPlayfieldLine<'a> {
@@ -1060,22 +1075,29 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
         native_x: usize,
     ) -> DeniseBitplaneSample {
         let mut idx = 0u8;
+        let mut active = false;
         for (plane, words) in self.plane_words.iter().enumerate().take(nplanes) {
             let delay = delays[plane];
             if native_x < delay {
+                active = true;
                 continue;
             }
             let fetch_x = native_x - delay;
             if fetch_x >= self.fetched_pixels {
                 continue;
             }
+            active = true;
             let word = words[fetch_x / 16];
             let bit = 15 - (fetch_x & 0x0F);
             if word & (1 << bit) != 0 {
                 idx |= 1 << plane;
             }
         }
-        DeniseBitplaneSample { idx, nplanes }
+        DeniseBitplaneSample {
+            idx,
+            nplanes,
+            active,
+        }
     }
 }
 
@@ -1110,7 +1132,11 @@ impl DeniseManualBitplaneShifter {
                 idx |= 1 << plane;
             }
         }
-        word_active.then_some(DeniseBitplaneSample { idx, nplanes })
+        word_active.then_some(DeniseBitplaneSample {
+            idx,
+            nplanes,
+            active: true,
+        })
     }
 }
 
@@ -2203,6 +2229,14 @@ fn push_control_segment(
         return;
     }
     control_segments[line].push(ControlSegment { x, control });
+}
+
+fn bitplane_scroll_effect_x(segment_x: usize, visible_x_stop: usize) -> usize {
+    if segment_x >= visible_x_stop {
+        segment_x
+    } else {
+        segment_x.saturating_sub(BITPLANE_CONTROL_PIPELINE_FB)
+    }
 }
 
 fn line_control_at_x(
@@ -3350,6 +3384,16 @@ struct SpritePixelDiagSpec {
     until: f64,
 }
 
+#[derive(Clone, Copy)]
+struct PixelDiagSpec {
+    beam_y: i32,
+    x_start: usize,
+    x_stop: usize,
+    step: usize,
+    after: f64,
+    until: f64,
+}
+
 fn manual_sprite_diag_spec() -> Option<ManualSpriteDiagSpec> {
     static SPEC: OnceLock<Option<ManualSpriteDiagSpec>> = OnceLock::new();
     *SPEC.get_or_init(|| {
@@ -3389,6 +3433,86 @@ fn sprite_pixel_diag_spec() -> Option<SpritePixelDiagSpec> {
             until: env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY),
         })
     })
+}
+
+fn parse_pixel_diag_spec(raw: &str) -> Option<PixelDiagSpec> {
+    let parts: Vec<_> = raw.split(',').map(str::trim).collect();
+    if !(3..=4).contains(&parts.len()) {
+        return None;
+    }
+    let beam_y = parts[0].parse::<i32>().ok()?;
+    let x_start = parts[1].parse::<usize>().ok()?;
+    let x_stop = parts[2].parse::<usize>().ok()?;
+    let step = parts
+        .get(3)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    Some(PixelDiagSpec {
+        beam_y,
+        x_start: x_start.min(x_stop),
+        x_stop: x_start.max(x_stop),
+        step,
+        after: env_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0),
+        until: env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY),
+    })
+}
+
+fn ham_pixel_diag_spec() -> Option<PixelDiagSpec> {
+    static SPEC: OnceLock<Option<PixelDiagSpec>> = OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let raw = crate::envcfg::var("COPPERLINE_DIAG_HAM_PIXELS")?;
+        parse_pixel_diag_spec(&raw)
+    })
+}
+
+fn manual_bpl_pixel_diag_spec() -> Option<PixelDiagSpec> {
+    static SPEC: OnceLock<Option<PixelDiagSpec>> = OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let raw = crate::envcfg::var("COPPERLINE_DIAG_MANUAL_BPL_PIXELS")?;
+        parse_pixel_diag_spec(&raw)
+    })
+}
+
+fn frame_pixel_diag_spec() -> Option<PixelDiagSpec> {
+    static SPEC: OnceLock<Option<PixelDiagSpec>> = OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let raw = crate::envcfg::var("COPPERLINE_DIAG_FRAME_PIXELS")?;
+        parse_pixel_diag_spec(&raw)
+    })
+}
+
+fn maybe_log_frame_pixel_samples(
+    label: &str,
+    emulated_seconds: f64,
+    emulated_frames: u64,
+    fb: &[u32],
+    visible_line0: i32,
+) {
+    let Some(spec) = frame_pixel_diag_spec()
+        .filter(|spec| emulated_seconds >= spec.after && emulated_seconds < spec.until)
+    else {
+        return;
+    };
+    let row = spec.beam_y - visible_line0;
+    if !(0..FB_HEIGHT as i32).contains(&row) {
+        return;
+    }
+    let row = row as usize;
+    let start = spec.x_start.min(FB_WIDTH);
+    let stop = spec.x_stop.min(FB_WIDTH);
+    for x in start..stop {
+        if !(x - start).is_multiple_of(spec.step) {
+            continue;
+        }
+        let color = fb[row * FB_WIDTH + x] & 0x00FF_FFFF;
+        log::info!(
+            "frame-pixel {label} secs={emulated_seconds:.4} frame={emulated_frames} y={} x={x} rgba={:#010X} rgb={:#08X}",
+            spec.beam_y,
+            fb[row * FB_WIDTH + x],
+            color,
+        );
+    }
 }
 
 fn maybe_log_manual_sprite_intervals(
@@ -4324,6 +4448,8 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 control_segment_idx,
                 base_controls[y].bplcon1,
                 visible_line0,
+                input.emulated_seconds,
+                input.emulated_frames,
             );
             for p in 0..dma_planes {
                 let m = control.modulo_for_plane(p, beam_y as i32);
@@ -4362,6 +4488,13 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         }
     }
     render_timing.playfield_nanos = playfield_started.elapsed().as_nanos();
+    maybe_log_frame_pixel_samples(
+        "after-playfield",
+        input.emulated_seconds,
+        input.emulated_frames,
+        fb,
+        visible_line0,
+    );
 
     let manual_bpl_started = Instant::now();
     render_timing.manual_bpl_segments = manual_bpl_segments.len() as u64;
@@ -4376,8 +4509,17 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         &base_controls,
         &control_segments,
         visible_line0,
+        input.emulated_seconds,
+        input.emulated_frames,
     );
     render_timing.manual_bpl_nanos = manual_bpl_started.elapsed().as_nanos();
+    maybe_log_frame_pixel_samples(
+        "after-manual-bpl",
+        input.emulated_seconds,
+        input.emulated_frames,
+        fb,
+        visible_line0,
+    );
     let sprite_started = Instant::now();
     clxdat |= render_sprites_with_manual_lines_and_writes(
         &state,
@@ -4402,6 +4544,13 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         visible_line0,
     );
     render_timing.sprite_nanos = sprite_started.elapsed().as_nanos();
+    maybe_log_frame_pixel_samples(
+        "after-sprites",
+        input.emulated_seconds,
+        input.emulated_frames,
+        fb,
+        visible_line0,
+    );
     maybe_log_sprite_pixel_samples(
         input.emulated_seconds,
         input.emulated_frames,
@@ -4432,6 +4581,13 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         rows,
     );
     blank_rows_past_frame_end(input.frame_lines, fb, visible_line0, rows);
+    maybe_log_frame_pixel_samples(
+        "final",
+        input.emulated_seconds,
+        input.emulated_frames,
+        fb,
+        visible_line0,
+    );
     render_timing.total_nanos = render_started.elapsed().as_nanos();
     RenderResult {
         timing: render_timing,
@@ -4532,18 +4688,23 @@ fn render_planned_playfield_line(
     mut control_segment_idx: usize,
     base_scroll_bplcon1: u16,
     visible_line0: i32,
+    emulated_seconds: f64,
+    emulated_frames: u64,
 ) {
     let mut ham_color = rgb12_to_rgb24(color_rgb12(palette[0]));
     let mut next_ham_native_x = 0usize;
     let mut x = plan.x_start;
+    let beam_y = visible_line0 + plan.y as i32;
+    let ham_diag = ham_pixel_diag_spec().filter(|spec| {
+        spec.beam_y == beam_y && emulated_seconds >= spec.after && emulated_seconds < spec.until
+    });
     // The bitplane scroll (BPLCON1) feeds the bitplane shifter, so a scroll
-    // write applies to the pixels it controls only after the Agnus-fetch ->
-    // Denise-display pipeline delay. Track it on the bitplane coordinate
+    // write normally applies on the bitplane coordinate
     // ([`BITPLANE_CONTROL_PIPELINE_FB`] left of the copper-x where the write was
-    // recorded) so a per-line scroll write governs the first fetched word rather
-    // than landing to its right (see the constant's docs / the E-clone bug). The
-    // other control fields (plane mode, priority, display window) are applied at
-    // the copper-x position and continue to advance with `control_segment_idx`.
+    // recorded). Once the normal output position is at or past the DIW right
+    // edge, the current scanline has no visible bitplane samples left to retap;
+    // keep that write in the normal register domain so it seeds following
+    // scanlines without disturbing the current HAM tail.
     let mut scroll_bplcon1 = base_scroll_bplcon1;
     let mut scroll_segment_idx = 0usize;
     // Playfield-collision classification (clxcon_planes_match) depends only on
@@ -4566,11 +4727,12 @@ fn render_planned_playfield_line(
             pixel_control = control_segments[control_segment_idx].control;
             control_segment_idx += 1;
         }
+        let scroll_visible_x_stop = pixel_control.display_window_x().1;
         while scroll_segment_idx < control_segments.len()
-            && control_segments[scroll_segment_idx]
-                .x
-                .saturating_sub(BITPLANE_CONTROL_PIPELINE_FB)
-                <= x
+            && bitplane_scroll_effect_x(
+                control_segments[scroll_segment_idx].x,
+                scroll_visible_x_stop,
+            ) <= x
         {
             scroll_bplcon1 = control_segments[scroll_segment_idx].control.bplcon1;
             scroll_segment_idx += 1;
@@ -4590,11 +4752,10 @@ fn render_planned_playfield_line(
             run_stop = run_stop.min(control_segments[control_segment_idx].x);
         }
         if scroll_segment_idx < control_segments.len() {
-            run_stop = run_stop.min(
-                control_segments[scroll_segment_idx]
-                    .x
-                    .saturating_sub(BITPLANE_CONTROL_PIPELINE_FB),
-            );
+            run_stop = run_stop.min(bitplane_scroll_effect_x(
+                control_segments[scroll_segment_idx].x,
+                scroll_visible_x_stop,
+            ));
         }
         if segment_idx < palette_segments.len() {
             run_stop = run_stop.min(palette_segments[segment_idx].x);
@@ -4682,10 +4843,39 @@ fn render_planned_playfield_line(
                 )
             } else {
                 let sample = plan.sample_prepared(nplanes, &delays, native_x);
-                (
-                    sample,
-                    denise_playfield_output(pixel_control, palette, sample.idx, &mut ham_color),
-                )
+                let ham_before = ham_color;
+                let output =
+                    denise_playfield_output(pixel_control, palette, sample.idx, &mut ham_color);
+                if let Some(spec) = ham_diag {
+                    if x >= spec.x_start
+                        && x < spec.x_stop
+                        && (x - spec.x_start).is_multiple_of(spec.step)
+                    {
+                        log::info!(
+                            "ham-pixel secs={emulated_seconds:.4} frame={emulated_frames} y={beam_y} x={x} native={native_x} rel={} idx={:#04X} active={} ham={} before={:#08X} after={:#08X} color={:#08X} latch={:#06X} nplanes={} fetched={} delays={:?} bplcon0={:#06X} bplcon1={:#06X} diw={:#06X}/{:#06X} ddf={:#06X}/{:#06X} win={}..{}",
+                            relative_native_x,
+                            sample.idx,
+                            u8::from(sample.active),
+                            u8::from(ham_mode),
+                            ham_before & 0x00FF_FFFF,
+                            ham_color & 0x00FF_FFFF,
+                            output.color & 0x00FF_FFFF,
+                            output.color_latch,
+                            nplanes,
+                            plan.fetched_pixels,
+                            delays,
+                            pixel_control.bplcon0,
+                            sample_control.bplcon1,
+                            pixel_control.diwstrt,
+                            pixel_control.diwstop,
+                            pixel_control.ddfstrt,
+                            pixel_control.ddfstop,
+                            win_x_start,
+                            win_x_stop,
+                        );
+                    }
+                }
+                (sample, output)
             };
             if ham_mode || !shres {
                 next_ham_native_x = next_ham_native_x.max(native_x + 1);
@@ -4851,9 +5041,12 @@ fn render_manual_bpl_segments(
         base_controls,
         control_segments,
         PAL_VISIBLE_LINE0,
+        0.0,
+        0,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_manual_bpl_segments_with_visible_line0(
     segments: &[ManualBplSegment],
     fb: &mut [u32],
@@ -4865,6 +5058,8 @@ fn render_manual_bpl_segments_with_visible_line0(
     base_controls: &[ControlState],
     control_segments: &[Vec<ControlSegment>],
     visible_line0: i32,
+    emulated_seconds: f64,
+    emulated_frames: u64,
 ) {
     if segments.is_empty() {
         return;
@@ -4883,6 +5078,10 @@ fn render_manual_bpl_segments_with_visible_line0(
             control_segments,
         );
         let mut ham_select = manual_bpl_ham_seed_select(seg, &ham_select_pixels);
+        let beam_y = visible_line0 + seg.line as i32;
+        let diag = manual_bpl_pixel_diag_spec().filter(|spec| {
+            spec.beam_y == beam_y && emulated_seconds >= spec.after && emulated_seconds < spec.until
+        });
         draw_manual_bpl_word(
             seg,
             fb,
@@ -4897,6 +5096,9 @@ fn render_manual_bpl_segments_with_visible_line0(
             &mut ham_select,
             &mut ham_select_pixels,
             visible_line0,
+            emulated_seconds,
+            emulated_frames,
+            diag,
         );
     }
 }
@@ -4952,6 +5154,9 @@ fn draw_manual_bpl_word(
     ham_select: &mut u8,
     ham_select_pixels: &mut [u8],
     visible_line0: i32,
+    emulated_seconds: f64,
+    emulated_frames: u64,
+    diag: Option<PixelDiagSpec>,
 ) {
     const MANUAL_BPL_WORD_BITS: usize = 16;
     const MAX_BPLCON1_DELAY: usize = 15;
@@ -5009,6 +5214,12 @@ fn draw_manual_bpl_word(
             native_idx += native_step;
             continue;
         }
+        let ham_before = *ham_color;
+        let output_idx = if source_control.hold_and_modify() {
+            *ham_select
+        } else {
+            sample.idx
+        };
         let source_output = if source_control.shres() {
             let right_sample = shifter
                 .sample(source_control, native_idx + 1)
@@ -5020,11 +5231,6 @@ fn draw_manual_bpl_word(
                 ham_color,
             )
         } else {
-            let output_idx = if source_control.hold_and_modify() {
-                *ham_select
-            } else {
-                sample.idx
-            };
             let output =
                 denise_playfield_output(source_control, source_palette, output_idx, ham_color);
             *ham_select = sample.idx;
@@ -5058,6 +5264,28 @@ fn draw_manual_bpl_word(
             );
             if !source_control.shres() {
                 ham_select_pixels[fb_idx] = sample.idx;
+            }
+            if let Some(spec) = diag {
+                if x >= spec.x_start
+                    && x < spec.x_stop
+                    && (x - spec.x_start).is_multiple_of(spec.step)
+                {
+                    let beam_y = visible_line0 + seg.line as i32;
+                    log::info!(
+                        "manual-bpl-pixel secs={emulated_seconds:.4} frame={emulated_frames} y={beam_y} x={x} seg_x={} native={} idx={:#04X} output_idx={:#04X} ham_before={:#08X} ham_after={:#08X} color={:#08X} latch={:#06X} bplcon0={:#06X} bplcon1={:#06X} win={:?}",
+                        seg.x,
+                        native_idx,
+                        sample.idx,
+                        output_idx,
+                        ham_before & 0x00FF_FFFF,
+                        *ham_color & 0x00FF_FFFF,
+                        source_output.color & 0x00FF_FFFF,
+                        source_output.color_latch,
+                        source_control.bplcon0,
+                        source_control.bplcon1,
+                        source_control.display_window_x(),
+                    );
+                }
             }
             let (pixel_color, pixel_color_latch) =
                 if source_control.shres() || source_control.hold_and_modify() {
@@ -6191,6 +6419,7 @@ fn shres_composite_sample(
     DeniseBitplaneSample {
         idx: (left.idx | right.idx) & 0x03,
         nplanes: left.nplanes.max(right.nplanes).min(2),
+        active: left.active || right.active,
     }
 }
 
@@ -7331,6 +7560,22 @@ mod tests {
         };
         assert_eq!(lores_late_fetch.native_x_offset(false, 2), 0);
         assert_eq!(lores_late_fetch.fetch_start_native_x(false, 2), 79);
+
+        let lores_early_fetch_standard_window = RenderState {
+            bplcon0: 0,
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16,
+            ddfstrt: 0x0030,
+            ddfstop: 0x00D0,
+            ..blank_state()
+        };
+        assert_eq!(
+            lores_early_fetch_standard_window.words_per_row(false, 0),
+            21
+        );
+        assert_eq!(
+            lores_early_fetch_standard_window.native_x_offset(false, 2),
+            16
+        );
     }
 
     #[test]
@@ -10251,6 +10496,7 @@ mod tests {
         let sample = DeniseBitplaneSample {
             idx: 0b000011,
             nplanes: 2,
+            active: true,
         };
         let mut playfield_mask = vec![0u8; 1];
         let mut collision_pixels = vec![CollisionPixel::default(); 1];
@@ -10293,14 +10539,16 @@ mod tests {
             line_plan.sample(control, 0),
             DeniseBitplaneSample {
                 idx: 0x01,
-                nplanes: 3
+                nplanes: 3,
+                active: true,
             }
         );
         assert_eq!(
             line_plan.sample(control, 1),
             DeniseBitplaneSample {
                 idx: 0x02,
-                nplanes: 3
+                nplanes: 3,
+                active: true,
             }
         );
 
@@ -10309,14 +10557,16 @@ mod tests {
             line_plan.sample(control, 0),
             DeniseBitplaneSample {
                 idx: 0x00,
-                nplanes: 3
+                nplanes: 3,
+                active: true,
             }
         );
         assert_eq!(
             line_plan.sample(control, 1),
             DeniseBitplaneSample {
                 idx: 0x03,
-                nplanes: 3
+                nplanes: 3,
+                active: true,
             }
         );
 
@@ -10325,7 +10575,8 @@ mod tests {
             line_plan.sample(control, 1),
             DeniseBitplaneSample {
                 idx: 0x01,
-                nplanes: 1
+                nplanes: 1,
+                active: true,
             }
         );
     }
@@ -10359,6 +10610,8 @@ mod tests {
             0,
             control.bplcon1,
             PAL_VISIBLE_LINE0,
+            0.0,
+            0,
         );
 
         assert_eq!(fb[68], rgb12_to_rgba8(0x0123));
@@ -10400,12 +10653,60 @@ mod tests {
             0,
             control.bplcon1,
             PAL_VISIBLE_LINE0,
+            0.0,
+            0,
         );
 
         assert_eq!(control.native_x_offset(control.diw_h_start(), 2), 1);
         assert_eq!(fb[64], rgb12_to_rgba8(0x0122));
         assert_eq!(fb[65], rgb12_to_rgba8(0x0122));
         assert_eq!(&playfield_mask[62..64], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn bplcon1_write_at_diw_right_edge_does_not_retap_current_ham_line() {
+        let mut row_words = vec![vec![0; 1]; 6];
+        row_words[0][0] |= 0x4000; // native x 1: direct palette entry 1
+        let line_plan = DenisePlannedPlayfieldLine::new(0, 64, 96, &row_words, 16);
+        let mut control = visible_lowres_control(0x6800);
+        control.diwstrt = ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16;
+        control.diwstop =
+            (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | (STANDARD_DIW_HSTART as u16 + 16);
+        control.diwhigh = DiwHigh::ecs_explicit(0);
+        let mut retapped_control = control;
+        retapped_control.bplcon1 = 0x0004;
+        let control_segments = [ControlSegment {
+            x: control.display_window_x().1,
+            control: retapped_control,
+        }];
+        let mut palette = Palette::new();
+        palette.write_ocs(1, 0x0123);
+        let mut fb = vec![0; FB_PIXELS];
+        let mut playfield_mask = vec![0; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut clxdat = 0;
+
+        render_planned_playfield_line(
+            &line_plan,
+            &mut fb,
+            &mut playfield_mask,
+            &mut collision_pixels,
+            &mut clxdat,
+            palette,
+            &[],
+            0,
+            control,
+            &control_segments,
+            0,
+            control.bplcon1,
+            PAL_VISIBLE_LINE0,
+            0.0,
+            0,
+        );
+
+        assert_eq!(control.display_window_x(), (64, 96));
+        assert_eq!(fb[64], rgb12_to_rgba8(0x0123));
+        assert_eq!(fb[65], rgb12_to_rgba8(0x0123));
     }
 
     #[test]
@@ -10435,6 +10736,8 @@ mod tests {
             0,
             control.bplcon1,
             PAL_VISIBLE_LINE0,
+            0.0,
+            0,
         );
 
         assert_eq!(fb[68], rgb12_to_rgba8_alpha(0x0F00, false));
@@ -10469,6 +10772,8 @@ mod tests {
             0,
             control.bplcon1,
             PAL_VISIBLE_LINE0,
+            0.0,
+            0,
         );
 
         assert_eq!(fb[68], rgb12_to_rgba8(0x0F00));
@@ -10503,6 +10808,8 @@ mod tests {
             0,
             control.bplcon1,
             PAL_VISIBLE_LINE0,
+            0.0,
+            0,
         );
 
         assert_eq!(fb[68], rgb12_to_rgba8(0x0F00));
@@ -10533,6 +10840,8 @@ mod tests {
             0,
             control.bplcon1,
             PAL_VISIBLE_LINE0,
+            0.0,
+            0,
         );
 
         assert_eq!(clxdat & 0x0001, 0x0001);
@@ -10553,14 +10862,16 @@ mod tests {
             shifter.sample(control, 0),
             Some(DeniseBitplaneSample {
                 idx: 0x01,
-                nplanes: 2
+                nplanes: 2,
+                active: true,
             })
         );
         assert_eq!(
             shifter.sample(control, 1),
             Some(DeniseBitplaneSample {
                 idx: 0x02,
-                nplanes: 2
+                nplanes: 2,
+                active: true,
             })
         );
         assert_eq!(shifter.sample(control, 16), None);
@@ -10570,14 +10881,16 @@ mod tests {
             shifter.sample(control, 0),
             Some(DeniseBitplaneSample {
                 idx: 0x00,
-                nplanes: 2
+                nplanes: 2,
+                active: true,
             })
         );
         assert_eq!(
             shifter.sample(control, 1),
             Some(DeniseBitplaneSample {
                 idx: 0x03,
-                nplanes: 2
+                nplanes: 2,
+                active: true,
             })
         );
     }
