@@ -43,6 +43,11 @@ pub struct Config {
     /// Extra Zorro boards loaded from `[[zorro]]` metadata files, in
     /// autoconfig chain order after the built-in RAM boards.
     pub zorro_boards: Vec<BoardSpec>,
+    /// Advertise the Copperline identification board on the Zorro autoconfig
+    /// chain (manufacturer 5192 / product 2) so guest software such as
+    /// identify.library can detect the emulator. Defaults to true; set
+    /// `identify = false` for a chain with no emulator-identifying board.
+    pub identify_board: bool,
     pub chipset: Chipset,
     /// Concrete chip revisions derived from the `[chipset] revision` preset,
     /// installed chip RAM, and the optional `agnus`/`denise` overrides.
@@ -520,6 +525,7 @@ impl Default for Config {
             slow_ram_bytes: A500_TRAPDOOR_RAM_BYTES,
             z3_ram_bytes: 0,
             zorro_boards: Vec::new(),
+            identify_board: true,
             chipset: Chipset::Ocs,
             agnus_revision: AgnusRevision::Ocs,
             denise_revision: DeniseRevision::Ocs,
@@ -589,8 +595,11 @@ impl Config {
     }
 
     /// Build the Zorro autoconfig chain this config asks for: the built-in
-    /// Zorro II fast RAM board, the built-in Zorro III RAM board, then any
-    /// `[[zorro]]` metadata boards in file order.
+    /// Zorro II fast RAM board, the built-in Zorro III RAM board, any
+    /// `[[zorro]]` metadata boards in file order, and finally (unless
+    /// `identify = false`) the Copperline identification board. The ID board
+    /// comes last so the configured RAM boards keep the autoconfig base
+    /// addresses they would get without it.
     pub fn build_zorro_chain(&self) -> Result<ZorroChain> {
         let mut chain = ZorroChain::default();
         if self.fast_ram_bytes > 0 {
@@ -601,6 +610,9 @@ impl Config {
         }
         for board in &self.zorro_boards {
             chain.add_board(board.clone())?;
+        }
+        if self.identify_board {
+            chain.add_board(BoardSpec::copperline_id())?;
         }
         Ok(chain)
     }
@@ -722,6 +734,9 @@ struct RawConfig {
     /// `[[zorro]]` board entries, configured in file order.
     #[serde(default)]
     zorro: Vec<RawZorroBoard>,
+    /// `identify = false` drops the Copperline identification board from the
+    /// autoconfig chain (default: present).
+    identify: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1067,6 +1082,7 @@ impl TryFrom<RawConfig> for Config {
             slow_ram_bytes,
             z3_ram_bytes,
             zorro_boards,
+            identify_board: raw.identify.unwrap_or(defaults.identify_board),
             chipset,
             agnus_revision,
             denise_revision,
@@ -2113,6 +2129,34 @@ mod tests {
         assert!(err.to_string().contains("needs a 32-bit CPU"), "{err:#}");
 
         let _ = fs::remove_file(&meta);
+        Ok(())
+    }
+
+    #[test]
+    fn identify_board_present_by_default() -> Result<()> {
+        // A bare config (no fast/Z3/metadata boards) still puts the
+        // Copperline identification board on the chain.
+        let cfg = parse_config("")?;
+        assert!(cfg.identify_board);
+        let chain = cfg.build_zorro_chain()?;
+        let base = crate::zorro::AUTOCONFIG_BASE;
+        // er_Type: Zorro II, no MEMLIST, 64K (size code 1) = 0xC1, exposed
+        // high nibble then low nibble (er_Type is not inverted).
+        assert_eq!(chain.config_read(base, 1), 0xC0);
+        assert_eq!(chain.config_read(base + 2, 1), 0x10);
+        // er_Product = 2, inverted to 0xFD on the physical nibbles.
+        assert_eq!(chain.config_read(base + 4, 1), 0xF0);
+        assert_eq!(chain.config_read(base + 6, 1), 0xD0);
+        Ok(())
+    }
+
+    #[test]
+    fn identify_false_drops_the_board() -> Result<()> {
+        let cfg = parse_config("identify = false")?;
+        assert!(!cfg.identify_board);
+        // No boards configured at all: the autoconfig window floats.
+        let chain = cfg.build_zorro_chain()?;
+        assert_eq!(chain.config_read(crate::zorro::AUTOCONFIG_BASE, 1), 0xFF);
         Ok(())
     }
 

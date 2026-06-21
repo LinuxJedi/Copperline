@@ -62,7 +62,16 @@ profile in a config file.
 rom = "KICK13.ROM"            # Kickstart image, exactly 512 KiB
 extended_rom = "cd32ext.rom"  # optional: CDTV (256K at $F00000) or
                               # CD32 (512K at $E00000) extended ROM
+# identify = false            # drop the Copperline identification board
+                              # from the Zorro chain (default: present)
 ```
+
+`identify` controls a small, inert Zorro autoconfig board Copperline puts on
+the expansion chain (manufacturer 5192 / product 2) so guest software such
+as [identify.library](https://github.com/shred/identify) can detect that it
+is running under the emulator. It is on by default and does not change the
+machine's usable memory; set `identify = false` for a chain with no
+emulator-identifying board. See [](../zorro) for details.
 
 The ROM path can be overridden by a positional CLI argument. Omit `rom`
 entirely (and pass no ROM argument) to boot the bundled AROS open-source

@@ -48,8 +48,10 @@ Field notes:
   link the board's space into the Exec free-memory list. Leave it `true`
   for RAM boards; a future I/O-style board would set it `false`.
 - `manufacturer`/`product`/`serial` are what the guest OS sees in the
-  expansion database. `0x07DB` is the conventional "hacker" ID used by the
-  built-in boards.
+  expansion database. `0x07DB` is the conventional "hacker"/"prototype" ID
+  for homemade boards. Copperline's own built-in boards instead use its
+  registered manufacturer ID (5192 / `0x1448`, dec0de Consulting); see
+  [The Copperline manufacturer ID](#the-copperline-manufacturer-id) below.
 
 The spec is validated on load (`BoardSpec::validate`,
 `src/zorro.rs`): bad sizes, unknown `zorro` versions, and unknown backing
@@ -85,6 +87,7 @@ Successful configuration is logged:
 
 ```
 zorro II board "fast RAM" autoconfigured at 0x00200000
+zorro II board "Copperline" autoconfigured at 0x00E90000
 ```
 
 Once configured, accesses inside a board's window are routed by
@@ -112,6 +115,35 @@ ways:
 On CDTV machines the DMAC occupies the config window first; the Zorro chain
 follows once it is configured, matching real-machine autoconfig order.
 
+## The Copperline manufacturer ID
+
+Copperline's built-in virtual boards autoconfig under manufacturer ID
+**5192** (`0x1448`) -- the registered ID of dec0de Consulting, which also
+makes the real ROMulus flash-ROM board. The product numbers under it are:
+
+| Product | Board |
+| ------- | ----- |
+| 1 | ROMulus (physical hardware; not emulated) |
+| 2 | Copperline identification board |
+| 3 | Built-in fast RAM (`[memory] fast`) |
+| 4 | Built-in Zorro III RAM (`[memory] z3`) |
+
+The **identification board** (`BoardSpec::copperline_id`) is always added to
+the chain (unless disabled, below) so guest software can detect that it is
+running under Copperline rather than on real hardware or another emulator --
+for example [identify.library](https://github.com/shred/identify) calling
+`FindConfigDev(5192, 2)`. It is the smallest legal Zorro II board (64K), is
+kept out of the Exec free-memory list, and never autoboots, so it sits
+inertly on the chain without changing the machine's usable memory map. Its
+autoconfig serial number carries the running Copperline version packed as
+`major << 16 | minor << 8 | patch`, so a tool can report the exact version
+and not just the emulator name.
+
+The board is added last, after the RAM and `[[zorro]]` boards, so those keep
+the base addresses they would get without it. Set `identify = false` in the
+configuration to drop it entirely (for a chain with no emulator-identifying
+board); see the `identify` option in [](guide/configuration).
+
 ## Adding a board in Rust
 
 For board types that need code (a new `BoardBacking` beyond RAM), the flow
@@ -128,12 +160,13 @@ example of a device-backed board:
        Self {
            name: "fast RAM".into(),
            version: ZorroVersion::II,
-           manufacturer: HACKER_MANUFACTURER_ID,
+           manufacturer: COPPERLINE_MANUFACTURER_ID,
            product: PRODUCT_FAST_RAM,
            serial: 0,
            size_bytes,
            backing: BoardBacking::Ram,
            memlist: true,
+           diag_vec: None,
        }
    }
    ```

@@ -44,11 +44,19 @@ const EC_BASEADDRESS_PHYS: u64 = 0x48;
 const EC_BASEADDRESS_LO_PHYS: u64 = 0x4A;
 const EC_SHUTUP_PHYS: u64 = 0x4C;
 
-/// "Hacker" manufacturer ID, reserved for uses like this emulator's
-/// built-in boards.
-pub const HACKER_MANUFACTURER_ID: u16 = 0x07DB;
-const PRODUCT_FAST_RAM: u8 = 0x01;
-const PRODUCT_Z3_RAM: u8 = 0x02;
+/// Copperline's registered Amiga expansion manufacturer ID (dec0de
+/// Consulting, 5192 / 0x1448). The same ID labels the real ROMulus
+/// flash-ROM board (product 1); the emulator's virtual boards take
+/// distinct product numbers under it so tools like identify.library can
+/// tell them apart.
+pub const COPPERLINE_MANUFACTURER_ID: u16 = 0x1448;
+/// The always-present identification board guest software finds (via
+/// expansion.library FindConfigDev) to detect that it is running under
+/// Copperline. Product 1 is the physical ROMulus board, so the emulator's
+/// product numbering starts at 2.
+const PRODUCT_COPPERLINE_ID: u8 = 0x02;
+const PRODUCT_FAST_RAM: u8 = 0x03;
+const PRODUCT_Z3_RAM: u8 = 0x04;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // "II"/"III" are the bus generations' proper names (roman numerals), not
@@ -93,7 +101,7 @@ impl BoardSpec {
         Self {
             name: "fast RAM".into(),
             version: ZorroVersion::II,
-            manufacturer: HACKER_MANUFACTURER_ID,
+            manufacturer: COPPERLINE_MANUFACTURER_ID,
             product: PRODUCT_FAST_RAM,
             serial: 0,
             size_bytes,
@@ -108,12 +116,35 @@ impl BoardSpec {
         Self {
             name: "Zorro III RAM".into(),
             version: ZorroVersion::III,
-            manufacturer: HACKER_MANUFACTURER_ID,
+            manufacturer: COPPERLINE_MANUFACTURER_ID,
             product: PRODUCT_Z3_RAM,
             serial: 0,
             size_bytes,
             backing: BoardBacking::Ram,
             memlist: true,
+            diag_vec: None,
+        }
+    }
+
+    /// The Copperline identification board: a tiny, inert Zorro II board
+    /// kept on the autoconfig chain so guest software can detect the
+    /// emulator by finding manufacturer [`COPPERLINE_MANUFACTURER_ID`] /
+    /// product [`PRODUCT_COPPERLINE_ID`] (e.g. identify.library calling
+    /// FindConfigDev). It is the smallest legal Zorro II size, is left out
+    /// of the free memory list, and never autoboots, so it does not perturb
+    /// the machine's memory map. Its serial number carries the running
+    /// Copperline version (see [`copperline_ident_serial`]) so a tool can
+    /// report the exact version, not just the emulator name.
+    pub fn copperline_id() -> Self {
+        Self {
+            name: "Copperline".into(),
+            version: ZorroVersion::II,
+            manufacturer: COPPERLINE_MANUFACTURER_ID,
+            product: PRODUCT_COPPERLINE_ID,
+            serial: copperline_ident_serial(),
+            size_bytes: 0x1_0000,
+            backing: BoardBacking::Ram,
+            memlist: false,
             diag_vec: None,
         }
     }
@@ -550,6 +581,23 @@ fn parse_board_size(s: &str) -> Result<usize> {
     Ok(bytes as usize)
 }
 
+/// Pack a `major.minor.patch` version string into a 32-bit autoconfig
+/// serial number: byte 2 holds major, byte 1 minor, byte 0 patch. Missing
+/// or non-numeric components (e.g. a `-dev` pre-release suffix) count as 0.
+fn pack_version_serial(version: &str) -> u32 {
+    let mut parts = version.split('.');
+    let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let patch: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (major << 16) | (minor << 8) | patch
+}
+
+/// The running Copperline version packed into a board serial number, so the
+/// identification board ([`BoardSpec::copperline_id`]) can advertise it.
+fn copperline_ident_serial() -> u32 {
+    pack_version_serial(env!("CARGO_PKG_VERSION"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,9 +636,38 @@ mod tests {
         assert_eq!(chain.config_read(AUTOCONFIG_BASE + 2, 1), 0x40);
 
         // er_Product is inverted before being exposed on the physical
-        // nibbles: product 0x01 appears as 0xFE.
+        // nibbles: product 0x03 appears as 0xFC.
         assert_eq!(chain.config_read(AUTOCONFIG_BASE + 4, 1), 0xF0);
-        assert_eq!(chain.config_read(AUTOCONFIG_BASE + 6, 1), 0xE0);
+        assert_eq!(chain.config_read(AUTOCONFIG_BASE + 6, 1), 0xC0);
+    }
+
+    #[test]
+    fn copperline_id_board_advertises_registered_manufacturer() {
+        let spec = BoardSpec::copperline_id();
+        // dec0de Consulting's registered manufacturer ID, with a product
+        // number distinct from the physical ROMulus board (product 1).
+        assert_eq!(spec.manufacturer, COPPERLINE_MANUFACTURER_ID);
+        assert_eq!(spec.manufacturer, 5192);
+        assert_eq!(spec.product, PRODUCT_COPPERLINE_ID);
+        // Inert: smallest Zorro II size, out of the free memory list, and
+        // no autoboot, so it does not perturb the machine's memory map.
+        assert_eq!(spec.version, ZorroVersion::II);
+        assert_eq!(spec.size_bytes, 64 * 1024);
+        assert!(!spec.memlist);
+        assert!(spec.diag_vec.is_none());
+        // Serial advertises the running Copperline version.
+        assert_eq!(spec.serial, copperline_ident_serial());
+        spec.validate().unwrap();
+    }
+
+    #[test]
+    fn version_serial_packs_major_minor_patch() {
+        assert_eq!(pack_version_serial("0.6.0"), 0x0000_0600);
+        assert_eq!(pack_version_serial("1.2.3"), 0x0001_0203);
+        assert_eq!(pack_version_serial("0.5"), 0x0000_0500);
+        assert_eq!(pack_version_serial("12.34.56"), (12 << 16) | (34 << 8) | 56);
+        // A pre-release suffix on the patch component counts as 0.
+        assert_eq!(pack_version_serial("0.6.0-dev"), 0x0000_0600);
     }
 
     #[test]
