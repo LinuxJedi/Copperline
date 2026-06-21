@@ -8415,8 +8415,8 @@ fn live_manual_sprite_collision_sources(
 fn live_manual_sprite_event_x(event: BeamRegisterWrite) -> i32 {
     let off = event.offset & 0x01FE;
     if (0x140..=0x17F).contains(&off) && (off - 0x140) & 0x0006 == 0 {
-        return ((event.hpos as i32 * 2 - RENDER_DIW_HSTART_FB0) * 2)
-            .clamp(0, RENDER_FRAMEBUFFER_WIDTH);
+        let hpos = event.hpos.saturating_sub(DENISE_HPOS_LAG_CCK);
+        return ((hpos as i32 * 2 - RENDER_DIW_HSTART_FB0) * 2).clamp(0, RENDER_FRAMEBUFFER_WIDTH);
     }
     ((event.hpos.saturating_sub(RENDER_COPPER_WAIT_HPOS_FB0)).saturating_mul(4))
         .min(RENDER_FRAMEBUFFER_WIDTH as u32) as i32
@@ -14875,7 +14875,8 @@ mod tests {
             value: 0,
             source: BeamWriteSource::Cpu,
         };
-        let sprite_compare_x = (event_hpos as i32 * 2 - RENDER_DIW_HSTART_FB0) * 2;
+        let sprite_compare_hpos = event_hpos.saturating_sub(DENISE_HPOS_LAG_CCK);
+        let sprite_compare_x = (sprite_compare_hpos as i32 * 2 - RENDER_DIW_HSTART_FB0) * 2;
         let colour_output_x = (event_hpos as i32 - RENDER_COPPER_WAIT_HPOS_FB0 as i32) * 4;
 
         assert_eq!(super::live_manual_sprite_event_x(event), sprite_compare_x);

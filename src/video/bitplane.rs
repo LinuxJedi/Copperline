@@ -61,6 +61,10 @@ const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// colour-register position rather than the earlier bitplane-control domain.
 /// Moved left by 8 colour clocks alongside the other origin anchors.
 const COLOR_WRITE_HPOS_FB0: i32 = 0x36;
+/// SPRxPOS writes update the Denise horizontal comparator ahead of the normal
+/// register/output beam domain. Manual sprite replays use this earlier domain
+/// so adjacent position writes can abut at their programmed HSTARTs.
+const SPRITE_POSITION_WRITE_PIPELINE_CCK: u32 = 4;
 /// Framebuffer-x offset between the copper/register coordinate
 /// ([`COPPER_WAIT_HPOS_FB0`], used to place beam-timed register writes) and the
 /// bitplane/DIW coordinate ([`DIW_HSTART_FB0`], used to place fetched bitplane
@@ -3012,8 +3016,13 @@ fn manual_sprite_position_event_beam(
     if vpos >= visible_end {
         return (visible_end, 0);
     }
-    let x = ((hpos as i32 * 2 - DIW_HSTART_FB0) * 2).clamp(0, FB_WIDTH as i32) as usize;
+    let x = sprite_position_write_framebuffer_x(hpos);
     (vpos, x)
+}
+
+fn sprite_position_write_framebuffer_x(hpos: u32) -> usize {
+    let hpos = hpos.saturating_sub(SPRITE_POSITION_WRITE_PIPELINE_CCK);
+    ((hpos as i32 * 2 - DIW_HSTART_FB0) * 2).clamp(0, FB_WIDTH as i32) as usize
 }
 
 fn flush_manual_sprite_lines(
@@ -8441,9 +8450,9 @@ mod tests {
         initial_state.sprdata[2] = 0xFFFF;
         initial_state.spr_armed[2] = true;
 
-        // hpos 96 reaches the sprite comparator before HSTART 192, but the
-        // colour-output register domain maps it to framebuffer x=224. The
-        // repositioned sprite must not be clipped to that later output x.
+        // SPRxPOS writes update the Denise sprite comparator before the
+        // general colour-output register domain reaches the same beam hpos.
+        // The repositioned sprite must not be clipped to that later output x.
         let event_hpos = 96;
         let manual_sprite_lines = manual_sprite_lines_from_events(
             &initial_state,
@@ -8458,12 +8467,62 @@ mod tests {
             .iter()
             .find(|line| line.beam_y == beam_y && line.hstart == new_hstart as i32)
             .expect("new position interval");
-        let sprite_compare_x = ((event_hpos as i32 * 2 - DIW_HSTART_FB0) * 2) as usize;
+        let sprite_position_x = sprite_position_write_framebuffer_x(event_hpos);
         let colour_output_x = ((event_hpos as i32 - COPPER_WAIT_HPOS_FB0) * 4) as usize;
 
-        assert_eq!(old_line.x_stop, sprite_compare_x);
-        assert_eq!(new_line.x_start, sprite_compare_x);
+        assert_eq!(old_line.x_stop, sprite_position_x);
+        assert_eq!(new_line.x_start, sprite_position_x);
         assert_ne!(new_line.x_start, colour_output_x);
+    }
+
+    #[test]
+    fn manual_sprite_position_writes_use_denise_compare_lag() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let initial_hstart = 64;
+        let first_hstart = 120;
+        let second_hstart = 136;
+        let (initial_pos, ctl) =
+            sprite_control_words(beam_y as u16, beam_y as u16 + 1, initial_hstart);
+        let (first_pos, _) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, first_hstart);
+        let (second_pos, _) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, second_hstart);
+        initial_state.sprpos[0] = initial_pos;
+        initial_state.sprctl[0] = ctl;
+        initial_state.sprdata[0] = 0xFFFF;
+        initial_state.spr_armed[0] = true;
+
+        let first_hpos = 64;
+        let second_hpos = 72;
+        let manual_sprite_lines = manual_sprite_lines_from_events(
+            &initial_state,
+            &[
+                cpu_event(beam_y as u32, first_hpos, 0x140, first_pos),
+                cpu_event(beam_y as u32, second_hpos, 0x140, second_pos),
+            ],
+        );
+
+        let first_line = manual_sprite_lines[0]
+            .iter()
+            .find(|line| line.beam_y == beam_y && line.hstart == first_hstart as i32)
+            .expect("first position interval");
+        let second_line = manual_sprite_lines[0]
+            .iter()
+            .find(|line| line.beam_y == beam_y && line.hstart == second_hstart as i32)
+            .expect("second position interval");
+        let first_base_x = ((first_hstart as i32 - DIW_HSTART_FB0) * 2) as usize;
+        let second_base_x = ((second_hstart as i32 - DIW_HSTART_FB0) * 2) as usize;
+
+        assert_eq!(first_line.x_start, first_base_x);
+        assert_eq!(first_line.x_stop, second_base_x);
+        assert_eq!(second_line.x_start, second_base_x);
+        assert_eq!(
+            first_line.x_start,
+            sprite_position_write_framebuffer_x(first_hpos)
+        );
+        assert_eq!(
+            second_line.x_start,
+            sprite_position_write_framebuffer_x(second_hpos)
+        );
     }
 
     #[test]

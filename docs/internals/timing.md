@@ -93,6 +93,15 @@ fixed bincode layout; future save-state versioning should serialize it if
 mid-line sprite-DMA resume accuracy is tightened. Test:
 `active_sprite_control_rewrite_preserves_descriptor_data_origin`.
 
+Beam-timed SPRxPOS writes are replayed in Denise's horizontal-comparator
+domain, four colour clocks ahead of the normal register-output position.
+This matters for manual sprite reuse with sprite DMA disabled: Copper lists
+can write consecutive SPRxPOS values whose HSTARTs exactly abut, while later
+SPRxDATA/SPRxDATB writes still take effect only from their ordinary beam
+position. Tests:
+`manual_sprite_position_write_before_hstart_uses_sprite_compare_domain`,
+`manual_sprite_position_writes_use_denise_compare_lag`.
+
 ## The Copper
 
 The Copper (`src/chipset/copper.rs`) is a two-cycle processor that
