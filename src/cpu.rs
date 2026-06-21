@@ -953,6 +953,7 @@ impl M68kMachine {
         let mut bus: Bus = deserialize_component(r, "bus")?;
 
         bus.adopt_host_resources(&mut self.bus.bus);
+        bus.reset_transient_video_after_state_load();
         // The CPU model travels with the state (cpu_type, timing tables, and
         // address_mask all live in CpuCore); keep the bus adapter's mask copy
         // in step so external decode agrees with the restored core.

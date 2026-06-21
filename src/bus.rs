@@ -683,6 +683,9 @@ pub struct Bus {
     blitter_trace: Option<std::fs::File>,
     display_dma_bplpt: [u32; 8],
     display_dma_sprpt: [u32; 8],
+    // Derived from sprite DMA descriptor/control fetches. Kept in the bincode
+    // layout for compatibility, then reset after a state load so stale decoded
+    // latches are rebuilt from the restored pointer context.
     display_dma_sprite_state: [DisplaySpriteDmaState; 8],
     display_dma_clipped_rows_advanced: bool,
     bitplane_dmacon_delay: Option<BitplaneDmaconDelay>,
@@ -1940,6 +1943,31 @@ impl Bus {
         std::mem::swap(&mut self.paula.serial, &mut live.paula.serial);
         std::mem::swap(&mut self.paula.audio, &mut live.paula.audio);
         self.blitter_trace = live.blitter_trace.take();
+    }
+
+    pub(crate) fn reset_transient_video_after_state_load(&mut self) {
+        self.last_frame_render_base = None;
+        self.last_frame_render_events.clear();
+        self.last_frame_beam_bottom_palette_events.clear();
+        self.current_frame_chip_ram.clear();
+        self.current_frame_chip_ram
+            .extend_from_slice(&self.mem.chip_ram);
+        self.last_frame_chip_ram.clear();
+        self.current_frame_chip_ram_writes.clear();
+        self.last_frame_chip_ram_writes.clear();
+        self.current_frame_bitplane_rows = empty_captured_bitplane_rows();
+        self.last_frame_bitplane_rows = empty_captured_bitplane_rows();
+        self.current_frame_sprite_lines.clear();
+        self.last_frame_sprite_lines.clear();
+        clear_captured_sprite_lines_by_y(&mut self.current_frame_sprite_lines_by_y);
+        self.current_frame_sprite_collision_sources = empty_sprite_collision_sources();
+        self.current_frame_held_sprites = [None; 8];
+        self.last_frame_held_sprites = [None; 8];
+        self.current_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
+        self.last_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
+        self.current_frame_sprite_dma_observed = false;
+        self.last_frame_sprite_dma_observed = false;
+        self.display_dma_sprite_state = [DisplaySpriteDmaState::default(); 8];
     }
 
     pub fn emulated_seconds(&self) -> f64 {
@@ -7114,12 +7142,15 @@ impl Bus {
             };
             let height = vstop - vstart;
             if height <= 0 {
-                state.next_ptr = Some(ptr);
+                // Equal start/stop descriptors idle the sprite stream for
+                // this field. Do not scan onward into the following words:
+                // they are often bitmap data for a later rearmed sprite.
+                state.terminated = true;
                 state.control = None;
                 state.data_dma_active = false;
                 state.last_line = None;
-                descriptor_can_match_current_vstart = true;
-                continue;
+                self.display_dma_sprite_state[sprite] = state;
+                return None;
             }
 
             // With SSCAN2 each fetched data line covers two display lines,
@@ -9549,12 +9580,13 @@ mod tests {
         live_sprite_playfield_collision_bits_in_range, live_sprite_sprite_collision_bits,
         visible_start_vpos_for_diw, BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus,
         CapturedBitplaneRow, CapturedSpriteLine, ChipBusOwner, CpuBusAccessKind, DeviceClock,
-        LiveCollisionControl, LiveCollisionLineReplay, LiveSpriteCollisionSource,
-        RenderRegisterSnapshot, BLITTER_SLOWDOWN_CPU_MISS_LIMIT, BLTCON1_DOFF, BPLCON0_ECSENA,
-        BPLCON3_BRDSPRT, BPLCON3_SPRES_HIRES, COPPER_BUS_LOCKOUT_HPOS, DENISE_HPOS_LAG_CCK,
-        DMACON_AUD_MASK, DMACON_BLTEN, DMACON_BLTPRI, DMACON_BPLEN, DMACON_SPREN,
-        RENDER_COPPER_WAIT_HPOS_FB0, RENDER_DIW_HSTART_FB0, RENDER_MIN_OVERSCAN_START_VPOS,
-        RENDER_VISIBLE_LINES, RENDER_VISIBLE_START_VPOS, SPRITE_DMA_PAIR_CAPTURE_HPOS,
+        DisplaySpriteControl, DisplaySpriteDmaState, DisplaySpriteLineData, LiveCollisionControl,
+        LiveCollisionLineReplay, LiveSpriteCollisionSource, RenderRegisterSnapshot,
+        BLITTER_SLOWDOWN_CPU_MISS_LIMIT, BLTCON1_DOFF, BPLCON0_ECSENA, BPLCON3_BRDSPRT,
+        BPLCON3_SPRES_HIRES, COPPER_BUS_LOCKOUT_HPOS, DENISE_HPOS_LAG_CCK, DMACON_AUD_MASK,
+        DMACON_BLTEN, DMACON_BLTPRI, DMACON_BPLEN, DMACON_SPREN, RENDER_COPPER_WAIT_HPOS_FB0,
+        RENDER_DIW_HSTART_FB0, RENDER_MIN_OVERSCAN_START_VPOS, RENDER_VISIBLE_LINES,
+        RENDER_VISIBLE_START_VPOS, SPRITE_DMA_PAIR_CAPTURE_HPOS,
     };
     use crate::audio::AudioSink;
     use crate::chipset::agnus::{
@@ -14343,7 +14375,89 @@ mod tests {
     }
 
     #[test]
-    fn sprite_dma_capture_skips_zero_height_control_words() {
+    fn state_load_resets_transient_video_latches() {
+        let mut bus = empty_bus();
+        bus.last_frame_render_base = Some(RenderRegisterSnapshot::default());
+        bus.last_frame_render_events.push(BeamRegisterWrite {
+            vpos: 0x2C,
+            hpos: 0x40,
+            offset: 0x180,
+            value: 0x0FFF,
+            source: BeamWriteSource::Copper,
+        });
+        bus.last_frame_chip_ram = vec![0xA5; bus.mem.chip_ram.len()];
+        bus.last_frame_chip_ram_writes
+            .push(BeamChipRamWrite::from_bytes(0x2C, 0x40, 0x0100, &[0x12]));
+        bus.current_frame_chip_ram.clear();
+        bus.current_frame_chip_ram_writes
+            .push(BeamChipRamWrite::from_bytes(0x2C, 0x40, 0x0100, &[0x34]));
+        bus.last_frame_bitplane_rows[0] = Some(CapturedBitplaneRow {
+            nplanes: 1,
+            words_per_row: 1,
+            planes: std::array::from_fn(|_| vec![0xFFFF]),
+        });
+        bus.current_frame_sprite_lines.push(CapturedSpriteLine {
+            sprite: 0,
+            hstart: 0x80,
+            hsub_70ns: false,
+            beam_y: 0x2C,
+            data: 0x1111,
+            datb: 0x2222,
+            data_ext: [0; 3],
+            datb_ext: [0; 3],
+            width_words: 1,
+            attached: false,
+        });
+        bus.display_dma_sprite_state[0] = DisplaySpriteDmaState {
+            control: Some(DisplaySpriteControl {
+                vstart: 0x20,
+                vstop: 0x40,
+                hstart: 0x80,
+                hsub_70ns: false,
+                data_vstart: 0x20,
+                data_base: 0x0100,
+                next_ptr: 0x0200,
+                attached: false,
+            }),
+            next_ptr: Some(0x0200),
+            terminated: false,
+            data_dma_active: true,
+            last_line: Some(DisplaySpriteLineData {
+                hstart: 0x80,
+                hsub_70ns: false,
+                data: 0x1111,
+                datb: 0x2222,
+                data_ext: [0; 3],
+                datb_ext: [0; 3],
+                width_words: 1,
+                attached: false,
+            }),
+        };
+        bus.display_dma_sprite_state[3].terminated = true;
+
+        bus.reset_transient_video_after_state_load();
+
+        assert!(bus.last_frame_render_base.is_none());
+        assert!(bus.last_frame_render_events.is_empty());
+        assert_eq!(bus.current_frame_chip_ram, bus.mem.chip_ram);
+        assert!(bus.last_frame_chip_ram.is_empty());
+        assert!(bus.current_frame_chip_ram_writes.is_empty());
+        assert!(bus.last_frame_chip_ram_writes.is_empty());
+        assert!(bus.current_frame_bitplane_rows.iter().all(Option::is_none));
+        assert!(bus.last_frame_bitplane_rows.iter().all(Option::is_none));
+        assert!(bus.current_frame_sprite_lines.is_empty());
+        assert!(bus.last_frame_sprite_lines.is_empty());
+        for state in bus.display_dma_sprite_state {
+            assert!(state.control.is_none());
+            assert!(state.next_ptr.is_none());
+            assert!(!state.terminated);
+            assert!(!state.data_dma_active);
+            assert!(state.last_line.is_none());
+        }
+    }
+
+    #[test]
+    fn sprite_dma_zero_height_descriptor_terminates_stream() {
         let mut bus = empty_bus();
         let sprite_ptr = 0x0100usize;
         let (zero_pos, zero_ctl) = sprite_control_words(0x2C, 0x2C, 0x0083);
@@ -14366,10 +14480,7 @@ mod tests {
         bus.advance_chipset(2);
 
         let lines = bus.frame_captured_sprite_lines();
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].hstart, 0x0091);
-        assert_eq!(lines[0].data, 0x1111);
-        assert_eq!(lines[0].datb, 0x2222);
+        assert!(lines.is_empty());
     }
 
     #[test]
@@ -14400,17 +14511,14 @@ mod tests {
     }
 
     #[test]
-    fn sprite_dma_capture_follows_control_chain_after_chip_address_wrap() {
+    fn sprite_dma_zero_height_descriptor_terminates_after_chip_address_wrap() {
         let mut bus = empty_bus();
-        let sprite_ptr = bus.mem.chip_ram.len() - 8;
+        let sprite_ptr = bus.mem.chip_ram.len() - 2;
         let (zero_pos, zero_ctl) = sprite_control_words(0x2C, 0x2C, 0x0083);
         let (pos, ctl) = sprite_control_words(0x2C, 0x2D, 0x0091);
-        for idx in 0..33 {
-            let off = sprite_ptr + idx * 4;
-            write_chip_word_wrapping(&mut bus, off, zero_pos);
-            write_chip_word_wrapping(&mut bus, off + 2, zero_ctl);
-        }
-        let active_ptr = sprite_ptr + 33 * 4;
+        write_chip_word_wrapping(&mut bus, sprite_ptr, zero_pos);
+        write_chip_word_wrapping(&mut bus, sprite_ptr + 2, zero_ctl);
+        let active_ptr = sprite_ptr + 4;
         write_chip_word_wrapping(&mut bus, active_ptr, pos);
         write_chip_word_wrapping(&mut bus, active_ptr + 2, ctl);
         write_chip_word_wrapping(&mut bus, active_ptr + 4, 0x1111);
@@ -14429,10 +14537,7 @@ mod tests {
         bus.advance_chipset(2);
 
         let lines = bus.frame_captured_sprite_lines();
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].hstart, 0x0091);
-        assert_eq!(lines[0].data, 0x1111);
-        assert_eq!(lines[0].datb, 0x2222);
+        assert!(lines.is_empty());
     }
 
     #[test]

@@ -198,10 +198,13 @@ guarantees and it keeps presentation state trivially rebuildable.
 
 `savestate::save` takes `&M68kMachine` and does not mutate emulated
 state. `savestate::load` parses fully before applying, then moves host
-resources across and resets any queued live-audio presentation frames from
-the old timeline; on success the window forces power on, clears any CPU halt
-latch, and invalidates `last_rendered_emulated_frame` so the next
-presentation re-renders from the restored Bus.
+resources across, resets any queued live-audio presentation frames from the
+old timeline, and clears transient video capture buffers. The restored guest
+RAM, custom registers, and beam event journal stay intact, while Agnus
+rebuilds sprite control/data latches from the restored pointer context under
+the current descriptor rules. On success the window forces power on, clears
+any CPU halt latch, and invalidates `last_rendered_emulated_frame` so the
+next presentation re-renders from the restored Bus.
 
 ## Verification
 

@@ -57,6 +57,12 @@ the first data word pair, not a memory descriptor. The frame-start replay
 path mirrors descriptor retargeting by replaying off-screen DMACON and
 SPRxPT writes in beam order before rendering the visible field.
 
+Sprite descriptors whose decoded VSTART equals VSTOP idle the current
+sprite stream until software rearms it or the next field fetches again;
+the following words are not scanned as another descriptor. This is distinct
+from an inverted VSTOP smaller than VSTART, where the stop comparator has
+already passed and DMA continues to the bottom of the field.
+
 A modelling note that catches people out: OCS lo-res with BPU=7 is an
 overprogrammed mode. Denise still decodes six BPLDAT latches, but Agnus
 only schedules four DMA streams, so planes 5 and 6 display whatever was
