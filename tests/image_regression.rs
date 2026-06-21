@@ -5,6 +5,10 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)]
+#[path = "../src/envcfg.rs"]
+mod envcfg;
+
 static EMULATOR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
@@ -102,7 +106,7 @@ fn repo_root() -> PathBuf {
 /// exists, falling back to the repo root itself so existing local checkouts
 /// keep working during the transition.
 fn asset_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("COPPERLINE_TEST_ASSETS") {
+    if let Some(dir) = envcfg::var_os("COPPERLINE_TEST_ASSETS") {
         return PathBuf::from(dir);
     }
     let dir = repo_root().join("test-assets");
@@ -439,8 +443,7 @@ fn assert_noaudio_ham_performance(
         // hosts that cannot sustain full speed (e.g. thermally throttled
         // laptops after long build sessions), so the pixel-content
         // assertions still run. Defaults to 1.0 (full strictness).
-        let scale = std::env::var("COPPERLINE_PERF_BUDGET_SCALE")
-            .ok()
+        let scale = envcfg::var("COPPERLINE_PERF_BUDGET_SCALE")
             .and_then(|v| v.trim().parse::<f64>().ok())
             .filter(|v| *v >= 1.0)
             .unwrap_or(1.0);
@@ -750,7 +753,7 @@ fn ocs_bpu7_ham_captures_avoid_isolated_vertical_rectangle_frames(
 fn ocs_bpu7_ham_live_audio_capture_has_no_cpal_underrun_bursts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock_emulator_tests();
-    if std::env::var_os("COPPERLINE_LIVE_AUDIO_ACCEPTANCE").is_none() {
+    if envcfg::var_os("COPPERLINE_LIVE_AUDIO_ACCEPTANCE").is_none() {
         eprintln!(
             "skipping live-audio acceptance; set COPPERLINE_LIVE_AUDIO_ACCEPTANCE=1 to run it"
         );

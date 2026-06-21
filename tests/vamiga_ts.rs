@@ -1,10 +1,13 @@
 use std::collections::hash_map::DefaultHasher;
-use std::env;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[allow(dead_code)]
+#[path = "../src/envcfg.rs"]
+mod envcfg;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -52,7 +55,7 @@ fn run_vamiga_ts_adf_screenshots() -> TestResult {
     })?;
 
     let mut cases = discover_adf_cases(&root)?;
-    let filter = env::var("COPPERLINE_VAMIGATS_FILTER").ok();
+    let filter = envcfg::var("COPPERLINE_VAMIGATS_FILTER");
     if let Some(filter) = filter.as_deref() {
         cases.retain(|case| case.name.contains(filter));
     }
@@ -74,8 +77,7 @@ fn run_vamiga_ts_adf_screenshots() -> TestResult {
         .into());
     }
 
-    let seconds = env::var("COPPERLINE_VAMIGATS_SECONDS")
-        .ok()
+    let seconds = envcfg::var("COPPERLINE_VAMIGATS_SECONDS")
         .map(|s| s.parse::<f32>())
         .transpose()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
@@ -88,8 +90,8 @@ fn run_vamiga_ts_adf_screenshots() -> TestResult {
     let vamiga_reference =
         env_path("COPPERLINE_VAMIGATS_VAMIGA").map(|executable| VAmigaReference {
             executable,
-            setup: env::var("COPPERLINE_VAMIGATS_VAMIGA_SETUP")
-                .unwrap_or_else(|_| "A500_OCS_1MB".to_string()),
+            setup: envcfg::var("COPPERLINE_VAMIGATS_VAMIGA_SETUP")
+                .unwrap_or_else(|| "A500_OCS_1MB".to_string()),
         });
 
     eprintln!(
@@ -172,7 +174,7 @@ fn run_vamiga_reference(
     case: &VAmigaTsCase,
 ) -> TestResult {
     let stem = vamiga_temp_stem(case);
-    let tmp_dir = env::temp_dir();
+    let tmp_dir = std::env::temp_dir();
     let tmp_adf = tmp_dir.join(format!("{stem}.adf"));
     let tmp_kick = tmp_dir.join(format!("{stem}-kick13.rom"));
     let tmp_raw = tmp_dir.join(format!("{stem}.raw"));
@@ -366,14 +368,13 @@ fn existing_path(path: PathBuf) -> Option<PathBuf> {
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
-    env::var_os(name)
+    envcfg::var_os(name)
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
 }
 
 fn parse_optional_usize(name: &str) -> TestResult<Option<usize>> {
-    env::var(name)
-        .ok()
+    envcfg::var(name)
         .map(|s| {
             s.parse::<usize>()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e).into())
@@ -390,7 +391,7 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()))
+    std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()))
 }
 
 fn vamiga_temp_stem(case: &VAmigaTsCase) -> String {

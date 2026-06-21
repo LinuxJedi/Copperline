@@ -590,8 +590,8 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_directory_image() {
-        let src = std::env::var("COPPERLINE_DIRFS_SRC").expect("COPPERLINE_DIRFS_SRC");
-        let out = std::env::var("COPPERLINE_DIRFS_OUT").expect("COPPERLINE_DIRFS_OUT");
+        let src = crate::envcfg::var("COPPERLINE_DIRFS_SRC").expect("COPPERLINE_DIRFS_SRC");
+        let out = crate::envcfg::var("COPPERLINE_DIRFS_OUT").expect("COPPERLINE_DIRFS_OUT");
         let image = build_ffs_image(Path::new(&src), "DirVolume").unwrap();
         std::fs::write(&out, image).unwrap();
         eprintln!("wrote {out}");

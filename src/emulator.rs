@@ -1761,8 +1761,7 @@ mod tests {
 
     #[test]
     fn real_mode_uses_stock_realtime_budget() {
-        std::env::remove_var("COPPERLINE_REAL_CPU_CPI");
-        let cpu_cycles_per_instruction = super::real_cpu_cycles_per_instruction();
+        let cpu_cycles_per_instruction = DEFAULT_CPU_CYCLES_PER_INSTRUCTION;
         let target = super::real_target_instructions_per_second(cpu_cycles_per_instruction);
         assert_eq!(
             realtime_budget(cpu_cycles_per_instruction),
