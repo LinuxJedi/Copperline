@@ -362,9 +362,25 @@ struct DisplaySpriteControl {
     vstop: i32,
     hstart: i32,
     hsub_70ns: bool,
+    #[serde(skip, default = "unset_sprite_data_vstart")]
+    data_vstart: i32,
     data_base: u32,
     next_ptr: u32,
     attached: bool,
+}
+
+fn unset_sprite_data_vstart() -> i32 {
+    i32::MIN
+}
+
+impl DisplaySpriteControl {
+    fn effective_data_vstart(self) -> i32 {
+        if self.data_vstart == unset_sprite_data_vstart() {
+            self.vstart
+        } else {
+            self.data_vstart
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -5171,11 +5187,12 @@ impl Bus {
         }
         if self.blitter.busy && self.blitter_dma_enabled() {
             // Idle blit pipeline cycles (the "-" slots in the HRM cycle diagrams,
-            // e.g. the non-write half of a D-only clear or a line blit's internal
-            // Bresenham cycles) never claim the bus: per the HRM they "are
-            // available to the other DMA channels or the 68000", and MiniMig only
-            // asserts the blitter's dma_req on channel-access states. The pipeline
-            // still advances through them -- see advance_one_chip_bus_quantum_limited.
+            // e.g. the first empty D phase after source fetches or a line blit's
+            // internal Bresenham cycles) never claim the bus: per the HRM they
+            // are available to the other DMA channels or the 68000, and MiniMig
+            // only asserts the blitter's dma_req on channel-access states. The
+            // pipeline still advances through them -- see
+            // advance_one_chip_bus_quantum_limited.
             if !self.blitter.current_slot_needs_bus() {
                 return ChipBusOwner::Idle;
             }
@@ -6511,11 +6528,12 @@ impl Bus {
             height as u32
         };
         let data_base = self.display_dma_sprpt[sprite] & self.chip_dma_mask & !1;
-        let control = DisplaySpriteControl {
+        let mut control = DisplaySpriteControl {
             vstart,
             vstop,
             hstart: sprite_hstart_from_words(pos, ctl),
             hsub_70ns: bitplane_shres(self.denise.bplcon0) && sprite_hsub_70ns_from_ctl(ctl),
+            data_vstart: vstart,
             data_base,
             next_ptr: data_base.wrapping_add(data_lines.saturating_mul(4 * quantum))
                 & self.chip_dma_mask
@@ -6524,6 +6542,7 @@ impl Bus {
         };
 
         let mut state = self.display_dma_sprite_state[sprite];
+        let previous_control = state.control;
         let beam_y = vpos as i32;
         let in_window = beam_y >= control.vstart && beam_y < control.vstop;
         let sprite_dma_enabled =
@@ -6535,6 +6554,14 @@ impl Bus {
             !sprite_dma_enabled && in_window && state.data_dma_active && state.last_line.is_some();
         let keep_active_dma_line =
             sprite_dma_enabled && in_window && state.data_dma_active && state.last_line.is_some();
+
+        if keep_held_line || keep_active_dma_line {
+            if let Some(previous_control) = previous_control {
+                control.data_vstart = previous_control.effective_data_vstart();
+                control.data_base = previous_control.data_base;
+                control.next_ptr = previous_control.next_ptr;
+            }
+        }
 
         state.control = Some(control);
         state.next_ptr = Some(control.next_ptr);
@@ -6583,6 +6610,7 @@ impl Bus {
         let ptr = self.display_dma_sprpt[sprite] & self.chip_dma_mask & !1;
         control.data_base =
             ptr.wrapping_sub(line.saturating_mul(line_bytes)) & self.chip_dma_mask & !1;
+        control.data_vstart = control.vstart;
         let height = (control.vstop - control.vstart).max(0) as u32;
         let data_lines = if sprite_scan_doubled(self.agnus.fmode()) {
             height.div_ceil(2)
@@ -6993,7 +7021,7 @@ impl Bus {
                     let quantum = sprite_fetch_quantum(self.agnus.fmode());
                     // SSCAN2 fetches sprite data only on every second display
                     // line; the in-between line redisplays the same data.
-                    let mut line = (beam_y - control.vstart) as u32;
+                    let mut line = (beam_y - control.effective_data_vstart()) as u32;
                     if sprite_scan_doubled(self.agnus.fmode()) {
                         line /= 2;
                     }
@@ -7106,6 +7134,7 @@ impl Bus {
                 vstop,
                 hstart: sprite_hstart_from_words(pos, ctl),
                 hsub_70ns: bitplane_shres(self.denise.bplcon0) && sprite_hsub_70ns_from_ctl(ctl),
+                data_vstart: vstart,
                 data_base: ptr,
                 next_ptr: ptr.wrapping_add(data_lines.saturating_mul(4 * quantum)) & ram_mask & !1,
                 attached: ctl & 0x0080 != 0,
@@ -13939,6 +13968,46 @@ mod tests {
     }
 
     #[test]
+    fn active_sprite_control_rewrite_preserves_descriptor_data_origin() {
+        let mut bus = empty_bus();
+        let sprite_ptr = 0x0100usize;
+        let (pos, ctl) = sprite_control_words(0x2C, 0x30, 0x0083);
+        let (moved_pos, moved_ctl) = sprite_control_words(0x2D, 0x30, 0x0091);
+        write_chip_word(&mut bus, sprite_ptr, pos);
+        write_chip_word(&mut bus, sprite_ptr + 2, ctl);
+        write_chip_word(&mut bus, sprite_ptr + 4, 0x1111);
+        write_chip_word(&mut bus, sprite_ptr + 6, 0x2222);
+        write_chip_word(&mut bus, sprite_ptr + 8, 0x3333);
+        write_chip_word(&mut bus, sprite_ptr + 10, 0x4444);
+
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.denise.sprpt[0] = sprite_ptr as u32;
+        bus.display_dma_sprpt[0] = sprite_ptr as u32;
+
+        bus.agnus.vpos = 0x2C;
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.advance_chipset(2);
+
+        bus.agnus.vpos = 0x2D;
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 8;
+        assert!(!bus.write_custom_word_from(0x140, moved_pos, BeamWriteSource::Copper));
+        assert!(!bus.write_custom_word_from(0x142, moved_ctl, BeamWriteSource::Copper));
+
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert!(bus.frame_sprite_dma_observed());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].data, 0x1111);
+        assert_eq!(lines[0].datb, 0x2222);
+        assert_eq!(lines[1].beam_y, 0x2D);
+        assert_eq!(lines[1].hstart, 0x0091);
+        assert_eq!(lines[1].data, 0x3333);
+        assert_eq!(lines[1].datb, 0x4444);
+    }
+
+    #[test]
     fn sprite_pointer_write_after_pair_slot_seeds_next_descriptor_fetch() {
         let mut bus = empty_bus();
         bus.set_chipset_revisions(AgnusRevision::AgaAlice, DeniseRevision::AgaLisa);
@@ -15882,16 +15951,28 @@ mod tests {
         let mut bus = empty_bus();
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_BLTEN;
         bus.agnus.hpos = 0x20;
-        bus.blitter.bltcon0 = 0x09F0;
+        // ABC source-only blit: after the lead-in every pipeline phase needs
+        // the bus, so this directly exercises the nice-blitter starvation
+        // yield rather than the D-output pipeline bubble.
+        bus.blitter.bltcon0 = 0x0E00;
         bus.blitter.bltcon1 = 0;
         bus.blitter.bltafwm = 0xFFFF;
         bus.blitter.bltalwm = 0xFFFF;
         bus.blitter.bltapt = 0x10;
-        bus.blitter.bltdpt = 0x20;
+        bus.blitter.bltbpt = 0x20;
+        bus.blitter.bltcpt = 0x30;
         write_chip_word(&mut bus, 0x10, 0x1111);
         write_chip_word(&mut bus, 0x12, 0x2222);
         write_chip_word(&mut bus, 0x14, 0x3333);
         write_chip_word(&mut bus, 0x16, 0x4444);
+        write_chip_word(&mut bus, 0x20, 0xAAAA);
+        write_chip_word(&mut bus, 0x22, 0xBBBB);
+        write_chip_word(&mut bus, 0x24, 0xCCCC);
+        write_chip_word(&mut bus, 0x26, 0xDDDD);
+        write_chip_word(&mut bus, 0x30, 0x5555);
+        write_chip_word(&mut bus, 0x32, 0x6666);
+        write_chip_word(&mut bus, 0x34, 0x7777);
+        write_chip_word(&mut bus, 0x36, 0x8888);
         bus.blitter.start_scheduled((1 << 6) | 4, &bus.mem.chip_ram);
         // Walk the blit past its two internal lead-in cycles (those are
         // CPU-available) so its pending slot is an A-channel bus access.
@@ -16439,15 +16520,19 @@ mod tests {
 
         bus.grant_cpu_bus_access(2, CpuBusAccessKind::Read);
 
-        // With BLTPRI set there is no starvation yield: the CPU waits through
-        // the blit's A and D accesses and is granted the internal E cycle
-        // (idle pipeline cycles are CPU-available even when the blitter is
-        // nasty). With the bus-free tail cck added after the granted slot the
-        // access costs 4 color clocks (A wait + D wait + E slot + tail).
+        // With BLTPRI set there is no starvation yield, but the empty D phase
+        // after A is an idle pipeline bubble and remains CPU-available. With
+        // the bus-free tail cck added after the granted slot the access costs
+        // 3 color clocks (A wait + D bubble + tail through E).
         let (cck, _) = bus.take_slice_bus_advance();
-        assert_eq!(cck, 4);
-        // The bus-free tail cck is the blit's final F slot: the queued word is
-        // written and the blit finishes during the access itself.
+        assert_eq!(cck, 3);
+        assert!(bus.blitter.busy);
+        assert_eq!(bus.paula.intreq & INT_BLIT, 0);
+        assert_eq!(&bus.mem.chip_ram[0x20..0x22], &[0x00, 0x00]);
+
+        // The final F slot is still owned by the blitter and writes the queued
+        // word once the CPU's bus cycle is over.
+        bus.advance_chipset(1);
         assert!(!bus.blitter.busy);
         assert_ne!(bus.paula.intreq & INT_BLIT, 0);
         assert_eq!(&bus.mem.chip_ram[0x20..0x22], &[0x12, 0x34]);
@@ -16458,15 +16543,27 @@ mod tests {
         let mut bus = empty_bus();
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_BLTEN | DMACON_BLTPRI;
         bus.agnus.hpos = 0x20;
-        bus.blitter.bltcon0 = 0x09F0;
+        // Use an ABC source-only blit so there are no idle destination bubbles
+        // before completion; BLTPRI should block the nice-blitter starvation
+        // yield for the whole remaining source cadence.
+        bus.blitter.bltcon0 = 0x0E00;
         bus.blitter.bltafwm = 0xFFFF;
         bus.blitter.bltalwm = 0xFFFF;
         bus.blitter.bltapt = 0x10;
-        bus.blitter.bltdpt = 0x20;
+        bus.blitter.bltbpt = 0x20;
+        bus.blitter.bltcpt = 0x30;
         write_chip_word(&mut bus, 0x10, 0x1111);
         write_chip_word(&mut bus, 0x12, 0x2222);
         write_chip_word(&mut bus, 0x14, 0x3333);
         write_chip_word(&mut bus, 0x16, 0x4444);
+        write_chip_word(&mut bus, 0x20, 0xAAAA);
+        write_chip_word(&mut bus, 0x22, 0xBBBB);
+        write_chip_word(&mut bus, 0x24, 0xCCCC);
+        write_chip_word(&mut bus, 0x26, 0xDDDD);
+        write_chip_word(&mut bus, 0x30, 0x5555);
+        write_chip_word(&mut bus, 0x32, 0x6666);
+        write_chip_word(&mut bus, 0x34, 0x7777);
+        write_chip_word(&mut bus, 0x36, 0x8888);
         bus.blitter.start_scheduled((1 << 6) | 4, &bus.mem.chip_ram);
         // Walk the blit past its two internal lead-in cycles so its pending
         // slot is the first A-channel access.
@@ -16476,18 +16573,12 @@ mod tests {
         bus.grant_cpu_bus_access(2, CpuBusAccessKind::Read);
 
         // With BLTPRI set the CPU gets no starvation yield: it waits through
-        // all eight A/D accesses of the four words and is granted the internal
-        // E cycle, then spends one bus-free tail cck, costing 10 color clocks.
+        // all twelve A/B/C accesses of the four words, then spends its granted
+        // slot plus the bus-free tail cck, costing 14 color clocks.
         let (cck, _) = bus.take_slice_bus_advance();
-        assert_eq!(cck, 10);
-        // The bus-free tail cck is the blit's final F slot: the last queued word
-        // is written and the blit finishes during the access itself.
+        assert_eq!(cck, 14);
         assert!(!bus.blitter.busy);
         assert_ne!(bus.paula.intreq & INT_BLIT, 0);
-        assert_eq!(
-            &bus.mem.chip_ram[0x20..0x28],
-            &[0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44]
-        );
     }
 
     #[test]

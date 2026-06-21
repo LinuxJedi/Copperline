@@ -164,6 +164,8 @@ pub struct Blitter {
 
     pending: Option<PendingBlit>,
     dma_addr_mask: u32,
+    #[serde(skip, default)]
+    bltaold: u16,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -316,6 +318,7 @@ impl Blitter {
             bltbdat: 0,
             bltcdat: 0,
             bltsizv: 0,
+            bltaold: 0,
             bltbold: 0,
             bltbold_init: true,
             line_bdat: 0,
@@ -618,8 +621,8 @@ impl Blitter {
         let mut cpt = self.bltcpt;
         let mut dpt = self.bltdpt;
 
-        let mut a_prev: u16 = 0;
-        let mut b_prev: u16 = if !self.bltbold_init { self.bltbold } else { 0 };
+        let mut a_prev: u16 = self.bltaold;
+        let mut b_prev: u16 = self.bltbold;
         for _row in 0..h {
             let mut fill_state: u16 = fci;
             // Buffer this row's D words so fill mode can process them
@@ -712,6 +715,10 @@ impl Blitter {
         self.bltbpt = bpt & ptr_mask;
         self.bltcpt = cpt & ptr_mask;
         self.bltdpt = dpt & ptr_mask;
+        self.bltaold = a_prev;
+        if use_b {
+            self.bltbold = b_prev;
+        }
     }
 
     /// Bresenham single-pixel line, BLTCON1.LINEMODE=1.
@@ -1082,12 +1089,8 @@ impl NormalBlitState {
             bpt: blitter.bltbpt,
             cpt: blitter.bltcpt,
             dpt: blitter.bltdpt,
-            a_prev: 0,
-            b_prev: if blitter.bltbold_init {
-                0
-            } else {
-                blitter.bltbold
-            },
+            a_prev: blitter.bltaold,
+            b_prev: blitter.bltbold,
             cur_a: 0,
             cur_b: 0,
             cur_c: 0,
@@ -1131,7 +1134,8 @@ impl NormalBlitState {
             NormalBlitPhase::B => true,
             // A real C fetch uses the bus; fill mode's C slot is idle.
             NormalBlitPhase::C => self.use_c,
-            NormalBlitPhase::D | NormalBlitPhase::F => self.use_d,
+            NormalBlitPhase::D => self.d_phase_needs_bus_with(self.pipeline_full),
+            NormalBlitPhase::F => self.use_d && self.pipeline_full,
             NormalBlitPhase::StartDelay
             | NormalBlitPhase::Init
             | NormalBlitPhase::E
@@ -1139,65 +1143,106 @@ impl NormalBlitState {
         }
     }
 
+    fn d_phase_needs_bus_with(&self, pipeline_full: bool) -> bool {
+        self.use_d && (pipeline_full || !self.d_output_waits_for_source_pipeline())
+    }
+
+    fn d_output_waits_for_source_pipeline(&self) -> bool {
+        self.use_a || self.use_b || self.has_c_phase()
+    }
+
     /// Access pattern of the next `limit` scheduled slots (bit k = slot k needs
-    /// the bus). Mirrors process_phase: 2 lead-in slots, then the per-word
-    /// [A, B?, C?, D?] cadence repeating, then the E/F flush tail when D is on.
+    /// the bus). Mirrors process_phase, including the delayed D holding
+    /// register: the first D phase after source fetches is the HRM "-" bubble
+    /// until a destination word has been queued.
     fn slot_access_pattern(&self, limit: u32) -> (u64, u32) {
         let count = self.slots_remaining.min(limit).min(64);
-
-        // Per-word cadence as (phase tag, needs_bus). Tags: 0=A 1=B 2=C 3=D.
-        let mut cadence: [(u8, bool); 4] = [(0, false); 4];
-        let mut cadence_len = 0usize;
-        cadence[cadence_len] = (0, self.use_a);
-        cadence_len += 1;
-        if self.use_b {
-            cadence[cadence_len] = (1, true);
-            cadence_len += 1;
-        }
-        if self.has_c_phase() {
-            // Real C fetch uses the bus; fill mode's C slot is idle.
-            cadence[cadence_len] = (2, self.use_c);
-            cadence_len += 1;
-        }
-        if self.use_d || !self.has_c_phase() {
-            cadence[cadence_len] = (3, self.use_d);
-            cadence_len += 1;
-        }
-        let tail_len: u32 = if self.use_d { 2 } else { 0 };
-
-        let cadence_pos = |tag: u8| -> usize {
-            cadence[..cadence_len]
-                .iter()
-                .position(|&(t, _)| t == tag)
-                .unwrap_or(0)
-        };
-        let (lead_in, cadence_idx) = match self.phase {
-            NormalBlitPhase::StartDelay => (2u32, 0usize),
-            NormalBlitPhase::Init => (1, 0),
-            NormalBlitPhase::A => (0, cadence_pos(0)),
-            NormalBlitPhase::B => (0, cadence_pos(1)),
-            NormalBlitPhase::C => (0, cadence_pos(2)),
-            NormalBlitPhase::D => (0, cadence_pos(3)),
-            // Already in the E/F tail; the from-end branch below handles it.
-            NormalBlitPhase::E | NormalBlitPhase::F | NormalBlitPhase::Done => (0, 0),
-        };
-
         let mut mask = 0u64;
+
+        let mut phase = self.phase;
+        let mut pipeline_full = self.pipeline_full;
+        let mut word_idx = self.word_idx;
+        let mut h_remaining = self.h_remaining;
+
         for k in 0..count {
-            let from_end = self.slots_remaining - 1 - k;
-            let needs = if from_end < tail_len {
-                // Tail: E (internal) then F (the final queued-D write).
-                from_end == 0 && self.use_d
-            } else if k < lead_in {
-                false
-            } else {
-                cadence[(cadence_idx + (k - lead_in) as usize) % cadence_len].1
+            let needs = match phase {
+                NormalBlitPhase::A => self.use_a,
+                NormalBlitPhase::B => true,
+                NormalBlitPhase::C => self.use_c,
+                NormalBlitPhase::D => self.d_phase_needs_bus_with(pipeline_full),
+                NormalBlitPhase::F => self.use_d && pipeline_full,
+                NormalBlitPhase::StartDelay
+                | NormalBlitPhase::Init
+                | NormalBlitPhase::E
+                | NormalBlitPhase::Done => false,
             };
             if needs {
                 mask |= 1u64 << k;
             }
+
+            match phase {
+                NormalBlitPhase::StartDelay => phase = NormalBlitPhase::Init,
+                NormalBlitPhase::Init => phase = NormalBlitPhase::A,
+                NormalBlitPhase::A => {
+                    phase = if self.use_b {
+                        NormalBlitPhase::B
+                    } else if self.has_c_phase() {
+                        NormalBlitPhase::C
+                    } else {
+                        NormalBlitPhase::D
+                    };
+                }
+                NormalBlitPhase::B => {
+                    phase = if self.has_c_phase() {
+                        NormalBlitPhase::C
+                    } else {
+                        NormalBlitPhase::D
+                    };
+                }
+                NormalBlitPhase::C => {
+                    if self.use_d {
+                        phase = NormalBlitPhase::D;
+                    } else {
+                        let done =
+                            Self::advance_pattern_word(self.w, &mut word_idx, &mut h_remaining);
+                        phase = if done {
+                            NormalBlitPhase::Done
+                        } else {
+                            NormalBlitPhase::A
+                        };
+                    }
+                }
+                NormalBlitPhase::D => {
+                    pipeline_full = self.use_d;
+                    let done = Self::advance_pattern_word(self.w, &mut word_idx, &mut h_remaining);
+                    phase = if done {
+                        if self.use_d {
+                            NormalBlitPhase::E
+                        } else {
+                            NormalBlitPhase::Done
+                        }
+                    } else {
+                        NormalBlitPhase::A
+                    };
+                }
+                NormalBlitPhase::E => phase = NormalBlitPhase::F,
+                NormalBlitPhase::F => {
+                    pipeline_full = false;
+                    phase = NormalBlitPhase::Done;
+                }
+                NormalBlitPhase::Done => {}
+            }
         }
         (mask, count)
+    }
+
+    fn advance_pattern_word(w: u32, word_idx: &mut u32, h_remaining: &mut u32) -> bool {
+        *word_idx += 1;
+        if *word_idx == w {
+            *word_idx = 0;
+            *h_remaining = h_remaining.saturating_sub(1);
+        }
+        *h_remaining == 0
     }
 
     fn slots_remaining(&self) -> u32 {
@@ -1434,6 +1479,10 @@ impl NormalBlitState {
         blitter.bltbpt = self.bpt & ptr_mask;
         blitter.bltcpt = self.cpt & ptr_mask;
         blitter.bltdpt = self.dpt & ptr_mask;
+        blitter.bltaold = self.a_prev;
+        if self.use_b {
+            blitter.bltbold = self.b_prev;
+        }
     }
 }
 
@@ -1746,6 +1795,34 @@ mod tests {
         );
     }
 
+    /// The A-channel barrel shifter's old-word latch is not cleared by
+    /// BLTSIZE. Split shifted blits can carry a boundary bit through BLTAOLD
+    /// when software starts the next blit without writing BLTADAT.
+    #[test]
+    fn scheduled_a_shift_carry_survives_bltsize_restart() {
+        let mut ram = vec![0u8; 256];
+        write_word(&mut ram, 0x10, 0x0001);
+        write_word(&mut ram, 0x12, 0x8000);
+
+        let mut b = Blitter::new();
+        b.bltcon0 = (1 << 12) | BLTCON0_USE_A | BLTCON0_USE_D | 0x00F0;
+        b.bltcon1 = 0;
+        b.bltafwm = 0xFFFF;
+        b.bltalwm = 0xFFFF;
+        b.bltapt = 0x10;
+        b.bltdpt = 0x20;
+        b.start_scheduled((1u16 << 6) | 1, &ram);
+        while !b.tick_scheduled_slot(&mut ram) {}
+        assert_eq!(read_word(&ram, 0x20), 0x0000);
+
+        b.bltapt = 0x12;
+        b.bltdpt = 0x22;
+        b.start_scheduled((1u16 << 6) | 1, &ram);
+        while !b.tick_scheduled_slot(&mut ram) {}
+
+        assert_eq!(read_word(&ram, 0x22), 0xC000);
+    }
+
     /// Verify BZERO surfaces correctly when all output bits are zero.
     #[test]
     fn bzero_when_d_all_zero() {
@@ -1962,8 +2039,9 @@ mod tests {
             [false, false, false, true, false, true, false, true]
         );
 
-        // A->D copy, 1 row x 2 words: every A fetch and D write is an access
-        // (HRM: "A0 -, A1 D0" steady state has no free cycles).
+        // A->D copy, 1 row x 2 words: the first D phase is the delayed-D
+        // pipeline bubble, then the steady state writes the previous word
+        // (HRM: "A0 -, A1 D0").
         let mut ram = vec![0u8; 256];
         let mut b = Blitter::new();
         b.bltcon0 = BLTCON0_USE_A | BLTCON0_USE_D | 0x00F0; // D := A
@@ -1974,7 +2052,24 @@ mod tests {
         b.start_scheduled((1u16 << 6) | 2, &ram);
         assert_eq!(
             needs_bus_walk(&mut b, &mut ram),
-            [false, false, true, true, true, true, false, true]
+            [false, false, true, false, true, true, false, true]
+        );
+
+        // ABCD cookie-cut, 1 row x 2 words: A/B/C fetch first, then the
+        // empty D bubble; the next D/F phases store the queued words.
+        let mut ram = vec![0u8; 256];
+        let mut b = Blitter::new();
+        b.bltcon0 = BLTCON0_USE_A | BLTCON0_USE_B | BLTCON0_USE_C | BLTCON0_USE_D | 0x00E4;
+        b.bltafwm = 0xFFFF;
+        b.bltalwm = 0xFFFF;
+        b.bltapt = 0x10;
+        b.bltbpt = 0x20;
+        b.bltcpt = 0x30;
+        b.bltdpt = 0x40;
+        b.start_scheduled((1u16 << 6) | 2, &ram);
+        assert_eq!(
+            needs_bus_walk(&mut b, &mut ram),
+            [false, false, true, true, true, false, true, true, true, true, false, true]
         );
 
         // Line blit, 2 pixels: StartDelay, Init, then [L1 L2 L3 L4] per pixel.

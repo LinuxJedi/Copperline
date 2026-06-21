@@ -78,6 +78,21 @@ it, the blitter yields a slot after the CPU has missed three consecutive
 slots, matching the Minimig RTL. The counter and the back-pressure rule
 are detailed under [](#cpu-contention) below.
 
+### Sprite DMA control rewrites
+
+Sprite DMA fetches POS/CTL at the fixed pair slots, then data words for
+the active line. Software can still rewrite SPRxPOS/SPRxCTL before a later
+pair slot to reposition an already active sprite on that scanline. Those
+writes update the live horizontal and vertical comparators, but they do
+not restart the sprite data stream: the row offset remains relative to the
+descriptor that armed the sprite. Copperline therefore keeps a runtime-only
+data-origin VSTART alongside the live comparator VSTART, preserving it
+across active POS/CTL rewrites while still using the rewritten HSTART for
+the line. The runtime origin is skipped in save states to preserve the
+fixed bincode layout; future save-state versioning should serialize it if
+mid-line sprite-DMA resume accuracy is tightened. Test:
+`active_sprite_control_rewrite_preserves_descriptor_data_origin`.
+
 ## The Copper
 
 The Copper (`src/chipset/copper.rs`) is a two-cycle processor that
@@ -190,9 +205,11 @@ A/B/C/D, and E/F flush slots for the delayed D holding register. The
 source cadence follows the enabled-channel speed table: A is always
 visited, B only when enabled, C when enabled (USEC) *or* in fill mode (an
 idle C slot, no bus access), and D when D is enabled or no C next-word
-state exists. D output is delayed through the hold register, so the first
-destination word is written on the next D slot and the final word in the F
-flush slot. Normal-mode A/B barrel-shifter carry is not cleared by the
+state exists. D output is delayed through the hold register: after source
+fetches, the first D phase is the HRM "-" bubble and does not claim the
+chip bus because no destination word is queued yet. The first destination
+word is written on the next D slot and the final word in the F flush slot.
+Normal-mode A/B barrel-shifter carry is not cleared by the
 BLTSIZE row counter; it carries from the last source word of one row into
 the first source word of the next, while masks, modulos, and fill carry
 still observe row boundaries. Line blits use L1-L4 phases (L2 latches the
@@ -201,6 +218,7 @@ through the current B shifter at write time, and at completion the
 hardware-visible ASH, BSH, SIGN, and low-word BLTAPT accumulator state is
 written back. Tests:
 `scheduled_normal_mode_bbusy_start_delay_precedes_first_source_slot`,
+`blit_pipeline_identifies_idle_cycles_per_hrm_diagrams`,
 `scheduled_line_mode_latches_c_source_before_store_phase`,
 `scheduled_shift_carry_crosses_normal_mode_row_boundary`.
 
