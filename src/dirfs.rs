@@ -115,9 +115,14 @@ fn amiga_datestamp(time: SystemTime) -> (u32, u32, u32) {
 /// volume (over 30 bytes, or containing ':' or '/') and non-file/dir
 /// entries (symlinks, sockets) are skipped with a warning.
 fn scan_tree(dir: &Path) -> anyhow::Result<Vec<EntryPlan>> {
+    let uae_metadata_extension = std::ffi::OsStr::new("uaem");
     let mut out = Vec::new();
     let mut listing: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| anyhow::anyhow!("reading directory {}: {e}", dir.display()))?
+        .filter(|e| {
+            e.as_ref()
+                .is_ok_and(|e| e.path().extension() != Some(uae_metadata_extension))
+        })
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("reading directory {}: {e}", dir.display()))?;
     listing.sort_by_key(|e| e.file_name().into_encoded_bytes().to_vec());
