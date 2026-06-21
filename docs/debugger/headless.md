@@ -98,7 +98,7 @@ authoritative list. The most useful ones:
 | `COPPERLINE_DIAG_SPRITES` | Sprite DMA fetch/render log |
 | `COPPERLINE_DIAG_SPRCAP` | `=BEAMY` or `=all`: log every captured sprite DMA line (frame, channel, hstart, attach, FMODE width, data words) on one beam line or all of them; also logs SPRxPT retargets of latched sprite descriptors |
 | `COPPERLINE_DIAG_MANUAL_SPRITES` | `=BEAMY` or `=all`: log manually replayed sprite intervals, sprite register writes, BPLCON3/BPLCON4/FMODE/COLOR timing, sprite pointer alignment, and held wide-sprite words |
-| `COPPERLINE_DIAG_SPRITE_PIXELS` | `=BEAMY[,STEP]`: sample non-transparent sprite pixels on one beam line, including sprite or attached-pair index, palette entry, RGB, BPLCON3, and BPLCON4; STEP defaults to 32 framebuffer pixels |
+| `COPPERLINE_DIAG_SPRITE_PIXELS` | `=BEAMY[,STEP]`: sample non-transparent sprite pixels on one beam line, including sprite or attached-pair index, palette entry, sprite RGB, final framebuffer RGB, playfield mask, priority/display gates, DIW, BPLCON2, BPLCON3, and BPLCON4; STEP defaults to 32 framebuffer pixels |
 | `COPPERLINE_DIAG_BLITREGS` | `=START:END` (emulated seconds): log the full blitter register set at every blit start (classic BLTSIZE and ECS BLTSIZH); pairs with `COPPERLINE_DUMP_BLITMEM` snapshots for offline blit verification |
 | `COPPERLINE_TRACE_BLITTER` | Path to a JSONL trace of blitter starts, forced finishes, DMACONR polls, and completion IRQ latches; start records include minterm/control registers, DMA/display context, FMODE, and all eight bitplane pointers |
 | `COPPERLINE_DIAG_DISK` | Disk DMA state changes (DSKLEN writes) |

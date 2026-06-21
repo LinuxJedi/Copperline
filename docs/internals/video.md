@@ -51,9 +51,12 @@ SPRxDATB writes affect only later pixels in the normal register-output
 domain, and SPRxCTL still disarms output at that point. SPRxPOS writes,
 however, re-arm the sprite horizontal comparator: if the write occurs before
 the newly programmed HSTART, the sprite can still begin at that HSTART. The
-replay clips those position intervals in the sprite-comparator domain so
-staggered even/odd attached-pair position writes do not create artificial
-half-pair strips.
+replay clips those position intervals in the sprite-comparator domain
+(seven CCK ahead of the normal register-output position) so adjacent manual
+sprite words can abut at their HSTARTs and staggered even/odd attached-pair
+position writes do not create artificial half-pair strips. Once a manual
+sprite word has started shifting, a later same-line SPRxPOS write can arm a
+future compare but does not truncate that active word.
 
 When sprite DMA was observed for the frame, captured DMA lines are the
 authoritative data source for DMA-fetched spans. Manual replay is seeded by

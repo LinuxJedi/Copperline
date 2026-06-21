@@ -94,13 +94,16 @@ mid-line sprite-DMA resume accuracy is tightened. Test:
 `active_sprite_control_rewrite_preserves_descriptor_data_origin`.
 
 Beam-timed SPRxPOS writes are replayed in Denise's horizontal-comparator
-domain, four colour clocks ahead of the normal register-output position.
+domain, seven colour clocks ahead of the normal register-output position.
 This matters for manual sprite reuse with sprite DMA disabled: Copper lists
 can write consecutive SPRxPOS values whose HSTARTs exactly abut, while later
 SPRxDATA/SPRxDATB writes still take effect only from their ordinary beam
-position. Tests:
+position. A same-line POS write also does not truncate a manual sprite word
+that has already started shifting; it re-arms a later compare while the
+active word completes. Tests:
 `manual_sprite_position_write_before_hstart_uses_sprite_compare_domain`,
-`manual_sprite_position_writes_use_denise_compare_lag`.
+`manual_sprite_position_writes_use_denise_compare_lag`,
+`manual_sprite_position_write_does_not_truncate_started_word`.
 
 ## The Copper
 
