@@ -6,6 +6,8 @@
 - macOS, Linux, or Windows. There is no SDL2 dependency: video uses
   `winit` + `pixels`, audio uses `cpal`, and gamepads use the pure-Rust
   `gilrs` crate.
+- A GPU backend for presentation: Metal on macOS, DX12 on Windows, and
+  **Vulkan on Linux** (see [](#vulkan-is-required-on-linux)).
 - Fedora build dependencies: `sudo dnf install alsa-lib-devel systemd-devel`.
 - A boot ROM. Copperline ships with the [AROS](http://www.aros.org/)
   open-source Kickstart replacement and boots it by default, so it runs out
@@ -52,6 +54,32 @@ chmod +x Copperline-*.AppImage
 
 Both bundle the AROS boot ROM, so they run out of the box. Packaging sources
 live in `packaging/flatpak/` and `packaging/appimage/`.
+
+### Vulkan is required on Linux
+
+The display is presented through wgpu's Vulkan backend. The OpenGL fallback
+is disabled because wgpu initializes its EGL instance without a display
+handle and silently selects Mesa's "surfaceless" platform, which cannot be
+paired with an on-screen window; adapter selection then fails. The symptom is
+the window flashing open and immediately exiting with:
+
+```
+ERROR copperline::video::window] pixels init failed: No suitable `wgpu::Adapter` found.
+```
+
+The fix is to provide a Vulkan driver. Any GPU from roughly Intel Skylake /
+2015 onward ships a hardware Vulkan driver in `mesa`. Older hardware, a
+headless host, or a VM can use the software lavapipe ICD instead:
+
+- Arch: `sudo pacman -S vulkan-swrast`
+- Debian/Ubuntu: `sudo apt install mesa-vulkan-drivers`
+- Fedora: `sudo dnf install mesa-vulkan-drivers`
+
+Copperline renders entirely on the CPU and only asks the GPU to blit one
+framebuffer per frame, so software Vulkan is perfectly adequate. The Flatpak
+runtime already includes lavapipe, so the Flatpak needs no extra package.
+`WGPU_BACKEND` overrides backend selection if you need to force one for
+debugging.
 
 ## Building
 

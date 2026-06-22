@@ -399,7 +399,7 @@ pub struct DiskInsertSpec {
 
 use anyhow::{anyhow, Result};
 use log::{error, info, warn};
-use pixels::{Pixels, ScalingMode, SurfaceTexture};
+use pixels::{Pixels, PixelsBuilder, ScalingMode, SurfaceTexture};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{
@@ -951,14 +951,43 @@ impl ApplicationHandler for App {
         let inner = window.inner_size();
         let surface = SurfaceTexture::new(inner.width.max(1), inner.height.max(1), window.clone());
         let texture_scale = texture_scale_for_window(&window);
-        let mut pixels = match Pixels::new(
+        let builder = PixelsBuilder::new(
             texture_width(texture_scale) as u32,
             texture_height(texture_scale) as u32,
             surface,
-        ) {
+        );
+        // On Linux, restrict wgpu to the Vulkan backend. wgpu's GL fallback
+        // initializes its EGL instance without a display handle (pixels uses
+        // InstanceDescriptor::new_without_display_handle), so EGL drops to the
+        // Mesa "surfaceless" platform, which is not compatible with an on-screen
+        // window surface -- adapter selection then fails with "No suitable
+        // wgpu::Adapter found" on any machine that lacks a hardware Vulkan
+        // driver. Vulkan does not need the display handle at instance creation,
+        // so it works; GPUs without a hardware Vulkan driver (pre-Skylake Intel
+        // and other pre-2015 parts) can fall back to the software lavapipe ICD.
+        // An explicit WGPU_BACKEND override is still honoured for debugging.
+        // Other platforms keep wgpu's default backend set (Metal on macOS,
+        // DX12/Vulkan on Windows). cfg!() (not #[cfg]) keeps the Linux branch
+        // type-checked on every host.
+        let builder = if cfg!(target_os = "linux") {
+            builder.wgpu_backend(
+                pixels::wgpu::Backends::from_env().unwrap_or(pixels::wgpu::Backends::VULKAN),
+            )
+        } else {
+            builder
+        };
+        let mut pixels = match builder.build() {
             Ok(p) => p,
             Err(e) => {
                 error!("pixels init failed: {e}");
+                if cfg!(target_os = "linux") {
+                    error!(
+                        "Copperline requires a Vulkan driver on Linux. Update your GPU \
+                         drivers, or install a software Vulkan ICD (lavapipe): \
+                         'vulkan-swrast' on Arch, 'mesa-vulkan-drivers' on Debian/Ubuntu, \
+                         'mesa-vulkan-drivers' (or 'vulkan-loader') on Fedora."
+                    );
+                }
                 event_loop.exit();
                 return;
             }

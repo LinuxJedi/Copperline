@@ -1,0 +1,61 @@
+name: Linux present
+
+# Verifies Copperline's presentation path initializes and renders a frame on
+# Linux using software Vulkan (Mesa lavapipe) under a headless X server. Guards
+# the "Vulkan required on Linux" policy in src/video/window.rs: wgpu's GL
+# fallback drops to an unusable surfaceless EGL platform, so a Vulkan adapter
+# (hardware or lavapipe) must be reachable for the window surface to come up.
+# GitHub runners have no GPU, so this exercises the lavapipe path -- the same
+# one a Vulkan-less host uses after installing a software ICD. The local
+# equivalent for an Apple Silicon dev host is packaging/test-linux-vulkan/.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/video/**"
+      - "vendor/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/workflows/linux-present.yml"
+  pull_request:
+    paths:
+      - "src/video/**"
+      - "vendor/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/workflows/linux-present.yml"
+
+concurrency:
+  group: linux-present-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  present-smoke:
+    name: Vulkan present smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        # Build: ALSA (cpal) + udev (gilrs). Runtime: software Vulkan (Mesa
+        # lavapipe) + a virtual X server. CI runners have no GPU, so lavapipe
+        # is the only ICD present.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev \
+            mesa-vulkan-drivers vulkan-tools \
+            xvfb xauth
+      - name: Show Vulkan driver
+        run: vulkaninfo --summary | head -n 25
+      - name: Build
+        run: cargo build --release --locked --bin copperline
+      - name: Headless screenshot (exercises Vulkan present init)
+        # A hidden window + present surface are still created in screenshot
+        # mode, so a non-empty PNG proves the wgpu instance/adapter/surface
+        # came up on Vulkan. Boots the bundled AROS ROM, so no assets needed.
+        run: |
+          xvfb-run -a -s "-screen 0 1280x720x24" \
+            ./target/release/copperline --noaudio --screenshot-after 3 /tmp/present.png
+          test -s /tmp/present.png
+          echo "present path OK ($(stat -c %s /tmp/present.png) bytes)"

@@ -59,6 +59,12 @@ against real hardware.
 - Fedora build dependencies: `sudo dnf install alsa-lib-devel systemd-devel`.
 - No SDL2 dependency. Developed and tested on **macOS**; the Linux and
   Windows paths are expected to work but are currently untested.
+- **Linux requires a Vulkan driver.** The display is presented with wgpu via
+  the Vulkan backend; the OpenGL fallback is not usable (see "Linux: Vulkan
+  required" below). Any GPU from roughly Intel Skylake / 2015 onward has a
+  hardware Vulkan driver. Older hardware (or a headless/VM host) can use the
+  software lavapipe ICD: `vulkan-swrast` on Arch, `mesa-vulkan-drivers` on
+  Debian/Ubuntu/Fedora. macOS (Metal) and Windows (DX12) are unaffected.
 
 ## Install (macOS, Homebrew)
 
@@ -83,6 +89,33 @@ Or grab the single-file `Copperline-*.AppImage` from the
 [releases page](https://github.com/LinuxJedi/Copperline/releases),
 `chmod +x` it and run. Both bundle the AROS boot ROM. Packaging sources are in
 `packaging/`.
+
+### Linux: Vulkan required
+
+On Linux the display is presented through wgpu's **Vulkan** backend. The
+OpenGL fallback is deliberately disabled: wgpu creates its EGL instance
+without a display handle, so it silently selects Mesa's "surfaceless"
+platform, which cannot be paired with an on-screen window. The symptom on a
+Vulkan-less machine is the window flashing open and then exiting with:
+
+```
+ERROR copperline::video::window] pixels init failed: No suitable `wgpu::Adapter` found.
+```
+
+If you hit this, install a Vulkan driver:
+
+- Hardware Vulkan (recommended): any GPU from roughly Intel Skylake / 2015
+  onward ships one. Update your `mesa`/GPU driver package.
+- Software fallback (older hardware, headless, or a VM) -- the lavapipe ICD:
+  - Arch: `sudo pacman -S vulkan-swrast`
+  - Debian/Ubuntu: `sudo apt install mesa-vulkan-drivers`
+  - Fedora: `sudo dnf install mesa-vulkan-drivers`
+
+Copperline does all rendering on the CPU and only asks the GPU to blit one
+framebuffer per frame, so software Vulkan (lavapipe) is perfectly adequate.
+The Flatpak runtime already includes lavapipe, so the Flatpak works without
+any extra package. Setting `WGPU_BACKEND` overrides the backend selection if
+you need to force a specific one for debugging.
 
 ## Build and run
 
