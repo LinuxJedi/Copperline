@@ -299,6 +299,11 @@ const VOLUME_GLYPH_X: usize = VOLUME_SLIDER_X - 16;
 const STANDARD_PAL_VISIBLE_WIDTH: usize = 320 * 2;
 const STANDARD_PAL_VISIBLE_LINES: usize = 256;
 const STANDARD_PAL_VISIBLE_START_VPOS: u32 = 0x2C;
+// Default TV presentation keeps a small consumer-visible overscan margin while
+// still hiding the deep edge columns that often contain unfinished effects.
+const TV_HORIZONTAL_OVERSCAN_MARGIN: usize = 24 * 2;
+const TV_TOP_OVERSCAN_MARGIN: usize = 8;
+const TV_BOTTOM_CROP_ROWS: usize = 1;
 const STATUS_BG: u32 = rgba(28, 28, 26);
 const STATUS_TOP: u32 = rgba(78, 76, 70);
 const STATUS_BOTTOM: u32 = rgba(12, 12, 11);
@@ -5733,30 +5738,24 @@ impl App {
 /// The window is a realistic PAL TV visible area rather than the bare
 /// standard window: real sets show a margin of overscan, which intentional
 /// overscan displays rely on, while the deep-overscan junk the mask exists
-/// to hide sits further out. Default TV presentation treats the standard PAL
-/// window as the bezel edge on both sides; full overscan remains available
-/// through `Overscan::Full`. Vertically the default TV view keeps top overscan
-/// but uses a tight lower bezel: software can leave active border sprites or
-/// unfinished effects below the standard window, and a consumer crop normally
-/// hides that. `h_shift` is the horizontal centring shift already applied to
-/// the frame, so the bezel tracks the shifted picture instead of clipping its
-/// left edge; `standard_top_row` is the framebuffer row where the standard
-/// window's first line sits after vertical centring, so the bezel tracks the
-/// centred picture vertically too (a fixed line count from row 0 clipped the
-/// bottom of every standard 256-line screen by the centring margin).
+/// to hide sits further out. Default TV presentation keeps 24 lo-res pixels
+/// of horizontal overscan beside the standard PAL window; full overscan
+/// remains available through `Overscan::Full`. Vertically the default TV
+/// view keeps top overscan but uses a tight lower bezel: software can leave
+/// active border sprites or unfinished effects below the standard window, and
+/// a consumer crop normally hides that. `h_shift` is the horizontal centring
+/// shift already applied to the frame, so the bezel tracks the shifted picture
+/// instead of clipping its left edge; `standard_top_row` is the framebuffer row
+/// where the standard window's first line sits after vertical centring, so the
+/// bezel tracks the centred picture vertically too (a fixed line count from
+/// row 0 clipped the bottom of every standard 256-line screen by the centring
+/// margin).
 fn mask_present_frame_to_tv(fb: &mut [u32], h_shift: usize, standard_top_row: usize) {
     debug_assert!(fb.len() >= FB_PIXELS);
-    // Keep a little top overscan, but crop the bottom just inside the
-    // standard window so lower-border junk stays behind the bezel by default.
-    const TV_TOP_OVERSCAN_MARGIN: usize = 8;
-    const TV_BOTTOM_CROP_ROWS: usize = 1;
     let black = rgba(0, 0, 0);
-    let left = bitplane::STANDARD_VISIBLE_X0.saturating_sub(h_shift);
-    let right = bitplane::STANDARD_VISIBLE_X0
-        .saturating_add(STANDARD_PAL_VISIBLE_WIDTH)
-        .saturating_sub(h_shift)
-        .min(FB_WIDTH)
-        .max(left);
+    let (source_left, source_right) = tv_source_h_bounds();
+    let left = source_left.saturating_sub(h_shift);
+    let right = source_right.saturating_sub(h_shift).min(FB_WIDTH).max(left);
     let top = standard_top_row.saturating_sub(TV_TOP_OVERSCAN_MARGIN);
     let bottom = (standard_top_row + STANDARD_PAL_VISIBLE_LINES)
         .saturating_sub(TV_BOTTOM_CROP_ROWS)
@@ -5847,17 +5846,29 @@ fn presentation_source_y_offset(visible_start_vpos: u32) -> usize {
 
 fn presentation_h_shift_for(snapshot: &RenderRegisterSnapshot, overscan: Overscan) -> usize {
     match overscan {
-        // TV mode now masks to the standard PAL aperture, so center that
-        // aperture in the presentation texture even if the raw frame fetches
-        // into horizontal overscan.
+        // TV mode masks to a consumer-visible aperture, so center that aperture
+        // in the presentation texture even if the raw frame fetches into deeper
+        // horizontal overscan.
         Overscan::Tv => tv_standard_h_shift(),
         Overscan::Full => bitplane::present_h_shift_for(snapshot),
     }
 }
 
 fn tv_standard_h_shift() -> usize {
-    let centered_left = FB_WIDTH.saturating_sub(STANDARD_PAL_VISIBLE_WIDTH) / 2;
-    bitplane::STANDARD_VISIBLE_X0.saturating_sub(centered_left)
+    let (source_left, source_right) = tv_source_h_bounds();
+    let source_width = source_right.saturating_sub(source_left);
+    let centered_left = FB_WIDTH.saturating_sub(source_width) / 2;
+    source_left.saturating_sub(centered_left)
+}
+
+fn tv_source_h_bounds() -> (usize, usize) {
+    let left = bitplane::STANDARD_VISIBLE_X0.saturating_sub(TV_HORIZONTAL_OVERSCAN_MARGIN);
+    let right = bitplane::STANDARD_VISIBLE_X0
+        .saturating_add(STANDARD_PAL_VISIBLE_WIDTH)
+        .saturating_add(TV_HORIZONTAL_OVERSCAN_MARGIN)
+        .min(FB_WIDTH)
+        .max(left);
+    (left, right)
 }
 
 fn should_render_emulated_frame(last_rendered: Option<u64>, current: u64) -> bool {
@@ -6169,22 +6180,22 @@ fn parse_u8(s: &str) -> Option<u8> {
 mod tests {
     use super::ui::Panel;
     use super::{
-        bar_layout, bitplane, center_present_frame_for_visible_start,
-        center_present_frame_horizontally, control_at, copperline_icon_image,
-        copperline_logo_image, copy_present_frame, draw_status_bar, fdd_track_counter_rect,
-        fdd_track_digit_rect, host_shortcut_modifier_pressed, host_to_amiga_rawkey,
-        joystick_mode_uses_keyboard, keyboard_joystick_key_for, led_row_rect,
-        mask_present_frame_to_tv, paint_test_screen, parse_amiga_key, pause_button_rect,
-        power_button_rect, present_row_sample, presentation_source_y_offset, reboot_button_rect,
-        rgba, shot_button_rect, should_render_emulated_frame, standard_window_top_row,
-        status_with_latched_fdd_track, take_integral_mouse_delta, texture_height, texture_width,
+        bar_layout, center_present_frame_for_visible_start, center_present_frame_horizontally,
+        control_at, copperline_icon_image, copperline_logo_image, copy_present_frame,
+        draw_status_bar, fdd_track_counter_rect, fdd_track_digit_rect,
+        host_shortcut_modifier_pressed, host_to_amiga_rawkey, joystick_mode_uses_keyboard,
+        keyboard_joystick_key_for, led_row_rect, mask_present_frame_to_tv, paint_test_screen,
+        parse_amiga_key, pause_button_rect, power_button_rect, present_row_sample,
+        presentation_source_y_offset, reboot_button_rect, rgba, shot_button_rect,
+        should_render_emulated_frame, standard_window_top_row, status_with_latched_fdd_track,
+        take_integral_mouse_delta, texture_height, texture_width, tv_source_h_bounds,
         tv_standard_h_shift, volume_percent_from_pos, volume_slider_track_rect, BarControl,
         DriveBar, JoystickInputMode, KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar,
         StatusBarView, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF, CD_LED_ON,
         DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON,
         POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
-        STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STANDARD_PAL_VISIBLE_WIDTH,
-        STATUS_BG, TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
+        STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
+        TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::FrontPanelStatus;
@@ -7146,16 +7157,15 @@ mod tests {
     }
 
     #[test]
-    fn tv_horizontal_centering_centers_the_standard_pal_aperture() {
+    fn tv_horizontal_centering_centers_the_tv_aperture() {
         let shift = tv_standard_h_shift();
-        let centered_left = (FB_WIDTH - STANDARD_PAL_VISIBLE_WIDTH) / 2;
-        let centered_right = centered_left + STANDARD_PAL_VISIBLE_WIDTH;
+        let (source_left, source_right) = tv_source_h_bounds();
+        let source_width = source_right - source_left;
+        let centered_left = (FB_WIDTH - source_width) / 2;
+        let centered_right = centered_left + source_width;
 
-        assert_eq!(bitplane::STANDARD_VISIBLE_X0 - shift, centered_left);
-        assert_eq!(
-            bitplane::STANDARD_VISIBLE_X0 + STANDARD_PAL_VISIBLE_WIDTH - shift,
-            centered_right
-        );
+        assert_eq!(source_left - shift, centered_left);
+        assert_eq!(source_right - shift, centered_right);
     }
 
     #[test]
@@ -7178,21 +7188,22 @@ mod tests {
         let mut fb = vec![marker; FB_PIXELS];
 
         // A standard screen centred by the presentation: window top at
-        // framebuffer row 14 (the standard centring offset).
+        // framebuffer row 14 (the standard centring offset), with the TV
+        // aperture centred horizontally.
         let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
-        mask_present_frame_to_tv(&mut fb, 0, std_top);
+        let shift = tv_standard_h_shift();
+        mask_present_frame_to_tv(&mut fb, shift, std_top);
 
-        // The TV window crops both horizontal sides at the standard PAL
-        // window; full overscan remains available through Overscan::Full.
-        let left = bitplane::STANDARD_VISIBLE_X0;
-        let right = bitplane::STANDARD_VISIBLE_X0 + STANDARD_PAL_VISIBLE_WIDTH;
+        let (source_left, source_right) = tv_source_h_bounds();
+        let left = source_left - shift;
+        let right = source_right - shift;
         let mid_row = std_top + 100;
         assert_eq!(fb[mid_row * FB_WIDTH + left - 1], rgba(0, 0, 0));
         assert_eq!(fb[mid_row * FB_WIDTH + left], marker);
         assert_eq!(fb[mid_row * FB_WIDTH + right - 1], marker);
         assert_eq!(fb[mid_row * FB_WIDTH + right], rgba(0, 0, 0));
         assert_eq!(fb[mid_row * FB_WIDTH + FB_WIDTH - 1], rgba(0, 0, 0));
-        // The left overscan margin stays hidden.
+        // The deep left overscan margin stays hidden.
         assert_eq!(fb[mid_row * FB_WIDTH], rgba(0, 0, 0));
         // The vertical TV window tracks the centred standard window: 8
         // lines of top overscan remain visible, while the bottom is cropped
@@ -7206,6 +7217,29 @@ mod tests {
     }
 
     #[test]
+    fn tv_horizontal_centering_preserves_visible_left_overscan_margin() {
+        let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
+        let mid_row = std_top + 100;
+        let (source_left, _) = tv_source_h_bounds();
+        let shift = tv_standard_h_shift();
+        let marker = rgba(0x12, 0x34, 0x56);
+        let hidden_marker = rgba(0x98, 0x76, 0x54);
+        let mut fb = vec![rgba(0, 0, 0); FB_PIXELS];
+
+        fb[mid_row * FB_WIDTH + source_left - 1] = hidden_marker;
+        fb[mid_row * FB_WIDTH + source_left] = marker;
+
+        center_present_frame_horizontally(&mut fb, shift);
+        mask_present_frame_to_tv(&mut fb, shift, std_top);
+
+        assert_eq!(
+            fb[mid_row * FB_WIDTH + source_left - shift - 1],
+            rgba(0, 0, 0)
+        );
+        assert_eq!(fb[mid_row * FB_WIDTH + source_left - shift], marker);
+    }
+
+    #[test]
     fn tv_overscan_mask_tracks_the_centering_shift() {
         let marker = rgba(0x12, 0x34, 0x56);
         let mut fb = vec![marker; FB_PIXELS];
@@ -7215,8 +7249,9 @@ mod tests {
         let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
         mask_present_frame_to_tv(&mut fb, 16, std_top);
 
-        let left = bitplane::STANDARD_VISIBLE_X0 - 16;
-        let right = bitplane::STANDARD_VISIBLE_X0 + STANDARD_PAL_VISIBLE_WIDTH - 16;
+        let (source_left, source_right) = tv_source_h_bounds();
+        let left = source_left - 16;
+        let right = source_right - 16;
         let mid_row = std_top + 100;
         assert_eq!(fb[mid_row * FB_WIDTH + left - 1], rgba(0, 0, 0));
         assert_eq!(fb[mid_row * FB_WIDTH + left], marker);
@@ -7238,7 +7273,7 @@ mod tests {
         let mut fb = vec![marker; FB_PIXELS];
         mask_present_frame_to_tv(&mut fb, 0, std_top);
 
-        let left = bitplane::STANDARD_VISIBLE_X0;
+        let (left, _) = tv_source_h_bounds();
         assert_eq!(fb[(std_top - 8 - 1) * FB_WIDTH + left], rgba(0, 0, 0));
         assert_eq!(fb[(std_top - 8) * FB_WIDTH + left], marker);
         let bottom = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
