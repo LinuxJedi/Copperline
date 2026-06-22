@@ -1938,11 +1938,8 @@ fn decode_uae_extended_adf(data: &[u8]) -> Result<FloppyImageData> {
                 if len == 0 {
                     None
                 } else {
-                    ensure!(
-                        len.is_multiple_of(BYTES_PER_SECTOR),
-                        "UAE extended ADF track {track} AmigaDOS data is not sector-aligned"
-                    );
-                    Some(FloppyTrackImage::AmigaDos(payload.to_vec()))
+                    decode_uae_extended_amigados_payload(track, payload, bit_len)?
+                        .map(|sector_data| FloppyTrackImage::AmigaDos(sector_data.to_vec()))
                 }
             }
             1 => Some(FloppyTrackImage::RawMfm {
@@ -1973,6 +1970,42 @@ fn decode_uae_extended_adf(data: &[u8]) -> Result<FloppyImageData> {
         out.push(image_track);
     }
     Ok(FloppyImageData::Tracks(out))
+}
+
+fn decode_uae_extended_amigados_payload(
+    track: usize,
+    payload: &[u8],
+    bit_len: u32,
+) -> Result<Option<&[u8]>> {
+    let data_len = if bit_len == 0 {
+        payload.len()
+    } else {
+        ensure!(
+            bit_len.is_multiple_of(8),
+            "UAE extended ADF track {track} AmigaDOS bit length is not byte-aligned"
+        );
+        (bit_len / 8) as usize
+    };
+    ensure!(
+        data_len <= payload.len(),
+        "UAE extended ADF track {track} AmigaDOS bit length exceeds stored data"
+    );
+    // UAE-1ADF exporters can store type-0 DOS tracks at raw-track byte
+    // length. `bit_len` identifies the sector payload; any surplus is fill.
+    // Extra blank cylinders may also appear as all-zero raw-length type-0
+    // tracks, which carry no sector stream.
+    if !data_len.is_multiple_of(BYTES_PER_SECTOR) && payload.iter().all(|&byte| byte == 0) {
+        return Ok(None);
+    }
+    ensure!(
+        data_len.is_multiple_of(BYTES_PER_SECTOR),
+        "UAE extended ADF track {track} AmigaDOS data is not sector-aligned"
+    );
+    ensure!(
+        payload[data_len..].iter().all(|&byte| byte == 0),
+        "UAE extended ADF track {track} AmigaDOS padding after bit length is non-zero"
+    );
+    Ok(Some(&payload[..data_len]))
 }
 
 fn decode_uae_legacy_extended_adf(data: &[u8]) -> Result<FloppyImageData> {
@@ -6088,6 +6121,68 @@ mod tests {
     }
 
     #[test]
+    fn uae_extended_adf_amigados_track_uses_bit_length_before_zero_padding() -> Result<()> {
+        let mut track_data = vec![0u8; SECTORS_PER_TRACK * BYTES_PER_SECTOR];
+        track_data[0..BYTES_PER_SECTOR].fill(0x5A);
+        let mut payload = track_data.clone();
+        payload.resize(0x31f0, 0);
+        let path = temp_ext2_track(0, (track_data.len() * 8) as u32, &payload)?;
+        let cfg = FloppyConfig {
+            drives: [
+                Some(FloppyDriveConfig {
+                    path: path.clone(),
+                    write_protected: true,
+                }),
+                None,
+                None,
+                None,
+            ],
+        };
+        let mut ctrl = FloppyController::from_config(&cfg)?;
+
+        ctrl.write_prb(!CIAB_DSKMOTOR & !CIAB_DSKSEL0);
+        ctrl.tick(MOTOR_READY_CCK, 0, &mut []);
+        ctrl.ensure_track(0, 0);
+        let decoded = decode_track_write(0, &ctrl.drives[0].cached_words())?;
+
+        let sector0 = decoded.iter().find(|(sector, _)| *sector == 0).unwrap();
+        assert_eq!(&sector0.1[..], &[0x5A; BYTES_PER_SECTOR]);
+        assert_eq!(decoded.len(), SECTORS_PER_TRACK);
+
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn uae_extended_adf_amigados_track_rejects_nonzero_padding_after_bit_length() {
+        let track_data = vec![0u8; SECTORS_PER_TRACK * BYTES_PER_SECTOR];
+        let mut payload = track_data.clone();
+        payload.resize(0x31f0, 0);
+        *payload.last_mut().unwrap() = 0x5A;
+        let image = ext2_track_image(0, (track_data.len() * 8) as u32, 1, &payload);
+
+        let err = match decode_uae_extended_adf(&image) {
+            Ok(_) => panic!("non-zero padding after AmigaDOS bit length should fail"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("AmigaDOS padding after bit length is non-zero"));
+    }
+
+    #[test]
+    fn uae_extended_adf_blank_amigados_track_without_sector_payload_is_empty() -> Result<()> {
+        let payload = vec![0u8; 0x31f0];
+        let image = ext2_track_image(0, (payload.len() * 8) as u32, 1, &payload);
+
+        let FloppyImageData::Tracks(tracks) = decode_uae_extended_adf(&image)? else {
+            panic!("UAE extended ADF should decode to per-track data");
+        };
+        assert!(tracks[0].is_none());
+        Ok(())
+    }
+
+    #[test]
     fn writable_extended_adf_amigados_track_persists_sector_updates() -> Result<()> {
         let path = temp_ext2_amigados(&vec![0u8; SECTORS_PER_TRACK * BYTES_PER_SECTOR])?;
         let cfg = FloppyConfig {
@@ -7233,6 +7328,14 @@ mod tests {
         payload: &[u8],
     ) -> Result<PathBuf> {
         let path = temp_path("test.ext.adf");
+        fs::write(
+            &path,
+            ext2_track_image(track_type, bit_len, revolutions, payload),
+        )?;
+        Ok(path)
+    }
+
+    fn ext2_track_image(track_type: u8, bit_len: u32, revolutions: u8, payload: &[u8]) -> Vec<u8> {
         let mut image = Vec::new();
         image.extend_from_slice(UAE_EXT2_SIGNATURE);
         image.extend_from_slice(&0u16.to_be_bytes());
@@ -7243,8 +7346,7 @@ mod tests {
         image.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         image.extend_from_slice(&bit_len.to_be_bytes());
         image.extend_from_slice(payload);
-        fs::write(&path, image)?;
-        Ok(path)
+        image
     }
 
     fn temp_scp_raw_revolutions(revolutions: &[&[u16]], bit_len: u32) -> Result<PathBuf> {
