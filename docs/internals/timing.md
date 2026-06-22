@@ -338,10 +338,13 @@ plus the exception sequence takes roughly 60-100 CCK on real hardware.
 Copperline models this with a configurable latency on newly-raised
 interrupt levels (`DEFAULT_IRQ_LATENCY_CCK = 65`, `src/bus.rs`;
 `COPPERLINE_IRQ_LATENCY_CCK` overrides, `0` disables).
-The delay is attached to Paula/CIA/blitter/Copper source assertions, not to a
-CPU write that merely changes INTENA/INTREQ masking or acknowledges a latch.
-If software unmasks a source that Paula already latched, the CPU-visible level
-updates without creating a fresh asynchronous recognition delay.
+The delay is attached to asynchronous Paula/CIA/blitter/Copper source
+assertions. A CPU write that merely changes INTENA/INTREQ masking or
+acknowledges a latch normally only updates the delayed-bit bookkeeping. PORTS
+is level-fed by CIA-A/Gayle-style INT2 sources and remains immediately visible
+when software unmasks an already-latched level; other newly exposed latched
+sources are treated as freshly-present CPU IPL inputs and still pass through
+recognition latency.
 
 This matters more than it sounds: a beam-bounded interrupt handler that
 arrives 50 CCK early steals that time from the main loop every frame. The
