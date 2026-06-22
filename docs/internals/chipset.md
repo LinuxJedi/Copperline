@@ -53,9 +53,11 @@ stream is discarded and the next sprite DMA slot fetches a descriptor from
 the new address; otherwise descriptor words can be mistaken for sprite data.
 Software can also write SPRxPOS/SPRxCTL directly and let sprite DMA fetch
 data from the current SPRxPT stream; in that case SPRxPT names the first
-data word pair, not a memory descriptor. The frame-start replay path mirrors
-this by replaying off-screen DMACON and SPRxPT writes in beam order before
-rendering the visible field.
+data word pair, not a memory descriptor. If a DMA descriptor has already
+been retained and is still waiting for VSTART, later SPRxPOS/SPRxCTL writes
+update the live comparators but keep the descriptor's post-control data
+origin. The frame-start replay path mirrors this by replaying off-screen
+DMACON and SPRxPT writes in beam order before rendering the visible field.
 
 Sprite descriptors whose decoded VSTART equals VSTOP idle the current
 sprite stream until software rearms it or the next field fetches again;

@@ -156,11 +156,11 @@ than adaptive (currently a 131072-frame ring, a ~150 ms prebuffer equal to
 the ~150 ms steady lead, and a ~300 ms stale-drop threshold at 44.1 kHz).
 Playback starts only after the first audible frames have filled that
 prebuffer, so silent boot/load periods do not queue seconds of zeros. If the
-cpal callback later drains near empty, it stops playback before the queue runs
-dry, outputs silence, and waits for the same prebuffer depth before restarting.
-During both startup and rebuffering the sink reports the missing buffer depth
-as extra live-audio lead, so the real-time pacer runs ahead until the cushion
-is restored instead of sleeping through the refill.
+cpal callback later drains the queue completely, it stops playback, outputs
+silence, and waits for the same prebuffer depth before restarting. While an
+already-started queue is merely below target, the sink reports the missing
+buffer depth as extra live-audio lead so the real-time pacer runs ahead and
+restores the cushion without forcing a host-side silence gap first.
 
 The live queue is host presentation state, not Paula state. A save-state or
 reverse-debug timeline jump keeps the restored Paula/CD/floppy mixer state but

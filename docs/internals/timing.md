@@ -81,16 +81,18 @@ are detailed under [](#cpu-contention) below.
 ### Sprite DMA control rewrites
 
 Sprite DMA fetches POS/CTL at the fixed pair slots, then data words for
-the active line. Software can still rewrite SPRxPOS/SPRxCTL before a later
-pair slot to reposition an already active sprite on that scanline. Those
-writes update the live horizontal and vertical comparators, but they do
-not restart the sprite data stream: the row offset remains relative to the
-descriptor that armed the sprite. Copperline therefore keeps a runtime-only
-data-origin VSTART alongside the live comparator VSTART, preserving it
-across active POS/CTL rewrites while still using the rewritten HSTART for
-the line. The runtime origin is skipped in save states to preserve the
-fixed bincode layout; future save-state versioning should serialize it if
-mid-line sprite-DMA resume accuracy is tightened. Test:
+the active line. Software can still rewrite SPRxPOS/SPRxCTL while a
+descriptor is pending or before a later pair slot to reposition an already
+active sprite on that scanline. Those writes update the live horizontal and
+vertical comparators, but they do not restart the sprite data stream: the
+data pointer stays with the descriptor that armed the sprite, and active
+row offsets remain relative to that descriptor. Copperline therefore keeps
+a runtime-only data-origin VSTART alongside the live comparator VSTART,
+preserving it across active POS/CTL rewrites while still using the
+rewritten HSTART for the line. The runtime origin is skipped in save states
+to preserve the fixed bincode layout; future save-state versioning should
+serialize it if mid-line sprite-DMA resume accuracy is tightened. Tests:
+`pending_sprite_control_rewrite_preserves_descriptor_data_origin`,
 `active_sprite_control_rewrite_preserves_descriptor_data_origin`.
 
 Beam-timed SPRxPOS writes are replayed in Denise's horizontal-comparator

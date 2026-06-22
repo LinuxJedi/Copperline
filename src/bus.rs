@@ -248,6 +248,8 @@ const BPLCON3_SPRES_MASK: u16 = 0x00C0;
 const BPLCON3_SPRES_LORES: u16 = 0x0040;
 const BPLCON3_SPRES_HIRES: u16 = 0x0080;
 const BPLCON3_SPRES_SHRES: u16 = 0x00C0;
+const CLXDAT_SPRITE_PLAYFIELD_MASK: u16 = 0x01FE;
+const CLXDAT_SPRITE_SPRITE_MASK: u16 = 0x7E00;
 const BITPLANE_DDF_HARD_START: u16 = 0x0018;
 const BITPLANE_DDF_HARD_STOP: u16 = 0x00D8;
 const OCS_LORES_BPL_SEQUENCE: [usize; 8] = [8, 4, 6, 2, 7, 3, 5, 1];
@@ -316,10 +318,12 @@ struct BitplaneDdfStartMiss {
 }
 
 /// Cache key for the memoized bitplane slot plan: every register input that
-/// feeds the plan computation. The vpos-dependent gates (vertical display
-/// window, DDFSTRT write miss) are evaluated live in `bitplane_slot_active_at`,
-/// so DIW registers do not belong here. The effective (write-delayed) DMACON
-/// and BPLCON0 values are keyed, so a delay expiring re-keys automatically.
+/// feeds the Agnus fetch-ownership computation. The vpos-dependent gates
+/// (vertical display window, DDFSTRT write miss) are evaluated live in
+/// `bitplane_slot_active_at`, so DIW registers do not belong here. Likewise,
+/// only BPLCON0's plane-count and resolution bits belong here: HAM, dual
+/// playfield, lace, color, and genlock affect Denise interpretation of fetched
+/// words, but they do not change which chip-bus slots Agnus reserves.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct BitplaneSlotKey {
     bplen: bool,
@@ -328,6 +332,18 @@ struct BitplaneSlotKey {
     ddfstop: u16,
     fmode: u16,
     harddis: bool,
+}
+
+const BPLCON0_SLOT_PLAN_MASK_OCS_ECS: u16 = 0xF040;
+const BPLCON0_SLOT_PLAN_MASK_AGA: u16 = BPLCON0_SLOT_PLAN_MASK_OCS_ECS | 0x0010;
+
+fn bitplane_slot_plan_bplcon0_key(bplcon0: u16, aga: bool) -> u16 {
+    let mask = if aga {
+        BPLCON0_SLOT_PLAN_MASK_AGA
+    } else {
+        BPLCON0_SLOT_PLAN_MASK_OCS_ECS
+    };
+    bplcon0 & mask
 }
 
 /// Derived bitplane fetch cadence for the current `BitplaneSlotKey`: the
@@ -355,6 +371,71 @@ struct BitplaneSlotPlan {
 
 /// Width covered by `BitplaneSlotPlan::slot_mask` (hpos 0..SLOT_MASK_BITS).
 const SLOT_MASK_BITS: u32 = 256;
+const BITPLANE_SLOT_PLAN_CACHE_LEN: usize = 8;
+
+type BitplaneSlotPlanCacheEntry = Option<(BitplaneSlotKey, Option<BitplaneSlotPlan>)>;
+
+struct BitplaneSlotPlanCache {
+    entries: [std::cell::Cell<BitplaneSlotPlanCacheEntry>; BITPLANE_SLOT_PLAN_CACHE_LEN],
+    next_insert: std::cell::Cell<usize>,
+    last_hit: std::cell::Cell<usize>,
+}
+
+impl BitplaneSlotPlanCache {
+    fn new() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| std::cell::Cell::new(None)),
+            next_insert: std::cell::Cell::new(0),
+            last_hit: std::cell::Cell::new(0),
+        }
+    }
+
+    fn lookup(&self, key: BitplaneSlotKey) -> Option<Option<BitplaneSlotPlan>> {
+        let last = self.last_hit.get().min(BITPLANE_SLOT_PLAN_CACHE_LEN - 1);
+        if let Some((cached_key, plan)) = self.entries[last].get() {
+            if cached_key == key {
+                return Some(plan);
+            }
+        }
+
+        for idx in 0..BITPLANE_SLOT_PLAN_CACHE_LEN {
+            if idx == last {
+                continue;
+            }
+            if let Some((cached_key, plan)) = self.entries[idx].get() {
+                if cached_key == key {
+                    self.last_hit.set(idx);
+                    return Some(plan);
+                }
+            }
+        }
+        None
+    }
+
+    fn insert(&self, key: BitplaneSlotKey, plan: Option<BitplaneSlotPlan>) {
+        let idx = self.next_insert.get() % BITPLANE_SLOT_PLAN_CACHE_LEN;
+        self.entries[idx].set(Some((key, plan)));
+        self.last_hit.set(idx);
+        self.next_insert
+            .set((idx + 1) % BITPLANE_SLOT_PLAN_CACHE_LEN);
+    }
+
+    #[cfg(test)]
+    fn entries_snapshot(&self) -> [BitplaneSlotPlanCacheEntry; BITPLANE_SLOT_PLAN_CACHE_LEN] {
+        std::array::from_fn(|idx| self.entries[idx].get())
+    }
+
+    #[cfg(test)]
+    fn last_hit_entry(&self) -> BitplaneSlotPlanCacheEntry {
+        self.entries[self.last_hit.get()].get()
+    }
+}
+
+impl Default for BitplaneSlotPlanCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 struct DisplaySpriteControl {
@@ -691,13 +772,13 @@ pub struct Bus {
     bitplane_dmacon_delay: Option<BitplaneDmaconDelay>,
     bitplane_bplcon0_delay: Option<BitplaneBplcon0Delay>,
     bitplane_ddfstart_miss: Option<BitplaneDdfStartMiss>,
-    /// Memoized bitplane fetch plan for `bitplane_slot_active_at`, keyed on
-    /// the registers that feed it. The arbiter asks for the bitplane slot
-    /// owner several times per color clock; recomputing the DDF window and
-    /// fetch cadence each time was a measurable share of host CPU. A Cell
-    /// keeps the `&self` owner-selection call graph intact.
+    /// Memoized bitplane fetch plans for `bitplane_slot_active_at`, keyed on
+    /// the registers that feed it. The arbiter asks for bitplane ownership on
+    /// every slot candidate, and mid-line fetch-shape changes can alternate
+    /// between a few valid plans. Per-entry Cells avoid copying the whole cache
+    /// on each hit while keeping the `&self` owner-selection call graph intact.
     #[serde(skip)]
-    bitplane_slot_plan_cache: std::cell::Cell<Option<(BitplaneSlotKey, Option<BitplaneSlotPlan>)>>,
+    bitplane_slot_plan_cache: BitplaneSlotPlanCache,
     bus_accounting: BusAccounting,
     /// Latches once BEAMCON0.DUAL (A2024/UHRES) is first seen set, so the
     /// "not emulated" warning is logged a single time, not per write.
@@ -1570,7 +1651,7 @@ impl Bus {
             bitplane_dmacon_delay: None,
             bitplane_bplcon0_delay: None,
             bitplane_ddfstart_miss: None,
-            bitplane_slot_plan_cache: std::cell::Cell::new(None),
+            bitplane_slot_plan_cache: BitplaneSlotPlanCache::new(),
             bus_accounting: BusAccounting::from_env(),
             uhres_dual_warned: false,
             dbg_ext_cck_x100: external_access_cck_x100_setting(),
@@ -4491,11 +4572,19 @@ impl Bus {
         // clock: it fetches on every other one and yields the idle half (and
         // any sleeping WAIT cycle) to the blitter/CPU. `allow_fetch` is false
         // when a forced owner (a granted CPU access) already holds this cycle.
-        let eligible =
-            cck >= CHIP_BUS_SLOT_CCK && self.copper_wait_free_cycle_available_at(self.agnus.hpos);
+        let hpos = self.agnus.hpos;
+        let fixed_dma_owner = if matches!(forced_owner, Some(ChipBusOwner::Cpu)) {
+            // A forced CPU owner is only used after `cpu_can_use_current_slot`
+            // has already proved that fixed DMA does not own this color clock.
+            // The Copper comparator still advances below with `allow_fetch=false`.
+            None
+        } else {
+            self.fixed_dma_owner_at(self.agnus.vpos, hpos)
+        };
+        let copper_runs = cck >= CHIP_BUS_SLOT_CCK && self.copper_comparator_runs_at(hpos);
+        let eligible = copper_runs && fixed_dma_owner.is_none();
         let copper_took_bus = eligible && self.step_copper_eligible_slot(forced_owner.is_none());
-        if !eligible && cck >= CHIP_BUS_SLOT_CCK && self.copper_comparator_runs_at(self.agnus.hpos)
-        {
+        if !eligible && copper_runs {
             // A fixed DMA owner (bitplane/sprite/disk/audio/refresh) holds
             // this color clock, but the Copper's WAIT/SKIP comparator is
             // combinational and keeps running: only instruction fetches need
@@ -4513,7 +4602,7 @@ impl Bus {
             Some(owner) => owner,
             None if copper_took_bus => ChipBusOwner::Copper,
             None if eligible => self.free_chip_bus_slot_owner(),
-            None => self.scheduled_dma_owner(false),
+            None => self.scheduled_dma_owner_after_fixed(false, fixed_dma_owner),
         };
         self.last_chip_bus_owner = owner;
         if self.bus_accounting.enabled {
@@ -4829,6 +4918,7 @@ impl Bus {
             x_start,
             x_stop,
             sprite_display_enable_x,
+            self.denise.clxdat,
         );
         self.denise.or_clxdat(clxdat);
         self.record_live_collision_timing(
@@ -4940,6 +5030,7 @@ impl Bus {
                     x_start,
                     x_stop,
                     sprite_display_enable_x,
+                    self.denise.clxdat,
                 );
             }
             bits
@@ -5114,6 +5205,7 @@ impl Bus {
             x_start,
             x_stop,
             sprite_display_enable_x,
+            self.denise.clxdat,
         );
         if let Some(row) = row {
             clxdat |= live_manual_sprite_playfield_collision_bits_in_range(
@@ -5126,6 +5218,7 @@ impl Bus {
                 x_start,
                 x_stop,
                 sprite_display_enable_x,
+                self.denise.clxdat | clxdat,
             );
         }
         self.denise.or_clxdat(clxdat);
@@ -5210,7 +5303,18 @@ impl Bus {
     }
 
     fn scheduled_dma_owner(&self, for_cpu: bool) -> ChipBusOwner {
-        if let Some(owner) = self.fixed_dma_owner_at(self.agnus.vpos, self.agnus.hpos) {
+        self.scheduled_dma_owner_after_fixed(
+            for_cpu,
+            self.fixed_dma_owner_at(self.agnus.vpos, self.agnus.hpos),
+        )
+    }
+
+    fn scheduled_dma_owner_after_fixed(
+        &self,
+        for_cpu: bool,
+        fixed_owner: Option<ChipBusOwner>,
+    ) -> ChipBusOwner {
+        if let Some(owner) = fixed_owner {
             return owner;
         }
         if self.agnus.dmacon & DMACON_DMAEN == 0 {
@@ -5583,6 +5687,20 @@ impl Bus {
     }
 
     fn bitplane_slot_active_at(&self, vpos: u32, hpos: u32) -> bool {
+        // Bitplane DMA only runs inside the vertical display window (set at
+        // DIWSTRT.V, cleared at DIWSTOP.V), so the top-border and vertical-
+        // blank lines are free for the blitter/CPU. Rejecting this before the
+        // DDF/BPLCON0 plan lookup avoids per-color-clock cache probes on lines
+        // that cannot fetch bitplanes.
+        if !display_window_contains_vpos(
+            self.denise.diwstrt,
+            self.denise.diwstop,
+            self.effective_diwhigh(),
+            vpos,
+        ) {
+            return false;
+        }
+
         let mut bplcon0 = self.effective_bitplane_bplcon0();
         let mut plan = self.bitplane_slot_plan_for_bplcon0(bplcon0);
         if plan.is_none() {
@@ -5594,20 +5712,6 @@ impl Bus {
         let Some(mut plan) = plan else {
             return false;
         };
-        // Bitplane DMA only runs inside the vertical display window (set at
-        // DIWSTRT.V, cleared at DIWSTOP.V), so the top-border and vertical-
-        // blank lines are free for the blitter/CPU. Without this gate the
-        // arbiter reserved bitplane slots on all 313 lines, starving a busy
-        // blitter on the ~28 off-window lines. Mirrors the capture path's
-        // display_window_contains_vpos check so the two cannot drift.
-        if !display_window_contains_vpos(
-            self.denise.diwstrt,
-            self.denise.diwstop,
-            self.effective_diwhigh(),
-            vpos,
-        ) {
-            return false;
-        }
         if self.bitplane_ddfstart_missed_on_line(vpos, plan.start) {
             return false;
         }
@@ -5682,19 +5786,17 @@ impl Bus {
         let dmacon = self.effective_bitplane_dmacon();
         let key = BitplaneSlotKey {
             bplen: dmacon & (DMACON_DMAEN | DMACON_BPLEN) == (DMACON_DMAEN | DMACON_BPLEN),
-            bplcon0,
+            bplcon0: bitplane_slot_plan_bplcon0_key(bplcon0, self.aga_enabled()),
             ddfstrt: self.denise.ddfstrt,
             ddfstop: self.denise.ddfstop,
             fmode: self.agnus.fmode(),
             harddis: self.harddis_active(),
         };
-        if let Some((cached_key, plan)) = self.bitplane_slot_plan_cache.get() {
-            if cached_key == key {
-                return plan;
-            }
+        if let Some(plan) = self.bitplane_slot_plan_cache.lookup(key) {
+            return plan;
         }
         let plan = self.compute_bitplane_slot_plan(&key);
-        self.bitplane_slot_plan_cache.set(Some((key, plan)));
+        self.bitplane_slot_plan_cache.insert(key, plan);
         plan
     }
 
@@ -5776,11 +5878,6 @@ impl Bus {
             return false;
         }
         self.copper.is_running()
-    }
-
-    fn copper_wait_free_cycle_available_at(&self, hpos: u32) -> bool {
-        self.copper_comparator_runs_at(hpos)
-            && self.fixed_dma_owner_at(self.agnus.vpos, hpos).is_none()
     }
 
     /// Whether the Copper's WAIT/SKIP comparator advances this color clock.
@@ -6560,6 +6657,7 @@ impl Bus {
         }
 
         let quantum = sprite_fetch_quantum(self.agnus.fmode());
+        let line_bytes = 4 * quantum;
         let data_lines = if sprite_scan_doubled(self.agnus.fmode()) {
             (height as u32).div_ceil(2)
         } else {
@@ -6573,7 +6671,7 @@ impl Bus {
             hsub_70ns: bitplane_shres(self.denise.bplcon0) && sprite_hsub_70ns_from_ctl(ctl),
             data_vstart: vstart,
             data_base,
-            next_ptr: data_base.wrapping_add(data_lines.saturating_mul(4 * quantum))
+            next_ptr: data_base.wrapping_add(data_lines.saturating_mul(line_bytes))
                 & self.chip_dma_mask
                 & !1,
             attached: ctl & 0x0080 != 0,
@@ -6592,12 +6690,29 @@ impl Bus {
             !sprite_dma_enabled && in_window && state.data_dma_active && state.last_line.is_some();
         let keep_active_dma_line =
             sprite_dma_enabled && in_window && state.data_dma_active && state.last_line.is_some();
+        let keep_pending_dma_origin = sprite_dma_enabled
+            && !state.data_dma_active
+            && state.last_line.is_none()
+            && previous_control
+                .map(|previous| beam_y < previous.vstop)
+                .unwrap_or(false);
 
         if keep_held_line || keep_active_dma_line {
             if let Some(previous_control) = previous_control {
                 control.data_vstart = previous_control.effective_data_vstart();
                 control.data_base = previous_control.data_base;
                 control.next_ptr = previous_control.next_ptr;
+            }
+        } else if keep_pending_dma_origin {
+            if let Some(previous_control) = previous_control {
+                // A pending descriptor has already consumed POS/CTL; direct
+                // control writes retime the comparators, not the data stream.
+                control.data_base = previous_control.data_base;
+                control.next_ptr = control
+                    .data_base
+                    .wrapping_add(data_lines.saturating_mul(line_bytes))
+                    & self.chip_dma_mask
+                    & !1;
             }
         }
 
@@ -8191,6 +8306,7 @@ fn live_sprite_sprite_collision_bits(
     x_start: i32,
     x_stop: i32,
     display_enable_x: Option<i32>,
+    latched_clxdat: u16,
 ) -> u16 {
     if sources.len() < 2 {
         return 0;
@@ -8200,15 +8316,21 @@ fn live_sprite_sprite_collision_bits(
     if x_start >= x_stop {
         return 0;
     }
+    let target_mask = live_sprite_sprite_possible_clx_mask(sources, x_start, x_stop);
+    let needed_mask = target_mask & !latched_clxdat;
+    if needed_mask == 0 {
+        return 0;
+    }
 
     let mut clxdat = 0u16;
+    let constant_control = control_replay.constant_control();
     for (idx, source) in sources.iter().enumerate() {
         for other in &sources[idx + 1..] {
             if source.group == other.group {
                 continue;
             }
             let clx_bit = sprite_sprite_clx_bit(source.group, other.group);
-            if clx_bit == 0 || clxdat & clx_bit != 0 {
+            if clx_bit == 0 || needed_mask & clx_bit == 0 || clxdat & clx_bit != 0 {
                 continue;
             }
             let Some((pair_x_start, pair_x_stop)) =
@@ -8216,6 +8338,43 @@ fn live_sprite_sprite_collision_bits(
             else {
                 continue;
             };
+            if let Some(control) = constant_control {
+                let Some((visible_x_start, visible_x_stop)) =
+                    live_sprite_visible_x_range_for_control(
+                        control,
+                        beam_y,
+                        pair_x_start,
+                        pair_x_stop,
+                        display_enable_x,
+                    )
+                else {
+                    continue;
+                };
+                for x in visible_x_start..visible_x_stop {
+                    if !live_sprite_source_collision_matches_with_control(
+                        source,
+                        control,
+                        control.clxcon,
+                        x,
+                    ) {
+                        continue;
+                    }
+                    if !live_sprite_source_collision_matches_with_control(
+                        other,
+                        control,
+                        control.clxcon,
+                        x,
+                    ) {
+                        continue;
+                    }
+                    clxdat |= clx_bit;
+                    break;
+                }
+                if clxdat & needed_mask == needed_mask {
+                    return clxdat;
+                }
+                continue;
+            }
             for x in pair_x_start..pair_x_stop {
                 let control = control_replay.control_for_x(x);
                 if !live_sprite_pixel_inside_display_window(control, beam_y, x, display_enable_x) {
@@ -8231,6 +8390,9 @@ fn live_sprite_sprite_collision_bits(
                 clxdat |= clx_bit;
                 break;
             }
+            if clxdat & needed_mask == needed_mask {
+                return clxdat;
+            }
         }
     }
 
@@ -8245,6 +8407,7 @@ fn live_manual_sprite_sprite_collision_bits_in_range(
     x_start: i32,
     x_stop: i32,
     display_enable_x: Option<i32>,
+    latched_clxdat: u16,
 ) -> u16 {
     if beam_y < 0 {
         return 0;
@@ -8259,8 +8422,56 @@ fn live_manual_sprite_sprite_collision_bits_in_range(
     if sources.len() < 2 {
         return 0;
     }
+    let target_mask = live_manual_sprite_sprite_possible_clx_mask(&sources, x_start, x_stop);
+    let needed_mask = target_mask & !latched_clxdat;
+    if needed_mask == 0 {
+        return 0;
+    }
 
     let mut clxdat = 0u16;
+    if let Some(control) = control_replay.constant_control() {
+        let Some((visible_x_start, visible_x_stop)) = live_sprite_visible_x_range_for_control(
+            control,
+            beam_y,
+            x_start,
+            x_stop,
+            display_enable_x,
+        ) else {
+            return 0;
+        };
+        for x in visible_x_start..visible_x_stop {
+            let mut occupied_groups = 0u8;
+            for source in &sources {
+                if x < source.x_start || x >= source.x_stop {
+                    continue;
+                }
+                if !live_sprite_source_collision_matches_with_control(
+                    &source.source,
+                    control,
+                    control.clxcon,
+                    x,
+                ) {
+                    continue;
+                }
+                for other_group in 0..4 {
+                    if occupied_groups & (1 << other_group) != 0
+                        && other_group != source.source.group
+                    {
+                        let clx_bit = sprite_sprite_clx_bit(source.source.group, other_group);
+                        if needed_mask & clx_bit != 0 {
+                            clxdat |= clx_bit;
+                        }
+                    }
+                }
+                if clxdat & needed_mask == needed_mask {
+                    return clxdat;
+                }
+                occupied_groups |= 1 << source.source.group;
+            }
+        }
+        return clxdat;
+    }
+
     for x in x_start..x_stop {
         let control = control_replay.control_for_x(x);
         if !live_sprite_pixel_inside_display_window(control, beam_y, x, display_enable_x) {
@@ -8281,8 +8492,14 @@ fn live_manual_sprite_sprite_collision_bits_in_range(
             }
             for other_group in 0..4 {
                 if occupied_groups & (1 << other_group) != 0 && other_group != source.source.group {
-                    clxdat |= sprite_sprite_clx_bit(source.source.group, other_group);
+                    let clx_bit = sprite_sprite_clx_bit(source.source.group, other_group);
+                    if needed_mask & clx_bit != 0 {
+                        clxdat |= clx_bit;
+                    }
                 }
+            }
+            if clxdat & needed_mask == needed_mask {
+                return clxdat;
             }
             occupied_groups |= 1 << source.source.group;
         }
@@ -8300,6 +8517,7 @@ fn live_manual_sprite_playfield_collision_bits_in_range(
     x_start: i32,
     x_stop: i32,
     display_enable_x: Option<i32>,
+    latched_clxdat: u16,
 ) -> u16 {
     if beam_y < 0 {
         return 0;
@@ -8314,8 +8532,28 @@ fn live_manual_sprite_playfield_collision_bits_in_range(
     if sources.is_empty() {
         return 0;
     }
+    let target_mask = live_manual_sprite_playfield_possible_clx_mask(&sources, x_start, x_stop);
+    let needed_mask = target_mask & !latched_clxdat;
+    if needed_mask == 0 {
+        return 0;
+    }
 
     let mut clxdat = 0u16;
+    let sprite_constant_control = sprite_control.constant_control();
+    let (x_start, x_stop) = if let Some(control) = sprite_constant_control {
+        let Some(range) = live_sprite_visible_x_range_for_control(
+            control,
+            beam_y,
+            x_start,
+            x_stop,
+            display_enable_x,
+        ) else {
+            return 0;
+        };
+        range
+    } else {
+        (x_start, x_stop)
+    };
     for x in x_start..x_stop {
         let control = playfield_control.control_for_x(x);
         let Some(collision) = live_bitplane_collision_pixel_at(
@@ -8336,28 +8574,44 @@ fn live_manual_sprite_playfield_collision_bits_in_range(
             if x < source.x_start || x >= source.x_stop {
                 continue;
             }
-            let sprite_control_at_x = sprite_control.control_for_x(x);
-            if !live_sprite_pixel_inside_display_window(
-                sprite_control_at_x,
-                beam_y,
-                x,
-                display_enable_x,
-            ) {
-                continue;
-            }
-            if !live_sprite_source_collision_matches(
-                &source.source,
-                sprite_control,
-                control.clxcon,
-                x,
-            ) {
+            let sprite_matches = if let Some(sprite_control_at_x) = sprite_constant_control {
+                live_sprite_source_collision_matches_with_control(
+                    &source.source,
+                    sprite_control_at_x,
+                    control.clxcon,
+                    x,
+                )
+            } else {
+                let sprite_control_at_x = sprite_control.control_for_x(x);
+                live_sprite_pixel_inside_display_window(
+                    sprite_control_at_x,
+                    beam_y,
+                    x,
+                    display_enable_x,
+                ) && live_sprite_source_collision_matches(
+                    &source.source,
+                    sprite_control,
+                    control.clxcon,
+                    x,
+                )
+            };
+            if !sprite_matches {
                 continue;
             }
             if collision.pf1_match {
-                clxdat |= 1 << (source.source.group + 1);
+                let clx_bit = 1 << (source.source.group + 1);
+                if needed_mask & clx_bit != 0 {
+                    clxdat |= clx_bit;
+                }
             }
             if collision.pf2_match {
-                clxdat |= 1 << (source.source.group + 5);
+                let clx_bit = 1 << (source.source.group + 5);
+                if needed_mask & clx_bit != 0 {
+                    clxdat |= clx_bit;
+                }
+            }
+            if clxdat & needed_mask == needed_mask {
+                return clxdat;
             }
         }
     }
@@ -8588,6 +8842,77 @@ fn live_sprite_source_pair_x_range(
     (start < stop).then_some((start, stop))
 }
 
+fn live_sprite_sprite_possible_clx_mask(
+    sources: &[LiveSpriteCollisionSource],
+    x_start: i32,
+    x_stop: i32,
+) -> u16 {
+    let mut mask = 0;
+    for (idx, source) in sources.iter().enumerate() {
+        for other in &sources[idx + 1..] {
+            if source.group == other.group
+                || live_sprite_source_pair_x_range(source, other, x_start, x_stop).is_none()
+            {
+                continue;
+            }
+            mask |= sprite_sprite_clx_bit(source.group, other.group);
+        }
+    }
+    mask & CLXDAT_SPRITE_SPRITE_MASK
+}
+
+fn live_manual_sprite_sprite_possible_clx_mask(
+    sources: &[LiveManualSpriteCollisionSource],
+    x_start: i32,
+    x_stop: i32,
+) -> u16 {
+    let mut mask = 0;
+    for (idx, source) in sources.iter().enumerate() {
+        for other in &sources[idx + 1..] {
+            if source.source.group == other.source.group
+                || source.x_start.max(other.x_start).max(x_start)
+                    >= source.x_stop.min(other.x_stop).min(x_stop)
+            {
+                continue;
+            }
+            mask |= sprite_sprite_clx_bit(source.source.group, other.source.group);
+        }
+    }
+    mask & CLXDAT_SPRITE_SPRITE_MASK
+}
+
+fn sprite_playfield_clx_mask_for_group(group: usize) -> u16 {
+    (1 << (group + 1)) | (1 << (group + 5))
+}
+
+fn live_sprite_playfield_possible_clx_mask(
+    sources: &[LiveSpriteCollisionSource],
+    x_start: i32,
+    x_stop: i32,
+) -> u16 {
+    let mut mask = 0;
+    for source in sources {
+        if live_sprite_source_may_overlap_x_range(source, x_start, x_stop) {
+            mask |= sprite_playfield_clx_mask_for_group(source.group);
+        }
+    }
+    mask & CLXDAT_SPRITE_PLAYFIELD_MASK
+}
+
+fn live_manual_sprite_playfield_possible_clx_mask(
+    sources: &[LiveManualSpriteCollisionSource],
+    x_start: i32,
+    x_stop: i32,
+) -> u16 {
+    let mut mask = 0;
+    for source in sources {
+        if source.x_start < x_stop && source.x_stop > x_start {
+            mask |= sprite_playfield_clx_mask_for_group(source.source.group);
+        }
+    }
+    mask & CLXDAT_SPRITE_PLAYFIELD_MASK
+}
+
 fn live_sprite_sources_have_group_pair_overlap(
     sources: &[LiveSpriteCollisionSource],
     x_start: i32,
@@ -8733,6 +9058,53 @@ fn live_sprite_source_collision_matches(
 ) -> bool {
     let presence = live_sprite_source_pixel_presence(source, control_replay, x);
     presence.even || (presence.odd && clxcon & (1 << (12 + source.group)) != 0)
+}
+
+fn live_sprite_source_collision_matches_with_control(
+    source: &LiveSpriteCollisionSource,
+    control: LiveCollisionControl,
+    clxcon: u16,
+    x: i32,
+) -> bool {
+    let presence = live_sprite_source_pixel_presence_with_control(source, control, x);
+    presence.even || (presence.odd && clxcon & (1 << (12 + source.group)) != 0)
+}
+
+fn live_sprite_visible_x_range_for_control(
+    control: LiveCollisionControl,
+    beam_y: i32,
+    x_start: i32,
+    x_stop: i32,
+    display_enable_x: Option<i32>,
+) -> Option<(i32, i32)> {
+    let x_start = x_start.max(0);
+    let x_stop = x_stop.min(RENDER_FRAMEBUFFER_WIDTH);
+    if x_start >= x_stop {
+        return None;
+    }
+    if control.bplcon0 & BPLCON0_ECSENA != 0 && control.bplcon3 & BPLCON3_BRDSPRT != 0 {
+        return Some((x_start, x_stop));
+    }
+    let display_enable_x = display_enable_x?;
+    if beam_y < 0
+        || !display_window_contains_vpos(
+            control.diwstrt,
+            control.diwstop,
+            control.diwhigh,
+            beam_y as u32,
+        )
+    {
+        return None;
+    }
+    let (window_x_start, window_x_stop) =
+        live_display_window_x(control.diwstrt, control.diwstop, control.diwhigh);
+    let x_start = x_start.max(display_enable_x).max(window_x_start);
+    let x_stop = if window_x_stop <= window_x_start {
+        x_stop
+    } else {
+        x_stop.min(window_x_stop)
+    };
+    (x_start < x_stop).then_some((x_start, x_stop))
 }
 
 fn live_sprite_pixel_inside_display_window(
@@ -9027,6 +9399,7 @@ fn live_sprite_playfield_collision_bits_in_range(
     x_start: i32,
     x_stop: i32,
     display_enable_x: Option<i32>,
+    latched_clxdat: u16,
 ) -> u16 {
     if sources.is_empty() {
         return 0;
@@ -9036,27 +9409,58 @@ fn live_sprite_playfield_collision_bits_in_range(
     if x_start >= x_stop {
         return 0;
     }
+    let target_mask = live_sprite_playfield_possible_clx_mask(sources, x_start, x_stop);
+    let needed_mask = target_mask & !latched_clxdat;
+    if needed_mask == 0 {
+        return 0;
+    }
 
     let mut clxdat = 0u16;
+    let sprite_constant_control = sprite_control.constant_control();
     for source in sources {
+        let source_mask = sprite_playfield_clx_mask_for_group(source.group) & needed_mask;
+        if source_mask == 0 || clxdat & source_mask == source_mask {
+            continue;
+        }
         let (source_start, source_stop) = live_sprite_source_framebuffer_bounds(source);
         let source_x_start = x_start.max(source_start);
         let source_x_stop = x_stop.min(source_stop);
         if source_x_start >= source_x_stop {
             continue;
         }
-        for x in source_x_start..source_x_stop {
-            let sprite_control_at_x = sprite_control.control_for_x(x);
-            if !live_sprite_pixel_inside_display_window(
-                sprite_control_at_x,
+        let (source_x_start, source_x_stop) = if let Some(control) = sprite_constant_control {
+            let Some(range) = live_sprite_visible_x_range_for_control(
+                control,
                 beam_y,
-                x,
+                source_x_start,
+                source_x_stop,
                 display_enable_x,
-            ) {
+            ) else {
                 continue;
-            }
+            };
+            range
+        } else {
+            (source_x_start, source_x_stop)
+        };
+        for x in source_x_start..source_x_stop {
             let control = playfield_control.control_for_x(x);
-            if !live_sprite_source_collision_matches(source, sprite_control, control.clxcon, x) {
+            let sprite_matches = if let Some(sprite_control_at_x) = sprite_constant_control {
+                live_sprite_source_collision_matches_with_control(
+                    source,
+                    sprite_control_at_x,
+                    control.clxcon,
+                    x,
+                )
+            } else {
+                let sprite_control_at_x = sprite_control.control_for_x(x);
+                live_sprite_pixel_inside_display_window(
+                    sprite_control_at_x,
+                    beam_y,
+                    x,
+                    display_enable_x,
+                ) && live_sprite_source_collision_matches(source, sprite_control, control.clxcon, x)
+            };
+            if !sprite_matches {
                 continue;
             }
             let Some(collision) = live_bitplane_collision_pixel_at(
@@ -9074,10 +9478,22 @@ fn live_sprite_playfield_collision_bits_in_range(
                 continue;
             };
             if collision.pf1_match {
-                clxdat |= 1 << (source.group + 1);
+                let clx_bit = 1 << (source.group + 1);
+                if needed_mask & clx_bit != 0 {
+                    clxdat |= clx_bit;
+                }
             }
             if collision.pf2_match {
-                clxdat |= 1 << (source.group + 5);
+                let clx_bit = 1 << (source.group + 5);
+                if needed_mask & clx_bit != 0 {
+                    clxdat |= clx_bit;
+                }
+            }
+            if clxdat & source_mask == source_mask {
+                break;
+            }
+            if clxdat & needed_mask == needed_mask {
+                return clxdat;
             }
         }
     }
@@ -9588,8 +10004,9 @@ fn palette_event_sequences_equivalent(a: &[BeamRegisterWrite], b: &[BeamRegister
 #[cfg(test)]
 mod tests {
     use super::{
-        bitplane_words_per_row, clipped_display_rows_before_visible, display_window_contains_vpos,
-        diw_h_start, diw_h_stop, diw_v_start, diw_v_stop, framebuffer_x_for_live_collision_hpos,
+        bitplane_slot_plan_bplcon0_key, bitplane_words_per_row,
+        clipped_display_rows_before_visible, display_window_contains_vpos, diw_h_start, diw_h_stop,
+        diw_v_start, diw_v_stop, framebuffer_x_for_live_collision_hpos,
         live_bitplane_collision_bits, live_display_window_x, live_manual_sprite_collision_sources,
         live_sprite_playfield_collision_bits_in_range, live_sprite_sprite_collision_bits,
         visible_start_vpos_for_diw, BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus,
@@ -9631,6 +10048,81 @@ mod tests {
     const STANDARD_VISIBLE_X0: usize = ((STANDARD_DIW_HSTART - RENDER_DIW_HSTART_FB0) * 2) as usize;
     const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x34;
     static BUS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn bitplane_slot_plan_key_ignores_denise_only_bplcon0_bits() {
+        let fetch_shape = 0x5000;
+        let denise_only_bits = 0x0F9F;
+
+        assert_eq!(
+            bitplane_slot_plan_bplcon0_key(fetch_shape, false),
+            bitplane_slot_plan_bplcon0_key(fetch_shape | denise_only_bits, false)
+        );
+    }
+
+    #[test]
+    fn bitplane_slot_plan_key_tracks_fetch_shape_bplcon0_bits() {
+        let base = 0x5000;
+
+        assert_ne!(
+            bitplane_slot_plan_bplcon0_key(base, false),
+            bitplane_slot_plan_bplcon0_key(base ^ 0x1000, false),
+            "plane-count changes alter Agnus bitplane fetch ownership"
+        );
+        assert_ne!(
+            bitplane_slot_plan_bplcon0_key(base, false),
+            bitplane_slot_plan_bplcon0_key(base | 0x8000, false),
+            "hires changes alter bitplane fetch cadence"
+        );
+        assert_ne!(
+            bitplane_slot_plan_bplcon0_key(base, false),
+            bitplane_slot_plan_bplcon0_key(base | 0x0040, false),
+            "shres changes alter bitplane fetch cadence"
+        );
+
+        assert_eq!(
+            bitplane_slot_plan_bplcon0_key(base, false),
+            bitplane_slot_plan_bplcon0_key(base | 0x0010, false),
+            "OCS/ECS do not decode AGA BPU3"
+        );
+        assert_ne!(
+            bitplane_slot_plan_bplcon0_key(base, true),
+            bitplane_slot_plan_bplcon0_key(base | 0x0010, true),
+            "AGA BPU3 changes bitplane fetch ownership"
+        );
+    }
+
+    #[test]
+    fn bitplane_slot_plan_cache_keeps_recent_fetch_shapes() {
+        let mut bus = empty_bus();
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_BPLEN;
+        bus.denise.ddfstrt = 0x0038;
+        bus.denise.ddfstop = 0x00D0;
+
+        let shapes = [0x1000, 0x2000, 0x5000];
+        for &bplcon0 in &shapes {
+            assert!(bus.bitplane_slot_plan_for_bplcon0(bplcon0).is_some());
+        }
+        assert!(bus.bitplane_slot_plan_for_bplcon0(shapes[0]).is_some());
+
+        let cache = bus.bitplane_slot_plan_cache.entries_snapshot();
+        let keys = shapes.map(|bplcon0| bitplane_slot_plan_bplcon0_key(bplcon0, false));
+        assert_eq!(
+            bus.bitplane_slot_plan_cache
+                .last_hit_entry()
+                .map(|(key, _)| key.bplcon0),
+            Some(keys[0]),
+            "a cache hit should become the next lookup fast path without moving entries"
+        );
+        for key in keys {
+            assert!(
+                cache
+                    .iter()
+                    .any(|entry| matches!(entry, Some((cached, _)) if cached.bplcon0 == key)),
+                "recent fetch shape {key:#06X} should remain cached"
+            );
+        }
+    }
 
     fn render_color_write_x(hpos: u32) -> usize {
         hpos.saturating_sub(RENDER_COLOR_WRITE_HPOS_FB0)
@@ -14399,6 +14891,49 @@ mod tests {
     }
 
     #[test]
+    fn pending_sprite_control_rewrite_preserves_descriptor_data_origin() {
+        let mut bus = empty_bus();
+        let sprite_ptr = 0x0100usize;
+        let vstart = RENDER_VISIBLE_START_VPOS as u16 + 10;
+        let vstop = vstart + 1;
+        let (pos, ctl) = sprite_control_words(vstart, vstop, 0x0083);
+        let (moved_pos, moved_ctl) = sprite_control_words(vstart, vstop, 0x00A1);
+        write_chip_word(&mut bus, sprite_ptr, pos);
+        write_chip_word(&mut bus, sprite_ptr + 2, ctl);
+        write_chip_word(&mut bus, sprite_ptr + 4, 0x1111);
+        write_chip_word(&mut bus, sprite_ptr + 6, 0x2222);
+        write_chip_word(&mut bus, sprite_ptr + 8, 0);
+        write_chip_word(&mut bus, sprite_ptr + 10, 0);
+
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.current_frame_render_base.sprpt[0] = sprite_ptr as u32;
+        bus.agnus.vpos = RENDER_VISIBLE_START_VPOS;
+        bus.agnus.hpos = 0;
+        bus.denise.sprpt[0] = sprite_ptr as u32;
+        bus.display_dma_sprpt[0] = sprite_ptr as u32;
+
+        bus.capture_current_frame_display_start();
+
+        bus.agnus.vpos = RENDER_VISIBLE_START_VPOS + 2;
+        bus.agnus.hpos = 0;
+        assert!(!bus.write_custom_word_from(0x140, moved_pos, BeamWriteSource::Copper));
+        assert!(!bus.write_custom_word_from(0x142, moved_ctl, BeamWriteSource::Copper));
+
+        bus.agnus.vpos = vstart as u32;
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].sprite, 0);
+        assert_eq!(lines[0].beam_y, vstart as i32);
+        assert_eq!(lines[0].hstart, 0x00A1);
+        assert_eq!(lines[0].data, 0x1111);
+        assert_eq!(lines[0].datb, 0x2222);
+    }
+
+    #[test]
     fn sprite_dma_capture_treats_zero_pointer_as_chip_address() {
         let mut bus = empty_bus();
         let (pos, ctl) = sprite_control_words(0x2C, 0x2D, 0x0083);
@@ -15501,6 +16036,7 @@ mod tests {
                 display_x - 2,
                 display_x,
                 Some(0),
+                0,
             ),
             0
         );
@@ -15514,6 +16050,7 @@ mod tests {
                 display_x,
                 display_x + 2,
                 Some(0),
+                0,
             ) & (1 << 5),
             0
         );
@@ -15561,6 +16098,7 @@ mod tests {
                 0,
                 2,
                 None,
+                0,
             ),
             0
         );
@@ -15572,6 +16110,7 @@ mod tests {
                 0,
                 2,
                 Some(2),
+                0,
             ),
             0
         );
@@ -15583,8 +16122,148 @@ mod tests {
                 0,
                 2,
                 Some(0),
+                0,
             ) & (1 << 9),
             1 << 9
+        );
+    }
+
+    #[test]
+    fn live_sprite_sprite_clxdat_skips_already_latched_bits() {
+        let control = LiveCollisionControl::from_current(
+            0x1000,
+            0,
+            0,
+            0,
+            ((RENDER_VISIBLE_START_VPOS as u16) << 8) | RENDER_DIW_HSTART_FB0 as u16,
+            ((RENDER_VISIBLE_START_VPOS as u16 + 1) << 8) | 0x00C1,
+            DiwHigh::ocs_implicit(),
+            0x0038,
+            [0; 8],
+        );
+        let replay = LiveCollisionLineReplay {
+            line_start: control,
+            segments: Vec::new(),
+        };
+        let sources = [
+            LiveSpriteCollisionSource {
+                group: 0,
+                hstart: RENDER_DIW_HSTART_FB0,
+                hsub_70ns: false,
+                words: [0x8000, 0, 0, 0],
+                requires_odd_enable: false,
+            },
+            LiveSpriteCollisionSource {
+                group: 1,
+                hstart: RENDER_DIW_HSTART_FB0,
+                hsub_70ns: false,
+                words: [0x8000, 0, 0, 0],
+                requires_odd_enable: false,
+            },
+            LiveSpriteCollisionSource {
+                group: 2,
+                hstart: RENDER_DIW_HSTART_FB0,
+                hsub_70ns: false,
+                words: [0x8000, 0, 0, 0],
+                requires_odd_enable: false,
+            },
+        ];
+
+        let clxdat = live_sprite_sprite_collision_bits(
+            &sources,
+            &replay,
+            RENDER_VISIBLE_START_VPOS as i32,
+            0,
+            2,
+            Some(0),
+            1 << 9,
+        );
+
+        assert_eq!(clxdat & (1 << 9), 0);
+        assert_ne!(clxdat & (1 << 10), 0);
+        assert_ne!(clxdat & (1 << 12), 0);
+    }
+
+    #[test]
+    fn live_sprite_playfield_clxdat_skips_already_latched_bits() {
+        let display_x = live_display_window_x(0x2C81, 0x2DC1, DiwHigh::ocs_implicit()).0;
+        let row = CapturedBitplaneRow {
+            nplanes: 1,
+            words_per_row: 1,
+            planes: [
+                vec![0x8000],
+                vec![0],
+                vec![0],
+                vec![0],
+                vec![0],
+                vec![0],
+                Vec::new(),
+                Vec::new(),
+            ],
+        };
+        let control = LiveCollisionControl::from_current(
+            0x1000,
+            0,
+            0,
+            0,
+            0x2C81,
+            0x2DC1,
+            DiwHigh::ocs_implicit(),
+            0x0038,
+            [0; 8],
+        );
+        let replay = LiveCollisionLineReplay {
+            line_start: control,
+            segments: Vec::new(),
+        };
+        let source = LiveSpriteCollisionSource {
+            group: 0,
+            hstart: 0x81,
+            hsub_70ns: false,
+            words: [0x8000, 0, 0, 0],
+            requires_odd_enable: false,
+        };
+
+        let clxdat = live_sprite_playfield_collision_bits_in_range(
+            &row,
+            &[source],
+            &replay,
+            &replay,
+            RENDER_VISIBLE_START_VPOS as i32,
+            display_x,
+            display_x + 2,
+            Some(0),
+            1 << 5,
+        );
+        assert_ne!(clxdat & (1 << 1), 0);
+        assert_eq!(clxdat & (1 << 5), 0);
+        assert_eq!(
+            live_sprite_playfield_collision_bits_in_range(
+                &row,
+                &[source],
+                &replay,
+                &replay,
+                RENDER_VISIBLE_START_VPOS as i32,
+                display_x,
+                display_x + 2,
+                Some(0),
+                (1 << 1) | (1 << 5),
+            ),
+            0
+        );
+        assert_ne!(
+            live_sprite_playfield_collision_bits_in_range(
+                &row,
+                &[source],
+                &replay,
+                &replay,
+                RENDER_VISIBLE_START_VPOS as i32,
+                display_x,
+                display_x + 2,
+                Some(0),
+                1 << 1,
+            ) & (1 << 5),
+            0
         );
     }
 
@@ -15630,6 +16309,7 @@ mod tests {
                 0,
                 2,
                 None,
+                0,
             ) & (1 << 9),
             1 << 9
         );

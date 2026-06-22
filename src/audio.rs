@@ -33,7 +33,6 @@ const CPAL_BUFFER_FRAMES: usize = 131072;
 // settling into a fragile low-latency state.
 const CPAL_TARGET_BUFFER_FRAMES: usize = 6615; // ~150 ms steady lead
 const CPAL_PREBUFFER_FRAMES: usize = CPAL_TARGET_BUFFER_FRAMES;
-const CPAL_REBUFFER_THRESHOLD_FRAMES: usize = 512; // stop before the callback drains dry
 const CPAL_STALE_DROP_THRESHOLD_FRAMES: usize = 13230; // trim only past ~300 ms
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -219,23 +218,13 @@ impl CpalSink {
                         return;
                     }
                     for frame in data.chunks_mut(chans) {
-                        let (l, r) = if playback_started_for_cb.load(Ordering::Relaxed) {
-                            if live_audio_should_rebuffer(consumer.occupied_len()) {
-                                resampler.reset();
-                                playback_started_for_cb.store(false, Ordering::Relaxed);
-                                (0.0, 0.0)
-                            } else {
-                                resampler.next_frame(
-                                    &mut consumer,
-                                    &underruns_for_cb,
-                                    &total_underruns_for_cb,
-                                    &playback_started_for_cb,
-                                )
-                            }
-                        } else {
-                            resampler.reset();
-                            (0.0, 0.0)
-                        };
+                        let (l, r) = next_live_audio_output_frame(
+                            &mut resampler,
+                            &mut consumer,
+                            &underruns_for_cb,
+                            &total_underruns_for_cb,
+                            &playback_started_for_cb,
+                        );
                         if chans == 1 {
                             frame[0] = 0.5 * (l + r);
                         } else {
@@ -282,6 +271,21 @@ impl CpalSink {
             last_log: Instant::now(),
             prebuffer_frames,
         })
+    }
+}
+
+fn next_live_audio_output_frame(
+    resampler: &mut CpalResampler,
+    consumer: &mut ringbuf::HeapCons<(f32, f32)>,
+    underruns: &AtomicU64,
+    total_underruns: &AtomicU64,
+    playback_started: &AtomicBool,
+) -> (f32, f32) {
+    if playback_started.load(Ordering::Relaxed) {
+        resampler.next_frame(consumer, underruns, total_underruns, playback_started)
+    } else {
+        resampler.reset();
+        (0.0, 0.0)
     }
 }
 
@@ -573,10 +577,6 @@ fn live_output_lead_seconds_for_state(
     }
 }
 
-fn live_audio_should_rebuffer(occupied_frames: usize) -> bool {
-    occupied_frames <= CPAL_REBUFFER_THRESHOLD_FRAMES
-}
-
 fn live_output_prebuffering(
     playback_started: bool,
     occupied_frames: usize,
@@ -648,6 +648,33 @@ mod tests {
     }
 
     #[test]
+    fn live_audio_output_keeps_draining_low_queue_until_actual_underrun() {
+        let rb = HeapRb::<(f32, f32)>::new(8);
+        let (mut producer, mut consumer) = rb.split();
+        producer.try_push((0.25, -0.25)).unwrap();
+        producer.try_push((0.5, -0.5)).unwrap();
+        producer.try_push((0.75, -0.75)).unwrap();
+        let underruns = AtomicU64::new(0);
+        let total_underruns = AtomicU64::new(0);
+        let playback_started = AtomicBool::new(true);
+        let mut resampler = CpalResampler::new(super::MIX_SAMPLE_RATE);
+
+        assert_eq!(
+            super::next_live_audio_output_frame(
+                &mut resampler,
+                &mut consumer,
+                &underruns,
+                &total_underruns,
+                &playback_started,
+            ),
+            (0.25, -0.25)
+        );
+        assert!(playback_started.load(Ordering::Relaxed));
+        assert_eq!(underruns.load(Ordering::Relaxed), 0);
+        assert_eq!(total_underruns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn live_audio_lead_starts_after_audible_queueing() {
         assert_eq!(
             super::live_output_lead_seconds_for_state(false, 0, 4096),
@@ -678,16 +705,6 @@ mod tests {
         assert_eq!(prebuffer_seconds, underfilled_seconds);
         assert_eq!(full_seconds, target_seconds);
         assert_eq!(overfilled_seconds, target_seconds);
-    }
-
-    #[test]
-    fn live_audio_rebuffers_before_callback_queue_runs_dry() {
-        assert!(super::live_audio_should_rebuffer(
-            super::CPAL_REBUFFER_THRESHOLD_FRAMES
-        ));
-        assert!(!super::live_audio_should_rebuffer(
-            super::CPAL_REBUFFER_THRESHOLD_FRAMES + 1
-        ));
     }
 
     #[test]
