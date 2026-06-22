@@ -1067,16 +1067,29 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
     fn sample(&self, control: ControlState, native_x: usize) -> DeniseBitplaneSample {
         let nplanes = control.nplanes().min(self.plane_words.len());
         let delays = std::array::from_fn(|plane| control.scroll_for_plane(plane));
-        self.sample_prepared(nplanes, &delays, native_x)
+        self.sample_prepared(nplanes, &delays, 0, native_x)
     }
 
     /// `sample` with the control-derived inputs hoisted out: the playfield
     /// pixel loop runs this per output pixel, so the plane count and the
     /// per-plane scroll delays are computed once per control run instead.
+    ///
+    /// `min_fetch_x` is the first fetched-pixel index that the display window
+    /// actually shows (the renderer's `native_x_offset`). When the display
+    /// window opens to the right of the DDF-derived fetch origin
+    /// (`native_x_offset > 0`, e.g. a narrow DIWSTRT), the bitplane shifter has
+    /// already clocked those leading pixels out into the left border by the
+    /// time the window opens. BPLCON1 scroll must not pull that shifted-out
+    /// pre-fetch back into view: the scrolled-in region at the window's left
+    /// edge is background, matching the standard `native_x_offset == 0` case
+    /// where `native_x < delay` already yields background. (Kickstart 3.1's
+    /// insert-disk screen leaves an uninitialised word at the bitplane base,
+    /// which would otherwise scroll a stray fleck into the top-left corner.)
     fn sample_prepared(
         &self,
         nplanes: usize,
         delays: &[usize; 8],
+        min_fetch_x: usize,
         native_x: usize,
     ) -> DeniseBitplaneSample {
         let mut idx = 0u8;
@@ -1088,6 +1101,10 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
                 continue;
             }
             let fetch_x = native_x - delay;
+            if fetch_x < min_fetch_x {
+                active = true;
+                continue;
+            }
             if fetch_x >= self.fetched_pixels {
                 continue;
             }
@@ -4229,6 +4246,10 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 export_index = Some(vec![0u8; EXPORT_W * rows]);
             }
         }
+        // Tracks the last line that actually drew bitplanes, so a line whose
+        // predecessor was border (no carried-over shifter data) can suppress
+        // the BPLCON1 scroll pulling its leading pre-fetch words into view.
+        let mut last_playfield_line: Option<usize> = None;
         for y in 0..rows {
             let row_control_segments = &control_segments[y];
             let Some((x_start, x_stop)) = line_display_window_bounds(
@@ -4443,6 +4464,8 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 &row_words[..nplanes],
                 fetched_pixels,
             );
+            let block_start = last_playfield_line != Some(y.wrapping_sub(1));
+            last_playfield_line = Some(y);
             render_planned_playfield_line(
                 &line_plan,
                 fb,
@@ -4456,6 +4479,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 row_control_segments,
                 control_segment_idx,
                 base_controls[y].bplcon1,
+                block_start,
                 visible_line0,
                 input.emulated_seconds,
                 input.emulated_frames,
@@ -4696,6 +4720,7 @@ fn render_planned_playfield_line(
     control_segments: &[ControlSegment],
     mut control_segment_idx: usize,
     base_scroll_bplcon1: u16,
+    suppress_prefetch_scroll_fill: bool,
     visible_line0: i32,
     emulated_seconds: f64,
     emulated_frames: u64,
@@ -4776,6 +4801,20 @@ fn render_planned_playfield_line(
         let pixel_fetch_start_native_x =
             pixel_control.fetch_start_native_x(pixel_diw_h_start, pixel_repeat);
         let native_x_offset = pixel_control.native_x_offset(pixel_diw_h_start, pixel_repeat);
+        // BPLCON1 scroll fills the window's left edge from the bitplane
+        // shifter. On a line whose predecessor also fetched bitplanes the
+        // shifter still holds that line's tail, so the scroll-in is real
+        // content. At the first line of a bitplane-DMA block (the previous
+        // line was border) the shifter has no carried-over data, so the scroll
+        // must not pull the leading pre-fetch words (already clocked into the
+        // left border by the time the window opens) back into view. Suppress
+        // those by treating fetch positions before `native_x_offset` as
+        // background only on a block-start line.
+        let min_fetch_x = if suppress_prefetch_scroll_fill {
+            native_x_offset
+        } else {
+            0
+        };
         let shres = pixel_control.shres();
         let (win_x_start, win_x_stop) = pixel_control.display_window_x();
         let line_visible = pixel_control.display_window_contains_line(plan.y, visible_line0);
@@ -4823,14 +4862,15 @@ fn render_planned_playfield_line(
             if ham_mode {
                 let preroll_stop = native_x.min(plan.fetched_pixels);
                 while next_ham_native_x < preroll_stop {
-                    let skipped = plan.sample_prepared(nplanes, &delays, next_ham_native_x);
+                    let skipped =
+                        plan.sample_prepared(nplanes, &delays, min_fetch_x, next_ham_native_x);
                     denise_playfield_output(sample_control, palette, skipped.idx, &mut ham_color);
                     next_ham_native_x += 1;
                 }
             }
             if !visible_sample {
                 if ham_mode {
-                    let sample = plan.sample_prepared(nplanes, &delays, native_x);
+                    let sample = plan.sample_prepared(nplanes, &delays, min_fetch_x, native_x);
                     denise_playfield_output(sample_control, palette, sample.idx, &mut ham_color);
                     next_ham_native_x = next_ham_native_x.max(native_x + 1);
                 } else if !shres {
@@ -4844,14 +4884,14 @@ fn render_planned_playfield_line(
                 continue;
             }
             let (sample, output) = if shres {
-                let left = plan.sample_prepared(nplanes, &delays, native_x);
-                let right = plan.sample_prepared(nplanes, &delays, native_x + 1);
+                let left = plan.sample_prepared(nplanes, &delays, min_fetch_x, native_x);
+                let right = plan.sample_prepared(nplanes, &delays, min_fetch_x, native_x + 1);
                 (
                     shres_composite_sample(left, right),
                     denise_shres_playfield_output(palette, left.idx, right.idx, &mut ham_color),
                 )
             } else {
-                let sample = plan.sample_prepared(nplanes, &delays, native_x);
+                let sample = plan.sample_prepared(nplanes, &delays, min_fetch_x, native_x);
                 let ham_before = ham_color;
                 let output =
                     denise_playfield_output(pixel_control, palette, sample.idx, &mut ham_color);
@@ -10626,6 +10666,7 @@ mod tests {
             &[],
             0,
             control.bplcon1,
+            false,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -10669,6 +10710,7 @@ mod tests {
             &[],
             0,
             control.bplcon1,
+            false,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -10716,6 +10758,7 @@ mod tests {
             &control_segments,
             0,
             control.bplcon1,
+            false,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -10752,6 +10795,7 @@ mod tests {
             &[],
             0,
             control.bplcon1,
+            false,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -10788,6 +10832,7 @@ mod tests {
             &[],
             0,
             control.bplcon1,
+            false,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -10824,6 +10869,7 @@ mod tests {
             &[],
             0,
             control.bplcon1,
+            false,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -10856,6 +10902,7 @@ mod tests {
             &[],
             0,
             control.bplcon1,
+            false,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
