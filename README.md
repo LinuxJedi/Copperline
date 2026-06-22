@@ -264,6 +264,9 @@ chip-bus timings against the CIA E-clock for cross-emulator comparison.
 - The public-domain `font8x8` glyphs by Daniel Hepper / Marcel Sondaar
   for the on-screen overlay font.
 - The Amiga Hardware Reference Manual for register-level documentation.
+- The [DESiRE](https://demozoo.org/groups/1077/) demo group, whose practice of
+  releasing the source code to some of their demos has been invaluable for
+  debugging Copperline's hardware modelling against real-world code.
 
 ## License
 
