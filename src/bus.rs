@@ -375,6 +375,68 @@ const BITPLANE_SLOT_PLAN_CACHE_LEN: usize = 8;
 
 type BitplaneSlotPlanCacheEntry = Option<(BitplaneSlotKey, Option<BitplaneSlotPlan>)>;
 
+struct BitplaneSlotPlanCache {
+    entries: [std::cell::Cell<BitplaneSlotPlanCacheEntry>; BITPLANE_SLOT_PLAN_CACHE_LEN],
+    next_insert: std::cell::Cell<usize>,
+    last_hit: std::cell::Cell<usize>,
+}
+
+impl BitplaneSlotPlanCache {
+    fn new() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| std::cell::Cell::new(None)),
+            next_insert: std::cell::Cell::new(0),
+            last_hit: std::cell::Cell::new(0),
+        }
+    }
+
+    fn lookup(&self, key: BitplaneSlotKey) -> Option<Option<BitplaneSlotPlan>> {
+        let last = self.last_hit.get().min(BITPLANE_SLOT_PLAN_CACHE_LEN - 1);
+        if let Some((cached_key, plan)) = self.entries[last].get() {
+            if cached_key == key {
+                return Some(plan);
+            }
+        }
+
+        for idx in 0..BITPLANE_SLOT_PLAN_CACHE_LEN {
+            if idx == last {
+                continue;
+            }
+            if let Some((cached_key, plan)) = self.entries[idx].get() {
+                if cached_key == key {
+                    self.last_hit.set(idx);
+                    return Some(plan);
+                }
+            }
+        }
+        None
+    }
+
+    fn insert(&self, key: BitplaneSlotKey, plan: Option<BitplaneSlotPlan>) {
+        let idx = self.next_insert.get() % BITPLANE_SLOT_PLAN_CACHE_LEN;
+        self.entries[idx].set(Some((key, plan)));
+        self.last_hit.set(idx);
+        self.next_insert
+            .set((idx + 1) % BITPLANE_SLOT_PLAN_CACHE_LEN);
+    }
+
+    #[cfg(test)]
+    fn entries_snapshot(&self) -> [BitplaneSlotPlanCacheEntry; BITPLANE_SLOT_PLAN_CACHE_LEN] {
+        std::array::from_fn(|idx| self.entries[idx].get())
+    }
+
+    #[cfg(test)]
+    fn last_hit_entry(&self) -> BitplaneSlotPlanCacheEntry {
+        self.entries[self.last_hit.get()].get()
+    }
+}
+
+impl Default for BitplaneSlotPlanCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 struct DisplaySpriteControl {
     vstart: i32,
@@ -713,12 +775,10 @@ pub struct Bus {
     /// Memoized bitplane fetch plans for `bitplane_slot_active_at`, keyed on
     /// the registers that feed it. The arbiter asks for bitplane ownership on
     /// every slot candidate, and mid-line fetch-shape changes can alternate
-    /// between a few valid plans. A small MRU Cell avoids recomputing the DDF
-    /// window and fetch cadence while keeping the `&self` owner-selection call
-    /// graph intact.
+    /// between a few valid plans. Per-entry Cells avoid copying the whole cache
+    /// on each hit while keeping the `&self` owner-selection call graph intact.
     #[serde(skip)]
-    bitplane_slot_plan_cache:
-        std::cell::Cell<[BitplaneSlotPlanCacheEntry; BITPLANE_SLOT_PLAN_CACHE_LEN]>,
+    bitplane_slot_plan_cache: BitplaneSlotPlanCache,
     bus_accounting: BusAccounting,
     /// Latches once BEAMCON0.DUAL (A2024/UHRES) is first seen set, so the
     /// "not emulated" warning is logged a single time, not per write.
@@ -1591,7 +1651,7 @@ impl Bus {
             bitplane_dmacon_delay: None,
             bitplane_bplcon0_delay: None,
             bitplane_ddfstart_miss: None,
-            bitplane_slot_plan_cache: std::cell::Cell::new([None; BITPLANE_SLOT_PLAN_CACHE_LEN]),
+            bitplane_slot_plan_cache: BitplaneSlotPlanCache::new(),
             bus_accounting: BusAccounting::from_env(),
             uhres_dual_warned: false,
             dbg_ext_cck_x100: external_access_cck_x100_setting(),
@@ -5725,22 +5785,11 @@ impl Bus {
             fmode: self.agnus.fmode(),
             harddis: self.harddis_active(),
         };
-        let mut cache = self.bitplane_slot_plan_cache.get();
-        for idx in 0..BITPLANE_SLOT_PLAN_CACHE_LEN {
-            if let Some((cached_key, plan)) = cache[idx] {
-                if cached_key == key {
-                    if idx != 0 {
-                        cache[..=idx].rotate_right(1);
-                        self.bitplane_slot_plan_cache.set(cache);
-                    }
-                    return plan;
-                }
-            }
+        if let Some(plan) = self.bitplane_slot_plan_cache.lookup(key) {
+            return plan;
         }
         let plan = self.compute_bitplane_slot_plan(&key);
-        cache.rotate_right(1);
-        cache[0] = Some((key, plan));
-        self.bitplane_slot_plan_cache.set(cache);
+        self.bitplane_slot_plan_cache.insert(key, plan);
         plan
     }
 
@@ -10031,12 +10080,14 @@ mod tests {
         }
         assert!(bus.bitplane_slot_plan_for_bplcon0(shapes[0]).is_some());
 
-        let cache = bus.bitplane_slot_plan_cache.get();
+        let cache = bus.bitplane_slot_plan_cache.entries_snapshot();
         let keys = shapes.map(|bplcon0| bitplane_slot_plan_bplcon0_key(bplcon0, false));
         assert_eq!(
-            cache[0].map(|(key, _)| key.bplcon0),
+            bus.bitplane_slot_plan_cache
+                .last_hit_entry()
+                .map(|(key, _)| key.bplcon0),
             Some(keys[0]),
-            "a cache hit should promote the reused fetch shape to MRU"
+            "a cache hit should become the next lookup fast path without moving entries"
         );
         for key in keys {
             assert!(
