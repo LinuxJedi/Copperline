@@ -464,8 +464,12 @@ pub fn effective_bitplane_ddf_start_hpos(bplcon0: u16, raw: u16) -> u16 {
     }
 }
 
-pub fn effective_bitplane_ddf_stop_hpos(_bplcon0: u16, raw: u16) -> u16 {
-    raw & 0x00FC
+pub fn effective_bitplane_ddf_stop_hpos(bplcon0: u16, raw: u16) -> u16 {
+    if bitplane_hires_like_ddf(bplcon0) {
+        raw & 0x00FC
+    } else {
+        raw & 0x00F8
+    }
 }
 
 pub fn effective_bitplane_ddf_window(
@@ -1730,10 +1734,14 @@ mod tests {
     }
 
     #[test]
-    fn lores_ddfstop_bit_two_extends_partial_fetch_unit() {
+    fn lores_ddfstop_uses_fetch_block_granularity() {
         assert_eq!(
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x004A, 0x00B6, false),
-            15
+            14
+        );
+        assert_eq!(
+            bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0064, 0x00A5, false),
+            9
         );
     }
 

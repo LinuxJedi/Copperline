@@ -2670,11 +2670,22 @@ impl Bus {
     }
 
     /// CPU INTENA/INTREQ writes change Paula's mask/latch state, but they are
-    /// not new asynchronous interrupt-source edges. Keep the delayed-bit state
-    /// coherent without hiding an already-latched source again; real recognition
-    /// latency is armed where Paula/CIA/blitter sources assert.
+    /// usually not new asynchronous interrupt-source edges. Keep the delayed-bit
+    /// state coherent without hiding an already-latched source again; real
+    /// recognition latency is armed where Paula/CIA/blitter sources assert.
+    ///
+    /// PORTS is level-fed by CIA-A/Gayle-style INT2 sources and is left visible
+    /// immediately when software unmasks an already-latched level. Other newly
+    /// exposed sources still represent a freshly-present CPU IPL input and pass
+    /// through interrupt recognition.
     fn note_irq_latches_changed(&mut self) {
         let pending = self.current_enabled_irq_sources();
+        let newly = pending & !self.irq_latency_last_pending;
+        let delayed = newly & !INT_PORTS;
+        if delayed != 0 && self.irq_latency_setting != 0 {
+            self.irq_latency_mask |= delayed;
+            self.irq_latency_cck = self.irq_latency_setting;
+        }
         self.irq_latency_mask &= pending;
         self.irq_latency_last_pending = pending;
     }
@@ -6500,9 +6511,8 @@ impl Bus {
         if sprite >= 8 {
             return;
         }
-        let pair_slot_hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[sprite / 2];
         let state = self.display_dma_sprite_state[sprite];
-        if hpos > pair_slot_hpos && state.control.is_some() && !state.data_dma_active {
+        if state.control.is_some() && !state.data_dma_active {
             self.display_dma_sprite_state[sprite] = DisplaySpriteDmaState::default();
             return;
         }
@@ -8011,8 +8021,12 @@ fn effective_ddf_start_hpos_raw(bplcon0: u16, raw: u16) -> u16 {
     }
 }
 
-fn effective_ddf_stop_hpos(_bplcon0: u16, raw: u16) -> u16 {
-    raw & 0x00FC
+fn effective_ddf_stop_hpos(bplcon0: u16, raw: u16) -> u16 {
+    if bitplane_hires_like_ddf(bplcon0) {
+        raw & 0x00FC
+    } else {
+        raw & 0x00F8
+    }
 }
 
 fn effective_ddf_start_hpos(bplcon0: u16, raw: u16) -> u16 {
@@ -10383,12 +10397,16 @@ mod tests {
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x003C, 0x0040, false),
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0038, 0x0040, false)
         );
-        // Low-res DDFSTOP bit 2 is still inside the fetch-unit span: $B6
-        // extends through the $B4 unit, yielding the 30-byte row expected by
-        // five interleaved bitplanes.
+        // Low-res DDF comparators resolve to the 8-CCK fetch block grid; bit 2
+        // is ignored for both start and stop. The sequencer still completes the
+        // final block selected by that effective stop.
         assert_eq!(
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x004A, 0x00B6, false),
-            15
+            14
+        );
+        assert_eq!(
+            bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0064, 0x00A5, false),
+            9
         );
         // Hires DDF has 4-cck granularity: the start's low bits shift the
         // window by half a fetch unit. The sequencer still runs whole 8-cck
@@ -10656,7 +10674,38 @@ mod tests {
     }
 
     #[test]
-    fn intena_unmasks_latched_source_without_new_recognition_delay() {
+    fn intena_unmasks_latched_ports_source_without_new_recognition_delay() {
+        let mut bus = empty_bus();
+        bus.irq_latency_setting = 65;
+        bus.paula.intreq = INT_PORTS;
+
+        assert!(!bus.custom_write(0x09A, 2, u64::from(0x8000 | INT_MASTER | INT_PORTS)));
+
+        assert_ne!(bus.paula.intena & INT_MASTER, 0);
+        assert_ne!(bus.cpu_visible_intreq() & INT_PORTS, 0);
+        assert_eq!(bus.irq_latency_mask & INT_PORTS, 0);
+        assert_eq!(bus.irq_latency_last_pending & INT_PORTS, INT_PORTS);
+    }
+
+    #[test]
+    fn intena_unmask_of_latched_exter_arms_recognition_delay() {
+        let mut bus = empty_bus();
+        bus.irq_latency_setting = 65;
+        bus.paula.intreq = INT_EXTER;
+
+        assert!(!bus.custom_write(0x09A, 2, u64::from(0x8000 | INT_MASTER | INT_EXTER)));
+
+        assert_ne!(bus.paula.intena & INT_MASTER, 0);
+        assert_eq!(bus.cpu_visible_intreq() & INT_EXTER, 0);
+        assert_eq!(bus.irq_latency_mask & INT_EXTER, INT_EXTER);
+        assert_eq!(bus.irq_latency_last_pending & INT_EXTER, INT_EXTER);
+
+        bus.advance_chipset(65);
+        assert_ne!(bus.cpu_visible_intreq() & INT_EXTER, 0);
+    }
+
+    #[test]
+    fn intena_unmask_of_latched_vertb_arms_recognition_delay() {
         let mut bus = empty_bus();
         bus.irq_latency_setting = 65;
         bus.paula.intreq = INT_VERTB;
@@ -10664,9 +10713,12 @@ mod tests {
         assert!(!bus.custom_write(0x09A, 2, u64::from(0x8000 | INT_MASTER | INT_VERTB)));
 
         assert_ne!(bus.paula.intena & INT_MASTER, 0);
-        assert_ne!(bus.cpu_visible_intreq() & INT_VERTB, 0);
-        assert_eq!(bus.irq_latency_mask & INT_VERTB, 0);
+        assert_eq!(bus.cpu_visible_intreq() & INT_VERTB, 0);
+        assert_eq!(bus.irq_latency_mask & INT_VERTB, INT_VERTB);
         assert_eq!(bus.irq_latency_last_pending & INT_VERTB, INT_VERTB);
+
+        bus.advance_chipset(65);
+        assert_ne!(bus.cpu_visible_intreq() & INT_VERTB, 0);
     }
 
     #[test]
@@ -13948,30 +14000,31 @@ mod tests {
     }
 
     #[test]
-    fn sprite_pointer_write_before_vstart_retargets_latched_control_data_fetch() {
+    fn inactive_sprite_pointer_write_before_pair_slot_seeds_next_descriptor_fetch() {
         let mut bus = empty_bus();
-        let control_ptr = 0x0100usize;
-        let data_ptr = 0x0200usize;
-        let (pos, ctl) = sprite_control_words(0x2C, 0x30, 0x0083);
-        write_chip_word(&mut bus, control_ptr, pos);
-        write_chip_word(&mut bus, control_ptr + 2, ctl);
-        write_chip_word(&mut bus, control_ptr + 4, 0x1111);
-        write_chip_word(&mut bus, control_ptr + 6, 0x2222);
-        write_chip_word(&mut bus, data_ptr, 0xAAAA);
-        write_chip_word(&mut bus, data_ptr + 2, 0xBBBB);
-        write_chip_word(&mut bus, data_ptr + 4, 0xCCCC);
-        write_chip_word(&mut bus, data_ptr + 6, 0xDDDD);
+        let old_ptr = 0x0100usize;
+        let new_ptr = 0x0200usize;
+        let (old_pos, old_ctl) = sprite_control_words(0x2C, 0x30, 0x0083);
+        let (new_pos, new_ctl) = sprite_control_words(0x2C, 0x30, 0x00A1);
+        write_chip_word(&mut bus, old_ptr, old_pos);
+        write_chip_word(&mut bus, old_ptr + 2, old_ctl);
+        write_chip_word(&mut bus, old_ptr + 4, 0x1111);
+        write_chip_word(&mut bus, old_ptr + 6, 0x2222);
+        write_chip_word(&mut bus, new_ptr, new_pos);
+        write_chip_word(&mut bus, new_ptr + 2, new_ctl);
+        write_chip_word(&mut bus, new_ptr + 4, 0xAAAA);
+        write_chip_word(&mut bus, new_ptr + 6, 0xBBBB);
 
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
-        bus.denise.sprpt[0] = control_ptr as u32;
-        bus.display_dma_sprpt[0] = control_ptr as u32;
+        bus.denise.sprpt[0] = old_ptr as u32;
+        bus.display_dma_sprpt[0] = old_ptr as u32;
         bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
-        bus.current_frame_render_base.sprpt[0] = control_ptr as u32;
+        bus.current_frame_render_base.sprpt[0] = old_ptr as u32;
 
         bus.agnus.vpos = 0x24;
         bus.agnus.hpos = 0;
-        let _ = bus.write_custom_word_from(0x120, (data_ptr >> 16) as u16, BeamWriteSource::Copper);
-        let _ = bus.write_custom_word_from(0x122, data_ptr as u16, BeamWriteSource::Copper);
+        let _ = bus.write_custom_word_from(0x120, (new_ptr >> 16) as u16, BeamWriteSource::Copper);
+        let _ = bus.write_custom_word_from(0x122, new_ptr as u16, BeamWriteSource::Copper);
 
         bus.agnus.vpos = 0x2C;
         bus.agnus.hpos = 0;
@@ -13984,7 +14037,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].sprite, 0);
         assert_eq!(lines[0].beam_y, 0x2C);
-        assert_eq!(lines[0].hstart, 0x0083);
+        assert_eq!(lines[0].hstart, 0x00A1);
         assert_eq!(lines[0].data, 0xAAAA);
         assert_eq!(lines[0].datb, 0xBBBB);
     }
