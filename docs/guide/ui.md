@@ -103,7 +103,9 @@ tool window or overlay.
   extended ROM). The machine then cold-resets, as if the chip had been
   swapped and the power cycled.
 - **Keyboard Shortcuts**: the shortcut reference.
-- **About**: app version plus a summary of the emulated machine.
+- **About**: app version plus a summary of the emulated machine. Builds
+  made from an untagged git commit append the short commit ID to the version
+  shown in the window title and About panel.
 
 ```{figure} ../images/ui-preview-shortcuts.png
 :alt: The keyboard shortcuts window

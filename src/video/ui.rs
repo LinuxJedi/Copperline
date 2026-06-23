@@ -888,7 +888,7 @@ fn draw_about(frame: &mut [u8], rect: Rect, view: &AboutView, scale: usize) {
     let mut y = rect.y + TITLE_H + 14;
     draw_panel_text(frame, cx(title, 3), y, title, PANEL_TEXT_HILIGHT, 3, scale);
     y += 30;
-    let version = concat!("version ", env!("CARGO_PKG_VERSION"));
+    let version = concat!("version ", env!("COPPERLINE_DISPLAY_VERSION"));
     draw_panel_text(frame, cx(version, 1), y, version, PANEL_TEXT_DIM, 1, scale);
     y += 14;
     let tagline = "A cycle-stepped Amiga emulator";
