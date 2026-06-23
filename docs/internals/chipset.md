@@ -23,11 +23,12 @@ granularity than the unit in hi-res/super-hi-res and wide-FMODE modes, so
 a DDFSTOP landing mid-unit extends the fetch through the unit starting
 at-or-after it (`agnus::bitplane_fetch_blocks`; the CDTV trademark
 screen's hi-res $64/$A8 window fetches 20 words per row, not the truncated
-18). Lo-res OCS DDFSTRT and DDFSTOP are both rounded to the 8-CCK
-fetch-block grid before the whole-unit completion rule is applied: bit 2 of
-DDFSTOP does not select an extra low-res block, so a $4A/$B6 window fetches
-14 words per row and a $64/$A5 window fetches 9. Wide-FMODE units (16/32 CCK)
-use the same rule rather than moving DDFSTRT down to an absolute grid. In
+18). Lo-res OCS DDFSTRT is anchored on the 8-CCK fetch-block grid, but
+DDFSTOP keeps its 4-CCK precision before the whole-unit completion rule is
+applied: bit 2 of DDFSTOP can select the next low-res block, so a $4A/$B6
+window fetches 15 words per row, a $64/$A5 window fetches 10, and a
+$28/$D4 window fetches 23. Wide-FMODE units (16/32 CCK) use the same rule
+rather than moving DDFSTRT down to an absolute grid. In
 lo-res, the plane-order slots for a wide unit are packed into the unit's
 first eight CCKs; the remaining CCKs are free for other bus users. If a
 bitplane fetch block occupies sprite 7's late DMA slot at $30, sprite 7 DMA

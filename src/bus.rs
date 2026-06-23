@@ -8392,11 +8392,8 @@ fn effective_ddf_start_hpos_raw(bplcon0: u16, raw: u16) -> u16 {
 }
 
 fn effective_ddf_stop_hpos(bplcon0: u16, raw: u16) -> u16 {
-    if bitplane_hires_like_ddf(bplcon0) {
-        raw & 0x00FC
-    } else {
-        raw & 0x00F8
-    }
+    let _ = bplcon0;
+    raw & 0x00FC
 }
 
 fn effective_ddf_start_hpos(bplcon0: u16, raw: u16) -> u16 {
@@ -11187,16 +11184,20 @@ mod tests {
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x003C, 0x0040, false),
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0038, 0x0040, false)
         );
-        // Low-res DDF comparators resolve to the 8-CCK fetch block grid; bit 2
-        // is ignored for both start and stop. The sequencer still completes the
-        // final block selected by that effective stop.
+        // Low-res DDFSTRT resolves to the 8-CCK fetch block grid, but DDFSTOP
+        // keeps 4-CCK precision. A stop in the second half of a low-res block
+        // selects the next block, and the sequencer still completes it.
         assert_eq!(
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x004A, 0x00B6, false),
-            14
+            15
         );
         assert_eq!(
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0064, 0x00A5, false),
-            9
+            10
+        );
+        assert_eq!(
+            bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0028, 0x00D4, false),
+            23
         );
         // Hires DDF has 4-cck granularity: the start's low bits shift the
         // window by half a fetch unit. The sequencer still runs whole 8-cck

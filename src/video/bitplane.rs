@@ -6215,11 +6215,8 @@ fn effective_ddf_start_hpos_raw(hires: bool, raw: u16) -> u16 {
 }
 
 fn effective_ddf_stop_hpos(hires: bool, raw: u16) -> u16 {
-    if hires {
-        raw & 0x00FC
-    } else {
-        raw & 0x00F8
-    }
+    let _ = hires;
+    raw & 0x00FC
 }
 
 fn effective_ddf_start_hpos(hires: bool, raw: u16) -> u16 {
@@ -7841,14 +7838,21 @@ mod tests {
             ddfstop: 0x00B6,
             ..blank_state()
         };
-        assert_eq!(lores_partial_stop.words_per_row(false, 320), 14);
+        assert_eq!(lores_partial_stop.words_per_row(false, 320), 15);
 
         let lores_odd_stop = RenderState {
             ddfstrt: 0x0064,
             ddfstop: 0x00A5,
             ..blank_state()
         };
-        assert_eq!(lores_odd_stop.words_per_row(false, 320), 9);
+        assert_eq!(lores_odd_stop.words_per_row(false, 320), 10);
+
+        let lores_second_half_stop = RenderState {
+            ddfstrt: 0x0028,
+            ddfstop: 0x00D4,
+            ..blank_state()
+        };
+        assert_eq!(lores_second_half_stop.words_per_row(false, 320), 23);
 
         let ecs_equal = RenderState {
             agnus_revision: AgnusRevision::Ecs8372Rev4,
