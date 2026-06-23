@@ -3,7 +3,9 @@
 Press `Cmd+B` on macOS or `Alt+B` on Linux/Windows (or pick **Debugger**
 from the status-bar menu) to pause the machine and open the debugger
 tool window alongside the emulated display. Closing it restores the pause
-state from before it opened.
+state from before it opened. The debugger and frame analyzer are independent
+tool windows, so both can stay open while you compare CPU/chipset state with
+the captured bus trace.
 Everything the debugger shows comes from
 side-effect-free peeks -- inspecting memory or registers never disturbs the
 emulated machine -- and stepping drives the same cycle-exact core as normal
@@ -94,10 +96,10 @@ the register state the beam will replay.
 
 Pick **Frame Analyzer...** from the status-bar menu to pause the machine and
 open the chip-bus frame analyzer in a separate tool window, leaving the
-normal emulated display visible in the main window. The analyzer shows the
-whole captured Agnus beam frame, not just the TV-presented display. The trace
-includes vertical and horizontal overscan, blanking, and the visible display
-window.
+normal emulated display visible in the main window. It can remain open next
+to the debugger window. The analyzer shows the whole captured Agnus beam
+frame, not just the TV-presented display. The trace includes vertical and
+horizontal overscan, blanking, and the visible display window.
 
 The main heatmap is indexed by beam position: X is `hpos` colour clocks and Y
 is `vpos` lines. Each cell records the chip-bus owner for that colour clock:
@@ -106,11 +108,12 @@ white outline marks the framebuffer display area that Copperline captured for
 presentation. Register-write markers show CPU, Copper, and interrupt-time
 custom-register writes at their beam positions.
 
-Click the heatmap to select a beam slot. The lower strip expands that selected
-scanline, so horizontal DMA contention in overscan is easier to inspect. The
-right-hand counters summarize total colour clocks per owner, the percentage
-of busy-blitter time that the blitter actually received, and which owners
-consumed cycles while the blitter was waiting.
+Click or drag across the heatmap to select a beam slot. The cursor keys nudge
+the selector one colour clock or line at a time. The lower strip expands that
+selected scanline, so horizontal DMA contention in overscan is easier to
+inspect. The right-hand counters summarize total colour clocks per owner, the
+percentage of busy-blitter time that the blitter actually received, and which
+owners consumed cycles while the blitter was waiting.
 
 The pane has the same transport rhythm as the debugger:
 

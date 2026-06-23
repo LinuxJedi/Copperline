@@ -159,6 +159,7 @@ fn debug_tab_label(tab: DebugTab) -> &'static str {
 }
 
 /// Interactive state of the debugger sub-window.
+#[derive(Clone)]
 pub struct DebuggerPanel {
     pub tab: DebugTab,
     /// Base address of the Memory tab's hex dump.
@@ -205,6 +206,7 @@ impl Default for DebuggerPanel {
 }
 
 /// Interactive state of the frame analyzer pane.
+#[derive(Clone)]
 pub struct FrameAnalyzerPanel {
     pub selected_vpos: u16,
     pub selected_hpos: u16,
@@ -886,7 +888,7 @@ fn draw_about(frame: &mut [u8], rect: Rect, view: &AboutView, scale: usize) {
     let mut y = rect.y + TITLE_H + 14;
     draw_panel_text(frame, cx(title, 3), y, title, PANEL_TEXT_HILIGHT, 3, scale);
     y += 30;
-    let version = concat!("version ", env!("CARGO_PKG_VERSION"));
+    let version = concat!("version ", env!("COPPERLINE_DISPLAY_VERSION"));
     draw_panel_text(frame, cx(version, 1), y, version, PANEL_TEXT_DIM, 1, scale);
     y += 14;
     let tagline = "A cycle-stepped Amiga emulator";
@@ -1254,6 +1256,85 @@ fn draw_outline(frame: &mut [u8], rect: Rect, color: u32, scale: usize) {
     );
 }
 
+fn clipped_rect(rect: Rect, clip: Rect) -> Option<Rect> {
+    let x0 = rect.x.max(clip.x);
+    let y0 = rect.y.max(clip.y);
+    let x1 = rect
+        .x
+        .saturating_add(rect.w)
+        .min(clip.x.saturating_add(clip.w));
+    let y1 = rect
+        .y
+        .saturating_add(rect.h)
+        .min(clip.y.saturating_add(clip.h));
+    (x1 > x0 && y1 > y0).then(|| Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
+}
+
+fn fill_rect_clipped(frame: &mut [u8], rect: Rect, clip: Rect, color: u32, scale: usize) {
+    if let Some(rect) = clipped_rect(rect, clip) {
+        fill_rect(frame, scale_rect(rect, scale), color, scale);
+    }
+}
+
+fn draw_outline_clipped(frame: &mut [u8], rect: Rect, clip: Rect, color: u32, scale: usize) {
+    if rect.w == 0 || rect.h == 0 {
+        return;
+    }
+    fill_rect_clipped(
+        frame,
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: 1,
+        },
+        clip,
+        color,
+        scale,
+    );
+    fill_rect_clipped(
+        frame,
+        Rect {
+            x: rect.x,
+            y: rect.y + rect.h.saturating_sub(1),
+            w: rect.w,
+            h: 1,
+        },
+        clip,
+        color,
+        scale,
+    );
+    fill_rect_clipped(
+        frame,
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            w: 1,
+            h: rect.h,
+        },
+        clip,
+        color,
+        scale,
+    );
+    fill_rect_clipped(
+        frame,
+        Rect {
+            x: rect.x + rect.w.saturating_sub(1),
+            y: rect.y,
+            w: 1,
+            h: rect.h,
+        },
+        clip,
+        color,
+        scale,
+    );
+}
+
 fn trace_x(rect: Rect, hpos: usize, cols: usize) -> usize {
     rect.x + (hpos.min(cols.saturating_sub(1)) * rect.w / cols.max(1))
 }
@@ -1313,31 +1394,27 @@ fn draw_owner_heatmap(frame: &mut [u8], rect: Rect, trace: &AnalyzerTraceView, s
     for marker in trace.markers.iter().take(80) {
         let x = trace_x(rect, marker.hpos as usize, trace.cols);
         let y = trace_y(rect, marker.vpos as usize, trace.rows);
-        fill_rect(
+        fill_rect_clipped(
             frame,
-            scale_rect(
-                Rect {
-                    x: x.saturating_sub(1),
-                    y,
-                    w: 3,
-                    h: 1,
-                },
-                scale,
-            ),
+            Rect {
+                x: x.saturating_sub(1),
+                y,
+                w: 3,
+                h: 1,
+            },
+            rect,
             PANEL_TEXT_ACCENT,
             scale,
         );
-        fill_rect(
+        fill_rect_clipped(
             frame,
-            scale_rect(
-                Rect {
-                    x,
-                    y: y.saturating_sub(1),
-                    w: 1,
-                    h: 3,
-                },
-                scale,
-            ),
+            Rect {
+                x,
+                y: y.saturating_sub(1),
+                w: 1,
+                h: 3,
+            },
+            rect,
             PANEL_TEXT_ACCENT,
             scale,
         );
@@ -1345,7 +1422,7 @@ fn draw_owner_heatmap(frame: &mut [u8], rect: Rect, trace: &AnalyzerTraceView, s
 
     let sx = trace_x(rect, trace.selected_hpos, trace.cols);
     let sy = trace_y(rect, trace.selected_vpos, trace.rows);
-    draw_outline(
+    draw_outline_clipped(
         frame,
         Rect {
             x: sx.saturating_sub(3),
@@ -1353,6 +1430,7 @@ fn draw_owner_heatmap(frame: &mut [u8], rect: Rect, trace: &AnalyzerTraceView, s
             w: 7,
             h: 7,
         },
+        rect,
         PANEL_TEXT_HILIGHT,
         scale,
     );
@@ -2028,6 +2106,64 @@ mod tests {
         assert_eq!(wrapped.concat(), long_word);
         // Empty input still yields one (blank) line.
         assert_eq!(wrap_text("", 32, 31), vec![String::new()]);
+    }
+
+    #[test]
+    fn frame_analyzer_top_edge_overlays_clip_to_raster() {
+        use super::super::window::{texture_height, texture_width};
+
+        let scale = 1;
+        let (w, h) = (texture_width(scale), texture_height(scale));
+        let mut frame = vec![0u8; w * h * 4];
+        let raster = Rect {
+            x: 20,
+            y: 20,
+            w: 40,
+            h: 20,
+        };
+        let trace = AnalyzerTraceView {
+            frame: 1,
+            seconds: 0.0,
+            rows: 4,
+            cols: 4,
+            line_cck: 4,
+            visible_start_vpos: 0,
+            visible_lines: 2,
+            display_hpos_start: 0,
+            display_hpos_end: 4,
+            owner_cck: [0; 9],
+            blitter_busy_cck: 0,
+            blitter_starve_cck: [0; 9],
+            partial: false,
+            selected_vpos: 0,
+            selected_hpos: 0,
+            selected_owner: "idle",
+            selected_owner_code: b'.',
+            owners: vec![b'.'; 16],
+            markers: vec![AnalyzerMarker {
+                vpos: 0,
+                hpos: 1,
+                label: "copper v=000 h=001 $096=0000".to_string(),
+            }],
+        };
+
+        draw_owner_heatmap(&mut frame, raster, &trace, scale);
+
+        let pixel = |frame: &[u8], x: usize, y: usize| -> [u8; 4] {
+            frame[(y * w + x) * 4..(y * w + x) * 4 + 4]
+                .try_into()
+                .unwrap()
+        };
+        for x in raster.x - 4..raster.x + raster.w + 4 {
+            assert_eq!(pixel(&frame, x, raster.y - 1), [0, 0, 0, 0]);
+        }
+        for y in raster.y..raster.y + raster.h {
+            assert_eq!(pixel(&frame, raster.x - 1, y), [0, 0, 0, 0]);
+        }
+        assert_eq!(
+            pixel(&frame, raster.x, raster.y),
+            BUTTON_EDGE_LIGHT.to_le_bytes()
+        );
     }
 
     #[test]

@@ -347,7 +347,7 @@ const CAMERA_LENS: u32 = rgba(20, 22, 24);
 const STATUS_TEXT: u32 = rgba(174, 170, 154);
 const VOLUME_FILL: u32 = rgba(44, 178, 94);
 const VOLUME_FILL_HIGHLIGHT: u32 = rgba(128, 244, 150);
-const WINDOW_TITLE: &str = concat!("Copperline ", env!("CARGO_PKG_VERSION"));
+const WINDOW_TITLE: &str = concat!("Copperline ", env!("COPPERLINE_DISPLAY_VERSION"));
 const COPPERLINE_LOGO_PNG: &[u8] = include_bytes!("../../assets/brand/copperline-logo.png");
 const COPPERLINE_ICON_PNG: &[u8] = include_bytes!("../../assets/brand/copperline-icon.png");
 const MOUSE_MOTION_SCALE: f64 = 1.0;
@@ -434,7 +434,10 @@ pub struct App {
     present_fb: Vec<u32>,
     present_rows: usize,
     render: Option<Render>,
-    tool_window: Option<ToolWindow>,
+    debugger_tool_window: Option<ToolWindow>,
+    frame_analyzer_tool_window: Option<ToolWindow>,
+    debugger_panel: Option<ui::DebuggerPanel>,
+    frame_analyzer_panel: Option<ui::FrameAnalyzerPanel>,
     render_worker: Option<RenderWorker>,
     render_recycle_fb: Vec<u32>,
     cpu_halted: bool,
@@ -487,6 +490,9 @@ pub struct App {
     cursor_pos: Option<(i32, i32)>,
     last_display_cursor_pos: Option<(i32, i32)>,
     volume_dragging: bool,
+    /// True while the frame analyzer selector is following a held left
+    /// mouse button.
+    analyzer_dragging: bool,
     mouse_captured: bool,
     mouse_delta_remainder: (f64, f64),
     last_rendered_emulated_frame: Option<u64>,
@@ -523,8 +529,9 @@ pub struct App {
     last_gamepad_active: bool,
     /// Mapped host keys currently held for keyboard joystick emulation.
     keyboard_joy_held: KeyboardJoystickHeld,
-    /// Pop-up menu and overlay sub-window (about/debugger/calibration)
-    /// state. While a panel is open it consumes pointer and key input.
+    /// Pop-up menu and main-window overlay state. Debugger and frame
+    /// analyzer panes live in separate tool-window state so they can be
+    /// open at the same time.
     ui: UiState,
     /// Emulated-machine summary lines for the About window.
     about_machine_lines: Vec<String>,
@@ -599,6 +606,12 @@ struct ToolWindow {
     pixels: Pixels<'static>,
     texture_scale: usize,
     cursor_pos: Option<(i32, i32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPanelKind {
+    Debugger,
+    FrameAnalyzer,
 }
 
 struct RenderJob {
@@ -721,7 +734,10 @@ impl App {
             present_fb: vec![0u32; FB_WIDTH * OUT_HEIGHT],
             present_rows: OUT_HEIGHT,
             render: None,
-            tool_window: None,
+            debugger_tool_window: None,
+            frame_analyzer_tool_window: None,
+            debugger_panel: None,
+            frame_analyzer_panel: None,
             render_worker,
             render_recycle_fb: Vec::new(),
             cpu_halted: false,
@@ -754,6 +770,7 @@ impl App {
             cursor_pos: None,
             last_display_cursor_pos: None,
             volume_dragging: false,
+            analyzer_dragging: false,
             mouse_captured: false,
             mouse_delta_remainder: (0.0, 0.0),
             last_rendered_emulated_frame: None,
@@ -1129,8 +1146,8 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        if Some(window_id) == self.tool_window_id() {
-            self.handle_tool_window_event(event_loop, event);
+        if let Some(kind) = self.tool_window_kind(window_id) {
+            self.handle_tool_window_event(event_loop, kind, event);
             return;
         }
         if self
@@ -1154,7 +1171,7 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if repeat {
+                if repeat && !self.ui_key_accepts_repeat(None, code) {
                     return;
                 }
                 match (code, state) {
@@ -1190,7 +1207,7 @@ impl ApplicationHandler for App {
                     {
                         // Capturing the mouse under an open menu/panel would
                         // hide the cursor the panel needs.
-                        if !self.ui.active() {
+                        if !self.modal_ui_active() {
                             self.toggle_mouse_capture()
                         }
                     }
@@ -1198,7 +1215,7 @@ impl ApplicationHandler for App {
                         if host_shortcut_modifier_pressed(self.modifiers) =>
                     {
                         self.toggle_debugger();
-                        self.ensure_tool_window_for_current_panel(event_loop);
+                        self.ensure_tool_windows_for_open_panels(event_loop);
                     }
                     (KeyCode::KeyJ, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers) =>
@@ -1224,7 +1241,7 @@ impl ApplicationHandler for App {
                         // Open panels are modal: key presses must not leak
                         // into the emulated machine. Releases still pass so
                         // a key held across opening a panel is not stuck.
-                        if pressed && self.ui.panel.is_some() {
+                        if pressed && self.modal_ui_active() {
                             return;
                         }
                         if self.handle_keyboard_joystick_key(other, pressed) {
@@ -1252,7 +1269,7 @@ impl ApplicationHandler for App {
                     // While a menu/panel is open, the host cursor is
                     // operating the UI; don't feed its motion to the
                     // emulated mouse underneath.
-                    if self.ui.active() {
+                    if self.modal_ui_active() {
                         self.last_display_cursor_pos = None;
                     } else {
                         self.track_uncaptured_cursor_motion(pos);
@@ -1276,6 +1293,7 @@ impl ApplicationHandler for App {
                 self.cursor_pos = None;
                 self.last_display_cursor_pos = None;
                 self.volume_dragging = false;
+                self.analyzer_dragging = false;
                 let layout = bar_layout(&self.media_bar());
                 if bar_hover_changed(&layout, previous_cursor_pos, self.cursor_pos) {
                     self.request_redraw();
@@ -1283,21 +1301,30 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(false) => {
                 self.volume_dragging = false;
+                self.analyzer_dragging = false;
                 self.set_mouse_captured(false);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
-                if button == MouseButton::Left && !pressed && self.volume_dragging {
-                    self.volume_dragging = false;
-                    return;
+                if button == MouseButton::Left {
+                    if pressed {
+                        self.analyzer_dragging = false;
+                    } else {
+                        let was_volume_dragging = self.volume_dragging;
+                        self.volume_dragging = false;
+                        self.analyzer_dragging = false;
+                        if was_volume_dragging {
+                            return;
+                        }
+                    }
                 }
-                if pressed && !self.mouse_captured && self.ui.active() {
+                if pressed && !self.mouse_captured && self.modal_ui_active() {
                     if button == MouseButton::Left {
                         if let Some(control) =
                             self.cursor_pos.and_then(|p| self.main_ui_control_at(p))
                         {
                             self.activate_ui_control(control);
-                            self.ensure_tool_window_for_current_panel(event_loop);
+                            self.ensure_tool_windows_for_open_panels(event_loop);
                             return;
                         }
                     }
@@ -1396,12 +1423,7 @@ impl ApplicationHandler for App {
                 let warp = !self.emu.paced();
                 let recording = self.recorder.is_some();
                 let input_recording = self.input_recorder.is_some();
-                let panel_in_tool_window = self.tool_window.is_some();
-                let ui_data = if panel_in_tool_window {
-                    None
-                } else {
-                    self.build_panel_view_data()
-                };
+                let ui_data = self.build_panel_view_data();
                 if let Some(r) = self.render.as_mut() {
                     let frame = r.pixels.frame_mut();
                     copy_present_frame(&self.present_fb, self.present_rows, frame, r.texture_scale);
@@ -1414,35 +1436,17 @@ impl ApplicationHandler for App {
                     if let Some(text) = &osd {
                         draw_osd(frame, text, r.texture_scale);
                     }
-                    if panel_in_tool_window {
-                        let main_ui = UiState {
-                            menu_open: self.ui.menu_open,
-                            panel: None,
-                        };
-                        ui::draw(
-                            frame,
-                            r.texture_scale,
-                            &main_ui,
-                            ui_hover,
-                            None,
-                            warp,
-                            recording,
-                            input_recording,
-                            self.joystick_input_mode,
-                        );
-                    } else {
-                        ui::draw(
-                            frame,
-                            r.texture_scale,
-                            &self.ui,
-                            ui_hover,
-                            ui_data.as_ref(),
-                            warp,
-                            recording,
-                            input_recording,
-                            self.joystick_input_mode,
-                        );
-                    }
+                    ui::draw(
+                        frame,
+                        r.texture_scale,
+                        &self.ui,
+                        ui_hover,
+                        ui_data.as_ref(),
+                        warp,
+                        recording,
+                        input_recording,
+                        self.joystick_input_mode,
+                    );
                     if let Err(e) = r.pixels.render() {
                         error!("pixels.render: {e}");
                     }
@@ -1526,7 +1530,7 @@ impl ApplicationHandler for App {
             // A breakpoint/watchpoint hit pauses the machine and brings
             // the debugger window up with the reason.
             self.surface_debug_stop();
-            self.ensure_tool_window_for_current_panel(event_loop);
+            self.ensure_tool_windows_for_open_panels(event_loop);
         }
         let now = Instant::now();
         // While powered off, leave the parked test screen in place; the
@@ -4169,6 +4173,7 @@ impl App {
             return;
         };
         self.volume_dragging = false;
+        self.analyzer_dragging = false;
 
         if captured {
             match window
@@ -4274,7 +4279,7 @@ impl App {
     }
 
     fn main_ui_control_at(&self, pos: (i32, i32)) -> Option<UiControl> {
-        if self.tool_window.is_some() && !self.ui.menu_open {
+        if self.ui.panel.is_none() && self.tool_panel_open() && !self.ui.menu_open {
             return None;
         }
         self.ui.control_at(pos)
@@ -4289,29 +4294,108 @@ impl App {
             != current.and_then(|pos| self.main_ui_control_at(pos))
     }
 
-    fn tool_panel_control_at(&self, pos: (i32, i32)) -> Option<UiControl> {
-        self.ui
-            .panel
+    fn tool_panel_open(&self) -> bool {
+        self.debugger_panel.is_some() || self.frame_analyzer_panel.is_some()
+    }
+
+    fn modal_ui_active(&self) -> bool {
+        self.ui.active() || self.tool_panel_open()
+    }
+
+    fn tool_window(&self, kind: ToolPanelKind) -> Option<&ToolWindow> {
+        match kind {
+            ToolPanelKind::Debugger => self.debugger_tool_window.as_ref(),
+            ToolPanelKind::FrameAnalyzer => self.frame_analyzer_tool_window.as_ref(),
+        }
+    }
+
+    fn tool_window_mut(&mut self, kind: ToolPanelKind) -> Option<&mut ToolWindow> {
+        match kind {
+            ToolPanelKind::Debugger => self.debugger_tool_window.as_mut(),
+            ToolPanelKind::FrameAnalyzer => self.frame_analyzer_tool_window.as_mut(),
+        }
+    }
+
+    fn tool_window_slot(&mut self, kind: ToolPanelKind) -> &mut Option<ToolWindow> {
+        match kind {
+            ToolPanelKind::Debugger => &mut self.debugger_tool_window,
+            ToolPanelKind::FrameAnalyzer => &mut self.frame_analyzer_tool_window,
+        }
+    }
+
+    fn tool_panel_for_kind(&self, kind: ToolPanelKind) -> Option<Panel> {
+        match kind {
+            ToolPanelKind::Debugger => self
+                .debugger_panel
+                .as_ref()
+                .map(|panel| Panel::Debugger(panel.clone())),
+            ToolPanelKind::FrameAnalyzer => self
+                .frame_analyzer_panel
+                .as_ref()
+                .map(|panel| Panel::FrameAnalyzer(panel.clone())),
+        }
+    }
+
+    fn tool_panel_control_at(&self, kind: ToolPanelKind, pos: (i32, i32)) -> Option<UiControl> {
+        self.tool_panel_for_kind(kind)
             .as_ref()
             .and_then(|panel| ui::panel_control_at(panel, pos))
     }
 
     fn tool_hover_changed(
         &self,
+        kind: ToolPanelKind,
         previous: Option<(i32, i32)>,
         current: Option<(i32, i32)>,
     ) -> bool {
-        previous.and_then(|pos| self.tool_panel_control_at(pos))
-            != current.and_then(|pos| self.tool_panel_control_at(pos))
+        previous.and_then(|pos| self.tool_panel_control_at(kind, pos))
+            != current.and_then(|pos| self.tool_panel_control_at(kind, pos))
     }
 
-    fn tool_window_id(&self) -> Option<WindowId> {
-        self.tool_window.as_ref().map(|tool| tool.window.id())
+    fn tool_window_kind(&self, window_id: WindowId) -> Option<ToolPanelKind> {
+        [
+            (ToolPanelKind::Debugger, self.debugger_tool_window.as_ref()),
+            (
+                ToolPanelKind::FrameAnalyzer,
+                self.frame_analyzer_tool_window.as_ref(),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(kind, tool)| {
+            tool.is_some_and(|tool| tool.window.id() == window_id)
+                .then_some(kind)
+        })
     }
 
-    fn handle_tool_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+    fn ui_key_accepts_repeat(&self, kind: Option<ToolPanelKind>, code: KeyCode) -> bool {
+        kind == Some(ToolPanelKind::FrameAnalyzer)
+            && matches!(
+                code,
+                KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::ArrowUp | KeyCode::ArrowDown
+            )
+    }
+
+    fn activate_analyzer_pick_at(&mut self, kind: ToolPanelKind, pos: (i32, i32)) -> bool {
+        if kind != ToolPanelKind::FrameAnalyzer {
+            return false;
+        }
+        let control = self.tool_panel_control_at(kind, pos);
+        let Some(UiControl::AnalyzerPick { x, y, scanline }) = control else {
+            return false;
+        };
+        self.frame_analyzer_select(x, y, scanline);
+        self.request_redraw();
+        true
+    }
+
+    fn handle_tool_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        kind: ToolPanelKind,
+        event: WindowEvent,
+    ) {
         match event {
-            WindowEvent::CloseRequested => self.close_panel(),
+            WindowEvent::CloseRequested => self.close_tool_panel(kind),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -4322,12 +4406,14 @@ impl App {
                     },
                 ..
             } => {
-                if repeat || state != ElementState::Pressed {
+                if state != ElementState::Pressed
+                    || (repeat && !self.ui_key_accepts_repeat(Some(kind), code))
+                {
                     return;
                 }
                 if code == KeyCode::KeyQ && host_shortcut_modifier_pressed(self.modifiers) {
                     event_loop.exit();
-                } else if !self.ui_handle_key(code) {
+                } else if !self.ui_handle_tool_key(kind, code) {
                     self.request_redraw();
                 }
             }
@@ -4335,68 +4421,86 @@ impl App {
                 self.modifiers = modifiers.state();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let previous = self.tool_window.as_ref().and_then(|tool| tool.cursor_pos);
-                let pos = self.tool_window.as_ref().and_then(|tool| {
+                let previous = self.tool_window(kind).and_then(|tool| tool.cursor_pos);
+                let pos = self.tool_window(kind).and_then(|tool| {
                     cursor_texture_position(&tool.pixels, position, tool.texture_scale)
                 });
-                if let Some(tool) = self.tool_window.as_mut() {
+                if let Some(tool) = self.tool_window_mut(kind) {
                     tool.cursor_pos = pos;
                 }
-                if self.tool_hover_changed(previous, pos) {
+                if kind == ToolPanelKind::FrameAnalyzer && self.analyzer_dragging {
+                    if let Some(pos) = pos {
+                        self.activate_analyzer_pick_at(kind, pos);
+                    }
+                }
+                if self.tool_hover_changed(kind, previous, pos) {
                     self.request_redraw();
                 }
             }
             WindowEvent::CursorLeft { .. } => {
-                let previous = self.tool_window.as_ref().and_then(|tool| tool.cursor_pos);
-                if let Some(tool) = self.tool_window.as_mut() {
+                let previous = self.tool_window(kind).and_then(|tool| tool.cursor_pos);
+                if let Some(tool) = self.tool_window_mut(kind) {
                     tool.cursor_pos = None;
                 }
-                if self.tool_hover_changed(previous, None) {
+                if kind == ToolPanelKind::FrameAnalyzer {
+                    self.analyzer_dragging = false;
+                }
+                if self.tool_hover_changed(kind, previous, None) {
                     self.request_redraw();
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if state != ElementState::Pressed || button != MouseButton::Left {
+                if button != MouseButton::Left {
                     return;
                 }
+                if state != ElementState::Pressed {
+                    if kind == ToolPanelKind::FrameAnalyzer {
+                        self.analyzer_dragging = false;
+                    }
+                    return;
+                }
+                if kind == ToolPanelKind::FrameAnalyzer {
+                    self.analyzer_dragging = false;
+                }
                 let control = self
-                    .tool_window
-                    .as_ref()
+                    .tool_window(kind)
                     .and_then(|tool| tool.cursor_pos)
-                    .and_then(|pos| self.tool_panel_control_at(pos));
+                    .and_then(|pos| self.tool_panel_control_at(kind, pos));
                 if let Some(control) = control {
-                    self.activate_ui_control(control);
-                    self.ensure_tool_window_for_current_panel(event_loop);
+                    if kind == ToolPanelKind::FrameAnalyzer {
+                        self.analyzer_dragging = matches!(control, UiControl::AnalyzerPick { .. });
+                    }
+                    self.activate_tool_control(kind, control);
+                    self.ensure_tool_windows_for_open_panels(event_loop);
                 }
             }
             WindowEvent::Resized(size) => {
-                if let Some(tool) = self.tool_window.as_mut() {
+                if let Some(tool) = self.tool_window_mut(kind) {
                     let _ = tool
                         .pixels
                         .resize_surface(size.width.max(1), size.height.max(1));
                 }
                 self.request_redraw();
             }
-            WindowEvent::RedrawRequested => self.draw_tool_window(),
+            WindowEvent::RedrawRequested => self.draw_tool_window(kind),
             _ => {}
         }
     }
 
-    fn draw_tool_window(&mut self) {
-        let Some(panel) = self.ui.panel.as_ref() else {
-            self.tool_window = None;
+    fn draw_tool_window(&mut self, kind: ToolPanelKind) {
+        let Some(panel) = self.tool_panel_for_kind(kind) else {
+            *self.tool_window_slot(kind) = None;
             return;
         };
-        let ui_data = self.build_panel_view_data();
+        let ui_data = self.build_tool_panel_view_data(kind);
         let hover = self
-            .tool_window
-            .as_ref()
+            .tool_window(kind)
             .and_then(|tool| tool.cursor_pos)
-            .and_then(|pos| ui::panel_control_at(panel, pos));
-        if let Some(tool) = self.tool_window.as_mut() {
+            .and_then(|pos| ui::panel_control_at(&panel, pos));
+        if let Some(tool) = self.tool_window_mut(kind) {
             let frame = tool.pixels.frame_mut();
             frame.fill(0);
-            ui::draw_panel_layer(frame, tool.texture_scale, panel, hover, ui_data.as_ref());
+            ui::draw_panel_layer(frame, tool.texture_scale, &panel, hover, ui_data.as_ref());
             if let Err(e) = tool.pixels.render() {
                 error!("tool pixels.render: {e}");
             }
@@ -4456,34 +4560,50 @@ impl App {
             }
             UiControl::CalSave => self.save_calibration(),
             UiControl::DebugTab(tab) => {
-                if let Some(Panel::Debugger(panel)) = self.ui.panel.as_mut() {
+                if let Some(panel) = self.debugger_panel.as_mut() {
                     panel.tab = tab;
                 }
             }
-            UiControl::DebugRun => self.debugger_toggle_run(),
-            UiControl::DebugStep => self.debugger_step(),
-            UiControl::DebugStepFrame => self.debugger_step_frame(),
-            UiControl::DebugRunTo => self.debugger_run_to(),
-            UiControl::DebugReverseStep => self.debugger_reverse_step(),
-            UiControl::DebugReverseFrame => self.debugger_reverse_frame(),
-            UiControl::DebugReverseRun => self.debugger_reverse_continue(),
-            UiControl::DebugMemPrev => self.debugger_mem_page(-1),
-            UiControl::DebugMemNext => self.debugger_mem_page(1),
+            UiControl::DebugRun => self.activate_tool_control(ToolPanelKind::Debugger, control),
+            UiControl::DebugStep => self.activate_tool_control(ToolPanelKind::Debugger, control),
+            UiControl::DebugStepFrame => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
+            }
+            UiControl::DebugRunTo => self.activate_tool_control(ToolPanelKind::Debugger, control),
+            UiControl::DebugReverseStep => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
+            }
+            UiControl::DebugReverseFrame => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
+            }
+            UiControl::DebugReverseRun => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
+            }
+            UiControl::DebugMemPrev => self.activate_tool_control(ToolPanelKind::Debugger, control),
+            UiControl::DebugMemNext => self.activate_tool_control(ToolPanelKind::Debugger, control),
             UiControl::DebugEntry => {
-                if let Some(Panel::Debugger(panel)) = self.ui.panel.as_mut() {
+                if let Some(panel) = self.debugger_panel.as_mut() {
                     panel.entry_active = true;
                 }
             }
-            UiControl::DebugBreakToggle => self.debugger_toggle_breakpoint(),
-            UiControl::DebugWatchToggle => self.debugger_toggle_watchpoint(),
-            UiControl::DebugRegToggle => self.debugger_toggle_reg_watch(),
-            UiControl::DebugBreaksClear => {
-                self.emu.machine.ui_breaks_clear();
-                self.last_debug_stop = None;
-                self.show_osd("Cleared all breakpoints and watchpoints");
+            UiControl::DebugBreakToggle => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
             }
-            UiControl::AnalyzerRun => self.frame_analyzer_toggle_run(),
-            UiControl::AnalyzerFrame => self.frame_analyzer_step_frame(),
+            UiControl::DebugWatchToggle => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
+            }
+            UiControl::DebugRegToggle => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
+            }
+            UiControl::DebugBreaksClear => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
+            }
+            UiControl::AnalyzerRun => {
+                self.activate_tool_control(ToolPanelKind::FrameAnalyzer, control)
+            }
+            UiControl::AnalyzerFrame => {
+                self.activate_tool_control(ToolPanelKind::FrameAnalyzer, control)
+            }
             UiControl::AnalyzerPick { x, y, scanline } => {
                 self.frame_analyzer_select(x, y, scanline)
             }
@@ -4491,78 +4611,177 @@ impl App {
         self.request_redraw();
     }
 
+    fn activate_tool_control(&mut self, kind: ToolPanelKind, control: UiControl) {
+        match (kind, control) {
+            (ToolPanelKind::Debugger, UiControl::PanelClose) => self.close_tool_panel(kind),
+            (ToolPanelKind::FrameAnalyzer, UiControl::PanelClose) => self.close_tool_panel(kind),
+            (ToolPanelKind::Debugger, UiControl::PanelBody)
+            | (ToolPanelKind::FrameAnalyzer, UiControl::PanelBody) => {}
+            (ToolPanelKind::Debugger, UiControl::DebugTab(tab)) => {
+                if let Some(panel) = self.debugger_panel.as_mut() {
+                    panel.tab = tab;
+                }
+            }
+            (ToolPanelKind::Debugger, UiControl::DebugRun) => self.debugger_toggle_run(),
+            (ToolPanelKind::Debugger, UiControl::DebugStep) => self.debugger_step(),
+            (ToolPanelKind::Debugger, UiControl::DebugStepFrame) => self.debugger_step_frame(),
+            (ToolPanelKind::Debugger, UiControl::DebugRunTo) => self.debugger_run_to(),
+            (ToolPanelKind::Debugger, UiControl::DebugReverseStep) => self.debugger_reverse_step(),
+            (ToolPanelKind::Debugger, UiControl::DebugReverseFrame) => {
+                self.debugger_reverse_frame()
+            }
+            (ToolPanelKind::Debugger, UiControl::DebugReverseRun) => {
+                self.debugger_reverse_continue()
+            }
+            (ToolPanelKind::Debugger, UiControl::DebugMemPrev) => self.debugger_mem_page(-1),
+            (ToolPanelKind::Debugger, UiControl::DebugMemNext) => self.debugger_mem_page(1),
+            (ToolPanelKind::Debugger, UiControl::DebugEntry) => {
+                if let Some(panel) = self.debugger_panel.as_mut() {
+                    panel.entry_active = true;
+                }
+            }
+            (ToolPanelKind::Debugger, UiControl::DebugBreakToggle) => {
+                self.debugger_toggle_breakpoint()
+            }
+            (ToolPanelKind::Debugger, UiControl::DebugWatchToggle) => {
+                self.debugger_toggle_watchpoint()
+            }
+            (ToolPanelKind::Debugger, UiControl::DebugRegToggle) => {
+                self.debugger_toggle_reg_watch()
+            }
+            (ToolPanelKind::Debugger, UiControl::DebugBreaksClear) => {
+                self.emu.machine.ui_breaks_clear();
+                self.last_debug_stop = None;
+                self.show_osd("Cleared all breakpoints and watchpoints");
+            }
+            (ToolPanelKind::FrameAnalyzer, UiControl::AnalyzerRun) => {
+                self.frame_analyzer_toggle_run()
+            }
+            (ToolPanelKind::FrameAnalyzer, UiControl::AnalyzerFrame) => {
+                self.frame_analyzer_step_frame()
+            }
+            (ToolPanelKind::FrameAnalyzer, UiControl::AnalyzerPick { x, y, scanline }) => {
+                self.frame_analyzer_select(x, y, scanline)
+            }
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
     /// Keys consumed by the open menu/panel (Escape, debugger hex entry).
     /// Returns true when the key was handled and must not reach the Amiga.
     fn ui_handle_key(&mut self, code: KeyCode) -> bool {
-        if !self.ui.active() {
+        if self.ui.active() {
+            if code == KeyCode::Escape {
+                if self.ui.menu_open {
+                    self.ui.menu_open = false;
+                    self.request_redraw();
+                } else {
+                    self.close_panel();
+                }
+                return true;
+            }
             return false;
         }
+        self.default_tool_key_kind()
+            .is_some_and(|kind| self.ui_handle_tool_key(kind, code))
+    }
+
+    fn default_tool_key_kind(&self) -> Option<ToolPanelKind> {
+        if self.debugger_panel.is_some() {
+            Some(ToolPanelKind::Debugger)
+        } else if self.frame_analyzer_panel.is_some() {
+            Some(ToolPanelKind::FrameAnalyzer)
+        } else {
+            None
+        }
+    }
+
+    fn ui_handle_tool_key(&mut self, kind: ToolPanelKind, code: KeyCode) -> bool {
         if code == KeyCode::Escape {
-            if self.ui.menu_open {
-                self.ui.menu_open = false;
-                self.request_redraw();
-            } else {
-                self.close_panel();
-            }
+            self.close_tool_panel(kind);
             return true;
         }
-        if let Some(Panel::Debugger(panel)) = self.ui.panel.as_mut() {
-            if panel.entry_active {
-                if let Some(ch) = hex_char_for_key(code) {
-                    panel.push_entry_char(ch);
+        match kind {
+            ToolPanelKind::Debugger => self.ui_handle_debugger_key(code),
+            ToolPanelKind::FrameAnalyzer => self.ui_handle_frame_analyzer_key(code),
+        }
+    }
+
+    fn ui_handle_debugger_key(&mut self, code: KeyCode) -> bool {
+        let Some(panel) = self.debugger_panel.as_mut() else {
+            return false;
+        };
+        if panel.entry_active {
+            if let Some(ch) = hex_char_for_key(code) {
+                panel.push_entry_char(ch);
+                self.request_redraw();
+                return true;
+            }
+            match code {
+                KeyCode::Backspace => {
+                    panel.backspace_entry();
                     self.request_redraw();
                     return true;
                 }
-                match code {
-                    KeyCode::Backspace => {
-                        panel.backspace_entry();
-                        self.request_redraw();
-                        return true;
-                    }
-                    KeyCode::Enter | KeyCode::NumpadEnter => {
-                        match panel.tab {
-                            ui::DebugTab::Memory => {
-                                if let Some(addr) = panel.entry_addr() {
-                                    panel.mem_addr = addr & !0xF;
-                                }
+                KeyCode::Enter | KeyCode::NumpadEnter => {
+                    match panel.tab {
+                        ui::DebugTab::Memory => {
+                            if let Some(addr) = panel.entry_addr() {
+                                panel.mem_addr = addr & !0xF;
                             }
-                            // On the CPU tab, Enter pins the disassembly to
-                            // the typed address; an empty box follows the
-                            // PC again.
-                            ui::DebugTab::Cpu => panel.disasm_addr = panel.entry_addr(),
-                            _ => {}
                         }
-                        panel.entry_active = false;
-                        self.request_redraw();
-                        return true;
+                        // On the CPU tab, Enter pins the disassembly to
+                        // the typed address; an empty box follows the PC again.
+                        ui::DebugTab::Cpu => panel.disasm_addr = panel.entry_addr(),
+                        _ => {}
                     }
-                    _ => {}
-                }
-            }
-            // Single-key transport while the entry box is not focused.
-            if !panel.entry_active {
-                let control = match code {
-                    KeyCode::KeyS => Some(UiControl::DebugStep),
-                    KeyCode::KeyF => Some(UiControl::DebugStepFrame),
-                    KeyCode::KeyR => Some(UiControl::DebugRun),
-                    _ => None,
-                };
-                if let Some(control) = control {
-                    self.activate_ui_control(control);
+                    panel.entry_active = false;
+                    self.request_redraw();
                     return true;
                 }
+                _ => {}
             }
         }
-        if matches!(self.ui.panel, Some(Panel::FrameAnalyzer(_))) {
-            let control = match code {
-                KeyCode::KeyF => Some(UiControl::AnalyzerFrame),
-                KeyCode::KeyR => Some(UiControl::AnalyzerRun),
-                _ => None,
-            };
-            if let Some(control) = control {
-                self.activate_ui_control(control);
-                return true;
-            }
+        if panel.entry_active {
+            return false;
+        }
+        let control = match code {
+            KeyCode::KeyS => Some(UiControl::DebugStep),
+            KeyCode::KeyF => Some(UiControl::DebugStepFrame),
+            KeyCode::KeyR => Some(UiControl::DebugRun),
+            _ => None,
+        };
+        if let Some(control) = control {
+            self.activate_tool_control(ToolPanelKind::Debugger, control);
+            return true;
+        }
+        false
+    }
+
+    fn ui_handle_frame_analyzer_key(&mut self, code: KeyCode) -> bool {
+        if self.frame_analyzer_panel.is_none() {
+            return false;
+        }
+        let control = match code {
+            KeyCode::KeyF => Some(UiControl::AnalyzerFrame),
+            KeyCode::KeyR => Some(UiControl::AnalyzerRun),
+            _ => None,
+        };
+        if let Some(control) = control {
+            self.activate_tool_control(ToolPanelKind::FrameAnalyzer, control);
+            return true;
+        }
+        let delta = match code {
+            KeyCode::ArrowLeft => Some((-1, 0)),
+            KeyCode::ArrowRight => Some((1, 0)),
+            KeyCode::ArrowUp => Some((0, -1)),
+            KeyCode::ArrowDown => Some((0, 1)),
+            _ => None,
+        };
+        if let Some((dhpos, dvpos)) = delta {
+            self.frame_analyzer_move_selection(dhpos, dvpos);
+            return true;
         }
         false
     }
@@ -4570,8 +4789,8 @@ impl App {
     /// Open the debugger window (pausing the machine), or close it again
     /// if it is already open (the host shortcut toggle).
     fn toggle_debugger(&mut self) {
-        if matches!(self.ui.panel, Some(Panel::Debugger(_))) {
-            self.close_panel();
+        if self.debugger_panel.is_some() {
+            self.close_tool_panel(ToolPanelKind::Debugger);
         } else {
             self.ui.menu_open = false;
             self.open_debugger();
@@ -4580,13 +4799,11 @@ impl App {
     }
 
     fn open_debugger(&mut self) {
-        if !matches!(self.ui.panel, Some(Panel::Debugger(_))) {
-            if matches!(self.ui.panel, Some(Panel::FrameAnalyzer(_))) {
-                self.emu.bus_mut().set_frame_analyzer_enabled(false);
-            }
+        if self.debugger_panel.is_none() {
             // The debugger shortcut can arrive while the mouse is captured;
             // release it so the window's controls are reachable.
             self.set_mouse_captured(false);
+            self.ui.panel = None;
             self.paused_before_debugger = self.paused;
             self.paused = true;
             self.sync_live_audio_suspension();
@@ -4594,7 +4811,7 @@ impl App {
             // Start the memory view at the current program counter's
             // neighbourhood; it is usually what you came to look at.
             panel.mem_addr = self.emu.machine.pc() & 0x00FF_FFF0;
-            self.ui.panel = Some(Panel::Debugger(panel));
+            self.debugger_panel = Some(panel);
             // Arm reverse debugging so the < Step / < Run controls work. A
             // conservative interval keeps the per-snapshot serialize off the
             // critical path; captures only accrue while the machine advances
@@ -4608,29 +4825,32 @@ impl App {
         }
     }
 
-    fn tool_window_title(panel: &Panel) -> &'static str {
-        match panel {
-            Panel::Debugger(_) => "Copperline Debugger",
-            Panel::FrameAnalyzer(_) => "Copperline Frame Analyzer",
-            Panel::About => "Copperline About",
-            Panel::Shortcuts => "Copperline Keyboard Shortcuts",
-            Panel::Calibration(_) => "Copperline Gamepad Calibration",
+    fn tool_window_title(kind: ToolPanelKind) -> &'static str {
+        match kind {
+            ToolPanelKind::Debugger => "Copperline Debugger",
+            ToolPanelKind::FrameAnalyzer => "Copperline Frame Analyzer",
         }
     }
 
-    fn panel_prefers_tool_window(panel: &Panel) -> bool {
-        matches!(panel, Panel::Debugger(_) | Panel::FrameAnalyzer(_))
+    fn tool_panel_is_open(&self, kind: ToolPanelKind) -> bool {
+        match kind {
+            ToolPanelKind::Debugger => self.debugger_panel.is_some(),
+            ToolPanelKind::FrameAnalyzer => self.frame_analyzer_panel.is_some(),
+        }
     }
 
-    fn ensure_tool_window_for_current_panel(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(panel) = self.ui.panel.as_ref() else {
-            return;
-        };
-        if !Self::panel_prefers_tool_window(panel) {
+    fn ensure_tool_windows_for_open_panels(&mut self, event_loop: &ActiveEventLoop) {
+        self.ensure_tool_window_for_kind(event_loop, ToolPanelKind::Debugger);
+        self.ensure_tool_window_for_kind(event_loop, ToolPanelKind::FrameAnalyzer);
+    }
+
+    fn ensure_tool_window_for_kind(&mut self, event_loop: &ActiveEventLoop, kind: ToolPanelKind) {
+        if !self.tool_panel_is_open(kind) {
+            *self.tool_window_slot(kind) = None;
             return;
         }
-        let title = Self::tool_window_title(panel);
-        if let Some(tool) = self.tool_window.as_ref() {
+        let title = Self::tool_window_title(kind);
+        if let Some(tool) = self.tool_window(kind) {
             tool.window.set_title(title);
             tool.window.request_redraw();
             return;
@@ -4665,7 +4885,7 @@ impl App {
             texture_width(texture_scale),
             texture_height(texture_scale)
         );
-        self.tool_window = Some(ToolWindow {
+        *self.tool_window_slot(kind) = Some(ToolWindow {
             window,
             pixels,
             texture_scale,
@@ -4675,14 +4895,14 @@ impl App {
     }
 
     fn open_frame_analyzer(&mut self) {
-        if !matches!(self.ui.panel, Some(Panel::FrameAnalyzer(_))) {
+        if self.frame_analyzer_panel.is_none() {
             self.set_mouse_captured(false);
+            self.ui.panel = None;
             self.paused_before_analyzer = self.paused;
             self.paused = true;
             self.sync_live_audio_suspension();
             self.emu.bus_mut().set_frame_analyzer_enabled(true);
-            self.ui.panel = Some(Panel::FrameAnalyzer(ui::FrameAnalyzerPanel::new()));
-            self.resize_for_active_panel();
+            self.frame_analyzer_panel = Some(ui::FrameAnalyzerPanel::new());
         }
     }
 
@@ -4706,38 +4926,71 @@ impl App {
         };
         let hpos = (usize::from(x) * trace.cols / 1024).min(trace.cols.saturating_sub(1));
         let vpos = if scanline {
-            self.ui
-                .panel
+            self.frame_analyzer_panel
                 .as_ref()
-                .and_then(|panel| match panel {
-                    Panel::FrameAnalyzer(panel) => Some(panel.selected_vpos as usize),
-                    _ => None,
-                })
+                .map(|panel| panel.selected_vpos as usize)
                 .unwrap_or(trace.visible_start_vpos as usize)
         } else {
             (usize::from(y) * trace.rows / 1024).min(trace.rows.saturating_sub(1))
         };
-        if let Some(Panel::FrameAnalyzer(panel)) = self.ui.panel.as_mut() {
+        if let Some(panel) = self.frame_analyzer_panel.as_mut() {
             panel.selected_hpos = hpos.min(u16::MAX as usize) as u16;
             panel.selected_vpos = vpos.min(u16::MAX as usize) as u16;
         }
     }
 
-    /// Close the open panel. Closing the debugger restores the pause state
-    /// from before it opened (as updated by Run/Pause used inside it).
+    fn frame_analyzer_move_selection(&mut self, dhpos: i16, dvpos: i16) {
+        let Some((max_hpos, max_vpos)) = self.emu.bus().frame_bus_trace().map(|trace| {
+            (
+                trace.cols.saturating_sub(1).min(u16::MAX as usize) as i32,
+                trace.rows.saturating_sub(1).min(u16::MAX as usize) as i32,
+            )
+        }) else {
+            return;
+        };
+        if let Some(panel) = self.frame_analyzer_panel.as_mut() {
+            let hpos =
+                (i32::from(panel.selected_hpos) + i32::from(dhpos)).clamp(0, max_hpos) as u16;
+            let vpos =
+                (i32::from(panel.selected_vpos) + i32::from(dvpos)).clamp(0, max_vpos) as u16;
+            if panel.selected_hpos != hpos || panel.selected_vpos != vpos {
+                panel.selected_hpos = hpos;
+                panel.selected_vpos = vpos;
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Close the open main-window overlay panel.
     fn close_panel(&mut self) {
-        if matches!(self.ui.panel, Some(Panel::Debugger(_))) {
-            self.paused = self.paused_before_debugger;
-            self.last_debug_stop = None;
-            self.sync_live_audio_suspension();
-        }
-        if matches!(self.ui.panel, Some(Panel::FrameAnalyzer(_))) {
-            self.paused = self.paused_before_analyzer;
-            self.emu.bus_mut().set_frame_analyzer_enabled(false);
-            self.sync_live_audio_suspension();
-        }
+        self.analyzer_dragging = false;
         self.ui.panel = None;
-        self.tool_window = None;
+        self.resize_for_active_panel();
+        self.request_redraw();
+    }
+
+    fn close_tool_panel(&mut self, kind: ToolPanelKind) {
+        match kind {
+            ToolPanelKind::Debugger => {
+                if self.debugger_panel.is_some() {
+                    self.paused = self.paused_before_debugger;
+                    self.last_debug_stop = None;
+                    self.sync_live_audio_suspension();
+                }
+                self.debugger_panel = None;
+                self.debugger_tool_window = None;
+            }
+            ToolPanelKind::FrameAnalyzer => {
+                if self.frame_analyzer_panel.is_some() {
+                    self.paused = self.paused_before_analyzer;
+                    self.emu.bus_mut().set_frame_analyzer_enabled(false);
+                    self.sync_live_audio_suspension();
+                }
+                self.analyzer_dragging = false;
+                self.frame_analyzer_panel = None;
+                self.frame_analyzer_tool_window = None;
+            }
+        }
         self.resize_for_active_panel();
         self.request_redraw();
     }
@@ -5040,7 +5293,7 @@ impl App {
     /// bounded so a never-hit address cannot wedge the UI.
     fn debugger_run_to(&mut self) {
         const RUN_TO_BUDGET: usize = 2_000_000;
-        let Some(Panel::Debugger(panel)) = self.ui.panel.as_ref() else {
+        let Some(panel) = self.debugger_panel.as_ref() else {
             return;
         };
         let Some(addr) = panel.entry_addr() else {
@@ -5185,9 +5438,7 @@ impl App {
 
     /// The debugger entry-box address, or an OSD prompt when empty.
     fn debugger_entry_addr(&mut self, what: &str) -> Option<u32> {
-        let Some(Panel::Debugger(panel)) = self.ui.panel.as_ref() else {
-            return None;
-        };
+        let panel = self.debugger_panel.as_ref()?;
         let addr = panel.entry_addr();
         if addr.is_none() {
             self.show_osd(format!("{what}: type a hex address first"));
@@ -5197,7 +5448,7 @@ impl App {
 
     /// Page the Memory tab's hex dump up or down.
     fn debugger_mem_page(&mut self, direction: i32) {
-        if let Some(Panel::Debugger(panel)) = self.ui.panel.as_mut() {
+        if let Some(panel) = self.debugger_panel.as_mut() {
             if panel.tab == ui::DebugTab::Memory {
                 let delta = ui::MEM_PAGE_BYTES;
                 panel.mem_addr = if direction < 0 {
@@ -5225,6 +5476,18 @@ impl App {
             Panel::FrameAnalyzer(panel) => Some(ui::PanelViewData::FrameAnalyzer(Box::new(
                 self.build_frame_analyzer_view(panel),
             ))),
+        }
+    }
+
+    fn build_tool_panel_view_data(&self, kind: ToolPanelKind) -> Option<ui::PanelViewData> {
+        match kind {
+            ToolPanelKind::Debugger => self
+                .debugger_panel
+                .as_ref()
+                .map(|panel| ui::PanelViewData::Debugger(self.build_debugger_view(panel))),
+            ToolPanelKind::FrameAnalyzer => self.frame_analyzer_panel.as_ref().map(|panel| {
+                ui::PanelViewData::FrameAnalyzer(Box::new(self.build_frame_analyzer_view(panel)))
+            }),
         }
     }
 
@@ -5732,7 +5995,10 @@ impl App {
         if let Some(render) = self.render.as_ref() {
             render.window.request_redraw();
         }
-        if let Some(tool) = self.tool_window.as_ref() {
+        if let Some(tool) = self.debugger_tool_window.as_ref() {
+            tool.window.request_redraw();
+        }
+        if let Some(tool) = self.frame_analyzer_tool_window.as_ref() {
             tool.window.request_redraw();
         }
     }
@@ -6611,9 +6877,9 @@ mod tests {
         take_integral_mouse_delta, texture_height, texture_width, tv_source_h_bounds,
         tv_standard_h_shift, volume_percent_from_pos, volume_slider_track_rect, BarControl,
         DriveBar, JoystickInputMode, KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar,
-        StatusBarView, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF, CD_LED_ON,
-        DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON,
-        POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
+        StatusBarView, ToolPanelKind, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF,
+        CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF,
+        HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
         STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
         TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
     };
@@ -7899,8 +8165,8 @@ mod tests {
         app.toggle_debugger();
         assert!(app.paused);
         let pc_before = app.emu.machine.pc();
-        match app.ui.panel.as_ref() {
-            Some(Panel::Debugger(panel)) => {
+        match app.debugger_panel.as_ref() {
+            Some(panel) => {
                 assert_eq!(panel.mem_addr, pc_before & 0x00FF_FFF0);
             }
             _ => panic!("debugger panel should be open"),
@@ -7912,7 +8178,7 @@ mod tests {
 
         // Run to a nearby address lands exactly there.
         let target = pc_before.wrapping_add(10);
-        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_mut() {
+        if let Some(panel) = app.debugger_panel.as_mut() {
             panel.entry = format!("{target:X}");
         }
         app.debugger_run_to();
@@ -7925,7 +8191,7 @@ mod tests {
 
         // Closing restores the pre-debugger (running) state.
         app.toggle_debugger();
-        assert!(app.ui.panel.is_none());
+        assert!(app.debugger_panel.is_none());
         assert!(!app.paused);
 
         // Run pressed inside the debugger survives closing it.
@@ -7933,8 +8199,49 @@ mod tests {
         assert!(app.paused);
         app.debugger_toggle_run();
         assert!(!app.paused);
-        app.close_panel();
+        app.close_tool_panel(ToolPanelKind::Debugger);
         assert!(!app.paused);
+    }
+
+    #[test]
+    fn debugger_and_frame_analyzer_can_stay_open_together() {
+        let mut app = test_app();
+        assert!(!app.paused);
+
+        app.open_debugger();
+        assert!(app.paused);
+        assert!(app.debugger_panel.is_some());
+        assert!(app.frame_analyzer_panel.is_none());
+
+        app.open_frame_analyzer();
+        assert!(app.paused);
+        assert!(app.debugger_panel.is_some());
+        assert!(app.frame_analyzer_panel.is_some());
+
+        app.close_tool_panel(ToolPanelKind::FrameAnalyzer);
+        assert!(app.paused, "debugger should keep the machine paused");
+        assert!(app.debugger_panel.is_some());
+        assert!(app.frame_analyzer_panel.is_none());
+
+        app.close_tool_panel(ToolPanelKind::Debugger);
+        assert!(!app.paused);
+        assert!(app.debugger_panel.is_none());
+
+        let mut app = test_app();
+        app.open_frame_analyzer();
+        assert!(app.paused);
+        app.open_debugger();
+        assert!(app.debugger_panel.is_some());
+        assert!(app.frame_analyzer_panel.is_some());
+
+        app.close_tool_panel(ToolPanelKind::Debugger);
+        assert!(app.paused, "analyzer should keep the machine paused");
+        assert!(app.debugger_panel.is_none());
+        assert!(app.frame_analyzer_panel.is_some());
+
+        app.close_tool_panel(ToolPanelKind::FrameAnalyzer);
+        assert!(!app.paused);
+        assert!(app.frame_analyzer_panel.is_none());
     }
 
     #[test]
@@ -7944,10 +8251,10 @@ mod tests {
 
         let pc = app.emu.machine.pc();
         for tab in super::ui::DEBUG_TABS {
-            if let Some(Panel::Debugger(panel)) = app.ui.panel.as_mut() {
+            if let Some(panel) = app.debugger_panel.as_mut() {
                 panel.tab = tab;
             }
-            let Some(Panel::Debugger(panel)) = app.ui.panel.as_ref() else {
+            let Some(panel) = app.debugger_panel.as_ref() else {
                 unreachable!()
             };
             let view = app.build_debugger_view(panel);
@@ -7991,7 +8298,7 @@ mod tests {
 
         // Toggle a breakpoint a few instructions ahead via the entry box.
         let target = app.emu.machine.pc().wrapping_add(8) & 0x00FF_FFFF;
-        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_mut() {
+        if let Some(panel) = app.debugger_panel.as_mut() {
             panel.tab = super::ui::DebugTab::Break;
             panel.entry = format!("{target:X}");
         }
@@ -7999,7 +8306,7 @@ mod tests {
         assert!(app.emu.machine.ui_breaks().is_breakpoint(target));
 
         // The Break tab lists it.
-        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_ref() {
+        if let Some(panel) = app.debugger_panel.as_ref() {
             let view = app.build_debugger_view(panel);
             assert!(view
                 .lines
@@ -8009,13 +8316,13 @@ mod tests {
 
         // Close the panel (machine resumes) and run a frame: the hit
         // pauses the machine at the breakpoint, before it executes.
-        app.close_panel();
+        app.close_tool_panel(ToolPanelKind::Debugger);
         assert!(!app.paused);
         app.emu.step_frame().expect("frame");
         assert!(app.surface_debug_stop());
         assert!(app.paused);
         assert_eq!(app.emu.machine.pc() & 0x00FF_FFFF, target);
-        assert!(matches!(app.ui.panel, Some(Panel::Debugger(_))));
+        assert!(app.debugger_panel.is_some());
         assert!(app
             .last_debug_stop
             .as_deref()
@@ -8028,7 +8335,7 @@ mod tests {
         assert_ne!(app.emu.machine.pc() & 0x00FF_FFFF, target);
 
         // Toggling the same address again removes the breakpoint.
-        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_mut() {
+        if let Some(panel) = app.debugger_panel.as_mut() {
             panel.entry = format!("{target:X}");
         }
         app.activate_ui_control(super::ui::UiControl::DebugBreakToggle);
@@ -8041,7 +8348,7 @@ mod tests {
         // Opening the debugger auto-arms the reverse snapshot ring.
         app.open_debugger();
         assert!(app.emu.time_travel_enabled());
-        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_ref() {
+        if let Some(panel) = app.debugger_panel.as_ref() {
             assert!(
                 app.build_debugger_view(panel).reverse_available,
                 "reverse controls should be enabled once armed"
@@ -8130,14 +8437,14 @@ mod tests {
 
         // Watch DMACON via the entry box, accepting the full address form.
         app.open_debugger();
-        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_mut() {
+        if let Some(panel) = app.debugger_panel.as_mut() {
             panel.tab = super::ui::DebugTab::Break;
             panel.entry = "DFF096".to_string();
         }
         app.activate_ui_control(super::ui::UiControl::DebugRegToggle);
         assert_eq!(app.emu.machine.ui_breaks().reg_watches, [0x096]);
         app.debugger_toggle_run();
-        app.close_panel();
+        app.close_tool_panel(ToolPanelKind::Debugger);
 
         app.emu.step_frame().expect("frame");
         assert!(app.surface_debug_stop());
@@ -8159,7 +8466,7 @@ mod tests {
 
         // Hex entry: digits accumulate, Enter commits to the memory view.
         app.open_debugger();
-        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_mut() {
+        if let Some(panel) = app.debugger_panel.as_mut() {
             panel.entry_active = true;
             panel.tab = super::ui::DebugTab::Memory;
         }
@@ -8172,13 +8479,87 @@ mod tests {
             assert!(app.ui_handle_key(key));
         }
         assert!(app.ui_handle_key(KeyCode::Enter));
-        match app.ui.panel.as_ref() {
-            Some(Panel::Debugger(panel)) => {
+        match app.debugger_panel.as_ref() {
+            Some(panel) => {
                 assert_eq!(panel.entry, "C001");
                 assert_eq!(panel.mem_addr, 0xC000);
                 assert!(!panel.entry_active);
             }
             _ => panic!("debugger panel should be open"),
+        }
+    }
+
+    #[test]
+    fn frame_analyzer_cursor_keys_move_selected_slot() {
+        let mut app = test_app();
+        app.open_frame_analyzer();
+        app.frame_analyzer_step_frame();
+        assert!(app.emu.bus().frame_bus_trace().is_some());
+        assert!(app.ui_key_accepts_repeat(Some(ToolPanelKind::FrameAnalyzer), KeyCode::ArrowRight));
+        assert!(!app.ui_key_accepts_repeat(Some(ToolPanelKind::FrameAnalyzer), KeyCode::KeyR));
+
+        let (start_hpos, start_vpos) = match app.frame_analyzer_panel.as_ref() {
+            Some(panel) => (panel.selected_hpos, panel.selected_vpos),
+            _ => panic!("frame analyzer panel should be open"),
+        };
+
+        assert!(app.ui_handle_key(KeyCode::ArrowRight));
+        assert!(app.ui_handle_key(KeyCode::ArrowDown));
+        match app.frame_analyzer_panel.as_ref() {
+            Some(panel) => {
+                assert_eq!(panel.selected_hpos, start_hpos + 1);
+                assert_eq!(panel.selected_vpos, start_vpos + 1);
+            }
+            _ => panic!("frame analyzer panel should be open"),
+        }
+
+        assert!(app.ui_handle_key(KeyCode::ArrowLeft));
+        assert!(app.ui_handle_key(KeyCode::ArrowUp));
+        match app.frame_analyzer_panel.as_ref() {
+            Some(panel) => {
+                assert_eq!(panel.selected_hpos, start_hpos);
+                assert_eq!(panel.selected_vpos, start_vpos);
+            }
+            _ => panic!("frame analyzer panel should be open"),
+        }
+
+        if let Some(panel) = app.frame_analyzer_panel.as_mut() {
+            panel.selected_hpos = 0;
+            panel.selected_vpos = 0;
+        }
+        assert!(app.ui_handle_key(KeyCode::ArrowLeft));
+        assert!(app.ui_handle_key(KeyCode::ArrowUp));
+        match app.frame_analyzer_panel.as_ref() {
+            Some(panel) => {
+                assert_eq!(panel.selected_hpos, 0);
+                assert_eq!(panel.selected_vpos, 0);
+            }
+            _ => panic!("frame analyzer panel should be open"),
+        }
+
+        let (max_hpos, max_vpos) = app
+            .emu
+            .bus()
+            .frame_bus_trace()
+            .map(|trace| {
+                (
+                    trace.cols.saturating_sub(1).min(u16::MAX as usize) as u16,
+                    trace.rows.saturating_sub(1).min(u16::MAX as usize) as u16,
+                )
+            })
+            .unwrap();
+        if let Some(panel) = app.frame_analyzer_panel.as_mut() {
+            panel.selected_hpos = max_hpos;
+            panel.selected_vpos = max_vpos;
+        }
+        assert!(app.ui_handle_key(KeyCode::ArrowRight));
+        assert!(app.ui_handle_key(KeyCode::ArrowDown));
+        match app.frame_analyzer_panel.as_ref() {
+            Some(panel) => {
+                assert_eq!(panel.selected_hpos, max_hpos);
+                assert_eq!(panel.selected_vpos, max_vpos);
+            }
+            _ => panic!("frame analyzer panel should be open"),
         }
     }
 
@@ -8201,33 +8582,33 @@ mod tests {
 
         // On the CPU tab, Enter pins the disassembly origin to the typed
         // address; an empty box follows the PC again.
-        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_mut() {
+        if let Some(panel) = app.debugger_panel.as_mut() {
             panel.entry_active = true;
             panel.entry = "FC0010".to_string();
         }
         assert!(app.ui_handle_key(KeyCode::Enter));
-        match app.ui.panel.as_ref() {
-            Some(Panel::Debugger(panel)) => {
+        match app.debugger_panel.as_ref() {
+            Some(panel) => {
                 assert_eq!(panel.disasm_addr, Some(0xFC0010));
                 let view = app.build_debugger_view(panel);
                 assert!(view.lines.iter().any(|l| l.text.starts_with("00FC0010")));
             }
             _ => panic!("debugger panel should be open"),
         }
-        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_mut() {
+        if let Some(panel) = app.debugger_panel.as_mut() {
             panel.entry_active = true;
             panel.entry.clear();
         }
         assert!(app.ui_handle_key(KeyCode::Enter));
-        match app.ui.panel.as_ref() {
-            Some(Panel::Debugger(panel)) => assert_eq!(panel.disasm_addr, None),
+        match app.debugger_panel.as_ref() {
+            Some(panel) => assert_eq!(panel.disasm_addr, None),
             _ => panic!("debugger panel should be open"),
         }
 
         // While the entry box is focused, S is a hex digit candidate, not
         // a transport key: it must not step (S is not hex, so it is just
         // swallowed by the modal panel).
-        if let Some(Panel::Debugger(panel)) = app.ui.panel.as_mut() {
+        if let Some(panel) = app.debugger_panel.as_mut() {
             panel.entry_active = true;
         }
         let pc_before = app.emu.machine.pc();

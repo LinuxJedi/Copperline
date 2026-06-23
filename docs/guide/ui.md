@@ -72,9 +72,10 @@ The pop-up menu opened from the status bar.
 
 The menu opens debugger-style tool windows and smaller overlay panels. Tool
 windows are separate native windows so the emulated display remains visible;
-overlay panels are drawn over the display. While either kind is open, key
-presses and display clicks stay in the UI instead of reaching the Amiga;
-`Esc` closes it.
+the debugger and frame analyzer can be open at the same time. Overlay panels
+are drawn over the display. While either kind is open, key presses and display
+clicks stay in the UI instead of reaching the Amiga; `Esc` closes the focused
+tool window or overlay.
 
 - **Frame Analyzer...**: pauses the machine and opens a separate diagnostic
   window showing which chip-bus owner had each Agnus colour clock across
@@ -102,7 +103,9 @@ presses and display clicks stay in the UI instead of reaching the Amiga;
   extended ROM). The machine then cold-resets, as if the chip had been
   swapped and the power cycled.
 - **Keyboard Shortcuts**: the shortcut reference.
-- **About**: app version plus a summary of the emulated machine.
+- **About**: app version plus a summary of the emulated machine. Builds
+  made from an untagged git commit append the short commit ID to the version
+  shown in the window title and About panel.
 
 ```{figure} ../images/ui-preview-shortcuts.png
 :alt: The keyboard shortcuts window
