@@ -61,6 +61,11 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.6.0" date="2026-06-23">
+      <description>
+        <p>Chip-bus frame analysis, remote GDB debugging, Linux Vulkan presentation checks, Zorro board identification, TV-visible overscan modelling, sprite and bitplane timing fixes, padded UAE-1ADF handling, and live-audio pacing improvements.</p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-06-21">
       <description>
         <p>OCS/ECS and AGA display-timing fixes, sprite and HAM replay corrections, better ADF metadata filtering, PAL ADF gap handling, live-audio pacing improvements, and additional reverse-debugger controls.</p>
