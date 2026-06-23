@@ -345,11 +345,7 @@ impl Copper {
         self.pc = address & !1;
         self.pending_first = None;
         self.skip_next_move = false;
-        self.state = if self.pc == 0 {
-            CopperState::Stopped
-        } else {
-            CopperState::Running
-        };
+        self.state = CopperState::Running;
     }
 
     pub fn stop(&mut self) {
@@ -863,23 +859,20 @@ mod tests {
     #[test]
     fn dma_fetches_one_instruction_word_per_slot() {
         let mut copper = Copper::new();
-        let chip_ram = [0x00, 0x00, 0x01, 0x80, 0x0A, 0xBC, 0xFF, 0xFF, 0xFF, 0xFE];
+        let chip_ram = [0x01, 0x80, 0x0A, 0xBC, 0x01, 0x82, 0x04, 0x56];
         copper.jump(0);
-        assert_eq!(copper.fetch_decode(&chip_ram), CopperFetch::Idle);
-
-        copper.jump(2);
         assert_eq!(
             copper.fetch_decode(&chip_ram),
             CopperFetch::FirstWord {
-                pc: 2,
+                pc: 0,
                 word: 0x0180
             }
         );
-        assert_eq!(copper.pc(), 4);
+        assert_eq!(copper.pc(), 2);
         assert_eq!(
             copper.fetch_decode(&chip_ram),
             CopperFetch::Instruction {
-                pc: 2,
+                pc: 0,
                 first: 0x0180,
                 second: 0x0ABC,
                 instruction: CopperInstruction::Move {
@@ -888,7 +881,30 @@ mod tests {
                 }
             }
         );
+        assert_eq!(copper.pc(), 4);
+
+        copper.jump(4);
+        assert_eq!(
+            copper.fetch_decode(&chip_ram),
+            CopperFetch::FirstWord {
+                pc: 4,
+                word: 0x0182
+            }
+        );
         assert_eq!(copper.pc(), 6);
+        assert_eq!(
+            copper.fetch_decode(&chip_ram),
+            CopperFetch::Instruction {
+                pc: 4,
+                first: 0x0182,
+                second: 0x0456,
+                instruction: CopperInstruction::Move {
+                    register: 0x0182,
+                    value: 0x0456
+                }
+            }
+        );
+        assert_eq!(copper.pc(), 8);
     }
 
     #[test]

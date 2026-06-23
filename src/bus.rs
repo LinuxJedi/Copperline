@@ -11404,6 +11404,28 @@ mod tests {
     }
 
     #[test]
+    fn copper_can_fetch_list_from_chip_ram_base() {
+        let mut bus = empty_bus();
+        for (pc, word) in [
+            (0x0000, 0x0180),
+            (0x0002, 0x00F0),
+            (0x0004, 0xFFFF),
+            (0x0006, 0xFFFE),
+        ] {
+            write_chip_word(&mut bus, pc, word);
+        }
+
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_COPEN;
+        bus.agnus.hpos = 0x20;
+        assert!(!bus.custom_write(0x080, 2, 0x0000));
+        assert!(!bus.custom_write(0x082, 2, 0x0000));
+        assert!(!bus.custom_write(0x088, 2, 0xFFFF));
+        bus.advance_chipset(6);
+
+        assert_eq!(bus.denise.palette[0], 0x00F0);
+    }
+
+    #[test]
     fn copper_interrupt_wait_fires_coper_at_programmed_line() {
         let mut bus = empty_bus();
         let cop1 = 0x0100usize;
