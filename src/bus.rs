@@ -3584,7 +3584,9 @@ impl Bus {
             1 => {
                 let b = (val & 0xFF) as u16;
                 let word_off = off & 0xFFE;
-                let word = if let Some(cur) = self.custom_byte_write_latch(word_off) {
+                let word = if custom_byte_write_mirrors_to_word(word_off) {
+                    (b << 8) | b
+                } else if let Some(cur) = self.custom_byte_write_latch(word_off) {
                     if off & 1 == 0 {
                         (cur & 0x00FF) | (b << 8)
                     } else {
@@ -8198,6 +8200,10 @@ impl Bus {
     }
 }
 
+fn custom_byte_write_mirrors_to_word(off: u16) -> bool {
+    matches!(off & 0xFFE, 0x02E)
+}
+
 fn bus_slots_for_cpu_access(size: usize) -> u32 {
     (size.max(1) as u32).div_ceil(2)
 }
@@ -11125,6 +11131,13 @@ mod tests {
 
         let _ = bus.custom_write(0xDFF075, 1, 0x01);
         assert_eq!(bus.blitter.bltadat, 0x8001);
+
+        // COPCON's one-bit Agnus control latch sees the mirrored byte value,
+        // so a 68000 byte bit operation such as `bset #1,COPCON` enables CDANG.
+        let _ = bus.custom_write(0xDFF02E, 1, 0x02);
+        assert_eq!(bus.agnus.copcon, 0x0002);
+        let _ = bus.custom_write(0xDFF02E, 1, 0x00);
+        assert_eq!(bus.agnus.copcon, 0x0000);
 
         // Audio registers do NOT use the addressed-lane latch: a real
         // 68000 drives a byte write onto both data-bus halves and Paula

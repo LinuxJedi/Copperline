@@ -200,6 +200,8 @@ wait for the blitter to go idle.
   `TODO.md` (`t=165s`/`t=180s` frame dumps).
 
 Copper writes to "dangerous" registers are gated by COPCON's CDANG bit.
+COPCON is a one-bit Agnus control latch; byte writes use the mirrored 68000
+byte value, so a byte bit operation such as `bset #1,COPCON` sets CDANG.
 References: HRM [Coprocessor
 Hardware](https://www.theflatnet.de/pub/cbm/amiga/AmigaDevDocs/hard_2.html).
 
