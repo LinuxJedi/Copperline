@@ -735,8 +735,8 @@ impl ControlState {
 
     fn has_valid_ddf_window(&self) -> bool {
         let hires_like = self.hires() || self.shres();
-        let start = effective_ddf_start_hpos_raw(hires_like, self.ddfstrt);
-        let stop = effective_ddf_stop_hpos(hires_like, self.ddfstop);
+        let start = effective_ddf_start_hpos_raw(self.agnus_revision, hires_like, self.ddfstrt);
+        let stop = effective_ddf_stop_hpos(self.agnus_revision, hires_like, self.ddfstop);
         (start == 0 && stop == 0)
             || effective_ddf_window(
                 self.agnus_revision,
@@ -776,14 +776,16 @@ impl ControlState {
         }
         // The displayed shifter origin moves in whole fetch gulps, matching
         // the renderer's placement (see `fetch_origin_native_shift`). This is
-        // separate from the DMA slot positions, which start at raw DDFSTRT.
-        // Each colour clock of DDF shift moves the picture two lo-res H units.
+        // separate from the DMA slot positions, which start at the
+        // revision-masked DDFSTRT comparator value. Each colour clock of DDF
+        // shift moves the picture two lo-res H units.
         let gulp = self.fetch_period() as i32;
         let align = |hpos: i32| -> i32 {
             (hpos.div_euclid(gulp) * gulp).max(BITPLANE_DDF_HARD_START as i32)
         };
         let standard_ddf = if hires_like { 0x003C } else { 0x0038 };
-        let aligned_start = align(effective_ddf_start_hpos(hires_like, self.ddfstrt) as i32);
+        let aligned_start =
+            align(effective_ddf_start_hpos(self.agnus_revision, hires_like, self.ddfstrt) as i32);
         let start_h = STANDARD_DIW_HSTART + (aligned_start - align(standard_ddf)) * 2;
         // Fetched H width: one word spans 16 lo-res, 8 hi-res, or 4 super-hi-res
         // H units, so the standard 20/40/80-word row is 320 H units wide.
@@ -823,9 +825,10 @@ impl ControlState {
         };
         // The displayed picture position is quantized to the fetch-period
         // grid (one FMODE gulp per plane). The DMA sequencer itself starts at
-        // raw DDFSTRT, but the shifter consumes data in whole 1/2/4-word
-        // gulps, so a DDFSTRT moved within one gulp changes how much tail data
-        // is fetched without necessarily moving the visible picture. With
+        // the revision-masked DDFSTRT comparator value, but the shifter
+        // consumes data in whole 1/2/4-word gulps, so a DDFSTRT moved within
+        // one gulp changes how much tail data is fetched without necessarily
+        // moving the visible picture. With
         // FMODE=0 the gulp equals the DDF granularity and nothing changes
         // (boot-screen insert-disk art is drawn for the continuous placement:
         // its negative modulos overlap rows so the hand/disk's right edge
@@ -843,10 +846,13 @@ impl ControlState {
             // fetch position is not visible.
             (hpos.div_euclid(gulp) * gulp).max(BITPLANE_DDF_HARD_START as i32)
         };
-        let ddf_native_shift =
-            (align(effective_ddf_start_hpos(self.hires() || self.shres(), self.ddfstrt) as i32)
-                - align(standard_ddf))
-                * ddf_native_scale;
+        let ddf_native_shift = (align(effective_ddf_start_hpos(
+            self.agnus_revision,
+            self.hires() || self.shres(),
+            self.ddfstrt,
+        ) as i32)
+            - align(standard_ddf))
+            * ddf_native_scale;
         // The render loop measures output pixels from the CLAMPED display
         // window start: the framebuffer cannot show anything left of
         // DIW_HSTART_FB0, so a window programmed further left (extreme
@@ -859,7 +865,11 @@ impl ControlState {
         let clamped_window_native =
             ((DIW_HSTART_FB0 - diw_h_start as i32).max(0) * 2) / pixel_repeat as i32;
         let mut origin_shift = display_native_shift - ddf_native_shift + clamped_window_native;
-        let ddf_start = effective_ddf_start_hpos(self.hires() || self.shres(), self.ddfstrt);
+        let ddf_start = effective_ddf_start_hpos(
+            self.agnus_revision,
+            self.hires() || self.shres(),
+            self.ddfstrt,
+        );
         if !self.hires()
             && !self.shres()
             && self.fetch_quantum() == 1
@@ -2402,6 +2412,7 @@ fn native_frame_width_for_control(control: ControlState) -> usize {
 
 fn bitplane_fetch_hpos_for_plane(control: ControlState, word_idx: usize, plane: usize) -> u32 {
     let start = u32::from(effective_ddf_start_hpos(
+        control.agnus_revision,
         control.hires() || control.shres(),
         control.ddfstrt,
     ));
@@ -2478,6 +2489,7 @@ fn line_fetch_plan_for_word(
     let mut plan = LineFetchPlan::empty();
     if control_segments.is_empty() {
         let start = u32::from(effective_ddf_start_hpos(
+            base_control.agnus_revision,
             base_control.hires() || base_control.shres(),
             base_control.ddfstrt,
         ));
@@ -6206,21 +6218,26 @@ fn read_chip_word_wrapping(ram: &[u8], addr: u32) -> u16 {
     u16::from_be_bytes([ram[a], ram[(a + 1) & mask]])
 }
 
-fn effective_ddf_start_hpos_raw(hires: bool, raw: u16) -> u16 {
-    if hires {
-        raw & 0x00FC
+fn ddf_register_mask(revision: AgnusRevision) -> u16 {
+    if matches!(revision, AgnusRevision::Ocs) {
+        0x00FC
     } else {
-        raw & 0x00F8
+        0x00FE
     }
 }
 
-fn effective_ddf_stop_hpos(hires: bool, raw: u16) -> u16 {
+fn effective_ddf_start_hpos_raw(revision: AgnusRevision, hires: bool, raw: u16) -> u16 {
     let _ = hires;
-    raw & 0x00FC
+    raw & ddf_register_mask(revision)
 }
 
-fn effective_ddf_start_hpos(hires: bool, raw: u16) -> u16 {
-    let start = effective_ddf_start_hpos_raw(hires, raw);
+fn effective_ddf_stop_hpos(revision: AgnusRevision, hires: bool, raw: u16) -> u16 {
+    let _ = hires;
+    raw & ddf_register_mask(revision)
+}
+
+fn effective_ddf_start_hpos(revision: AgnusRevision, hires: bool, raw: u16) -> u16 {
+    let start = effective_ddf_start_hpos_raw(revision, hires, raw);
     if start == 0 {
         0
     } else {
@@ -6236,8 +6253,8 @@ fn effective_ddf_window(
     harddis: bool,
 ) -> Option<(u16, u16)> {
     let (hard_start, hard_stop) = ddf_hard_bounds(harddis);
-    let start = effective_ddf_start_hpos_raw(hires, ddfstrt);
-    let mut stop = effective_ddf_stop_hpos(hires, ddfstop);
+    let start = effective_ddf_start_hpos_raw(revision, hires, ddfstrt);
+    let mut stop = effective_ddf_stop_hpos(revision, hires, ddfstop);
     if start == 0 || start > hard_stop {
         return None;
     }
@@ -7845,7 +7862,14 @@ mod tests {
             ddfstop: 0x00A5,
             ..blank_state()
         };
-        assert_eq!(lores_odd_stop.words_per_row(false, 320), 10);
+        assert_eq!(lores_odd_stop.words_per_row(false, 320), 9);
+
+        let lores_four_cck_start = RenderState {
+            ddfstrt: 0x0034,
+            ddfstop: 0x00D4,
+            ..blank_state()
+        };
+        assert_eq!(lores_four_cck_start.words_per_row(false, 320), 21);
 
         let lores_second_half_stop = RenderState {
             ddfstrt: 0x0028,

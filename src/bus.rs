@@ -5077,6 +5077,7 @@ impl Bus {
             VIDEO_COLLISION_TIMING_SAMPLE_RATE,
         );
         let current_control = LiveCollisionControl::from_current(
+            self.agnus.revision(),
             self.denise.bplcon0,
             self.denise.bplcon1,
             self.denise.bplcon3,
@@ -5169,6 +5170,7 @@ impl Bus {
             VIDEO_COLLISION_TIMING_SAMPLE_RATE,
         );
         let current_control = LiveCollisionControl::from_current(
+            self.agnus.revision(),
             self.denise.bplcon0,
             self.denise.bplcon1,
             self.denise.bplcon3,
@@ -5273,6 +5275,7 @@ impl Bus {
             VIDEO_COLLISION_TIMING_SAMPLE_RATE,
         );
         let current_control = LiveCollisionControl::from_current(
+            self.agnus.revision(),
             self.denise.bplcon0,
             self.denise.bplcon1,
             self.denise.bplcon3,
@@ -5362,6 +5365,7 @@ impl Bus {
         self.ensure_current_collision_sprite_index();
         let row = self.current_frame_bitplane_rows[fb_y].as_ref();
         let current_control = LiveCollisionControl::from_current(
+            self.agnus.revision(),
             self.denise.bplcon0,
             self.denise.bplcon1,
             self.denise.bplcon3,
@@ -5858,7 +5862,7 @@ impl Bus {
 
     fn record_ddfstrt_write_match_miss(&mut self, ddfstrt: u16) {
         let bplcon0 = self.effective_bitplane_bplcon0();
-        let ddfstart = u32::from(effective_ddf_hpos(bplcon0, ddfstrt));
+        let ddfstart = u32::from(effective_ddf_hpos(self.agnus.revision(), bplcon0, ddfstrt));
         if ddfstart != 0 && ddfstart == self.agnus.hpos {
             self.bitplane_ddfstart_miss = Some(BitplaneDdfStartMiss {
                 vpos: self.agnus.vpos,
@@ -8070,6 +8074,7 @@ impl Bus {
         };
         let native_samples_per_pixel = if bitplane_shres(bplcon0) { 2 } else { 1 };
         let fetch_start_native_x = live_fetch_start_native_x(
+            self.agnus.revision(),
             bplcon0,
             self.denise.diwstrt,
             self.effective_diwhigh(),
@@ -8307,10 +8312,6 @@ fn bitplane_hires(bplcon0: u16) -> bool {
     bplcon0 & 0x8000 != 0 && !bitplane_shres(bplcon0)
 }
 
-fn bitplane_hires_like_ddf(bplcon0: u16) -> bool {
-    bitplane_hires(bplcon0) || bitplane_shres(bplcon0)
-}
-
 // Capture-side twins of the agnus fetch-mode helpers (see agnus.rs).
 fn bitplane_fetch_quantum(fmode: u16) -> u32 {
     match fmode & 0x0003 {
@@ -8385,25 +8386,30 @@ fn next_chip_bus_quantum_at(hpos: u32, line_cck: u32) -> u32 {
     CHIP_BUS_SLOT_CCK.min(line_cck.saturating_sub(hpos).max(1))
 }
 
-fn effective_ddf_hpos(bplcon0: u16, raw: u16) -> u16 {
-    effective_ddf_start_hpos_raw(bplcon0, raw)
+fn effective_ddf_hpos(revision: AgnusRevision, bplcon0: u16, raw: u16) -> u16 {
+    effective_ddf_start_hpos_raw(revision, bplcon0, raw)
 }
 
-fn effective_ddf_start_hpos_raw(bplcon0: u16, raw: u16) -> u16 {
-    if bitplane_hires_like_ddf(bplcon0) {
-        raw & 0x00FC
+fn ddf_register_mask(revision: AgnusRevision) -> u16 {
+    if matches!(revision, AgnusRevision::Ocs) {
+        0x00FC
     } else {
-        raw & 0x00F8
+        0x00FE
     }
 }
 
-fn effective_ddf_stop_hpos(bplcon0: u16, raw: u16) -> u16 {
+fn effective_ddf_start_hpos_raw(revision: AgnusRevision, bplcon0: u16, raw: u16) -> u16 {
     let _ = bplcon0;
-    raw & 0x00FC
+    raw & ddf_register_mask(revision)
 }
 
-fn effective_ddf_start_hpos(bplcon0: u16, raw: u16) -> u16 {
-    let start = effective_ddf_start_hpos_raw(bplcon0, raw);
+fn effective_ddf_stop_hpos(revision: AgnusRevision, bplcon0: u16, raw: u16) -> u16 {
+    let _ = bplcon0;
+    raw & ddf_register_mask(revision)
+}
+
+fn effective_ddf_start_hpos(revision: AgnusRevision, bplcon0: u16, raw: u16) -> u16 {
+    let start = effective_ddf_start_hpos_raw(revision, bplcon0, raw);
     if start == 0 {
         0
     } else {
@@ -8419,8 +8425,8 @@ fn effective_ddf_window(
     harddis: bool,
 ) -> Option<(u16, u16)> {
     let (hard_start, hard_stop) = ddf_hard_bounds(harddis);
-    let start = effective_ddf_start_hpos_raw(bplcon0, ddfstrt);
-    let mut stop = effective_ddf_stop_hpos(bplcon0, ddfstop);
+    let start = effective_ddf_start_hpos_raw(revision, bplcon0, ddfstrt);
+    let mut stop = effective_ddf_stop_hpos(revision, bplcon0, ddfstop);
     if start == 0 || start > hard_stop {
         return None;
     }
@@ -8816,6 +8822,7 @@ fn live_manual_sprite_playfield_collision_bits_in_range(
         let control = playfield_control.control_for_x(x);
         let Some(collision) = live_bitplane_collision_pixel_at(
             row,
+            control.agnus_revision,
             control.bplcon0,
             control.bplcon1,
             control.clxcon,
@@ -9439,6 +9446,7 @@ fn live_bitplane_collision_bits_in_range(
         }
         let Some(collision) = live_bitplane_collision_pixel_at(
             row,
+            control.agnus_revision,
             control.bplcon0,
             control.bplcon1,
             control.clxcon,
@@ -9468,6 +9476,7 @@ struct LivePlayfieldCollisionPixel {
 
 #[derive(Clone, Copy)]
 struct LiveCollisionControl {
+    agnus_revision: AgnusRevision,
     bplcon0: u16,
     bplcon1: u16,
     bplcon3: u16,
@@ -9481,6 +9490,7 @@ struct LiveCollisionControl {
 
 impl LiveCollisionControl {
     fn from_current(
+        agnus_revision: AgnusRevision,
         bplcon0: u16,
         bplcon1: u16,
         bplcon3: u16,
@@ -9492,6 +9502,7 @@ impl LiveCollisionControl {
         bpldat: [u16; 8],
     ) -> Self {
         Self {
+            agnus_revision,
             bplcon0,
             bplcon1,
             bplcon3,
@@ -9506,6 +9517,7 @@ impl LiveCollisionControl {
 
     fn from_snapshot(snapshot: RenderRegisterSnapshot) -> Self {
         Self {
+            agnus_revision: snapshot.agnus_revision,
             bplcon0: snapshot.bplcon0,
             bplcon1: snapshot.bplcon1,
             bplcon3: snapshot.bplcon3,
@@ -9723,6 +9735,7 @@ fn live_sprite_playfield_collision_bits_in_range(
             }
             let Some(collision) = live_bitplane_collision_pixel_at(
                 row,
+                control.agnus_revision,
                 control.bplcon0,
                 control.bplcon1,
                 control.clxcon,
@@ -9986,6 +9999,7 @@ fn live_manual_bpl_word_collision_bits(
 
 fn live_bitplane_collision_pixel_at(
     row: &CapturedBitplaneRow,
+    agnus_revision: AgnusRevision,
     bplcon0: u16,
     bplcon1: u16,
     clxcon: u16,
@@ -10011,10 +10025,11 @@ fn live_bitplane_collision_pixel_at(
     let native_samples_per_pixel = if shres { 2 } else { 1 };
     let output_native_x =
         ((framebuffer_x - window_x_start) as usize / pixel_repeat) * native_samples_per_pixel;
-    let fetch_start_native_x = live_fetch_start_native_x(bplcon0, diwstrt, diwhigh, ddfstrt);
+    let fetch_start_native_x =
+        live_fetch_start_native_x(agnus_revision, bplcon0, diwstrt, diwhigh, ddfstrt);
     let relative_native_x = output_native_x.checked_sub(fetch_start_native_x)?;
-    let native_x =
-        relative_native_x + live_fetch_origin_native_offset(bplcon0, diwstrt, diwhigh, ddfstrt);
+    let native_x = relative_native_x
+        + live_fetch_origin_native_offset(agnus_revision, bplcon0, diwstrt, diwhigh, ddfstrt);
     let fetched_pixels = row.words_per_row * 16;
     // Collision sampling stays on the pre-AGA 6-plane decode until CLXCON2 /
     // 8-plane collisions land (plan 3.4).
@@ -10115,20 +10130,30 @@ fn live_scroll_for_plane(bplcon1: u16, plane: usize) -> usize {
     }
 }
 
-fn live_fetch_start_native_x(bplcon0: u16, diwstrt: u16, diwhigh: DiwHigh, ddfstrt: u16) -> usize {
-    (-live_fetch_origin_native_shift(bplcon0, diwstrt, diwhigh, ddfstrt)).max(0) as usize
-}
-
-fn live_fetch_origin_native_offset(
+fn live_fetch_start_native_x(
+    agnus_revision: AgnusRevision,
     bplcon0: u16,
     diwstrt: u16,
     diwhigh: DiwHigh,
     ddfstrt: u16,
 ) -> usize {
-    live_fetch_origin_native_shift(bplcon0, diwstrt, diwhigh, ddfstrt).max(0) as usize
+    (-live_fetch_origin_native_shift(agnus_revision, bplcon0, diwstrt, diwhigh, ddfstrt)).max(0)
+        as usize
+}
+
+fn live_fetch_origin_native_offset(
+    agnus_revision: AgnusRevision,
+    bplcon0: u16,
+    diwstrt: u16,
+    diwhigh: DiwHigh,
+    ddfstrt: u16,
+) -> usize {
+    live_fetch_origin_native_shift(agnus_revision, bplcon0, diwstrt, diwhigh, ddfstrt).max(0)
+        as usize
 }
 
 fn live_fetch_origin_native_shift(
+    agnus_revision: AgnusRevision,
     bplcon0: u16,
     diwstrt: u16,
     diwhigh: DiwHigh,
@@ -10154,8 +10179,9 @@ fn live_fetch_origin_native_shift(
     } else {
         2
     };
-    let ddf_native_shift =
-        (effective_ddf_start_hpos(bplcon0, ddfstrt) as i32 - standard_ddf) * ddf_native_scale;
+    let ddf_native_shift = (effective_ddf_start_hpos(agnus_revision, bplcon0, ddfstrt) as i32
+        - standard_ddf)
+        * ddf_native_scale;
     display_native_shift - ddf_native_shift
 }
 
@@ -11197,16 +11223,20 @@ mod tests {
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x003C, 0x0040, false),
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0038, 0x0040, false)
         );
-        // Low-res DDFSTRT resolves to the 8-CCK fetch block grid, but DDFSTOP
-        // keeps 4-CCK precision. A stop in the second half of a low-res block
-        // selects the next block, and the sequencer still completes it.
+        // OCS DDF registers keep 4-CCK precision. The low-res fetch
+        // sequencer still completes whole 8-CCK units, so DDFSTRT bit 2 can
+        // change the row length when DDFSTOP is aligned to the same unit.
         assert_eq!(
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x004A, 0x00B6, false),
             15
         );
         assert_eq!(
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0064, 0x00A5, false),
-            10
+            9
+        );
+        assert_eq!(
+            bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0034, 0x00D4, false),
+            21
         );
         assert_eq!(
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0028, 0x00D4, false),
@@ -16287,6 +16317,7 @@ mod tests {
             ],
         };
         let control = LiveCollisionControl::from_current(
+            AgnusRevision::Ocs,
             0x2400,
             0,
             0,
@@ -16338,6 +16369,7 @@ mod tests {
             ],
         };
         let control = LiveCollisionControl::from_current(
+            AgnusRevision::Ocs,
             0x1000,
             0,
             0,
@@ -16393,6 +16425,7 @@ mod tests {
     #[test]
     fn sprite_sprite_clxdat_waits_for_bpl1dat_display_enable() {
         let control = LiveCollisionControl::from_current(
+            AgnusRevision::Ocs,
             0x1000,
             0,
             0,
@@ -16465,6 +16498,7 @@ mod tests {
     #[test]
     fn live_sprite_sprite_clxdat_skips_already_latched_bits() {
         let control = LiveCollisionControl::from_current(
+            AgnusRevision::Ocs,
             0x1000,
             0,
             0,
@@ -16536,6 +16570,7 @@ mod tests {
             ],
         };
         let control = LiveCollisionControl::from_current(
+            AgnusRevision::Ocs,
             0x1000,
             0,
             0,
@@ -16604,6 +16639,7 @@ mod tests {
     #[test]
     fn brdsprt_bypasses_bpl1dat_display_enable_for_live_sprite_clxdat() {
         let control = LiveCollisionControl::from_current(
+            AgnusRevision::Ocs,
             BPLCON0_ECSENA | 0x1000,
             0,
             BPLCON3_BRDSPRT,
