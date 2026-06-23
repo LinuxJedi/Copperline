@@ -127,7 +127,8 @@ pub struct CliArgs {
     /// exit, without starting the emulator.
     pub calibrate_gamepad: bool,
     /// Command-line machine overrides (`--model`, `--chipset`, `--cpu`,
-    /// `--fpu`/`--no-fpu`, `--cpu-clock`, `--chip`, `--fast`, `--slow`).
+    /// `--fpu`/`--no-fpu`, `--cpu-clock`, `--chip`, `--fast`, `--slow`,
+    /// `--floppy-drives`).
     /// Applied on top of the config file (or the built-in defaults) before
     /// validation.
     pub overrides: ConfigOverrides,
@@ -324,6 +325,12 @@ where
                     args.next()
                         .ok_or_else(|| anyhow!("--slow requires a size (e.g. 0, 512K)"))?,
                 );
+            }
+            "--floppy-drives" | "--fdd-drives" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--floppy-drives requires COUNT (1-4)"))?;
+                overrides.floppy_drives = Some(parse_floppy_drive_count(&value)?);
             }
             "--click-after" => {
                 let secs: f32 = args
@@ -643,6 +650,7 @@ fn print_help() {
          --chip SIZE                    chip RAM size, e.g. 512K, 1M, 2M\n  \
          --fast SIZE                    Zorro II fast RAM size, e.g. 0, 1M, 4M, 8M\n  \
          --slow SIZE                    trapdoor slow RAM at $C00000, e.g. 0, 512K\n  \
+         --floppy-drives COUNT          wired floppy drives, 1-4 (DF0 plus externals)\n  \
          \x20                            (--model/--cpu/etc. override the config file or defaults)\n  \
          --screenshot-after SECS PATH   save a PNG to PATH after SECS emulated seconds, then exit\n  \
          --save-state-after SECS PATH   write a save state to PATH after SECS emulated seconds,\n  \
@@ -712,6 +720,18 @@ fn parse_floppy_drive_idx(s: &str, option: &str) -> Result<usize> {
     Ok(idx)
 }
 
+fn parse_floppy_drive_count(s: &str) -> Result<u8> {
+    let count: u8 = s
+        .parse()
+        .map_err(|_| anyhow!("--floppy-drives COUNT must be an integer from 1 to 4"))?;
+    if !(1..=4).contains(&count) {
+        return Err(anyhow!(
+            "--floppy-drives COUNT must be an integer from 1 to 4"
+        ));
+    }
+    Ok(count)
+}
+
 fn resolve_disk_insert_after(
     cfg: &mut Config,
     disk_insert_after: Vec<CliDiskInsert>,
@@ -719,7 +739,18 @@ fn resolve_disk_insert_after(
     let mut out = Vec::new();
     for insert in disk_insert_after {
         match insert {
-            CliDiskInsert::Explicit(spec) => out.push(spec),
+            CliDiskInsert::Explicit(spec) => {
+                if !cfg.floppy_connected[spec.drive_idx] {
+                    return Err(anyhow!(
+                        "--insert-disk-after df{} needs a connected drive; \
+                         use --floppy-drives {} or configure floppy.df{}",
+                        spec.drive_idx,
+                        spec.drive_idx + 1,
+                        spec.drive_idx
+                    ));
+                }
+                out.push(spec);
+            }
             CliDiskInsert::Configured { secs, drive_idx } => {
                 let Some(drive) = cfg.floppy.drives[drive_idx].take() else {
                     return Err(anyhow!(
@@ -913,7 +944,7 @@ fn main() -> Result<()> {
         cfg.denise_revision,
         cfg.video_standard,
         cfg.rom_path.display(),
-        cfg.floppy.drives.iter().filter(|d| d.is_some()).count()
+        cfg.floppy_connected.iter().filter(|&&connected| connected).count()
     );
 
     if matches!(cfg.chipset, Chipset::Aga) {
@@ -967,7 +998,8 @@ fn main() -> Result<()> {
         }
         None => None,
     };
-    let floppy = FloppyController::from_config(&cfg.floppy)?;
+    let mut floppy = FloppyController::from_config(&cfg.floppy)?;
+    floppy.set_connected_drives(cfg.floppy_connected);
     // Best-effort realtime-like scheduling for the latency-critical threads.
     // Resolved once here (env var overrides the config) so the audio sink can
     // promote its callback thread and the pacer thread can be raised below.
@@ -1166,7 +1198,11 @@ fn about_machine_lines(cfg: &Config) -> Vec<String> {
     if let Some(name) = cfg.rom_path.file_name() {
         lines.push(format!("ROM: {}", name.to_string_lossy()));
     }
-    let drives = cfg.floppy.drives.iter().filter(|d| d.is_some()).count();
+    let drives = cfg
+        .floppy_connected
+        .iter()
+        .filter(|&&connected| connected)
+        .count();
     lines.push(format!("Floppy drives: {drives}"));
     lines
 }
@@ -1614,6 +1650,21 @@ mod tests {
     }
 
     #[test]
+    fn floppy_drive_count_override_parses_with_alias() -> Result<()> {
+        assert_eq!(
+            parse(&["--floppy-drives", "2"])?.overrides.floppy_drives,
+            Some(2)
+        );
+        assert_eq!(
+            parse(&["--fdd-drives", "4"])?.overrides.floppy_drives,
+            Some(4)
+        );
+        let err = parse(&["--floppy-drives", "0"]).unwrap_err();
+        assert!(err.to_string().contains("from 1 to 4"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
     fn defer_disk_insert_parses_configured_drive() -> Result<()> {
         let args = parse(&["--defer-disk-insert", "10", "df0:"])?;
         assert_eq!(
@@ -1653,6 +1704,35 @@ mod tests {
             }]
         );
         Ok(())
+    }
+
+    #[test]
+    fn scheduled_disk_insert_requires_connected_drive() {
+        let mut cfg = Config::default();
+        let err = resolve_disk_insert_after(
+            &mut cfg,
+            vec![CliDiskInsert::Explicit(DiskInsertSpec {
+                secs: 10.0,
+                drive_idx: 1,
+                path: PathBuf::from("demo-disk.adf"),
+                write_protected: true,
+            })],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("connected drive"), "{err:#}");
+
+        cfg.floppy_connected[1] = true;
+        let inserts = resolve_disk_insert_after(
+            &mut cfg,
+            vec![CliDiskInsert::Explicit(DiskInsertSpec {
+                secs: 10.0,
+                drive_idx: 1,
+                path: PathBuf::from("demo-disk.adf"),
+                write_protected: true,
+            })],
+        )
+        .unwrap();
+        assert_eq!(inserts[0].drive_idx, 1);
     }
 
     #[test]
@@ -1706,6 +1786,8 @@ mod tests {
             "8M",
             "--slow",
             "512K",
+            "--floppy-drives",
+            "3",
             "--chipset",
             "AGA",
         ])?;
@@ -1716,6 +1798,7 @@ mod tests {
         assert_eq!(args.overrides.chip.as_deref(), Some("2M"));
         assert_eq!(args.overrides.fast.as_deref(), Some("8M"));
         assert_eq!(args.overrides.slow.as_deref(), Some("512K"));
+        assert_eq!(args.overrides.floppy_drives, Some(3));
         assert_eq!(args.overrides.chipset.as_deref(), Some("AGA"));
         Ok(())
     }

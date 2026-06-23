@@ -236,6 +236,17 @@ impl FloppyController {
         Ok(ctrl)
     }
 
+    pub fn set_connected_drives(&mut self, connected: [bool; 4]) {
+        for (idx, drive) in self.drives.iter_mut().enumerate().skip(1) {
+            drive.external_id = if connected[idx] {
+                STANDARD_EXTERNAL_DRIVE_ID
+            } else {
+                0
+            };
+            drive.reset_external_signal();
+        }
+    }
+
     pub fn set_dma_addr_mask(&mut self, mask: u32) {
         self.dma_addr_mask = mask | 1;
         self.dskpt &= self.dma_ptr_mask();
@@ -4019,6 +4030,26 @@ mod tests {
             STANDARD_EXTERNAL_DRIVE_ID
         );
         Ok(())
+    }
+
+    #[test]
+    fn connected_empty_external_drive_answers_standard_drive_id() {
+        let mut ctrl = FloppyController::default();
+        ctrl.set_connected_drives([true, true, false, true]);
+
+        assert!(ctrl.drive_connected(1));
+        assert!(!ctrl.disk_inserted(1));
+        assert_eq!(
+            read_external_drive_id(&mut ctrl, 1),
+            STANDARD_EXTERNAL_DRIVE_ID
+        );
+        assert!(!ctrl.drive_connected(2));
+        assert_eq!(read_external_drive_id(&mut ctrl, 2), 0);
+        assert!(ctrl.drive_connected(3));
+        assert_eq!(
+            read_external_drive_id(&mut ctrl, 3),
+            STANDARD_EXTERNAL_DRIVE_ID
+        );
     }
 
     #[test]

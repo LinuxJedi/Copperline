@@ -214,10 +214,14 @@ floppy_sounds = true
 floppy_sounds_volume = 100
 
 
-# Optional floppy drives. Missing [floppy.dfN] tables mean no disk in
-# that drive. Standard 901120-byte DD ADF images and DMS archives are
-# supported. DMS archives are decoded to ADF data at load time and are
-# always treated as write-protected.
+# Optional floppy drives. DF0 is always connected; set [floppy] drives
+# to wire empty external mechanisms as well (1-4 total drives). Missing
+# [floppy.dfN] tables mean no disk in that drive. Supported images:
+# DD ADF (901120 bytes), ADZ/gzip, DMS, UAE extended ADF, and read-only
+# SCP flux captures. DMS/gzip/SCP are always treated as write-protected.
+#
+# [floppy]
+# drives = 2
 #
 # [floppy.df0]
 # path = "Workbench.adf"

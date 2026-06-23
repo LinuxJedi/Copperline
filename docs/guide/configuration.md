@@ -43,6 +43,7 @@ range checks as the equivalent TOML fields:
 | `--chip SIZE` | `[memory] chip` | `512K`, `1M`, `2M`, ... |
 | `--fast SIZE` | `[memory] fast` | `0`, `1M`, `4M`, `8M`, ... |
 | `--slow SIZE` | `[memory] slow` | `0`, up to `512K` |
+| `--floppy-drives COUNT` | `[floppy] drives` | `1` to `4` wired drives (`DF0:` plus external drives) |
 
 For example, to boot a stock A1200 profile but with 8 MB of fast RAM and a
 faster CPU, with no config file at all:
@@ -278,15 +279,24 @@ The drive sounds are generated from scratch: motor hum with spin-up/down,
 head-step clicks for seeks and the empty-drive poll, and faint read/write
 hiss during disk DMA.
 
-## `[floppy.df0]` .. `[floppy.df3]`
+## `[floppy]` and `[floppy.df0]` .. `[floppy.df3]`
 
 ```toml
+[floppy]
+drives = 2                 # DF0 and DF1 connected; default is DF0 only
+
 [floppy.df0]
 path = "demo.adf"            # single image, or:
 # paths = ["disk1.adf", "disk2.adf"]   # swap playlist (shortcut cycles)
 write_protected = true       # default true
 # enabled = true             # implied by path/paths
 ```
+
+`drives` controls how many mechanisms are wired, from one to four. DF0 is
+the internal drive; DF1-DF3 are external drives that answer the standard
+Amiga external-drive ID protocol when connected. A configured disk image
+also connects that drive automatically, so existing configs that name
+`[floppy.df1]` .. `[floppy.df3]` keep working.
 
 Supported image formats: standard 901120-byte DD ADF, gzip-compressed
 images (ADZ), DMS archives, UAE extended ADF, and read-only SCP flux

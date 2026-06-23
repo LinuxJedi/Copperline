@@ -168,6 +168,9 @@ slow = "512K"         # A500 trapdoor RAM at $C00000, up to 512K
 revision = "OCS"      # OCS, ECS, or AGA (picks the Agnus/Denise revisions)
 video = "PAL"         # PAL or NTSC
 
+[floppy]
+# drives = 2           # wired mechanisms, 1-4; default is DF0 only
+
 [floppy.df0]
 path = "AmigaTestKit.adf"   # DD ADF / ADZ / DMS / SCP; omit for no disk
 ```

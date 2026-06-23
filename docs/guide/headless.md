@@ -70,6 +70,7 @@ deterministically:
 | `--click-after SECS BUTTON MS` | Press a mouse button (`left`/`right`/`middle`) for MS milliseconds |
 | `--joy-after SECS BUTTON MS` | Press a port-2 joystick / CD32-pad control (`up`/`down`/`left`/`right`/`red` (alias `fire`)/`blue`/`green`/`yellow`/`play`/`rwd`/`ffw`) for MS milliseconds |
 | `--mouse-after SECS DX DY` | Apply a relative port-1 mouse motion of (DX, DY) counter steps |
+| `--floppy-drives COUNT` | Connect `COUNT` floppy drives (`1` to `4`), so scheduled inserts can target empty external drives |
 | `--insert-disk-after SECS DFN PATH` | Insert a disk image into `df0`..`df3` |
 | `--defer-disk-insert SECS DFN` | Start with the configured drive empty, then insert its configured image |
 | `--script FILE` | Run scripted-input directives from a file (below) |

@@ -88,6 +88,10 @@ pub struct Config {
     /// autoconfigs on the Zorro chain and carries its own scsi.device).
     pub scsi: ScsiConfig,
     pub floppy: FloppyConfig,
+    /// Which floppy drive slots are electrically present. DF0 is the
+    /// internal drive and is always present; DF1-DF3 are external drives
+    /// that answer the standard Amiga external-drive ID protocol when true.
+    pub floppy_connected: [bool; 4],
     /// Per-drive disk-swap playlists. Entry `i` is the ordered list of
     /// image paths configured for `dfI` (via `path`/`paths` in TOML); the
     /// first entry is the boot disk. A list with two or more entries lets
@@ -544,6 +548,7 @@ impl Default for Config {
             ide: IdeConfig::default(),
             scsi: ScsiConfig::default(),
             floppy: FloppyConfig::default(),
+            floppy_connected: [true, false, false, false],
             floppy_playlists: std::array::from_fn(|_| Vec::new()),
             overscan: Overscan::Tv,
             phosphor: 0.0,
@@ -656,6 +661,7 @@ pub struct ConfigOverrides {
     pub chip: Option<String>,
     pub fast: Option<String>,
     pub slow: Option<String>,
+    pub floppy_drives: Option<u8>,
 }
 
 impl ConfigOverrides {
@@ -669,6 +675,7 @@ impl ConfigOverrides {
             && self.chip.is_none()
             && self.fast.is_none()
             && self.slow.is_none()
+            && self.floppy_drives.is_none()
     }
 
     /// Inject the set overrides into the raw config, replacing the values
@@ -697,6 +704,9 @@ impl ConfigOverrides {
         }
         if let Some(slow) = &self.slow {
             raw.memory.slow = Some(slow.clone());
+        }
+        if let Some(drives) = self.floppy_drives {
+            raw.floppy.drives = Some(drives);
         }
     }
 }
@@ -869,6 +879,9 @@ struct RawAudio {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFloppy {
+    /// Number of wired floppy drives, DF0..DFN-1. DF0 is the internal drive,
+    /// so the valid range is 1-4.
+    drives: Option<u8>,
     df0: Option<RawFloppyDrive>,
     df1: Option<RawFloppyDrive>,
     df2: Option<RawFloppyDrive>,
@@ -997,7 +1010,7 @@ impl TryFrom<RawConfig> for Config {
                 Some(v) => bail!("[audio] floppy_sounds_volume must be 0-100, got {v}"),
             },
         };
-        let (floppy, floppy_playlists) = parse_floppy(raw.floppy)?;
+        let (floppy, floppy_connected, floppy_playlists) = parse_floppy(raw.floppy)?;
         let overscan = match raw.display.overscan.as_deref() {
             None => defaults.overscan,
             Some(s) => parse_overscan(s)?,
@@ -1112,6 +1125,7 @@ impl TryFrom<RawConfig> for Config {
             ide,
             scsi,
             floppy,
+            floppy_connected,
             floppy_playlists,
             overscan,
             phosphor,
@@ -1419,9 +1433,18 @@ fn validate_slow_ram(slow: usize) -> Result<()> {
     Ok(())
 }
 
-fn parse_floppy(raw: RawFloppy) -> Result<(FloppyConfig, [Vec<PathBuf>; 4])> {
+fn parse_floppy(raw: RawFloppy) -> Result<(FloppyConfig, [bool; 4], [Vec<PathBuf>; 4])> {
+    let connected_count = match raw.drives {
+        None => None,
+        Some(n @ 1..=4) => Some(usize::from(n)),
+        Some(n) => bail!("[floppy] drives must be between 1 and 4, got {n}"),
+    };
     let raws = [raw.df0, raw.df1, raw.df2, raw.df3];
     let mut drives: [Option<FloppyDriveConfig>; 4] = std::array::from_fn(|_| None);
+    let mut connected = match connected_count {
+        Some(count) => std::array::from_fn(|idx| idx < count),
+        None => [true, false, false, false],
+    };
     let mut playlists: [Vec<PathBuf>; 4] = std::array::from_fn(|_| Vec::new());
     for (idx, raw_drive) in raws.into_iter().enumerate() {
         let Some(raw_drive) = raw_drive else {
@@ -1441,6 +1464,19 @@ fn parse_floppy(raw: RawFloppy) -> Result<(FloppyConfig, [Vec<PathBuf>; 4])> {
         if !enabled {
             continue;
         }
+        if let Some(count) = connected_count {
+            if !connected[idx] {
+                bail!(
+                    "[floppy] drives = {} leaves floppy.df{} disconnected, \
+                     but floppy.df{} has media configured",
+                    count,
+                    idx,
+                    idx
+                );
+            }
+        } else {
+            connected[idx] = true;
+        }
         if !has_images {
             bail!("floppy.df{} is enabled but has no path", idx);
         }
@@ -1459,7 +1495,7 @@ fn parse_floppy(raw: RawFloppy) -> Result<(FloppyConfig, [Vec<PathBuf>; 4])> {
         });
         playlists[idx] = images;
     }
-    Ok((FloppyConfig { drives }, playlists))
+    Ok((FloppyConfig { drives }, connected, playlists))
 }
 
 fn validate_floppy_image_path(idx: usize, path: &Path) -> Result<()> {
@@ -2197,6 +2233,20 @@ mod tests {
         let df0 = cfg.floppy.drives[0].as_ref().unwrap();
         assert_eq!(df0.path, adf);
         assert!(df0.write_protected);
+        assert_eq!(cfg.floppy_connected, [true, false, false, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn floppy_drive_count_connects_empty_external_mechanisms() -> Result<()> {
+        let cfg = parse_config(
+            r#"
+            [floppy]
+            drives = 3
+            "#,
+        )?;
+        assert_eq!(cfg.floppy_connected, [true, true, true, false]);
+        assert!(cfg.floppy.drives.iter().all(Option::is_none));
         Ok(())
     }
 
@@ -2360,6 +2410,42 @@ mod tests {
     }
 
     #[test]
+    fn floppy_image_connects_external_drive_without_count() -> Result<()> {
+        let adf = temp_adf()?;
+        let cfg = parse_config(&format!(
+            r#"
+            [floppy.df1]
+            path = "{}"
+            "#,
+            toml_path(&adf)
+        ))?;
+        assert_eq!(cfg.floppy_connected, [true, true, false, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn floppy_drive_count_rejects_media_beyond_connected_slots() -> Result<()> {
+        let adf = temp_adf()?;
+        let err = parse_config(&format!(
+            r#"
+            [floppy]
+            drives = 1
+            [floppy.df1]
+            path = "{}"
+            "#,
+            toml_path(&adf)
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("leaves floppy.df1 disconnected"),
+            "{err:#}"
+        );
+        let err = parse_config("[floppy]\ndrives = 0").unwrap_err();
+        assert!(err.to_string().contains("between 1 and 4"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
     fn enabled_floppy_requires_path() {
         let err = parse_config(
             r#"
@@ -2422,6 +2508,24 @@ mod tests {
         assert_eq!(cfg.cpu_clock_mhz, 28.0);
         assert_eq!(cfg.fast_ram_bytes, 4 * 1024 * 1024);
         assert_eq!(cfg.slow_ram_bytes, 512 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_floppy_drive_override_uses_config_validation() -> Result<()> {
+        let overrides = ConfigOverrides {
+            floppy_drives: Some(4),
+            ..Default::default()
+        };
+        let cfg = Config::load_with_overrides(None, &overrides)?;
+        assert_eq!(cfg.floppy_connected, [true, true, true, true]);
+
+        let overrides = ConfigOverrides {
+            floppy_drives: Some(5),
+            ..Default::default()
+        };
+        let err = Config::load_with_overrides(None, &overrides).unwrap_err();
+        assert!(err.to_string().contains("between 1 and 4"), "{err:#}");
         Ok(())
     }
 
