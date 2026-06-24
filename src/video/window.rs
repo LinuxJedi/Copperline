@@ -5537,17 +5537,32 @@ impl App {
         true
     }
 
-    /// Toggle a PC breakpoint at the entry-box address.
+    /// Toggle a PC breakpoint from the entry box. The entry may carry an
+    /// optional condition and ignore count: "ADDR [LHS OP RHS] [IGN N]".
     fn debugger_toggle_breakpoint(&mut self) {
-        let Some(addr) = self.debugger_entry_addr("Break") else {
+        let spec = self
+            .debugger_panel
+            .as_ref()
+            .and_then(|panel| ui::parse_break_spec(&panel.entry));
+        let Some((addr, cond, ignore)) = spec else {
+            self.show_osd("Break: ADDR [LHS OP RHS] [IGN N] e.g. C033C2 D0 EQ 5");
             return;
         };
-        let set = self.emu.machine.ui_toggle_breakpoint(addr);
-        self.show_osd(format!(
+        let set = self.emu.machine.ui_set_breakpoint(addr, cond, ignore);
+        let mut msg = format!(
             "Breakpoint ${:06X} {}",
             addr & 0x00FF_FFFF,
             if set { "set" } else { "removed" }
-        ));
+        );
+        if set {
+            if let Some(cond) = &cond {
+                msg.push_str(&format!(" when {}", cond.describe()));
+            }
+            if ignore > 0 {
+                msg.push_str(&format!(" ign {ignore}"));
+            }
+        }
+        self.show_osd(msg);
     }
 
     /// Toggle a memory word watchpoint at the entry-box address.
@@ -5813,10 +5828,13 @@ impl App {
                         "Disassembly pinned at ${origin:06X} (empty box + Enter follows PC)"
                     )));
                 }
+                let breaks = machine.ui_breaks();
                 let mut addr = panel.disasm_addr.unwrap_or(pc) & !1;
                 for _ in 0..24 {
                     let (text, len) = crate::disasm::disassemble(read, addr, machine.cpu_type());
-                    let line = format!("{addr:08X}  {text}");
+                    // A leading bullet marks a line that carries a breakpoint.
+                    let marker = if breaks.is_breakpoint(addr) { "*" } else { " " };
+                    let line = format!("{marker}{addr:08X}  {text}");
                     lines.push(if addr == pc {
                         ui::DbgLine::hilit(line)
                     } else {
@@ -5952,14 +5970,27 @@ impl App {
                 lines.push(ui::DbgLine::plain(
                     "Reg takes a custom-register offset (96) or address (DFF096).",
                 ));
+                lines.push(ui::DbgLine::plain(
+                    "Break cond: ADDR [LHS OP RHS] [IGN N]  e.g. C033C2 D0 EQ 5",
+                ));
+                lines.push(ui::DbgLine::plain(
+                    "  ops EQ NE LT GT LE GE AND; operand Dn An PC SR Mhex hex",
+                ));
                 lines.push(ui::DbgLine::plain(""));
                 let breaks = self.emu.machine.ui_breaks();
                 lines.push(ui::DbgLine::plain("Breakpoints:"));
                 if breaks.breakpoints.is_empty() {
                     lines.push(ui::DbgLine::plain("  (none)"));
                 }
-                for pc in &breaks.breakpoints {
-                    lines.push(ui::DbgLine::plain(format!("  ${pc:06X}")));
+                for bp in &breaks.breakpoints {
+                    let mut text = format!("  ${:06X}", bp.addr);
+                    if let Some(cond) = &bp.cond {
+                        text.push_str(&format!("  {}", cond.describe()));
+                    }
+                    if bp.ignore > 0 {
+                        text.push_str(&format!("  ign {}/{}", bp.hits, bp.ignore));
+                    }
+                    lines.push(ui::DbgLine::plain(text));
                 }
                 lines.push(ui::DbgLine::plain(""));
                 lines.push(ui::DbgLine::plain("Watchpoints (word, stop on change):"));
@@ -6783,9 +6814,9 @@ fn take_integral_mouse_delta(value: &mut f64) -> i32 {
 }
 
 /// Hex digit for a key, for the debugger's address entry box.
-/// Map a key to the character it types into the debugger entry box: hex digits,
-/// plus Space and P/S/R so the box can hold "ADDR VALUE" / "REG VALUE" for poke
-/// (`push_entry_char` filters anything it should not accept).
+/// Map a key to the character it types into the debugger entry box: digits, all
+/// letters (for register names and the EQ/NE/.../AND/IGN condition mnemonics and
+/// M<hex> memory operands), and Space. `push_entry_char` filters and uppercases.
 fn entry_char_for_key(code: KeyCode) -> Option<char> {
     use KeyCode::*;
     Some(match code {
@@ -6805,10 +6836,26 @@ fn entry_char_for_key(code: KeyCode) -> Option<char> {
         KeyD => 'D',
         KeyE => 'E',
         KeyF => 'F',
-        // Extra register-name letters (PC/SR/SP) and the token separator.
+        KeyG => 'G',
+        KeyH => 'H',
+        KeyI => 'I',
+        KeyJ => 'J',
+        KeyK => 'K',
+        KeyL => 'L',
+        KeyM => 'M',
+        KeyN => 'N',
+        KeyO => 'O',
         KeyP => 'P',
-        KeyS => 'S',
+        KeyQ => 'Q',
         KeyR => 'R',
+        KeyS => 'S',
+        KeyT => 'T',
+        KeyU => 'U',
+        KeyV => 'V',
+        KeyW => 'W',
+        KeyX => 'X',
+        KeyY => 'Y',
+        KeyZ => 'Z',
         Space => ' ',
         _ => return None,
     })
@@ -8828,7 +8875,8 @@ mod tests {
             Some(panel) => {
                 assert_eq!(panel.disasm_addr, Some(0xFC0010));
                 let view = app.build_debugger_view(panel);
-                assert!(view.lines.iter().any(|l| l.text.starts_with("00FC0010")));
+                // Each disasm line carries a one-char breakpoint marker prefix.
+                assert!(view.lines.iter().any(|l| l.text.contains("00FC0010")));
             }
             _ => panic!("debugger panel should be open"),
         }

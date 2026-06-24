@@ -273,12 +273,132 @@ pub fn custom_reg_name(off: u16) -> String {
     fixed.to_string()
 }
 
+/// One operand in a breakpoint condition: a register, an immediate, or a
+/// 16-bit memory word. Memory and immediates are written in hex; the memory
+/// form is `M<hex>` (e.g. `MC00002`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CondOperand {
+    Data(usize),
+    Addr(usize),
+    Pc,
+    Sr,
+    Imm(u32),
+    Mem(u32),
+}
+
+/// Comparison used in a breakpoint condition. `And` is a bit test: it is true
+/// when `lhs & rhs` is non-zero, handy for checking flag/register bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CondOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+}
+
+/// A breakpoint condition: `lhs op rhs`, evaluated against live CPU/memory
+/// state through [`BreakContext`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BreakCond {
+    pub lhs: CondOperand,
+    pub op: CondOp,
+    pub rhs: CondOperand,
+}
+
+/// Live CPU/memory state a [`BreakCond`] reads. Implemented over the running
+/// machine at the breakpoint gate, kept as a trait so the condition logic and
+/// its tests stay independent of the CPU core type.
+pub trait BreakContext {
+    fn data(&self, n: usize) -> u32;
+    fn addr_reg(&self, n: usize) -> u32;
+    fn pc(&self) -> u32;
+    fn sr(&self) -> u32;
+    fn mem_word(&self, addr: u32) -> u16;
+}
+
+impl CondOperand {
+    fn value(self, ctx: &dyn BreakContext) -> u32 {
+        match self {
+            CondOperand::Data(n) => ctx.data(n),
+            CondOperand::Addr(n) => ctx.addr_reg(n),
+            CondOperand::Pc => ctx.pc(),
+            CondOperand::Sr => ctx.sr(),
+            CondOperand::Imm(v) => v,
+            CondOperand::Mem(a) => u32::from(ctx.mem_word(a)),
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            CondOperand::Data(n) => format!("D{n}"),
+            CondOperand::Addr(n) => format!("A{n}"),
+            CondOperand::Pc => "PC".to_string(),
+            CondOperand::Sr => "SR".to_string(),
+            CondOperand::Imm(v) => format!("${v:X}"),
+            CondOperand::Mem(a) => format!("M{a:X}"),
+        }
+    }
+}
+
+impl CondOp {
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            CondOp::Eq => "EQ",
+            CondOp::Ne => "NE",
+            CondOp::Lt => "LT",
+            CondOp::Gt => "GT",
+            CondOp::Le => "LE",
+            CondOp::Ge => "GE",
+            CondOp::And => "AND",
+        }
+    }
+}
+
+impl BreakCond {
+    pub fn eval(&self, ctx: &dyn BreakContext) -> bool {
+        let l = self.lhs.value(ctx);
+        let r = self.rhs.value(ctx);
+        match self.op {
+            CondOp::Eq => l == r,
+            CondOp::Ne => l != r,
+            CondOp::Lt => l < r,
+            CondOp::Gt => l > r,
+            CondOp::Le => l <= r,
+            CondOp::Ge => l >= r,
+            CondOp::And => (l & r) != 0,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.lhs.describe(),
+            self.op.mnemonic(),
+            self.rhs.describe()
+        )
+    }
+}
+
+/// One interactive PC breakpoint: an address, an optional condition that must
+/// hold for it to fire, and an ignore count (skip this many qualifying hits
+/// before stopping).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Breakpoint {
+    pub addr: u32,
+    pub cond: Option<BreakCond>,
+    pub ignore: u32,
+    pub hits: u32,
+}
+
 /// The debugger window's breakpoint/watchpoint set. Owned by the CPU
 /// machine so it stays armed while the window is closed; `armed` is the
 /// single per-instruction gate the hot loop checks.
 #[derive(Default)]
 pub struct InteractiveBreaks {
-    pub breakpoints: Vec<u32>,
+    pub breakpoints: Vec<Breakpoint>,
     pub watches: Vec<UiWatch>,
     /// Watched custom-register word offsets into $DFF000 ($000-$1FE).
     /// Hits are recorded by the bus's custom-register write path (which
@@ -299,26 +419,61 @@ impl InteractiveBreaks {
             && self.reg_watches.is_empty());
     }
 
+    /// Whether any breakpoint is set at `pc`, ignoring its condition. Used for
+    /// display (marking the address) and the reverse-debug scan.
     pub fn is_breakpoint(&self, pc: u32) -> bool {
-        self.breakpoints.contains(&pc)
+        let pc = pc & UI_ADDR_MASK;
+        self.breakpoints.iter().any(|bp| bp.addr == pc)
     }
 
-    /// Add the breakpoint, or remove it when already set. Returns true
-    /// when the breakpoint is now set.
-    pub fn toggle_breakpoint(&mut self, addr: u32) -> bool {
+    /// Add a breakpoint with an optional condition and ignore count, or remove
+    /// the breakpoint at `addr` when one already exists. Returns true when the
+    /// breakpoint is now set.
+    pub fn toggle_breakpoint_full(
+        &mut self,
+        addr: u32,
+        cond: Option<BreakCond>,
+        ignore: u32,
+    ) -> bool {
         let addr = addr & UI_ADDR_MASK;
-        let added = match self.breakpoints.iter().position(|&pc| pc == addr) {
+        let added = match self.breakpoints.iter().position(|bp| bp.addr == addr) {
             Some(pos) => {
                 self.breakpoints.remove(pos);
                 false
             }
             None => {
-                self.breakpoints.push(addr);
+                self.breakpoints.push(Breakpoint {
+                    addr,
+                    cond,
+                    ignore,
+                    hits: 0,
+                });
                 true
             }
         };
         self.rearm();
         added
+    }
+
+    /// Decide whether reaching `pc` should stop. A breakpoint stops when its
+    /// address matches, its condition (if any) holds against `ctx`, and its
+    /// ignore count has been exhausted -- each qualifying hit before that is
+    /// counted and skipped.
+    pub fn breakpoint_stops(&mut self, pc: u32, ctx: &dyn BreakContext) -> bool {
+        let pc = pc & UI_ADDR_MASK;
+        let Some(bp) = self.breakpoints.iter_mut().find(|bp| bp.addr == pc) else {
+            return false;
+        };
+        if let Some(cond) = &bp.cond {
+            if !cond.eval(ctx) {
+                return false;
+            }
+        }
+        if bp.hits < bp.ignore {
+            bp.hits = bp.hits.saturating_add(1);
+            return false;
+        }
+        true
     }
 
     /// Add a word watch at `addr` (recording `current` as its baseline),
@@ -640,14 +795,99 @@ mod tests {
         assert!(!breaks.armed());
 
         // Adding masks the address to the 68000 bus width.
-        assert!(breaks.toggle_breakpoint(0xFFC0_33C2));
+        assert!(breaks.toggle_breakpoint_full(0xFFC0_33C2, None, 0));
         assert!(breaks.armed());
         assert!(breaks.is_breakpoint(0x00C0_33C2));
 
         // Toggling the same (masked) address removes it and disarms.
-        assert!(!breaks.toggle_breakpoint(0x00C0_33C2));
+        assert!(!breaks.toggle_breakpoint_full(0x00C0_33C2, None, 0));
         assert!(!breaks.armed());
         assert!(!breaks.is_breakpoint(0x00C0_33C2));
+    }
+
+    /// Fixed register/memory snapshot for exercising condition evaluation.
+    #[derive(Default)]
+    struct FakeCtx {
+        data: [u32; 8],
+        addr: [u32; 8],
+        pc: u32,
+        sr: u32,
+        mem: std::collections::HashMap<u32, u16>,
+    }
+
+    impl BreakContext for FakeCtx {
+        fn data(&self, n: usize) -> u32 {
+            self.data[n]
+        }
+        fn addr_reg(&self, n: usize) -> u32 {
+            self.addr[n]
+        }
+        fn pc(&self) -> u32 {
+            self.pc
+        }
+        fn sr(&self) -> u32 {
+            self.sr
+        }
+        fn mem_word(&self, addr: u32) -> u16 {
+            self.mem.get(&addr).copied().unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn conditional_breakpoint_stops_only_when_condition_holds() {
+        let mut breaks = InteractiveBreaks::default();
+        breaks.toggle_breakpoint_full(
+            0x1000,
+            Some(BreakCond {
+                lhs: CondOperand::Data(0),
+                op: CondOp::Eq,
+                rhs: CondOperand::Imm(5),
+            }),
+            0,
+        );
+        let mut ctx = FakeCtx::default();
+
+        // Address matches but the condition is false: no stop.
+        ctx.data[0] = 4;
+        assert!(!breaks.breakpoint_stops(0x1000, &ctx));
+        // A different address never stops regardless of the condition.
+        ctx.data[0] = 5;
+        assert!(!breaks.breakpoint_stops(0x2000, &ctx));
+        // Address matches and the condition holds: stop.
+        assert!(breaks.breakpoint_stops(0x1000, &ctx));
+    }
+
+    #[test]
+    fn ignore_count_skips_the_first_qualifying_hits() {
+        let mut breaks = InteractiveBreaks::default();
+        // Stop on the 4th qualifying hit (ignore the first 3).
+        breaks.toggle_breakpoint_full(0x1000, None, 3);
+        let ctx = FakeCtx::default();
+        assert!(!breaks.breakpoint_stops(0x1000, &ctx));
+        assert!(!breaks.breakpoint_stops(0x1000, &ctx));
+        assert!(!breaks.breakpoint_stops(0x1000, &ctx));
+        assert!(breaks.breakpoint_stops(0x1000, &ctx));
+        // And it keeps stopping afterwards.
+        assert!(breaks.breakpoint_stops(0x1000, &ctx));
+    }
+
+    #[test]
+    fn bit_test_condition_uses_memory_word() {
+        let mut breaks = InteractiveBreaks::default();
+        breaks.toggle_breakpoint_full(
+            0x40,
+            Some(BreakCond {
+                lhs: CondOperand::Mem(0xDFF002),
+                op: CondOp::And,
+                rhs: CondOperand::Imm(0x4000),
+            }),
+            0,
+        );
+        let mut ctx = FakeCtx::default();
+        ctx.mem.insert(0xDFF002, 0x0000);
+        assert!(!breaks.breakpoint_stops(0x40, &ctx));
+        ctx.mem.insert(0xDFF002, 0x4000);
+        assert!(breaks.breakpoint_stops(0x40, &ctx));
     }
 
     #[test]
@@ -665,7 +905,7 @@ mod tests {
         assert!(!breaks.toggle_reg_watch(0x097));
         assert!(breaks.reg_watches.is_empty());
         assert!(breaks.armed()); // memory watch still set
-        breaks.toggle_breakpoint(0x100);
+        breaks.toggle_breakpoint_full(0x100, None, 0);
         breaks.clear();
         assert!(!breaks.armed());
         assert!(breaks.breakpoints.is_empty());

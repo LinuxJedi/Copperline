@@ -14,6 +14,7 @@ use super::window::{
 };
 use super::{font, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL, PRESENT_HEIGHT};
 use crate::config::WarpSpeed;
+use crate::debugger::{BreakCond, CondOp, CondOperand};
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -215,14 +216,11 @@ impl DebuggerPanel {
     }
 
     pub fn push_entry_char(&mut self, ch: char) {
-        // Hex for addresses and values, plus space and the non-hex letters in
-        // register names (P/S/R) so the box can hold "ADDR VALUE" or
-        // "REG VALUE" for poke. A leading or doubled space is dropped so the
-        // two tokens stay clean.
-        let allowed = ch.is_ascii_hexdigit()
-            || ch == ' '
-            || matches!(ch.to_ascii_uppercase(), 'P' | 'S' | 'R');
-        if !allowed || self.entry.len() >= 20 {
+        // Alphanumerics and spaces: hex for addresses/values, letters for
+        // register names (Dn/An/PC/SR), memory operands (M<hex>), and the
+        // breakpoint-condition mnemonics (EQ/NE/LT/GT/LE/GE/AND/IGN). A leading
+        // or doubled space is dropped so the tokens stay clean.
+        if (!ch.is_ascii_alphanumeric() && ch != ' ') || self.entry.len() >= 40 {
             return;
         }
         if ch == ' ' && (self.entry.is_empty() || self.entry.ends_with(' ')) {
@@ -1938,6 +1936,65 @@ fn parse_reg_name(token: &str) -> Option<usize> {
     }
 }
 
+/// Parse a breakpoint spec from the entry box: "ADDR [LHS OP RHS] [IGN N]".
+/// Returns the address, an optional condition, and an ignore count. The
+/// condition is three whitespace tokens (operand, mnemonic, operand); the
+/// optional trailing "IGN N" gives a hex ignore count.
+pub fn parse_break_spec(entry: &str) -> Option<(u32, Option<BreakCond>, u32)> {
+    let mut tokens = entry.split_whitespace();
+    let addr = parse_hex_u32(tokens.next()?)?;
+    let rest: Vec<&str> = tokens.collect();
+    // Split off a trailing "IGN N" clause if present.
+    let (cond_tokens, ignore) = match rest.iter().position(|t| t.eq_ignore_ascii_case("IGN")) {
+        Some(i) => {
+            let count = parse_hex_u32(rest.get(i + 1)?)?;
+            (&rest[..i], count)
+        }
+        None => (&rest[..], 0),
+    };
+    let cond = match cond_tokens {
+        [] => None,
+        [lhs, op, rhs] => Some(BreakCond {
+            lhs: parse_cond_operand(lhs)?,
+            op: parse_cond_op(op)?,
+            rhs: parse_cond_operand(rhs)?,
+        }),
+        _ => return None,
+    };
+    Some((addr, cond, ignore))
+}
+
+/// Parse a condition operand: a register name, `M<hex>` for a memory word, or a
+/// bare hex immediate. Register names win over hex (so `D0` is the register,
+/// not `$D0`); write an immediate with a leading zero (`0D0`) to disambiguate.
+fn parse_cond_operand(token: &str) -> Option<CondOperand> {
+    if let Some(reg) = parse_reg_name(token) {
+        return Some(match reg {
+            0..=7 => CondOperand::Data(reg),
+            8..=15 => CondOperand::Addr(reg - 8),
+            16 => CondOperand::Sr,
+            _ => CondOperand::Pc,
+        });
+    }
+    if let Some(hex) = token.strip_prefix('M').or_else(|| token.strip_prefix('m')) {
+        return Some(CondOperand::Mem(parse_hex_u32(hex)?));
+    }
+    Some(CondOperand::Imm(parse_hex_u32(token)?))
+}
+
+fn parse_cond_op(token: &str) -> Option<CondOp> {
+    Some(match token.to_ascii_uppercase().as_str() {
+        "EQ" => CondOp::Eq,
+        "NE" => CondOp::Ne,
+        "LT" => CondOp::Lt,
+        "GT" => CondOp::Gt,
+        "LE" => CondOp::Le,
+        "GE" => CondOp::Ge,
+        "AND" => CondOp::And,
+        _ => return None,
+    })
+}
+
 const DMACON_BITS: [(u16, &str); 15] = [
     (1 << 14, "BBUSY"),
     (1 << 13, "BZERO"),
@@ -2149,18 +2206,22 @@ mod tests {
         assert_eq!(ui.control_at(pos), Some(UiControl::PanelBody));
 
         let mut panel = DebuggerPanel::new();
-        for ch in ['c', '0', '0', 'z', '3', 'C'] {
+        for ch in ['c', '0', '0', '3', 'C'] {
             panel.push_entry_char(ch);
         }
         assert_eq!(panel.entry, "C003C");
         assert_eq!(panel.entry_addr(), Some(0xC003C));
+        // Punctuation is rejected (letters/digits/space are kept for spec
+        // mnemonics).
+        panel.push_entry_char('!');
+        assert_eq!(panel.entry, "C003C");
         panel.backspace_entry();
         assert_eq!(panel.entry, "C003");
-        // Capped at the entry length (room for an "ADDR VALUE" poke).
-        for _ in 0..30 {
+        // Capped at the entry length (room for a conditional breakpoint spec).
+        for _ in 0..50 {
             panel.push_entry_char('F');
         }
-        assert_eq!(panel.entry.len(), 20);
+        assert_eq!(panel.entry.len(), 40);
     }
 
     #[test]
@@ -2209,14 +2270,54 @@ mod tests {
         // Memory poke takes both tokens; the address is forced even.
         assert_eq!(panel.poke_target(), Some((0xC00000, 0xDEAD)));
 
-        // Leading/doubled spaces are dropped, and disallowed characters
-        // (e.g. 'G', 'X') never make it in.
+        // Leading/doubled spaces are collapsed, and punctuation never makes it
+        // in (letters are allowed now, for register names and condition
+        // mnemonics).
         let mut panel = DebuggerPanel::new();
-        for ch in " GD0 X12Z34".chars() {
+        for ch in "  D0  1234!".chars() {
             panel.push_entry_char(ch);
         }
         assert_eq!(panel.entry, "D0 1234");
         assert_eq!(panel.reg_poke(), Some((0, 0x1234)));
+    }
+
+    #[test]
+    fn break_spec_parses_address_condition_and_ignore() {
+        // Bare address: plain breakpoint.
+        assert_eq!(parse_break_spec("C033C2"), Some((0xC033C2, None, 0)));
+
+        // Address plus a register/immediate condition.
+        let (addr, cond, ignore) = parse_break_spec("C033C2 D0 EQ 5").unwrap();
+        assert_eq!(addr, 0xC033C2);
+        assert_eq!(ignore, 0);
+        assert_eq!(
+            cond,
+            Some(BreakCond {
+                lhs: CondOperand::Data(0),
+                op: CondOp::Eq,
+                rhs: CondOperand::Imm(5),
+            })
+        );
+
+        // Memory operand, bit-test op, and a trailing ignore count.
+        let (_, cond, ignore) = parse_break_spec("40 MC00002 AND 4000 IGN A").unwrap();
+        assert_eq!(ignore, 0xA);
+        assert_eq!(
+            cond,
+            Some(BreakCond {
+                lhs: CondOperand::Mem(0xC00002),
+                op: CondOp::And,
+                rhs: CondOperand::Imm(0x4000),
+            })
+        );
+
+        // Ignore count with no condition.
+        assert_eq!(parse_break_spec("1234 IGN 3"), Some((0x1234, None, 3)));
+
+        // Malformed condition and bad address are rejected.
+        assert!(parse_break_spec("C033C2 D0 EQ").is_none());
+        assert!(parse_break_spec("C033C2 D0 XX 5").is_none());
+        assert!(parse_break_spec("xyz").is_none());
     }
 
     #[test]

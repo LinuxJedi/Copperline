@@ -104,6 +104,8 @@ avoid externally mutating hard-drive/CD images during a debug session.
 | `status` | CPU PC/SR, frame, beam, instruction position, reverse status |
 | `beam` | beam/frame/colour-clock position |
 | `custom` | compact custom-chip state dump |
+| `stepover` | step over a BSR/JSR/TRAP call (single step otherwise) |
+| `finish` | run until the current subroutine returns to its caller |
 | `reg NAME\|OFFSET` | side-effect-free custom-register latch read |
 | `write-reg NAME\|OFFSET VALUE` | real custom-register word write |
 | `watch-reg NAME\|OFFSET` | stop on CPU or Copper writes to the custom register |

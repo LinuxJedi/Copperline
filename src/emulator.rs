@@ -804,7 +804,15 @@ impl Emulator {
     /// may exist before the oldest snapshot. (Watch-based reverse-continue is
     /// not yet modelled; breakpoints only.)
     pub fn tt_reverse_continue(&mut self) -> Result<crate::timetravel::ReverseOutcome<u64>> {
-        let breakpoints = self.machine.ui_breaks().breakpoints.clone();
+        // Reverse-continue honours breakpoint addresses only (conditions are
+        // not replayed), so collect the bare addresses.
+        let breakpoints: Vec<u32> = self
+            .machine
+            .ui_breaks()
+            .breakpoints
+            .iter()
+            .map(|bp| bp.addr)
+            .collect();
         self.tt_reverse_continue_to(&breakpoints)
     }
 
@@ -2029,6 +2037,34 @@ mod tests {
         emu.debug_step_over(10_000).unwrap(); // MOVEQ is not a call: single step
         assert_eq!(emu.machine.pc(), 0x00F8_0014);
         assert_eq!(emu.machine.d(0), 1);
+    }
+
+    #[test]
+    fn conditional_breakpoint_fires_during_execution() {
+        use crate::debugger::{BreakCond, CondOp, CondOperand};
+        let mut emu = emulator_with_call_program();
+        // Break at the subroutine entry only when D1 == 0 (true on first
+        // entry; the callee sets D1=2 afterwards).
+        emu.machine.ui_set_breakpoint(
+            0x00F8_0020,
+            Some(BreakCond {
+                lhs: CondOperand::Data(1),
+                op: CondOp::Eq,
+                rhs: CondOperand::Imm(0),
+            }),
+            0,
+        );
+        let mut stopped = false;
+        for _ in 0..32 {
+            emu.debug_step_instructions(1).unwrap();
+            if emu.machine.ui_debug_stop_pending() {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "conditional breakpoint did not fire");
+        assert_eq!(emu.machine.pc(), 0x00F8_0020);
+        assert!(emu.machine.take_ui_debug_stop().is_some());
     }
 
     #[test]
