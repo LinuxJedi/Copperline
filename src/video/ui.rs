@@ -14,6 +14,7 @@ use super::window::{
 };
 use super::{font, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL, PRESENT_HEIGHT};
 use crate::config::WarpSpeed;
+use crate::debugger::{BreakCond, CondOp, CondOperand};
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -190,15 +191,42 @@ impl DebuggerPanel {
         }
     }
 
-    /// The typed address, when the entry holds valid hex.
+    /// The typed address: the first whitespace-separated token parsed as hex.
+    /// (Poke uses a second token; the address consumers only need the first.)
     pub fn entry_addr(&self) -> Option<u32> {
-        parse_hex_u32(&self.entry)
+        parse_hex_u32(self.entry.split_whitespace().next()?)
+    }
+
+    /// Memory poke target: two hex tokens "ADDR VALUE", as an even address and
+    /// the 16-bit word to write there.
+    pub fn poke_target(&self) -> Option<(u32, u16)> {
+        let mut tokens = self.entry.split_whitespace();
+        let addr = parse_hex_u32(tokens.next()?)?;
+        let value = parse_hex_u32(tokens.next()?)?;
+        Some((addr & !1, value as u16))
+    }
+
+    /// Register poke target: a register name then a hex value, e.g. "D0 1234"
+    /// or "PC F80000". Returns the GDB-style register index and the value.
+    pub fn reg_poke(&self) -> Option<(usize, u32)> {
+        let mut tokens = self.entry.split_whitespace();
+        let reg = parse_reg_name(tokens.next()?)?;
+        let value = parse_hex_u32(tokens.next()?)?;
+        Some((reg, value))
     }
 
     pub fn push_entry_char(&mut self, ch: char) {
-        if self.entry.len() < 8 && ch.is_ascii_hexdigit() {
-            self.entry.push(ch.to_ascii_uppercase());
+        // Alphanumerics and spaces: hex for addresses/values, letters for
+        // register names (Dn/An/PC/SR), memory operands (M<hex>), and the
+        // breakpoint-condition mnemonics (EQ/NE/LT/GT/LE/GE/AND/IGN). A leading
+        // or doubled space is dropped so the tokens stay clean.
+        if (!ch.is_ascii_alphanumeric() && ch != ' ') || self.entry.len() >= 40 {
+            return;
         }
+        if ch == ' ' && (self.entry.is_empty() || self.entry.ends_with(' ')) {
+            return;
+        }
+        self.entry.push(ch.to_ascii_uppercase());
     }
 
     pub fn backspace_entry(&mut self) {
@@ -334,6 +362,11 @@ pub enum UiControl {
     DebugTab(DebugTab),
     DebugRun,
     DebugStep,
+    /// Step over a call: run the callee to completion, stopping at the
+    /// instruction after a BSR/JSR/TRAP (a plain single step otherwise).
+    DebugStepOver,
+    /// Step out: run until the current subroutine returns to its caller.
+    DebugStepOut,
     DebugStepFrame,
     DebugRunTo,
     /// Reverse-debug: step one instruction backward (reconstructed from the
@@ -346,6 +379,9 @@ pub enum UiControl {
     DebugMemPrev,
     DebugMemNext,
     DebugEntry,
+    /// Poke: on the Memory tab write a word from the entry box's "ADDR VALUE";
+    /// on the CPU tab set a register from "REG VALUE".
+    DebugPoke,
     /// Break tab: toggle a PC breakpoint at the entry address.
     DebugBreakToggle,
     /// Break tab: toggle a memory word watchpoint at the entry address.
@@ -451,11 +487,20 @@ fn debug_tab_rect(rect: Rect, index: usize) -> Rect {
     }
 }
 
-fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 10] {
+fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 13] {
     let y = rect.y + rect.h - DEBUG_BUTTON_H - 6;
+    // Step Over / Step Out share a second transport row just above the main
+    // one; the main row is already full edge to edge.
+    let y2 = rect.y + rect.h - 2 * DEBUG_BUTTON_H - 10;
     let button = |x: usize, w: usize| Rect {
         x: rect.x + x,
         y,
+        w,
+        h: DEBUG_BUTTON_H,
+    };
+    let button2 = |x: usize, w: usize| Rect {
+        x: rect.x + x,
+        y: y2,
         w,
         h: DEBUG_BUTTON_H,
     };
@@ -471,6 +516,11 @@ fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 10] {
         (UiControl::DebugReverseFrame, button(466, 76)),
         (UiControl::DebugReverseStep, button(546, 66)),
         (UiControl::DebugReverseRun, button(616, 60)),
+        // Forward step-over / step-out on the second row.
+        (UiControl::DebugStepOver, button2(8, 90)),
+        (UiControl::DebugStepOut, button2(102, 84)),
+        // Poke (Memory tab) / Set Reg (CPU tab), on the second row.
+        (UiControl::DebugPoke, button2(200, 90)),
     ]
 }
 
@@ -976,7 +1026,7 @@ fn draw_shortcuts(frame: &mut [u8], rect: Rect, scale: usize) {
     for line in [
         "Shortcuts: Cmd on macOS, Alt on Linux/Windows",
         "Amiga modifiers: Alt, Cmd/Super=Amiga, Ctrl",
-        "In the debugger: S step, F frame, R run/pause",
+        "In the debugger: S step, O over, U out, F frame, R run/pause",
     ] {
         draw_panel_text(frame, rect.x + 24, y, line, PANEL_TEXT_DIM, 1, scale);
         y += 12;
@@ -1101,9 +1151,10 @@ fn draw_debugger(
             );
         }
     }
-    // Content lines.
+    // Content lines. Two transport rows sit at the bottom now (the main row
+    // plus the Step Over/Out row), so the text area ends above both.
     let content_top = debug_content_top(rect);
-    let content_bottom = rect.y + rect.h - DEBUG_BUTTON_H - 12;
+    let content_bottom = rect.y + rect.h - 2 * DEBUG_BUTTON_H - 16;
     let pitch = 10;
     let max_lines = content_bottom.saturating_sub(content_top) / pitch;
     for (index, line) in view.lines.iter().take(max_lines).enumerate() {
@@ -1151,6 +1202,8 @@ fn draw_debugger(
                         }
                     }
                     UiControl::DebugStep => "Step",
+                    UiControl::DebugStepOver => "Step Over",
+                    UiControl::DebugStepOut => "Step Out",
                     UiControl::DebugStepFrame => "Frame",
                     UiControl::DebugRunTo => "Run to $",
                     UiControl::DebugReverseStep => "< Step",
@@ -1158,6 +1211,13 @@ fn draw_debugger(
                     UiControl::DebugReverseRun => "< Run",
                     UiControl::DebugMemPrev => "<",
                     UiControl::DebugMemNext => ">",
+                    UiControl::DebugPoke => {
+                        if panel.tab == DebugTab::Cpu {
+                            "Set Reg"
+                        } else {
+                            "Poke"
+                        }
+                    }
                     _ => "",
                 };
                 let enabled = match control {
@@ -1165,6 +1225,11 @@ fn draw_debugger(
                         panel.tab == DebugTab::Memory
                     }
                     UiControl::DebugRunTo => panel.entry_addr().is_some(),
+                    UiControl::DebugPoke => match panel.tab {
+                        DebugTab::Memory => panel.poke_target().is_some(),
+                        DebugTab::Cpu => panel.reg_poke().is_some(),
+                        _ => false,
+                    },
                     UiControl::DebugReverseStep
                     | UiControl::DebugReverseFrame
                     | UiControl::DebugReverseRun => view.reverse_available,
@@ -1848,6 +1913,88 @@ pub fn parse_hex_u32(s: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
+/// Parse a 68000 register name into the GDB-style index used by
+/// `debug_set_register`: D0-D7 -> 0-7, A0-A7 -> 8-15, SR -> 16, PC -> 17,
+/// with SP an alias for A7.
+fn parse_reg_name(token: &str) -> Option<usize> {
+    let token = token.to_ascii_uppercase();
+    match token.as_str() {
+        "PC" => return Some(17),
+        "SR" => return Some(16),
+        "SP" => return Some(15),
+        _ => {}
+    }
+    if token.len() < 2 {
+        return None;
+    }
+    let (kind, idx) = token.split_at(1);
+    let n: usize = idx.parse().ok()?;
+    match kind {
+        "D" if n <= 7 => Some(n),
+        "A" if n <= 7 => Some(8 + n),
+        _ => None,
+    }
+}
+
+/// Parse a breakpoint spec from the entry box: "ADDR [LHS OP RHS] [IGN N]".
+/// Returns the address, an optional condition, and an ignore count. The
+/// condition is three whitespace tokens (operand, mnemonic, operand); the
+/// optional trailing "IGN N" gives a hex ignore count.
+pub fn parse_break_spec(entry: &str) -> Option<(u32, Option<BreakCond>, u32)> {
+    let mut tokens = entry.split_whitespace();
+    let addr = parse_hex_u32(tokens.next()?)?;
+    let rest: Vec<&str> = tokens.collect();
+    // Split off a trailing "IGN N" clause if present.
+    let (cond_tokens, ignore) = match rest.iter().position(|t| t.eq_ignore_ascii_case("IGN")) {
+        Some(i) => {
+            let count = parse_hex_u32(rest.get(i + 1)?)?;
+            (&rest[..i], count)
+        }
+        None => (&rest[..], 0),
+    };
+    let cond = match cond_tokens {
+        [] => None,
+        [lhs, op, rhs] => Some(BreakCond {
+            lhs: parse_cond_operand(lhs)?,
+            op: parse_cond_op(op)?,
+            rhs: parse_cond_operand(rhs)?,
+        }),
+        _ => return None,
+    };
+    Some((addr, cond, ignore))
+}
+
+/// Parse a condition operand: a register name, `M<hex>` for a memory word, or a
+/// bare hex immediate. Register names win over hex (so `D0` is the register,
+/// not `$D0`); write an immediate with a leading zero (`0D0`) to disambiguate.
+fn parse_cond_operand(token: &str) -> Option<CondOperand> {
+    if let Some(reg) = parse_reg_name(token) {
+        return Some(match reg {
+            0..=7 => CondOperand::Data(reg),
+            8..=15 => CondOperand::Addr(reg - 8),
+            16 => CondOperand::Sr,
+            _ => CondOperand::Pc,
+        });
+    }
+    if let Some(hex) = token.strip_prefix('M').or_else(|| token.strip_prefix('m')) {
+        return Some(CondOperand::Mem(parse_hex_u32(hex)?));
+    }
+    Some(CondOperand::Imm(parse_hex_u32(token)?))
+}
+
+fn parse_cond_op(token: &str) -> Option<CondOp> {
+    Some(match token.to_ascii_uppercase().as_str() {
+        "EQ" => CondOp::Eq,
+        "NE" => CondOp::Ne,
+        "LT" => CondOp::Lt,
+        "GT" => CondOp::Gt,
+        "LE" => CondOp::Le,
+        "GE" => CondOp::Ge,
+        "AND" => CondOp::And,
+        _ => return None,
+    })
+}
+
 const DMACON_BITS: [(u16, &str); 15] = [
     (1 << 14, "BBUSY"),
     (1 << 13, "BZERO"),
@@ -2059,18 +2206,22 @@ mod tests {
         assert_eq!(ui.control_at(pos), Some(UiControl::PanelBody));
 
         let mut panel = DebuggerPanel::new();
-        for ch in ['c', '0', '0', 'z', '3', 'C'] {
+        for ch in ['c', '0', '0', '3', 'C'] {
             panel.push_entry_char(ch);
         }
         assert_eq!(panel.entry, "C003C");
         assert_eq!(panel.entry_addr(), Some(0xC003C));
+        // Punctuation is rejected (letters/digits/space are kept for spec
+        // mnemonics).
+        panel.push_entry_char('!');
+        assert_eq!(panel.entry, "C003C");
         panel.backspace_entry();
         assert_eq!(panel.entry, "C003");
-        // Capped at 8 hex digits.
-        for _ in 0..12 {
+        // Capped at the entry length (room for a conditional breakpoint spec).
+        for _ in 0..50 {
             panel.push_entry_char('F');
         }
-        assert_eq!(panel.entry.len(), 8);
+        assert_eq!(panel.entry.len(), 40);
     }
 
     #[test]
@@ -2104,6 +2255,84 @@ mod tests {
         assert_eq!(parse_hex_u32("C00000"), Some(0xC00000));
         assert_eq!(parse_hex_u32(""), None);
         assert_eq!(parse_hex_u32("xyz"), None);
+    }
+
+    #[test]
+    fn entry_box_parses_address_and_poke_tokens() {
+        let mut panel = DebuggerPanel::new();
+        // The entry only accepts hex, space, and the P/S/R register letters.
+        for ch in "C00000 DEAD".chars() {
+            panel.push_entry_char(ch);
+        }
+        assert_eq!(panel.entry, "C00000 DEAD");
+        // The address consumers see just the first token.
+        assert_eq!(panel.entry_addr(), Some(0xC00000));
+        // Memory poke takes both tokens; the address is forced even.
+        assert_eq!(panel.poke_target(), Some((0xC00000, 0xDEAD)));
+
+        // Leading/doubled spaces are collapsed, and punctuation never makes it
+        // in (letters are allowed now, for register names and condition
+        // mnemonics).
+        let mut panel = DebuggerPanel::new();
+        for ch in "  D0  1234!".chars() {
+            panel.push_entry_char(ch);
+        }
+        assert_eq!(panel.entry, "D0 1234");
+        assert_eq!(panel.reg_poke(), Some((0, 0x1234)));
+    }
+
+    #[test]
+    fn break_spec_parses_address_condition_and_ignore() {
+        // Bare address: plain breakpoint.
+        assert_eq!(parse_break_spec("C033C2"), Some((0xC033C2, None, 0)));
+
+        // Address plus a register/immediate condition.
+        let (addr, cond, ignore) = parse_break_spec("C033C2 D0 EQ 5").unwrap();
+        assert_eq!(addr, 0xC033C2);
+        assert_eq!(ignore, 0);
+        assert_eq!(
+            cond,
+            Some(BreakCond {
+                lhs: CondOperand::Data(0),
+                op: CondOp::Eq,
+                rhs: CondOperand::Imm(5),
+            })
+        );
+
+        // Memory operand, bit-test op, and a trailing ignore count.
+        let (_, cond, ignore) = parse_break_spec("40 MC00002 AND 4000 IGN A").unwrap();
+        assert_eq!(ignore, 0xA);
+        assert_eq!(
+            cond,
+            Some(BreakCond {
+                lhs: CondOperand::Mem(0xC00002),
+                op: CondOp::And,
+                rhs: CondOperand::Imm(0x4000),
+            })
+        );
+
+        // Ignore count with no condition.
+        assert_eq!(parse_break_spec("1234 IGN 3"), Some((0x1234, None, 3)));
+
+        // Malformed condition and bad address are rejected.
+        assert!(parse_break_spec("C033C2 D0 EQ").is_none());
+        assert!(parse_break_spec("C033C2 D0 XX 5").is_none());
+        assert!(parse_break_spec("xyz").is_none());
+    }
+
+    #[test]
+    fn register_names_map_to_gdb_indices() {
+        assert_eq!(parse_reg_name("D0"), Some(0));
+        assert_eq!(parse_reg_name("d7"), Some(7));
+        assert_eq!(parse_reg_name("A0"), Some(8));
+        assert_eq!(parse_reg_name("A7"), Some(15));
+        assert_eq!(parse_reg_name("SP"), Some(15));
+        assert_eq!(parse_reg_name("SR"), Some(16));
+        assert_eq!(parse_reg_name("PC"), Some(17));
+        assert_eq!(parse_reg_name("D8"), None);
+        assert_eq!(parse_reg_name("A8"), None);
+        assert_eq!(parse_reg_name("Z0"), None);
+        assert_eq!(parse_reg_name(""), None);
     }
 
     /// Render each panel and the menu into a presentation-sized frame.

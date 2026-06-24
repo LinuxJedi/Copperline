@@ -67,26 +67,63 @@ On the Break tab, type an address into the `$` box and toggle any of:
 **Clear all** removes everything. Breakpoints and watchpoints stay armed
 when the window is closed: a hit pauses the machine, reopens the debugger
 on the Break tab with the reason highlighted, and shows it as an on-screen
-message.
+message. A breakpoint also shows as a `*` next to its line in the CPU
+tab's disassembly.
+
+### Conditional and counted breakpoints
+
+The Break box accepts more than a bare address:
+
+```
+ADDR [LHS OP RHS] [IGN N]
+```
+
+- **Condition** `LHS OP RHS` -- the breakpoint only stops when it holds.
+  Operands are registers (`D0`-`D7`, `A0`-`A7`, `PC`, `SR`), a memory word
+  `M<hex>` (e.g. `MC00002`), or a bare hex immediate. A register name wins
+  over hex, so write an immediate that looks like a register with a leading
+  zero (`0D0`). Operators are `EQ NE LT GT LE GE` and `AND` (a bit test:
+  true when `LHS & RHS` is non-zero).
+- **Ignore count** `IGN N` -- skip the first `N` (hex) qualifying hits, then
+  stop on the next one. The Break list shows the running `ign hits/N`.
+
+Examples: `C033C2 D0 EQ 5` stops at `$C033C2` only when `D0` is 5;
+`40 MC00002 AND 4000 IGN A` stops at `$40` once the word at `$C00002` has
+bit `$4000` set, after ten earlier qualifying passes.
 
 ## Transport controls
 
 | Control | Key | Effect |
 |---|---|---|
 | Run / Pause | `R` | Resume or pause the machine |
-| Step | `S` | Execute exactly one instruction |
+| Step | `S` | Execute exactly one instruction (into calls) |
+| Step Over | `O` | Run a BSR/JSR/TRAP callee to completion, stopping after the call |
+| Step Out | `U` | Run until the current subroutine returns to its caller |
 | Frame | `F` | Run to the next video frame and re-render the display |
 | Run to `$` | -- | Run until the PC reaches the address in the box |
 | &lt; Frame | -- | Step one video frame *backward* |
 | &lt; Step | -- | Step one instruction *backward* (see [](reverse)) |
 | &lt; Run | -- | Run *backward* to the previous breakpoint hit |
 
-The `R`/`S`/`F` keys work whenever the hex box is unfocused (while it is
-focused they are hex input). **Run to $** is bounded by a 2M-instruction
-budget so a never-reached address cannot wedge the UI; if the budget runs
-out, the debugger says so and stays paused. If the CPU is sitting in a
-`STOP`, stepping fast-forwards device time to the interrupt that wakes it,
-exactly as the live core would.
+The `R`/`S`/`O`/`U`/`F` keys work whenever the box is unfocused (while it is
+focused they are text input). **Run to $**, **Step Over**, and **Step Out**
+are bounded by an instruction budget so a never-returning call or
+never-reached address cannot wedge the UI; if the budget runs out, the
+debugger stays paused. Step Out detects the return by the stack pointer
+rising past its value at entry, so nested calls and interrupt handlers do
+not end it early. If the CPU is sitting in a `STOP`, stepping fast-forwards
+device time to the interrupt that wakes it, exactly as the live core would.
+
+## Editing memory and registers
+
+While paused you can patch state live from the `$` box and the **Poke** /
+**Set Reg** button (the second transport row, on the Memory and CPU tabs):
+
+- On the **Memory** tab, type `ADDR VALUE` (two hex words) and click
+  **Poke** to write a 16-bit word. ROM and device windows are left
+  untouched, exactly like the GDB memory-write path.
+- On the **CPU** tab, type `REG VALUE` (e.g. `D0 1234`, `PC F80000`; `SP`
+  aliases `A7`) and click **Set Reg**.
 
 **Frame** is the tool for raster work: combined with the Chipset and Copper
 tabs it lets you single-step a Copper effect one frame at a time and watch

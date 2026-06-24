@@ -1078,9 +1078,26 @@ impl M68kMachine {
         &self.ui_breaks
     }
 
-    /// Toggle a PC breakpoint. Returns true when the breakpoint is now set.
-    pub fn ui_toggle_breakpoint(&mut self, addr: u32) -> bool {
-        self.ui_breaks.toggle_breakpoint(addr)
+    /// Toggle a PC breakpoint carrying an optional condition and ignore count.
+    /// Returns true when the breakpoint is now set.
+    pub fn ui_set_breakpoint(
+        &mut self,
+        addr: u32,
+        cond: Option<crate::debugger::BreakCond>,
+        ignore: u32,
+    ) -> bool {
+        self.ui_breaks.toggle_breakpoint_full(addr, cond, ignore)
+    }
+
+    /// Evaluate the breakpoint gate at `pc` against live register/memory state.
+    /// Disjoint field borrows let the breakpoint set update its hit counter
+    /// while reading the CPU core and bus.
+    fn ui_breakpoint_stops(&mut self, pc: u32) -> bool {
+        let ctx = MachineBreakContext {
+            cpu: &self.cpu,
+            bus: &self.bus.bus,
+        };
+        self.ui_breaks.breakpoint_stops(pc, &ctx)
     }
 
     /// Toggle a word watchpoint at `addr` (word-aligned), baselining it on
@@ -1149,7 +1166,7 @@ impl M68kMachine {
     fn ui_check_breaks_after_step(&mut self) {
         use crate::debugger::DebugStop;
         let pc = self.cpu.pc & crate::debugger::UI_ADDR_MASK;
-        if self.ui_breaks.is_breakpoint(pc) {
+        if self.ui_breakpoint_stops(pc) {
             self.ui_stop = Some(DebugStop::Breakpoint { pc });
             return;
         }
@@ -1216,7 +1233,7 @@ impl M68kMachine {
                 // stop before the handler's first instruction executes.
                 if self.ui_breaks.armed() {
                     let pc = self.cpu.pc & crate::debugger::UI_ADDR_MASK;
-                    if self.ui_breaks.is_breakpoint(pc) {
+                    if self.ui_breakpoint_stops(pc) {
                         self.ui_stop = Some(crate::debugger::DebugStop::Breakpoint { pc });
                         break;
                     }
@@ -2066,6 +2083,32 @@ impl AddressBus for CpuBus {
 
     fn reset_devices(&mut self) {
         self.bus.reset_custom_chips_from_cpu_reset();
+    }
+}
+
+/// Adapts the live CPU core and bus to the [`BreakContext`] a breakpoint
+/// condition reads. Borrows the `cpu` and `bus` fields disjointly from the
+/// breakpoint set so the gate can update hit counters while evaluating.
+struct MachineBreakContext<'a> {
+    cpu: &'a CpuCore,
+    bus: &'a crate::bus::Bus,
+}
+
+impl crate::debugger::BreakContext for MachineBreakContext<'_> {
+    fn data(&self, n: usize) -> u32 {
+        self.cpu.d(n)
+    }
+    fn addr_reg(&self, n: usize) -> u32 {
+        self.cpu.a(n)
+    }
+    fn pc(&self) -> u32 {
+        self.cpu.pc
+    }
+    fn sr(&self) -> u32 {
+        u32::from(self.cpu.get_sr())
+    }
+    fn mem_word(&self, addr: u32) -> u16 {
+        self.bus.peek_word_any(addr)
     }
 }
 

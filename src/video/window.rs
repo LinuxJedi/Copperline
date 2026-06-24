@@ -368,6 +368,18 @@ fn host_shortcut_modifier_pressed(modifiers: ModifiersState) -> bool {
     }
 }
 
+/// Display name for a GDB-style register index (see `debug_set_register`):
+/// D0-D7, A0-A7, SR, PC.
+fn gdb_reg_label(reg: usize) -> String {
+    match reg {
+        0..=7 => format!("D{reg}"),
+        8..=15 => format!("A{}", reg - 8),
+        16 => "SR".to_string(),
+        17 => "PC".to_string(),
+        _ => format!("r{reg}"),
+    }
+}
+
 fn window_title_mouse_captured() -> String {
     format!("{WINDOW_TITLE} - Mouse captured ({HOST_SHORTCUT_MODIFIER_LABEL}+G releases)")
 }
@@ -4618,6 +4630,10 @@ impl App {
             }
             UiControl::DebugRun => self.activate_tool_control(ToolPanelKind::Debugger, control),
             UiControl::DebugStep => self.activate_tool_control(ToolPanelKind::Debugger, control),
+            UiControl::DebugStepOver => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
+            }
+            UiControl::DebugStepOut => self.activate_tool_control(ToolPanelKind::Debugger, control),
             UiControl::DebugStepFrame => {
                 self.activate_tool_control(ToolPanelKind::Debugger, control)
             }
@@ -4633,6 +4649,7 @@ impl App {
             }
             UiControl::DebugMemPrev => self.activate_tool_control(ToolPanelKind::Debugger, control),
             UiControl::DebugMemNext => self.activate_tool_control(ToolPanelKind::Debugger, control),
+            UiControl::DebugPoke => self.activate_tool_control(ToolPanelKind::Debugger, control),
             UiControl::DebugEntry => {
                 if let Some(panel) = self.debugger_panel.as_mut() {
                     panel.entry_active = true;
@@ -4676,6 +4693,8 @@ impl App {
             }
             (ToolPanelKind::Debugger, UiControl::DebugRun) => self.debugger_toggle_run(),
             (ToolPanelKind::Debugger, UiControl::DebugStep) => self.debugger_step(),
+            (ToolPanelKind::Debugger, UiControl::DebugStepOver) => self.debugger_step_over(),
+            (ToolPanelKind::Debugger, UiControl::DebugStepOut) => self.debugger_step_out(),
             (ToolPanelKind::Debugger, UiControl::DebugStepFrame) => self.debugger_step_frame(),
             (ToolPanelKind::Debugger, UiControl::DebugRunTo) => self.debugger_run_to(),
             (ToolPanelKind::Debugger, UiControl::DebugReverseStep) => self.debugger_reverse_step(),
@@ -4687,6 +4706,7 @@ impl App {
             }
             (ToolPanelKind::Debugger, UiControl::DebugMemPrev) => self.debugger_mem_page(-1),
             (ToolPanelKind::Debugger, UiControl::DebugMemNext) => self.debugger_mem_page(1),
+            (ToolPanelKind::Debugger, UiControl::DebugPoke) => self.debugger_poke(),
             (ToolPanelKind::Debugger, UiControl::DebugEntry) => {
                 if let Some(panel) = self.debugger_panel.as_mut() {
                     panel.entry_active = true;
@@ -4765,7 +4785,7 @@ impl App {
             return false;
         };
         if panel.entry_active {
-            if let Some(ch) = hex_char_for_key(code) {
+            if let Some(ch) = entry_char_for_key(code) {
                 panel.push_entry_char(ch);
                 self.request_redraw();
                 return true;
@@ -4800,6 +4820,8 @@ impl App {
         }
         let control = match code {
             KeyCode::KeyS => Some(UiControl::DebugStep),
+            KeyCode::KeyO => Some(UiControl::DebugStepOver),
+            KeyCode::KeyU => Some(UiControl::DebugStepOut),
             KeyCode::KeyF => Some(UiControl::DebugStepFrame),
             KeyCode::KeyR => Some(UiControl::DebugRun),
             _ => None,
@@ -5350,6 +5372,39 @@ impl App {
         self.surface_debug_stop();
     }
 
+    /// Step over a subroutine call while paused: run a BSR/JSR/TRAP callee to
+    /// completion and stop at the following instruction (a plain single step
+    /// otherwise). Bounded so a call that never returns cannot wedge the UI.
+    fn debugger_step_over(&mut self) {
+        const STEP_OVER_BUDGET: usize = 5_000_000;
+        self.paused = true;
+        self.sync_live_audio_suspension();
+        self.last_debug_stop = None;
+        if let Err(e) = self.emu.debug_step_over(STEP_OVER_BUDGET) {
+            error!("debugger step-over halted: {e:?}");
+            self.cpu_halted = true;
+            self.sync_live_audio_suspension();
+        }
+        self.surface_debug_stop();
+        self.finish_render_for_current_frame();
+    }
+
+    /// Step out of the current subroutine while paused: run until it returns to
+    /// its caller. Bounded so a routine that never returns cannot wedge the UI.
+    fn debugger_step_out(&mut self) {
+        const STEP_OUT_BUDGET: usize = 5_000_000;
+        self.paused = true;
+        self.sync_live_audio_suspension();
+        self.last_debug_stop = None;
+        if let Err(e) = self.emu.debug_step_out(STEP_OUT_BUDGET) {
+            error!("debugger step-out halted: {e:?}");
+            self.cpu_halted = true;
+            self.sync_live_audio_suspension();
+        }
+        self.surface_debug_stop();
+        self.finish_render_for_current_frame();
+    }
+
     /// Run one whole video frame while paused, refreshing the display so
     /// mid-frame raster effects can be inspected frame by frame. A
     /// scheduler quantum is shorter than a PAL frame, so step until the
@@ -5482,17 +5537,32 @@ impl App {
         true
     }
 
-    /// Toggle a PC breakpoint at the entry-box address.
+    /// Toggle a PC breakpoint from the entry box. The entry may carry an
+    /// optional condition and ignore count: "ADDR [LHS OP RHS] [IGN N]".
     fn debugger_toggle_breakpoint(&mut self) {
-        let Some(addr) = self.debugger_entry_addr("Break") else {
+        let spec = self
+            .debugger_panel
+            .as_ref()
+            .and_then(|panel| ui::parse_break_spec(&panel.entry));
+        let Some((addr, cond, ignore)) = spec else {
+            self.show_osd("Break: ADDR [LHS OP RHS] [IGN N] e.g. C033C2 D0 EQ 5");
             return;
         };
-        let set = self.emu.machine.ui_toggle_breakpoint(addr);
-        self.show_osd(format!(
+        let set = self.emu.machine.ui_set_breakpoint(addr, cond, ignore);
+        let mut msg = format!(
             "Breakpoint ${:06X} {}",
             addr & 0x00FF_FFFF,
             if set { "set" } else { "removed" }
-        ));
+        );
+        if set {
+            if let Some(cond) = &cond {
+                msg.push_str(&format!(" when {}", cond.describe()));
+            }
+            if ignore > 0 {
+                msg.push_str(&format!(" ign {ignore}"));
+            }
+        }
+        self.show_osd(msg);
     }
 
     /// Toggle a memory word watchpoint at the entry-box address.
@@ -5544,6 +5614,54 @@ impl App {
                     panel.mem_addr.wrapping_add(delta)
                 } & 0x00FF_FFF0;
             }
+        }
+    }
+
+    /// Write the entry box's value live while paused: a memory word from
+    /// "ADDR VALUE" on the Memory tab, or a register from "REG VALUE" on the
+    /// CPU tab. The panel borrow is resolved into a plain action first so the
+    /// emulator can then be borrowed mutably to perform the write.
+    fn debugger_poke(&mut self) {
+        enum Poke {
+            Mem(u32, u16),
+            Reg(usize, u32),
+            MemHelp,
+            RegHelp,
+            None,
+        }
+        let action = match self.debugger_panel.as_ref() {
+            Some(panel) => match panel.tab {
+                ui::DebugTab::Memory => match panel.poke_target() {
+                    Some((addr, value)) => Poke::Mem(addr, value),
+                    None => Poke::MemHelp,
+                },
+                ui::DebugTab::Cpu => match panel.reg_poke() {
+                    Some((reg, value)) => Poke::Reg(reg, value),
+                    None => Poke::RegHelp,
+                },
+                _ => Poke::None,
+            },
+            None => Poke::None,
+        };
+        match action {
+            Poke::Mem(addr, value) => {
+                let written = self
+                    .emu
+                    .machine
+                    .debug_write_memory(addr, &value.to_be_bytes());
+                if written == 2 {
+                    self.show_osd(format!("Poked ${value:04X} -> ${addr:06X}"));
+                } else {
+                    self.show_osd(format!("${addr:06X} is not writable RAM"));
+                }
+            }
+            Poke::Reg(reg, value) => {
+                self.emu.machine.debug_set_register(reg, value);
+                self.show_osd(format!("{} <- ${value:X}", gdb_reg_label(reg)));
+            }
+            Poke::MemHelp => self.show_osd("Poke: type \"ADDR VALUE\" (hex) first"),
+            Poke::RegHelp => self.show_osd("Set Reg: type \"REG VALUE\" e.g. D0 1234"),
+            Poke::None => {}
         }
     }
 
@@ -5710,10 +5828,13 @@ impl App {
                         "Disassembly pinned at ${origin:06X} (empty box + Enter follows PC)"
                     )));
                 }
+                let breaks = machine.ui_breaks();
                 let mut addr = panel.disasm_addr.unwrap_or(pc) & !1;
                 for _ in 0..24 {
                     let (text, len) = crate::disasm::disassemble(read, addr, machine.cpu_type());
-                    let line = format!("{addr:08X}  {text}");
+                    // A leading bullet marks a line that carries a breakpoint.
+                    let marker = if breaks.is_breakpoint(addr) { "*" } else { " " };
+                    let line = format!("{marker}{addr:08X}  {text}");
                     lines.push(if addr == pc {
                         ui::DbgLine::hilit(line)
                     } else {
@@ -5849,14 +5970,27 @@ impl App {
                 lines.push(ui::DbgLine::plain(
                     "Reg takes a custom-register offset (96) or address (DFF096).",
                 ));
+                lines.push(ui::DbgLine::plain(
+                    "Break cond: ADDR [LHS OP RHS] [IGN N]  e.g. C033C2 D0 EQ 5",
+                ));
+                lines.push(ui::DbgLine::plain(
+                    "  ops EQ NE LT GT LE GE AND; operand Dn An PC SR Mhex hex",
+                ));
                 lines.push(ui::DbgLine::plain(""));
                 let breaks = self.emu.machine.ui_breaks();
                 lines.push(ui::DbgLine::plain("Breakpoints:"));
                 if breaks.breakpoints.is_empty() {
                     lines.push(ui::DbgLine::plain("  (none)"));
                 }
-                for pc in &breaks.breakpoints {
-                    lines.push(ui::DbgLine::plain(format!("  ${pc:06X}")));
+                for bp in &breaks.breakpoints {
+                    let mut text = format!("  ${:06X}", bp.addr);
+                    if let Some(cond) = &bp.cond {
+                        text.push_str(&format!("  {}", cond.describe()));
+                    }
+                    if bp.ignore > 0 {
+                        text.push_str(&format!("  ign {}/{}", bp.hits, bp.ignore));
+                    }
+                    lines.push(ui::DbgLine::plain(text));
                 }
                 lines.push(ui::DbgLine::plain(""));
                 lines.push(ui::DbgLine::plain("Watchpoints (word, stop on change):"));
@@ -6680,7 +6814,10 @@ fn take_integral_mouse_delta(value: &mut f64) -> i32 {
 }
 
 /// Hex digit for a key, for the debugger's address entry box.
-fn hex_char_for_key(code: KeyCode) -> Option<char> {
+/// Map a key to the character it types into the debugger entry box: digits, all
+/// letters (for register names and the EQ/NE/.../AND/IGN condition mnemonics and
+/// M<hex> memory operands), and Space. `push_entry_char` filters and uppercases.
+fn entry_char_for_key(code: KeyCode) -> Option<char> {
     use KeyCode::*;
     Some(match code {
         Digit0 | Numpad0 => '0',
@@ -6699,6 +6836,27 @@ fn hex_char_for_key(code: KeyCode) -> Option<char> {
         KeyD => 'D',
         KeyE => 'E',
         KeyF => 'F',
+        KeyG => 'G',
+        KeyH => 'H',
+        KeyI => 'I',
+        KeyJ => 'J',
+        KeyK => 'K',
+        KeyL => 'L',
+        KeyM => 'M',
+        KeyN => 'N',
+        KeyO => 'O',
+        KeyP => 'P',
+        KeyQ => 'Q',
+        KeyR => 'R',
+        KeyS => 'S',
+        KeyT => 'T',
+        KeyU => 'U',
+        KeyV => 'V',
+        KeyW => 'W',
+        KeyX => 'X',
+        KeyY => 'Y',
+        KeyZ => 'Z',
+        Space => ' ',
         _ => return None,
     })
 }
@@ -8717,7 +8875,8 @@ mod tests {
             Some(panel) => {
                 assert_eq!(panel.disasm_addr, Some(0xFC0010));
                 let view = app.build_debugger_view(panel);
-                assert!(view.lines.iter().any(|l| l.text.starts_with("00FC0010")));
+                // Each disasm line carries a one-char breakpoint marker prefix.
+                assert!(view.lines.iter().any(|l| l.text.contains("00FC0010")));
             }
             _ => panic!("debugger panel should be open"),
         }
@@ -8731,14 +8890,46 @@ mod tests {
             _ => panic!("debugger panel should be open"),
         }
 
-        // While the entry box is focused, S is a hex digit candidate, not
-        // a transport key: it must not step (S is not hex, so it is just
-        // swallowed by the modal panel).
+        // While the entry box is focused, S types the register-name letter
+        // 'S' (for SR/SP) into the box instead of stepping.
         if let Some(panel) = app.debugger_panel.as_mut() {
             panel.entry_active = true;
+            panel.entry.clear();
         }
         let pc_before = app.emu.machine.pc();
-        assert!(!app.ui_handle_key(KeyCode::KeyS));
+        assert!(app.ui_handle_key(KeyCode::KeyS));
         assert_eq!(app.emu.machine.pc(), pc_before);
+        assert_eq!(
+            app.debugger_panel.as_ref().map(|p| p.entry.as_str()),
+            Some("S")
+        );
+    }
+
+    #[test]
+    fn debugger_poke_writes_memory_and_registers() {
+        let mut app = test_app();
+        app.open_debugger();
+        // Map chip RAM at $0 so the low test address is writable RAM, not the
+        // boot ROM overlay.
+        app.emu.machine.disable_overlay();
+
+        // Memory tab: "ADDR VALUE" writes a word into chip RAM.
+        if let Some(panel) = app.debugger_panel.as_mut() {
+            panel.tab = super::ui::DebugTab::Memory;
+            panel.entry = "2000 BEEF".to_string();
+        }
+        app.debugger_poke();
+        assert_eq!(
+            app.emu.machine.debug_read_memory(0x2000, 2),
+            vec![0xBE, 0xEF]
+        );
+
+        // CPU tab: "REG VALUE" sets a register.
+        if let Some(panel) = app.debugger_panel.as_mut() {
+            panel.tab = super::ui::DebugTab::Cpu;
+            panel.entry = "D3 12345678".to_string();
+        }
+        app.debugger_poke();
+        assert_eq!(app.emu.machine.d(3), 0x1234_5678);
     }
 }
