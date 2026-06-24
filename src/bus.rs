@@ -10330,7 +10330,7 @@ mod tests {
 
     const STANDARD_DIW_HSTART: i32 = 0x81;
     const STANDARD_VISIBLE_X0: usize = ((STANDARD_DIW_HSTART - RENDER_DIW_HSTART_FB0) * 2) as usize;
-    const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x34;
+    const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x38;
     static BUS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
@@ -12261,14 +12261,14 @@ mod tests {
             &mut bus,
             0x0100,
             RENDER_VISIBLE_START_VPOS,
-            RENDER_COPPER_WAIT_HPOS_FB0 + 30,
+            RENDER_COPPER_WAIT_HPOS_FB0 + 34,
             &[(0x0182, 0x00F0)],
         );
 
         let event_hpos = bus.current_render_events()[0].hpos;
         // MOVE write lands on its second-word fetch, two color clocks into the
-        // 4-color-clock cadence from the start hpos (+30).
-        assert_eq!(event_hpos, RENDER_COPPER_WAIT_HPOS_FB0 + 32);
+        // 4-color-clock cadence from the start hpos (+34).
+        assert_eq!(event_hpos, RENDER_COPPER_WAIT_HPOS_FB0 + 36);
         let words_per_row = bitplane_words_per_row(
             bus.agnus.revision(),
             bus.denise.bplcon0,

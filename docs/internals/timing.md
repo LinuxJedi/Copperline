@@ -141,12 +141,12 @@ shared by the live bus path and the blitter-deadline predictor's cloned
 simulation, so prediction and execution cannot drift apart.
 
 For the OCS low-res renderer, a same-line `COLORxx` write at beam `hpos`
-starts affecting pixels at `(hpos - $34) * 4` (`COLOR_WRITE_HPOS_FB0` in
+starts affecting pixels at `(hpos - $38) * 4` (`COLOR_WRITE_HPOS_FB0` in
 `src/video/bitplane.rs`); beam-timed placement is anchored at
 `COPPER_WAIT_HPOS_FB0` ($28), and bitplane-control writes add the
 fetch-to-display pipeline offset (`BITPLANE_CONTROL_PIPELINE_FB`). AGA
 BPLCON4's sprite palette-base byte uses Lisa's earlier sprite colour-lookup
-path at `(hpos - $36) * 4` (`SPRITE_PALETTE_CONTROL_HPOS_FB0`). Because
+path at `(hpos - $3A) * 4` (`SPRITE_PALETTE_CONTROL_HPOS_FB0`). Because
 colour MOVEs are spaced four colour clocks apart, a gradient changes
 colour every 8 lores pixels, matching hardware rather than the previous
 (too-fine) 4-pixel spacing. Tests:

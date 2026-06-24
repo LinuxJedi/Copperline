@@ -58,14 +58,15 @@ const DIW_HSTART_FETCH_REFERENCE_HIRES: i32 = 0x83;
 const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// COLORxx writes feed Denise's final colour-selection/output path, not the
 /// upstream bitplane shifter. Treat the left output edge as the first visible
-/// colour-register position rather than the earlier bitplane-control domain.
-/// Moved left by 8 colour clocks alongside the other origin anchors.
-const COLOR_WRITE_HPOS_FB0: i32 = 0x34;
+/// colour-register position rather than the earlier bitplane-control domain;
+/// in low-res copper gradients, writes four colour clocks apart advance by one
+/// 16-pixel colour cell.
+const COLOR_WRITE_HPOS_FB0: i32 = 0x38;
 /// AGA BPLCON4's low sprite-palette byte follows Lisa's sprite colour lookup
 /// path, which reaches sprite output earlier than ordinary COLORxx palette
 /// writes. Keep it separate from COLOR replay so copper palette gradients stay
 /// in the Denise palette-output phase on OCS/ECS.
-const SPRITE_PALETTE_CONTROL_HPOS_FB0: i32 = 0x36;
+const SPRITE_PALETTE_CONTROL_HPOS_FB0: i32 = 0x3A;
 /// SPRxPOS writes update the Denise horizontal comparator seven CCK ahead of
 /// the normal register/output beam domain. Manual sprite replays use this
 /// earlier domain so adjacent position writes can abut at their programmed
@@ -1508,6 +1509,7 @@ struct BeamSpriteState {
     sprdata: [u16; 8],
     sprdatb: [u16; 8],
     spr_armed: [bool; 8],
+    direct_data_armed: [bool; 8],
     /// Lisa only: FMODE SPR32/SPAGEM widen manual sprites too. A CPU/Copper
     /// SPRxDATA/SPRxDATB write loads the same 16-bit value into every word
     /// of the wide holding register, so a manual wide sprite repeats its
@@ -1550,6 +1552,7 @@ impl BeamSpriteState {
             sprdata: state.sprdata,
             sprdatb: state.sprdatb,
             spr_armed,
+            direct_data_armed: [false; 8],
             aga: matches!(state.agnus_revision, AgnusRevision::AgaAlice),
             fmode: state.fmode,
             held: *held,
@@ -1572,10 +1575,12 @@ impl BeamSpriteState {
             0x2 => {
                 self.sprctl[idx] = val;
                 self.spr_armed[idx] = false;
+                self.direct_data_armed[idx] = false;
             }
             0x4 => {
                 self.sprdata[idx] = val;
                 self.spr_armed[idx] = true;
+                self.direct_data_armed[idx] = true;
             }
             0x6 => self.sprdatb[idx] = val,
             _ => {}
@@ -1615,19 +1620,21 @@ impl BeamSpriteState {
                 x_stop,
             });
         }
-        let vstart = sprite_vstart(pos, ctl);
-        let vstop = sprite_vstop(ctl);
-        // Normal pair: [vstart, vstop). Equal start/stop is an empty window;
-        // only a strictly inverted pair wraps through the frame boundary.
-        let in_window = if vstop == vstart {
-            false
-        } else if vstop > vstart {
-            beam_y >= vstart && beam_y < vstop
-        } else {
-            beam_y >= vstart || beam_y < vstop
-        };
-        if !in_window {
-            return None;
+        if !self.direct_data_armed[sprite] {
+            let vstart = sprite_vstart(pos, ctl);
+            let vstop = sprite_vstop(ctl);
+            // Normal pair: [vstart, vstop). Equal start/stop is an empty window;
+            // only a strictly inverted pair wraps through the frame boundary.
+            let in_window = if vstop == vstart {
+                false
+            } else if vstop > vstart {
+                beam_y >= vstart && beam_y < vstop
+            } else {
+                beam_y >= vstart || beam_y < vstop
+            };
+            if !in_window {
+                return None;
+            }
         }
         let width_words = if self.aga {
             sprite_width_words_from_fmode(self.fmode)
@@ -7337,7 +7344,7 @@ mod tests {
         );
         assert_eq!(
             beam_to_framebuffer_x_unclamped(COLOR_WRITE_HPOS_FB0 as u32),
-            48
+            64
         );
         assert_eq!(
             sprite_palette_control_framebuffer_x(SPRITE_PALETTE_CONTROL_HPOS_FB0 as u32),
@@ -8616,22 +8623,56 @@ mod tests {
     }
 
     #[test]
-    fn manual_sprite_vstart_equal_vstop_is_empty() {
+    fn latched_sprite_vstart_equal_vstop_is_empty() {
         let mut initial_state = blank_state();
         let beam_y = PAL_VISIBLE_LINE0;
         let (pos, ctl) = sprite_control_words(beam_y as u16, beam_y as u16, DIW_HSTART_FB0 as u16);
         initial_state.sprpos[0] = pos;
         initial_state.sprctl[0] = ctl;
+        initial_state.sprdata[0] = 0xFFFF;
+        initial_state.spr_armed[0] = true;
 
-        let events = [cpu_event(
-            beam_y as u32,
-            COPPER_WAIT_HPOS_FB0 as u32,
-            0x144,
-            0xFFFF,
-        )];
-        let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            true,
+        );
 
         assert!(manual_sprite_lines[0].is_empty());
+    }
+
+    #[test]
+    fn direct_sprite_data_write_ignores_dma_vertical_window() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0 + 12;
+        let (pos, ctl) = sprite_control_words(
+            PAL_VISIBLE_LINE0 as u16,
+            PAL_VISIBLE_LINE0 as u16,
+            DIW_HSTART_FB0 as u16,
+        );
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[cpu_event(
+                beam_y as u32,
+                COPPER_WAIT_HPOS_FB0 as u32,
+                0x144,
+                0xFFFF,
+            )],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .any(|line| line.beam_y == beam_y));
     }
 
     #[test]
