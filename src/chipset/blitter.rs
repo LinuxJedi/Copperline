@@ -164,8 +164,6 @@ pub struct Blitter {
 
     pending: Option<PendingBlit>,
     dma_addr_mask: u32,
-    #[serde(skip, default)]
-    bltaold: u16,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -318,7 +316,6 @@ impl Blitter {
             bltbdat: 0,
             bltcdat: 0,
             bltsizv: 0,
-            bltaold: 0,
             bltbold: 0,
             bltbold_init: true,
             line_bdat: 0,
@@ -621,8 +618,12 @@ impl Blitter {
         let mut cpt = self.bltcpt;
         let mut dpt = self.bltdpt;
 
-        let mut a_prev: u16 = self.bltaold;
-        let mut b_prev: u16 = self.bltbold;
+        let mut a_prev: u16 = 0;
+        let mut b_prev: u16 = if use_b || self.bltbold_init {
+            0
+        } else {
+            self.bltbold
+        };
         for _row in 0..h {
             let mut fill_state: u16 = fci;
             // Buffer this row's D words so fill mode can process them
@@ -715,8 +716,7 @@ impl Blitter {
         self.bltbpt = bpt & ptr_mask;
         self.bltcpt = cpt & ptr_mask;
         self.bltdpt = dpt & ptr_mask;
-        self.bltaold = a_prev;
-        if use_b {
+        if !use_b {
             self.bltbold = b_prev;
         }
     }
@@ -1089,8 +1089,12 @@ impl NormalBlitState {
             bpt: blitter.bltbpt,
             cpt: blitter.bltcpt,
             dpt: blitter.bltdpt,
-            a_prev: blitter.bltaold,
-            b_prev: blitter.bltbold,
+            a_prev: 0,
+            b_prev: if use_b || blitter.bltbold_init {
+                0
+            } else {
+                blitter.bltbold
+            },
             cur_a: 0,
             cur_b: 0,
             cur_c: 0,
@@ -1479,8 +1483,7 @@ impl NormalBlitState {
         blitter.bltbpt = self.bpt & ptr_mask;
         blitter.bltcpt = self.cpt & ptr_mask;
         blitter.bltdpt = self.dpt & ptr_mask;
-        blitter.bltaold = self.a_prev;
-        if self.use_b {
+        if !self.use_b {
             blitter.bltbold = self.b_prev;
         }
     }
@@ -1795,11 +1798,11 @@ mod tests {
         );
     }
 
-    /// The A-channel barrel shifter's old-word latch is not cleared by
-    /// BLTSIZE. Split shifted blits can carry a boundary bit through BLTAOLD
-    /// when software starts the next blit without writing BLTADAT.
+    /// A new BLTSIZE starts the A-channel barrel shifter with zero fill.
+    /// Carry still crosses row boundaries inside one blit, but it must not
+    /// leak from the previous blit into the first word of the next one.
     #[test]
-    fn scheduled_a_shift_carry_survives_bltsize_restart() {
+    fn scheduled_a_shift_zero_fills_first_word_of_new_blit() {
         let mut ram = vec![0u8; 256];
         write_word(&mut ram, 0x10, 0x0001);
         write_word(&mut ram, 0x12, 0x8000);
@@ -1820,7 +1823,7 @@ mod tests {
         b.start_scheduled((1u16 << 6) | 1, &ram);
         while !b.tick_scheduled_slot(&mut ram) {}
 
-        assert_eq!(read_word(&ram, 0x22), 0xC000);
+        assert_eq!(read_word(&ram, 0x22), 0x4000);
     }
 
     /// Verify BZERO surfaces correctly when all output bits are zero.

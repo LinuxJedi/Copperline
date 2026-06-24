@@ -227,18 +227,18 @@ state exists. D output is delayed through the hold register: after source
 fetches, the first D phase is the HRM "-" bubble and does not claim the
 chip bus because no destination word is queued yet. The first destination
 word is written on the next D slot and the final word in the F flush slot.
-Normal-mode A/B barrel-shifter carry is not cleared by the
-BLTSIZE row counter; it carries from the last source word of one row into
-the first source word of the next, while masks, modulos, and fill carry
-still observe row boundaries. Line blits use L1-L4 phases (L2 latches the
-C source word, L3 propagates, L4 stores); line-mode B data loads pass
-through the current B shifter at write time, and at completion the
-hardware-visible ASH, BSH, SIGN, and low-word BLTAPT accumulator state is
-written back. Tests:
+Normal-mode A/B barrel-shifter carry is cleared at the first word of a new
+BLTSIZE, then carries from the last source word of one row into the first
+source word of the next inside that blit; masks, modulos, and fill carry
+still observe row boundaries. Line blits use L1-L4 phases (L2 latches the C
+source word, L3 propagates, L4 stores); line-mode B data loads pass through
+the current B shifter at write time, and at completion the hardware-visible
+ASH, BSH, SIGN, and low-word BLTAPT accumulator state is written back. Tests:
 `scheduled_normal_mode_bbusy_start_delay_precedes_first_source_slot`,
 `blit_pipeline_identifies_idle_cycles_per_hrm_diagrams`,
 `scheduled_line_mode_latches_c_source_before_store_phase`,
-`scheduled_shift_carry_crosses_normal_mode_row_boundary`.
+`scheduled_shift_carry_crosses_normal_mode_row_boundary`,
+`scheduled_a_shift_zero_fills_first_word_of_new_blit`.
 
 ### Mid-operation register writes
 
