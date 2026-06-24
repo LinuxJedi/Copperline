@@ -14,6 +14,10 @@ use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+/// Instruction budget for the `monitor stepover` / `monitor finish` helpers, so
+/// a call or subroutine that never returns cannot wedge the debug server.
+const MONITOR_STEP_BUDGET: usize = 5_000_000;
+
 const TARGET_XML: &str = r#"<?xml version="1.0"?>
 <target>
   <architecture>m68k</architecture>
@@ -523,6 +527,21 @@ impl Session {
                 self.emu.retired_instructions()
             )),
             "custom" => Ok(self.monitor_custom()),
+            "stepover" => {
+                // Step over a BSR/JSR/TRAP call (single step otherwise),
+                // bounded so a call that never returns cannot hang the server.
+                self.cpu_idle = false;
+                self.emu.debug_step_over(MONITOR_STEP_BUDGET)?;
+                self.refresh_watchpoints();
+                Ok(format!("pc=${:08X}\n", self.emu.machine.pc()))
+            }
+            "finish" => {
+                // Run until the current subroutine returns to its caller.
+                self.cpu_idle = false;
+                self.emu.debug_step_out(MONITOR_STEP_BUDGET)?;
+                self.refresh_watchpoints();
+                Ok(format!("pc=${:08X}\n", self.emu.machine.pc()))
+            }
             "reg" => {
                 let Some(name) = parts.next() else {
                     return Ok("usage: monitor reg NAME|OFFSET\n".to_string());
@@ -703,6 +722,7 @@ fn monitor_help() -> String {
     "monitor commands:\n\
      help\n\
      status | beam | custom\n\
+     stepover | finish\n\
      reg NAME|OFFSET\n\
      write-reg NAME|OFFSET VALUE\n\
      watch-reg NAME|OFFSET | unwatch-reg NAME|OFFSET | clear-reg-watches\n\

@@ -345,6 +345,20 @@ fn real_target_instructions_per_second(cpu_cycles_per_instruction: f64) -> f64 {
     PAL_68000_CLOCK_HZ / cpu_cycles_per_instruction
 }
 
+/// True when the opword is a call that, once its callee returns, resumes at the
+/// following instruction: BSR (`0x61xx`), JSR (`0x4E80..=0x4EBF`), or TRAP #n
+/// (`0x4E40..=0x4E4F`). Step-over runs to the instruction after one of these.
+fn instruction_returns_inline(op: u16) -> bool {
+    (op & 0xFF00) == 0x6100 || (op & 0xFFC0) == 0x4E80 || (op & 0xFFF0) == 0x4E40
+}
+
+/// True when the opword returns from a subroutine or exception: RTE (`0x4E73`),
+/// RTD (`0x4E74`), RTS (`0x4E75`), or RTR (`0x4E77`). Step-out watches for one
+/// of these lifting the stack pointer past the entry frame.
+fn instruction_is_return(op: u16) -> bool {
+    matches!(op, 0x4E73 | 0x4E74 | 0x4E75 | 0x4E77)
+}
+
 #[derive(Default)]
 pub struct EmuStats {
     pub frames: u64,
@@ -1110,32 +1124,39 @@ impl Emulator {
         Ok(())
     }
 
+    /// Execute one instruction with the same STOP/idle fast-forward handling as
+    /// the real-time loop: a CPU halted in STOP makes no progress under a
+    /// single-instruction slice, so advance devices to the next event and let
+    /// the wake-up interrupt fire. Shared by the run-to / step-over / step-out
+    /// helpers so they all step a STOPped CPU forward instead of spinning.
+    fn debug_step_one_with_idle(&mut self) -> Result<()> {
+        let run = self.execute_cpu_slice(1)?;
+        self.machine.refresh_irq_line();
+        if run.cpu_stopped {
+            let chunk = self.idle_fast_forward_chunk(INSTRUCTIONS_PER_REALTIME_SLICE);
+            let run = self.execute_cpu_slice(chunk)?;
+            let accounting = real_slice_accounting(
+                &run,
+                chunk,
+                self.cpu_cycles_per_instruction,
+                self.real_pacing_budget_mode,
+            );
+            if run.cpu_stopped {
+                let idle_cck = accounting.slice_cck.saturating_sub(run.bus_advanced_cck);
+                self.bus_mut().advance_devices(idle_cck);
+            }
+            self.machine.refresh_irq_line();
+        }
+        Ok(())
+    }
+
     /// Run until the CPU reaches `target_pc` (masked to the bus width), up
     /// to `max_instructions`. Returns true when the target was hit.
     pub fn debug_run_to_pc(&mut self, target_pc: u32, max_instructions: usize) -> Result<bool> {
         const PC_MASK: u32 = 0x00FF_FFFF;
         let target = target_pc & PC_MASK;
         for _ in 0..max_instructions {
-            let run = self.execute_cpu_slice(1)?;
-            self.machine.refresh_irq_line();
-            if run.cpu_stopped {
-                // A stopped CPU makes no progress under single-instruction
-                // slices; advance devices to the next event so the wake-up
-                // interrupt can fire, mirroring step_real's fast-forward.
-                let chunk = self.idle_fast_forward_chunk(INSTRUCTIONS_PER_REALTIME_SLICE);
-                let run = self.execute_cpu_slice(chunk)?;
-                let accounting = real_slice_accounting(
-                    &run,
-                    chunk,
-                    self.cpu_cycles_per_instruction,
-                    self.real_pacing_budget_mode,
-                );
-                if run.cpu_stopped {
-                    let idle_cck = accounting.slice_cck.saturating_sub(run.bus_advanced_cck);
-                    self.bus_mut().advance_devices(idle_cck);
-                }
-                self.machine.refresh_irq_line();
-            }
+            self.debug_step_one_with_idle()?;
             if self.machine.pc() & PC_MASK == target {
                 return Ok(true);
             }
@@ -1146,6 +1167,47 @@ impl Emulator {
             }
         }
         Ok(false)
+    }
+
+    /// Step over the instruction at PC. When it is a call that returns to the
+    /// following instruction (BSR/JSR/TRAP), run until that return address (or
+    /// an earlier breakpoint/watch hit, or the `max_instructions` budget if the
+    /// call never returns); otherwise this is a plain single step.
+    pub fn debug_step_over(&mut self, max_instructions: usize) -> Result<()> {
+        let pc = self.machine.pc();
+        let op = self.machine.bus().peek_word_any(pc);
+        if !instruction_returns_inline(op) {
+            return self.debug_step_instructions(1);
+        }
+        let cpu_type = self.machine.cpu_type();
+        let len = {
+            let bus = self.machine.bus();
+            crate::disasm::disassemble(|a| bus.peek_word_any(a), pc, cpu_type).1
+        };
+        self.debug_run_to_pc(pc.wrapping_add(len), max_instructions)?;
+        Ok(())
+    }
+
+    /// Run until the current subroutine returns to its caller, up to
+    /// `max_instructions`. The return is detected by the stack pointer rising
+    /// above its value at entry right after a return instruction (RTS/RTR/RTE/
+    /// RTD): nested calls and interrupt handlers push below the entry frame and
+    /// pop back to it, so only this frame's own return lifts the SP past entry.
+    /// An earlier breakpoint/watch hit also ends the run.
+    pub fn debug_step_out(&mut self, max_instructions: usize) -> Result<()> {
+        let start_sp = self.machine.a(7);
+        for _ in 0..max_instructions {
+            let op = self.machine.bus().peek_word_any(self.machine.pc());
+            let is_return = instruction_is_return(op);
+            self.debug_step_one_with_idle()?;
+            if is_return && self.machine.a(7) > start_sp {
+                return Ok(());
+            }
+            if self.machine.ui_debug_stop_pending() {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     pub fn step_frame(&mut self) -> Result<()> {
@@ -1891,6 +1953,93 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    /// Build an emulator whose reset vector runs a tiny program in ROM:
+    ///
+    /// ```text
+    /// F80010  BSR.S  $F80020   ; call the subroutine
+    /// F80012  MOVEQ  #1,D0     ; return lands here (step-over stops before it)
+    /// F80014  BRA.S  *         ; halt
+    /// F80020  MOVEQ  #2,D1     ; subroutine body
+    /// F80022  RTS
+    /// ```
+    ///
+    /// SSP resets to $4000 (chip RAM), so BSR/RTS push and pop the return
+    /// address through real memory. The reset vectors live in chip RAM (overlay
+    /// is off, so the CPU reads them from address 0 at reset).
+    fn emulator_with_call_program() -> super::Emulator {
+        let mut rom = vec![0u8; crate::memory::ROM_SIZE];
+        let put = |mem: &mut [u8], off: usize, word: u16| {
+            mem[off..off + 2].copy_from_slice(&word.to_be_bytes());
+        };
+        put(&mut rom, 0x10, 0x610E); // BSR.S $F80020
+        put(&mut rom, 0x12, 0x7001); // MOVEQ #1,D0
+        put(&mut rom, 0x14, 0x60FE); // BRA.S *
+        put(&mut rom, 0x20, 0x7202); // MOVEQ #2,D1
+        put(&mut rom, 0x22, 0x4E75); // RTS
+
+        let mut chip_ram = vec![0u8; 512 * 1024];
+        chip_ram[0..4].copy_from_slice(&0x0000_4000u32.to_be_bytes()); // reset SSP
+        chip_ram[4..8].copy_from_slice(&0x00F8_0010u32.to_be_bytes()); // reset PC
+
+        let bus = crate::bus::Bus::new(
+            crate::memory::Memory {
+                chip_ram,
+                slow_ram: Vec::new(),
+                rom,
+                overlay: false,
+                zorro: crate::zorro::ZorroChain::default(),
+                extended_rom: Vec::new(),
+                extended_rom_base: 0,
+            },
+            crate::chipset::paula::Paula::new(
+                Box::new(crate::serial::NullSerialSink),
+                Box::new(crate::audio::NullSink),
+            ),
+            crate::floppy::FloppyController::default(),
+        );
+        super::Emulator::new(
+            bus,
+            crate::config::CpuModel::M68000,
+            false,
+            crate::config::PacingBudget::Cycles,
+            2,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn step_over_runs_the_callee_and_stops_after_the_call() {
+        let mut emu = emulator_with_call_program();
+        assert_eq!(emu.machine.pc(), 0x00F8_0010);
+        emu.debug_step_over(10_000).unwrap();
+        // The subroutine ran to completion (D1=2) and we stopped at the
+        // instruction after the BSR, before it executed (D0 still 0).
+        assert_eq!(emu.machine.pc(), 0x00F8_0012);
+        assert_eq!(emu.machine.d(1), 2);
+        assert_eq!(emu.machine.d(0), 0);
+    }
+
+    #[test]
+    fn step_over_a_non_call_is_a_plain_single_step() {
+        let mut emu = emulator_with_call_program();
+        emu.debug_step_over(10_000).unwrap(); // over the BSR -> at $F80012
+        emu.debug_step_over(10_000).unwrap(); // MOVEQ is not a call: single step
+        assert_eq!(emu.machine.pc(), 0x00F8_0014);
+        assert_eq!(emu.machine.d(0), 1);
+    }
+
+    #[test]
+    fn step_out_returns_to_the_caller() {
+        let mut emu = emulator_with_call_program();
+        emu.debug_step_instructions(1).unwrap(); // execute the BSR -> inside callee
+        assert_eq!(emu.machine.pc(), 0x00F8_0020);
+        emu.debug_step_out(10_000).unwrap();
+        // Returned to the instruction after the call; the callee body ran.
+        assert_eq!(emu.machine.pc(), 0x00F8_0012);
+        assert_eq!(emu.machine.d(1), 2);
     }
 
     #[test]

@@ -334,6 +334,11 @@ pub enum UiControl {
     DebugTab(DebugTab),
     DebugRun,
     DebugStep,
+    /// Step over a call: run the callee to completion, stopping at the
+    /// instruction after a BSR/JSR/TRAP (a plain single step otherwise).
+    DebugStepOver,
+    /// Step out: run until the current subroutine returns to its caller.
+    DebugStepOut,
     DebugStepFrame,
     DebugRunTo,
     /// Reverse-debug: step one instruction backward (reconstructed from the
@@ -451,11 +456,20 @@ fn debug_tab_rect(rect: Rect, index: usize) -> Rect {
     }
 }
 
-fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 10] {
+fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 12] {
     let y = rect.y + rect.h - DEBUG_BUTTON_H - 6;
+    // Step Over / Step Out share a second transport row just above the main
+    // one; the main row is already full edge to edge.
+    let y2 = rect.y + rect.h - 2 * DEBUG_BUTTON_H - 10;
     let button = |x: usize, w: usize| Rect {
         x: rect.x + x,
         y,
+        w,
+        h: DEBUG_BUTTON_H,
+    };
+    let button2 = |x: usize, w: usize| Rect {
+        x: rect.x + x,
+        y: y2,
         w,
         h: DEBUG_BUTTON_H,
     };
@@ -471,6 +485,9 @@ fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 10] {
         (UiControl::DebugReverseFrame, button(466, 76)),
         (UiControl::DebugReverseStep, button(546, 66)),
         (UiControl::DebugReverseRun, button(616, 60)),
+        // Forward step-over / step-out on the second row.
+        (UiControl::DebugStepOver, button2(8, 90)),
+        (UiControl::DebugStepOut, button2(102, 84)),
     ]
 }
 
@@ -976,7 +993,7 @@ fn draw_shortcuts(frame: &mut [u8], rect: Rect, scale: usize) {
     for line in [
         "Shortcuts: Cmd on macOS, Alt on Linux/Windows",
         "Amiga modifiers: Alt, Cmd/Super=Amiga, Ctrl",
-        "In the debugger: S step, F frame, R run/pause",
+        "In the debugger: S step, O over, U out, F frame, R run/pause",
     ] {
         draw_panel_text(frame, rect.x + 24, y, line, PANEL_TEXT_DIM, 1, scale);
         y += 12;
@@ -1101,9 +1118,10 @@ fn draw_debugger(
             );
         }
     }
-    // Content lines.
+    // Content lines. Two transport rows sit at the bottom now (the main row
+    // plus the Step Over/Out row), so the text area ends above both.
     let content_top = debug_content_top(rect);
-    let content_bottom = rect.y + rect.h - DEBUG_BUTTON_H - 12;
+    let content_bottom = rect.y + rect.h - 2 * DEBUG_BUTTON_H - 16;
     let pitch = 10;
     let max_lines = content_bottom.saturating_sub(content_top) / pitch;
     for (index, line) in view.lines.iter().take(max_lines).enumerate() {
@@ -1151,6 +1169,8 @@ fn draw_debugger(
                         }
                     }
                     UiControl::DebugStep => "Step",
+                    UiControl::DebugStepOver => "Step Over",
+                    UiControl::DebugStepOut => "Step Out",
                     UiControl::DebugStepFrame => "Frame",
                     UiControl::DebugRunTo => "Run to $",
                     UiControl::DebugReverseStep => "< Step",

@@ -4618,6 +4618,10 @@ impl App {
             }
             UiControl::DebugRun => self.activate_tool_control(ToolPanelKind::Debugger, control),
             UiControl::DebugStep => self.activate_tool_control(ToolPanelKind::Debugger, control),
+            UiControl::DebugStepOver => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
+            }
+            UiControl::DebugStepOut => self.activate_tool_control(ToolPanelKind::Debugger, control),
             UiControl::DebugStepFrame => {
                 self.activate_tool_control(ToolPanelKind::Debugger, control)
             }
@@ -4676,6 +4680,8 @@ impl App {
             }
             (ToolPanelKind::Debugger, UiControl::DebugRun) => self.debugger_toggle_run(),
             (ToolPanelKind::Debugger, UiControl::DebugStep) => self.debugger_step(),
+            (ToolPanelKind::Debugger, UiControl::DebugStepOver) => self.debugger_step_over(),
+            (ToolPanelKind::Debugger, UiControl::DebugStepOut) => self.debugger_step_out(),
             (ToolPanelKind::Debugger, UiControl::DebugStepFrame) => self.debugger_step_frame(),
             (ToolPanelKind::Debugger, UiControl::DebugRunTo) => self.debugger_run_to(),
             (ToolPanelKind::Debugger, UiControl::DebugReverseStep) => self.debugger_reverse_step(),
@@ -4800,6 +4806,8 @@ impl App {
         }
         let control = match code {
             KeyCode::KeyS => Some(UiControl::DebugStep),
+            KeyCode::KeyO => Some(UiControl::DebugStepOver),
+            KeyCode::KeyU => Some(UiControl::DebugStepOut),
             KeyCode::KeyF => Some(UiControl::DebugStepFrame),
             KeyCode::KeyR => Some(UiControl::DebugRun),
             _ => None,
@@ -5348,6 +5356,39 @@ impl App {
             self.sync_live_audio_suspension();
         }
         self.surface_debug_stop();
+    }
+
+    /// Step over a subroutine call while paused: run a BSR/JSR/TRAP callee to
+    /// completion and stop at the following instruction (a plain single step
+    /// otherwise). Bounded so a call that never returns cannot wedge the UI.
+    fn debugger_step_over(&mut self) {
+        const STEP_OVER_BUDGET: usize = 5_000_000;
+        self.paused = true;
+        self.sync_live_audio_suspension();
+        self.last_debug_stop = None;
+        if let Err(e) = self.emu.debug_step_over(STEP_OVER_BUDGET) {
+            error!("debugger step-over halted: {e:?}");
+            self.cpu_halted = true;
+            self.sync_live_audio_suspension();
+        }
+        self.surface_debug_stop();
+        self.finish_render_for_current_frame();
+    }
+
+    /// Step out of the current subroutine while paused: run until it returns to
+    /// its caller. Bounded so a routine that never returns cannot wedge the UI.
+    fn debugger_step_out(&mut self) {
+        const STEP_OUT_BUDGET: usize = 5_000_000;
+        self.paused = true;
+        self.sync_live_audio_suspension();
+        self.last_debug_stop = None;
+        if let Err(e) = self.emu.debug_step_out(STEP_OUT_BUDGET) {
+            error!("debugger step-out halted: {e:?}");
+            self.cpu_halted = true;
+            self.sync_live_audio_suspension();
+        }
+        self.surface_debug_stop();
+        self.finish_render_for_current_frame();
     }
 
     /// Run one whole video frame while paused, refreshing the display so
