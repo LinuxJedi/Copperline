@@ -91,9 +91,10 @@ The mapping from beam coordinates to framebuffer x is anchored by
 constants that encode the hardware's fetch-to-display pipeline delays --
 register writes, palette writes, and bitplane data each land at their own
 documented offset, and the bitplane fetch reference differs between lo-res
-and hi-res. Wide-FMODE DMA fetches start from raw DDFSTRT and complete
-whole units, but the displayed shifter origin is still quantized by the
-FMODE fetch gulp; the renderer keeps those two effects separate. These
+and hi-res. Wide-FMODE DMA fetches start from the revision-masked DDFSTRT
+comparator value and complete whole units, but the displayed shifter origin
+is still quantized by the FMODE fetch gulp; the renderer keeps those two
+effects separate. These
 anchors were calibrated against real-hardware captures and other
 emulators; `COPPERLINE_HCENTER=0` and `COPPERLINE_OVERSCAN=full` help when
 re-checking them.

@@ -18,16 +18,15 @@ the DDFSTRT comparator, then each fetch block/unit uses the BPLCON0 value
 visible at that block's first cycle. A mid-row BPLCON0 plane-count change
 therefore cannot retroactively fetch earlier words, but it can add or
 remove planes for later blocks in the same row. The sequence completes
-whole fetch units: DDF registers have finer
-granularity than the unit in hi-res/super-hi-res and wide-FMODE modes, so
-a DDFSTOP landing mid-unit extends the fetch through the unit starting
-at-or-after it (`agnus::bitplane_fetch_blocks`; the CDTV trademark
-screen's hi-res $64/$A8 window fetches 20 words per row, not the truncated
-18). Lo-res OCS DDFSTRT and DDFSTOP are both rounded to the 8-CCK
-fetch-block grid before the whole-unit completion rule is applied: bit 2 of
-DDFSTOP does not select an extra low-res block, so a $4A/$B6 window fetches
-14 words per row and a $64/$A5 window fetches 9. Wide-FMODE units (16/32 CCK)
-use the same rule rather than moving DDFSTRT down to an absolute grid. In
+whole fetch units: the DDF register value is first masked to the Agnus
+revision's comparator precision (OCS keeps 4-CCK precision; ECS/AGA keep
+2-CCK precision), then a DDFSTOP landing mid-unit extends the fetch through
+the unit starting at-or-after it (`agnus::bitplane_fetch_blocks`; the CDTV
+trademark screen's hi-res $64/$A8 window fetches 20 words per row, not the
+truncated 18). In lo-res OCS, bit 2 of DDFSTRT and DDFSTOP remains visible
+to the 8-CCK fetch-unit count: $34/$D4 fetches 21 words, $28/$D4 fetches
+23, and $4A/$B6 fetches 15. Wide-FMODE units (16/32 CCK) use the same rule
+rather than moving DDFSTRT down to an absolute grid. In
 lo-res, the plane-order slots for a wide unit are packed into the unit's
 first eight CCKs; the remaining CCKs are free for other bus users. If a
 bitplane fetch block occupies sprite 7's late DMA slot at $30, sprite 7 DMA

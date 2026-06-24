@@ -140,16 +140,21 @@ check is applied by `Copper::step_eligible_slot`, the single primitive
 shared by the live bus path and the blitter-deadline predictor's cloned
 simulation, so prediction and execution cannot drift apart.
 
-For the OCS low-res renderer, a same-line `COLORxx` write at beam `hpos`
+For the low-res renderer, a same-line `COLORxx` write at beam `hpos`
 starts affecting pixels at `(hpos - $34) * 4` (`COLOR_WRITE_HPOS_FB0` in
 `src/video/bitplane.rs`); beam-timed placement is anchored at
 `COPPER_WAIT_HPOS_FB0` ($28), and bitplane-control writes add the
-fetch-to-display pipeline offset (`BITPLANE_CONTROL_PIPELINE_FB`). AGA
-BPLCON4's sprite palette-base byte uses Lisa's earlier sprite colour-lookup
-path at `(hpos - $36) * 4` (`SPRITE_PALETTE_CONTROL_HPOS_FB0`). Because
-colour MOVEs are spaced four colour clocks apart, a gradient changes
-colour every 8 lores pixels, matching hardware rather than the previous
-(too-fine) 4-pixel spacing. Tests:
+fetch-to-display pipeline offset (`BITPLANE_CONTROL_PIPELINE_FB`). This
+anchor keeps a copper colour change aligned with the bitplane pixels it
+recolours: Denise (and MiniMig, which adds a one-lores-pixel bitplane delay
+"for alignment of bitplane data and copper colour change") emits the new
+colour in the same beam slot as those pixels. OCS Denise (8362) and ECS
+Denise (8373) share this timing; the only OCS/ECS colour-path difference is
+the OCS 12-bit value mask. (AGA Lisa delays colour changes by one hires
+pixel relative to OCS/ECS per WinUAE; that sub-colour-clock offset is not
+yet modelled.) AGA BPLCON4's sprite palette-base byte uses Lisa's earlier
+sprite colour-lookup path at `(hpos - $36) * 4`
+(`SPRITE_PALETTE_CONTROL_HPOS_FB0`). Tests:
 `copper_move_writes_visible_registers_on_second_dma_slot`,
 `copper_move_spends_four_color_clocks_leaving_alternate_cycles_free`.
 
@@ -200,6 +205,8 @@ wait for the blitter to go idle.
   `TODO.md` (`t=165s`/`t=180s` frame dumps).
 
 Copper writes to "dangerous" registers are gated by COPCON's CDANG bit.
+COPCON is a one-bit Agnus control latch; byte writes use the mirrored 68000
+byte value, so a byte bit operation such as `bset #1,COPCON` sets CDANG.
 References: HRM [Coprocessor
 Hardware](https://www.theflatnet.de/pub/cbm/amiga/AmigaDevDocs/hard_2.html).
 
@@ -225,18 +232,18 @@ state exists. D output is delayed through the hold register: after source
 fetches, the first D phase is the HRM "-" bubble and does not claim the
 chip bus because no destination word is queued yet. The first destination
 word is written on the next D slot and the final word in the F flush slot.
-Normal-mode A/B barrel-shifter carry is not cleared by the
-BLTSIZE row counter; it carries from the last source word of one row into
-the first source word of the next, while masks, modulos, and fill carry
-still observe row boundaries. Line blits use L1-L4 phases (L2 latches the
-C source word, L3 propagates, L4 stores); line-mode B data loads pass
-through the current B shifter at write time, and at completion the
-hardware-visible ASH, BSH, SIGN, and low-word BLTAPT accumulator state is
-written back. Tests:
+Normal-mode A/B barrel-shifter carry is cleared at the first word of a new
+BLTSIZE, then carries from the last source word of one row into the first
+source word of the next inside that blit; masks, modulos, and fill carry
+still observe row boundaries. Line blits use L1-L4 phases (L2 latches the C
+source word, L3 propagates, L4 stores); line-mode B data loads pass through
+the current B shifter at write time, and at completion the hardware-visible
+ASH, BSH, SIGN, and low-word BLTAPT accumulator state is written back. Tests:
 `scheduled_normal_mode_bbusy_start_delay_precedes_first_source_slot`,
 `blit_pipeline_identifies_idle_cycles_per_hrm_diagrams`,
 `scheduled_line_mode_latches_c_source_before_store_phase`,
-`scheduled_shift_carry_crosses_normal_mode_row_boundary`.
+`scheduled_shift_carry_crosses_normal_mode_row_boundary`,
+`scheduled_a_shift_zero_fills_first_word_of_new_blit`.
 
 ### Mid-operation register writes
 

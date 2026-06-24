@@ -56,10 +56,26 @@ const DIW_HSTART_FETCH_REFERENCE_HIRES: i32 = 0x83;
 // clocks in lockstep with DIW_HSTART_FB0 (16 lo-res pixels) so register writes
 // and bitplane pixels still register against each other after widening.
 const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
-/// COLORxx writes feed Denise's final colour-selection/output path, not the
-/// upstream bitplane shifter. Treat the left output edge as the first visible
-/// colour-register position rather than the earlier bitplane-control domain.
-/// Moved left by 8 colour clocks alongside the other origin anchors.
+/// COLORxx writes feed Denise's final colour-selection/output path. Denise
+/// keeps copper/CPU colour-register changes phase-aligned with the bitplane
+/// serializer output: a colour write and the bitplane pixels it recolours reach
+/// the DAC together. (MiniMig models this explicitly with a one-lores-pixel
+/// bitplane delay added "for alignment of bitplane data and copper colour
+/// change"; WinUAE applies colour changes in the same beam slot as the
+/// bitplane pixels.) OCS Denise (8362) and ECS Denise (8373) share this timing
+/// exactly -- the only OCS/ECS colour-path difference is the OCS 12-bit value
+/// mask -- so this anchor is revision-independent across OCS/ECS.
+///
+/// TODO: AGA Lisa delays colour changes by one hires pixel relative to
+/// OCS/ECS (WinUAE: "AGA color changes are 1 hires pixel delayed"). That
+/// sub-colour-clock offset is not yet modelled here.
+///
+/// STOP before retuning this. If a scene's colours or copper-driven picture
+/// look horizontally shifted, the cause is almost never this anchor -- it has
+/// been moved "to fix" demos several times and always had to be moved back
+/// (the real bug was bitplane fetch/DDF alignment, sprite arming, etc.). This
+/// value keeps copper colour writes aligned with the bitplane pixels they
+/// recolour and is the same on OCS and ECS; leave it at 0x34.
 const COLOR_WRITE_HPOS_FB0: i32 = 0x34;
 /// AGA BPLCON4's low sprite-palette byte follows Lisa's sprite colour lookup
 /// path, which reaches sprite output earlier than ordinary COLORxx palette
@@ -735,8 +751,8 @@ impl ControlState {
 
     fn has_valid_ddf_window(&self) -> bool {
         let hires_like = self.hires() || self.shres();
-        let start = effective_ddf_start_hpos_raw(hires_like, self.ddfstrt);
-        let stop = effective_ddf_stop_hpos(hires_like, self.ddfstop);
+        let start = effective_ddf_start_hpos_raw(self.agnus_revision, hires_like, self.ddfstrt);
+        let stop = effective_ddf_stop_hpos(self.agnus_revision, hires_like, self.ddfstop);
         (start == 0 && stop == 0)
             || effective_ddf_window(
                 self.agnus_revision,
@@ -776,14 +792,16 @@ impl ControlState {
         }
         // The displayed shifter origin moves in whole fetch gulps, matching
         // the renderer's placement (see `fetch_origin_native_shift`). This is
-        // separate from the DMA slot positions, which start at raw DDFSTRT.
-        // Each colour clock of DDF shift moves the picture two lo-res H units.
+        // separate from the DMA slot positions, which start at the
+        // revision-masked DDFSTRT comparator value. Each colour clock of DDF
+        // shift moves the picture two lo-res H units.
         let gulp = self.fetch_period() as i32;
         let align = |hpos: i32| -> i32 {
             (hpos.div_euclid(gulp) * gulp).max(BITPLANE_DDF_HARD_START as i32)
         };
         let standard_ddf = if hires_like { 0x003C } else { 0x0038 };
-        let aligned_start = align(effective_ddf_start_hpos(hires_like, self.ddfstrt) as i32);
+        let aligned_start =
+            align(effective_ddf_start_hpos(self.agnus_revision, hires_like, self.ddfstrt) as i32);
         let start_h = STANDARD_DIW_HSTART + (aligned_start - align(standard_ddf)) * 2;
         // Fetched H width: one word spans 16 lo-res, 8 hi-res, or 4 super-hi-res
         // H units, so the standard 20/40/80-word row is 320 H units wide.
@@ -823,9 +841,10 @@ impl ControlState {
         };
         // The displayed picture position is quantized to the fetch-period
         // grid (one FMODE gulp per plane). The DMA sequencer itself starts at
-        // raw DDFSTRT, but the shifter consumes data in whole 1/2/4-word
-        // gulps, so a DDFSTRT moved within one gulp changes how much tail data
-        // is fetched without necessarily moving the visible picture. With
+        // the revision-masked DDFSTRT comparator value, but the shifter
+        // consumes data in whole 1/2/4-word gulps, so a DDFSTRT moved within
+        // one gulp changes how much tail data is fetched without necessarily
+        // moving the visible picture. With
         // FMODE=0 the gulp equals the DDF granularity and nothing changes
         // (boot-screen insert-disk art is drawn for the continuous placement:
         // its negative modulos overlap rows so the hand/disk's right edge
@@ -843,10 +862,13 @@ impl ControlState {
             // fetch position is not visible.
             (hpos.div_euclid(gulp) * gulp).max(BITPLANE_DDF_HARD_START as i32)
         };
-        let ddf_native_shift =
-            (align(effective_ddf_start_hpos(self.hires() || self.shres(), self.ddfstrt) as i32)
-                - align(standard_ddf))
-                * ddf_native_scale;
+        let ddf_native_shift = (align(effective_ddf_start_hpos(
+            self.agnus_revision,
+            self.hires() || self.shres(),
+            self.ddfstrt,
+        ) as i32)
+            - align(standard_ddf))
+            * ddf_native_scale;
         // The render loop measures output pixels from the CLAMPED display
         // window start: the framebuffer cannot show anything left of
         // DIW_HSTART_FB0, so a window programmed further left (extreme
@@ -859,18 +881,32 @@ impl ControlState {
         let clamped_window_native =
             ((DIW_HSTART_FB0 - diw_h_start as i32).max(0) * 2) / pixel_repeat as i32;
         let mut origin_shift = display_native_shift - ddf_native_shift + clamped_window_native;
-        let ddf_start = effective_ddf_start_hpos(self.hires() || self.shres(), self.ddfstrt);
-        if !self.hires()
-            && !self.shres()
-            && self.fetch_quantum() == 1
-            && i32::from(ddf_start) < standard_ddf
-            && origin_shift > 0
-        {
-            // Single-word lo-res fetches that start before the standard $38
-            // slot expose whole 16-pixel groups. The standard one-sample
-            // lo-res phase bias must not push a standard-width DIW one sample
-            // past that completed early-DDF row at the right edge.
-            origin_shift -= 1;
+        let ddf_start = effective_ddf_start_hpos(
+            self.agnus_revision,
+            self.hires() || self.shres(),
+            self.ddfstrt,
+        );
+        if !self.hires() && !self.shres() && self.fetch_quantum() == 1 {
+            let ddf = i32::from(ddf_start);
+            if ddf < standard_ddf && origin_shift > 0 {
+                // Single-word lo-res fetches that start before the standard $38
+                // slot expose whole 16-pixel groups. The standard one-sample
+                // lo-res phase bias must not push a standard-width DIW one sample
+                // past that completed early-DDF row at the right edge.
+                origin_shift -= 1;
+            } else if ddf > standard_ddf && origin_shift < 0 && display_native_shift == 1 {
+                // Mirror of the above for a standard-width DIW whose DDFSTRT is
+                // *late*: the picture is positioned in whole fetch gulps, but the
+                // standard one-sample lo-res phase bias (DIWSTRT $81 vs the $80
+                // fetch reference, i.e. display_native_shift == 1) lands the
+                // clipped-sample count one off the gulp grid -- clipping the
+                // first cell column and orphaning a partial column at the right
+                // edge (e.g. a copper-fed bitplane mosaic fetched with DDFSTRT
+                // $48 in a standard DIW). Non-standard windows carry their own
+                // phase and are positioned by display_native_shift directly, so
+                // gate this on the standard +1 bias only.
+                origin_shift -= 1;
+            }
         }
         origin_shift
     }
@@ -1498,6 +1534,7 @@ struct BeamSpriteState {
     sprdata: [u16; 8],
     sprdatb: [u16; 8],
     spr_armed: [bool; 8],
+    direct_data_armed: [bool; 8],
     /// Lisa only: FMODE SPR32/SPAGEM widen manual sprites too. A CPU/Copper
     /// SPRxDATA/SPRxDATB write loads the same 16-bit value into every word
     /// of the wide holding register, so a manual wide sprite repeats its
@@ -1540,6 +1577,7 @@ impl BeamSpriteState {
             sprdata: state.sprdata,
             sprdatb: state.sprdatb,
             spr_armed,
+            direct_data_armed: [false; 8],
             aga: matches!(state.agnus_revision, AgnusRevision::AgaAlice),
             fmode: state.fmode,
             held: *held,
@@ -1562,10 +1600,12 @@ impl BeamSpriteState {
             0x2 => {
                 self.sprctl[idx] = val;
                 self.spr_armed[idx] = false;
+                self.direct_data_armed[idx] = false;
             }
             0x4 => {
                 self.sprdata[idx] = val;
                 self.spr_armed[idx] = true;
+                self.direct_data_armed[idx] = true;
             }
             0x6 => self.sprdatb[idx] = val,
             _ => {}
@@ -1605,19 +1645,21 @@ impl BeamSpriteState {
                 x_stop,
             });
         }
-        let vstart = sprite_vstart(pos, ctl);
-        let vstop = sprite_vstop(ctl);
-        // Normal pair: [vstart, vstop). Equal start/stop is an empty window;
-        // only a strictly inverted pair wraps through the frame boundary.
-        let in_window = if vstop == vstart {
-            false
-        } else if vstop > vstart {
-            beam_y >= vstart && beam_y < vstop
-        } else {
-            beam_y >= vstart || beam_y < vstop
-        };
-        if !in_window {
-            return None;
+        if !self.direct_data_armed[sprite] {
+            let vstart = sprite_vstart(pos, ctl);
+            let vstop = sprite_vstop(ctl);
+            // Normal pair: [vstart, vstop). Equal start/stop is an empty window;
+            // only a strictly inverted pair wraps through the frame boundary.
+            let in_window = if vstop == vstart {
+                false
+            } else if vstop > vstart {
+                beam_y >= vstart && beam_y < vstop
+            } else {
+                beam_y >= vstart || beam_y < vstop
+            };
+            if !in_window {
+                return None;
+            }
         }
         let width_words = if self.aga {
             sprite_width_words_from_fmode(self.fmode)
@@ -2129,19 +2171,11 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
 }
 
 fn cpu_palette_writes_are_beam_timed(events: &[BeamRegisterWrite], visible_line0: i32) -> bool {
-    let mut visible_cpu_palette_writes = 0usize;
-    for event in events {
-        if matches!(event.source, BeamWriteSource::Cpu)
+    events.iter().any(|event| {
+        matches!(event.source, BeamWriteSource::Cpu)
             && matches!(event.offset & 0x01FE, 0x180..=0x1BE)
             && (event.vpos as i32) > visible_line0
-        {
-            visible_cpu_palette_writes += 1;
-            if visible_cpu_palette_writes >= 64 {
-                return true;
-            }
-        }
-    }
-    false
+    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2313,26 +2347,67 @@ fn line_display_window_bounds(
     visible_line0: i32,
 ) -> Option<(usize, usize)> {
     let mut bounds = None;
-    if base_control.display_window_contains_line(line, visible_line0) {
-        bounds = Some(base_control.display_window_x());
-    }
+    let mut control = base_control;
+    let mut run_start = 0usize;
     for segment in control_segments {
-        if !segment
-            .control
-            .display_window_contains_line(line, visible_line0)
-        {
-            continue;
-        }
-        let (segment_x_start, segment_x_stop) = segment.control.display_window_x();
-        match &mut bounds {
-            Some((x_start, x_stop)) => {
-                *x_start = (*x_start).min(segment_x_start);
-                *x_stop = (*x_stop).max(segment_x_stop);
+        let run_stop = segment.x.min(FB_WIDTH);
+        merge_display_window_run_bounds(
+            &mut bounds,
+            control,
+            line,
+            visible_line0,
+            run_start,
+            run_stop,
+        );
+        control = segment.control;
+        run_start = run_stop;
+    }
+    merge_display_window_run_bounds(
+        &mut bounds,
+        control,
+        line,
+        visible_line0,
+        run_start,
+        FB_WIDTH,
+    );
+    bounds.filter(|(x_start, x_stop)| x_start < x_stop)
+}
+
+fn merge_display_window_run_bounds(
+    bounds: &mut Option<(usize, usize)>,
+    control: ControlState,
+    line: usize,
+    visible_line0: i32,
+    run_start: usize,
+    run_stop: usize,
+) {
+    if run_start >= run_stop || !control.display_window_contains_line(line, visible_line0) {
+        return;
+    }
+    let (window_x_start, window_x_stop) = control.display_window_x();
+    if window_x_start >= run_start && window_x_start <= run_stop {
+        // The horizontal DIW start comparator has fired while this control was
+        // active, so it establishes the shifter origin even if a same-line
+        // write clips all visible pixels before the next control run.
+        match bounds {
+            Some((bounds_start, _)) => {
+                *bounds_start = (*bounds_start).min(window_x_start);
             }
-            None => bounds = Some((segment_x_start, segment_x_stop)),
+            None => *bounds = Some((window_x_start, window_x_start)),
         }
     }
-    bounds.filter(|(x_start, x_stop)| x_start < x_stop)
+    let x_start = window_x_start.max(run_start);
+    let x_stop = window_x_stop.min(run_stop);
+    if x_start >= x_stop {
+        return;
+    }
+    match bounds {
+        Some((bounds_start, bounds_stop)) => {
+            *bounds_start = (*bounds_start).min(x_start);
+            *bounds_stop = (*bounds_stop).max(x_stop);
+        }
+        None => *bounds = Some((x_start, x_stop)),
+    }
 }
 
 fn line_max_display_planes(
@@ -2402,6 +2477,7 @@ fn native_frame_width_for_control(control: ControlState) -> usize {
 
 fn bitplane_fetch_hpos_for_plane(control: ControlState, word_idx: usize, plane: usize) -> u32 {
     let start = u32::from(effective_ddf_start_hpos(
+        control.agnus_revision,
         control.hires() || control.shres(),
         control.ddfstrt,
     ));
@@ -2478,6 +2554,7 @@ fn line_fetch_plan_for_word(
     let mut plan = LineFetchPlan::empty();
     if control_segments.is_empty() {
         let start = u32::from(effective_ddf_start_hpos(
+            base_control.agnus_revision,
             base_control.hires() || base_control.shres(),
             base_control.ddfstrt,
         ));
@@ -6058,20 +6135,25 @@ fn sprite_display_enable_x_for_y(
 
 fn sprite_pixel_inside_display_window(
     control: ControlState,
-    y: usize,
+    _y: usize,
     x: usize,
-    visible_line0: i32,
+    _visible_line0: i32,
     display_enable_x: Option<usize>,
 ) -> bool {
     if control.border_sprite_enabled() {
         return true;
     }
-    if display_enable_x.is_none_or(|enable_x| x < enable_x) {
+    let Some(enable_x) = display_enable_x else {
+        return false;
+    };
+    if x < enable_x {
         return false;
     }
-    if !control.display_window_contains_line(y, visible_line0) {
-        return false;
-    }
+    // OCS/ECS Denise starts sprite display for this scanline after the first
+    // BPL1DAT load, whether that load came from bitplane DMA or a manual
+    // copper/CPU write. DIW still clips horizontally, but a manual BPL1DAT
+    // write can make sprites visible on lines where the vertical bitplane
+    // window is closed.
     let (x_start, x_stop) = control.display_window_x();
     x >= x_start && x < x_stop
 }
@@ -6206,24 +6288,26 @@ fn read_chip_word_wrapping(ram: &[u8], addr: u32) -> u16 {
     u16::from_be_bytes([ram[a], ram[(a + 1) & mask]])
 }
 
-fn effective_ddf_start_hpos_raw(hires: bool, raw: u16) -> u16 {
-    if hires {
-        raw & 0x00FC
+fn ddf_register_mask(revision: AgnusRevision) -> u16 {
+    if matches!(revision, AgnusRevision::Ocs) {
+        0x00FC
     } else {
-        raw & 0x00F8
+        0x00FE
     }
 }
 
-fn effective_ddf_stop_hpos(hires: bool, raw: u16) -> u16 {
-    if hires {
-        raw & 0x00FC
-    } else {
-        raw & 0x00F8
-    }
+fn effective_ddf_start_hpos_raw(revision: AgnusRevision, hires: bool, raw: u16) -> u16 {
+    let _ = hires;
+    raw & ddf_register_mask(revision)
 }
 
-fn effective_ddf_start_hpos(hires: bool, raw: u16) -> u16 {
-    let start = effective_ddf_start_hpos_raw(hires, raw);
+fn effective_ddf_stop_hpos(revision: AgnusRevision, hires: bool, raw: u16) -> u16 {
+    let _ = hires;
+    raw & ddf_register_mask(revision)
+}
+
+fn effective_ddf_start_hpos(revision: AgnusRevision, hires: bool, raw: u16) -> u16 {
+    let start = effective_ddf_start_hpos_raw(revision, hires, raw);
     if start == 0 {
         0
     } else {
@@ -6239,8 +6323,8 @@ fn effective_ddf_window(
     harddis: bool,
 ) -> Option<(u16, u16)> {
     let (hard_start, hard_stop) = ddf_hard_bounds(harddis);
-    let start = effective_ddf_start_hpos_raw(hires, ddfstrt);
-    let mut stop = effective_ddf_stop_hpos(hires, ddfstop);
+    let start = effective_ddf_start_hpos_raw(revision, hires, ddfstrt);
+    let mut stop = effective_ddf_stop_hpos(revision, hires, ddfstop);
     if start == 0 || start > hard_stop {
         return None;
     }
@@ -7286,6 +7370,28 @@ mod tests {
     }
 
     #[test]
+    fn line_start_diw_write_replaces_previous_horizontal_display_bounds() {
+        let base = ControlState {
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16,
+            diwstop: (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | 0x00C1,
+            ..ControlState::default()
+        };
+        let narrowed = ControlState {
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | 0x00A0,
+            ..base
+        };
+        let segments = [ControlSegment {
+            x: 0,
+            control: narrowed,
+        }];
+
+        assert_eq!(
+            line_display_window_bounds(base, &segments, 0, PAL_VISIBLE_LINE0),
+            Some(narrowed.display_window_x())
+        );
+    }
+
+    #[test]
     fn beam_position_converts_to_line_and_segment_x() {
         let line = PAL_VISIBLE_LINE0 + 25;
         let hpos = COPPER_WAIT_HPOS_FB0 + 16;
@@ -7692,7 +7798,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_visible_cpu_palette_writes_seed_frame_base_without_beam_segments() {
+    fn visible_cpu_palette_write_replays_by_beam_position() {
         let mut state = blank_state();
         let mut base_palettes = [state.palette; FB_HEIGHT];
         let mut palette_segments = vec![Vec::new(); FB_HEIGHT];
@@ -7712,14 +7818,18 @@ mod tests {
         );
 
         let line = (0x45 - 0x2C) as usize;
-        assert_eq!(base_palettes[0][0], 0x0FFF);
-        assert_eq!(base_palettes[line][0], 0x0FFF);
-        assert!(palette_segments[line].is_empty());
+        assert_eq!(base_palettes[0][0], 0x0103);
+        assert_eq!(base_palettes[line][0], 0x0103);
+        assert_eq!(base_palettes[line + 1][0], 0x0FFF);
+        assert_eq!(palette_segments[line].len(), 1);
+        assert_eq!(palette_segments[line][0].x, 0);
+        assert_eq!(palette_segments[line][0].entry, 0);
+        assert_eq!(palette_segments[line][0].value, 0x0FFF);
         assert_eq!(state.palette[0], 0x0FFF);
     }
 
     #[test]
-    fn dense_visible_cpu_palette_writes_replay_by_beam_position() {
+    fn small_visible_cpu_palette_batch_replays_by_beam_position() {
         let mut state = blank_state();
         let mut base_palettes = [state.palette; FB_HEIGHT];
         let mut palette_segments = vec![Vec::new(); FB_HEIGHT];
@@ -7727,7 +7837,7 @@ mod tests {
         let mut control_segments = vec![Vec::new(); FB_HEIGHT];
         let mut manual_bpl_segments = Vec::new();
         let mut events = Vec::new();
-        for idx in 0..64 {
+        for idx in 0..30 {
             events.push(cpu_event(
                 0x45 + idx as u32,
                 COPPER_WAIT_HPOS_FB0 as u32,
@@ -7841,7 +7951,7 @@ mod tests {
             ddfstop: 0x00B6,
             ..blank_state()
         };
-        assert_eq!(lores_partial_stop.words_per_row(false, 320), 14);
+        assert_eq!(lores_partial_stop.words_per_row(false, 320), 15);
 
         let lores_odd_stop = RenderState {
             ddfstrt: 0x0064,
@@ -7849,6 +7959,20 @@ mod tests {
             ..blank_state()
         };
         assert_eq!(lores_odd_stop.words_per_row(false, 320), 9);
+
+        let lores_four_cck_start = RenderState {
+            ddfstrt: 0x0034,
+            ddfstop: 0x00D4,
+            ..blank_state()
+        };
+        assert_eq!(lores_four_cck_start.words_per_row(false, 320), 21);
+
+        let lores_second_half_stop = RenderState {
+            ddfstrt: 0x0028,
+            ddfstop: 0x00D4,
+            ..blank_state()
+        };
+        assert_eq!(lores_second_half_stop.words_per_row(false, 320), 23);
 
         let ecs_equal = RenderState {
             agnus_revision: AgnusRevision::Ecs8372Rev4,
@@ -8588,22 +8712,56 @@ mod tests {
     }
 
     #[test]
-    fn manual_sprite_vstart_equal_vstop_is_empty() {
+    fn latched_sprite_vstart_equal_vstop_is_empty() {
         let mut initial_state = blank_state();
         let beam_y = PAL_VISIBLE_LINE0;
         let (pos, ctl) = sprite_control_words(beam_y as u16, beam_y as u16, DIW_HSTART_FB0 as u16);
         initial_state.sprpos[0] = pos;
         initial_state.sprctl[0] = ctl;
+        initial_state.sprdata[0] = 0xFFFF;
+        initial_state.spr_armed[0] = true;
 
-        let events = [cpu_event(
-            beam_y as u32,
-            COPPER_WAIT_HPOS_FB0 as u32,
-            0x144,
-            0xFFFF,
-        )];
-        let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            true,
+        );
 
         assert!(manual_sprite_lines[0].is_empty());
+    }
+
+    #[test]
+    fn direct_sprite_data_write_ignores_dma_vertical_window() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0 + 12;
+        let (pos, ctl) = sprite_control_words(
+            PAL_VISIBLE_LINE0 as u16,
+            PAL_VISIBLE_LINE0 as u16,
+            DIW_HSTART_FB0 as u16,
+        );
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[cpu_event(
+                beam_y as u32,
+                COPPER_WAIT_HPOS_FB0 as u32,
+                0x144,
+                0xFFFF,
+            )],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .any(|line| line.beam_y == beam_y));
     }
 
     #[test]
@@ -9565,6 +9723,89 @@ mod tests {
         assert_eq!(fb[0], rgb12_to_rgba8(0));
         assert_eq!(fb[3], rgb12_to_rgba8(0));
         assert_eq!(fb[4], rgb12_to_rgba8(0x0F00));
+    }
+
+    #[test]
+    fn manual_bpl1dat_display_enable_allows_sprites_on_vertically_closed_diw_line() {
+        let mut state = RenderState {
+            dmacon: DMACON_DMAEN | DMACON_SPREN,
+            diwstrt: (((PAL_VISIBLE_LINE0 + 10) as u16) << 8) | DIW_HSTART_FB0 as u16,
+            diwstop: (((PAL_VISIBLE_LINE0 + 20) as u16) << 8) | 0x00C1,
+            ..blank_state()
+        };
+        state.palette.write_ocs(17, 0x0F00);
+        let ram = vec![0; 64];
+        let base_palettes = [state.palette; FB_HEIGHT];
+        let palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let base_controls = [ControlState::from_render_state(&state); FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let playfield_mask = vec![0u8; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let captured = [CapturedSpriteLine {
+            sprite: 0,
+            hstart: DIW_HSTART_FB0,
+            hsub_70ns: false,
+            beam_y: PAL_VISIBLE_LINE0,
+            data: 0x8000,
+            datb: 0,
+            attached: false,
+            data_ext: [0; 3],
+            datb_ext: [0; 3],
+            width_words: 1,
+        }];
+
+        let mut fb = vec![rgb12_to_rgba8(0); FB_PIXELS];
+        let display_disabled = [None; FB_HEIGHT];
+        render_sprites_with_manual_lines_and_writes(
+            &state,
+            &ram,
+            &mut fb,
+            SpriteClip {
+                x_start: 0,
+                x_stop: FB_WIDTH,
+                y_start: 0,
+                y_stop: FB_HEIGHT,
+            },
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &display_disabled,
+            &playfield_mask,
+            &mut collision_pixels,
+            &captured,
+            true,
+            None,
+            PAL_VISIBLE_LINE0,
+        );
+        assert_eq!(fb[0], rgb12_to_rgba8(0));
+
+        let mut fb = vec![rgb12_to_rgba8(0); FB_PIXELS];
+        let mut display_enabled = [None; FB_HEIGHT];
+        display_enabled[0] = Some(0);
+        render_sprites_with_manual_lines_and_writes(
+            &state,
+            &ram,
+            &mut fb,
+            SpriteClip {
+                x_start: 0,
+                x_stop: FB_WIDTH,
+                y_start: 0,
+                y_stop: FB_HEIGHT,
+            },
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &display_enabled,
+            &playfield_mask,
+            &mut collision_pixels,
+            &captured,
+            true,
+            None,
+            PAL_VISIBLE_LINE0,
+        );
+        assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
     }
 
     #[test]

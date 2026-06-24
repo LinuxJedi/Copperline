@@ -420,10 +420,6 @@ fn bitplane_hires(bplcon0: u16) -> bool {
     bplcon0 & 0x8000 != 0 && !bitplane_shres(bplcon0)
 }
 
-fn bitplane_hires_like_ddf(bplcon0: u16) -> bool {
-    bitplane_hires(bplcon0) || bitplane_shres(bplcon0)
-}
-
 fn bitplane_fetch_cck_per_word(bplcon0: u16) -> u32 {
     if bitplane_shres(bplcon0) {
         2
@@ -456,20 +452,22 @@ fn bitplane_fetch_unit(bplcon0: u16, fmode: u16) -> u32 {
     bitplane_fetch_period(bplcon0, fmode).max(8)
 }
 
-pub fn effective_bitplane_ddf_start_hpos(bplcon0: u16, raw: u16) -> u16 {
-    if bitplane_hires_like_ddf(bplcon0) {
-        raw & 0x00FC
+fn ddf_register_mask(revision: AgnusRevision) -> u16 {
+    if matches!(revision, AgnusRevision::Ocs) {
+        0x00FC
     } else {
-        raw & 0x00F8
+        0x00FE
     }
 }
 
-pub fn effective_bitplane_ddf_stop_hpos(bplcon0: u16, raw: u16) -> u16 {
-    if bitplane_hires_like_ddf(bplcon0) {
-        raw & 0x00FC
-    } else {
-        raw & 0x00F8
-    }
+pub fn effective_bitplane_ddf_start_hpos(revision: AgnusRevision, bplcon0: u16, raw: u16) -> u16 {
+    let _ = bplcon0;
+    raw & ddf_register_mask(revision)
+}
+
+pub fn effective_bitplane_ddf_stop_hpos(revision: AgnusRevision, bplcon0: u16, raw: u16) -> u16 {
+    let _ = bplcon0;
+    raw & ddf_register_mask(revision)
 }
 
 pub fn effective_bitplane_ddf_window(
@@ -480,8 +478,8 @@ pub fn effective_bitplane_ddf_window(
     harddis: bool,
 ) -> Option<(u16, u16)> {
     let (hard_start, hard_stop) = ddf_hard_bounds(harddis);
-    let start = effective_bitplane_ddf_start_hpos(bplcon0, ddfstrt);
-    let mut stop = effective_bitplane_ddf_stop_hpos(bplcon0, ddfstop);
+    let start = effective_bitplane_ddf_start_hpos(revision, bplcon0, ddfstrt);
+    let mut stop = effective_bitplane_ddf_stop_hpos(revision, bplcon0, ddfstop);
     if start == 0 || start > hard_stop {
         return None;
     }
@@ -1737,11 +1735,19 @@ mod tests {
     fn lores_ddfstop_uses_fetch_block_granularity() {
         assert_eq!(
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x004A, 0x00B6, false),
-            14
+            15
         );
         assert_eq!(
             bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0064, 0x00A5, false),
             9
+        );
+        assert_eq!(
+            bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0034, 0x00D4, false),
+            21
+        );
+        assert_eq!(
+            bitplane_words_per_row(AgnusRevision::Ocs, 0x0000, 0, 0x0028, 0x00D4, false),
+            23
         );
     }
 
