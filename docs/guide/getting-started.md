@@ -30,6 +30,16 @@ override to click through, unlike a downloaded prebuilt app. Use
 `brew install --HEAD copperline` to build the latest `main` instead of the
 most recent tagged release, then run `copperline` from the terminal.
 
+For a no-compiler install, download `Copperline-X.Y.Z-macos-universal.dmg`
+from the [releases page](https://github.com/LinuxJedi/Copperline/releases),
+open it, and drag `Copperline.app` onto the Applications shortcut. The app is a
+universal binary that runs natively on Apple Silicon and Intel, and bundles the
+AROS boot ROM, so it runs out of the box. The image is not code-signed or
+notarized, so on first launch Gatekeeper refuses to open it; right-click (or
+Control-click) the app and choose **Open**, then confirm. macOS remembers the
+choice. If it still refuses, clear the download quarantine with
+`xattr -dr com.apple.quarantine /Applications/Copperline.app`.
+
 ## Installing on Linux
 
 Two channels are provided.

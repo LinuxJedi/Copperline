@@ -1,0 +1,85 @@
+name: macOS
+
+# Builds the macOS disk image (a universal Copperline.app in a .dmg) and
+# uploads it as a workflow artifact on every qualifying change, and attaches it
+# to the GitHub Release when a v* tag is pushed. The main CI already builds and
+# tests on macOS; this workflow only adds the packaging path, so it is scoped to
+# the code and packaging surface that affects the bundle.
+#
+# The image is intentionally unsigned (no Developer ID, no notarization), so it
+# trips Gatekeeper on first launch; the bundled README.txt documents the
+# right-click-Open workaround.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "src/**"
+      - "vendor/**"
+      - "assets/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".cargo/**"
+      - "packaging/macos/**"
+      - ".github/workflows/macos.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "vendor/**"
+      - "assets/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".cargo/**"
+      - "packaging/macos/**"
+      - ".github/workflows/macos.yml"
+  # Manual rebuild. Use this to attach a dmg to a release whose tag predates
+  # this workflow (the v* tag tree has no macos.yml, so a tag push cannot
+  # trigger it): run it against a branch with the source parity you want and set
+  # release_tag to push the built dmg onto that existing release.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the dmg to (e.g. v0.7.0). Leave blank to only upload a workflow artifact."
+        required: false
+        default: ""
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build macOS dmg
+    runs-on: macos-latest
+    # Needed only by the release-attach step on v* tags.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both Apple architectures so build-dmg.sh can lipo a universal binary.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build dmg
+        run: packaging/macos/build-dmg.sh
+      - name: Locate artifact
+        id: artifact
+        run: echo "path=$(ls Copperline-*-macos-universal.dmg | head -n1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: copperline-macos
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.artifact.outputs.path }}
+      - name: Attach to existing release (manual run)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # --clobber so a re-run replaces the asset instead of failing on a
+        # name clash.
+        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.artifact.outputs.path }}" --clobber
