@@ -69,6 +69,13 @@ const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// TODO: AGA Lisa delays colour changes by one hires pixel relative to
 /// OCS/ECS (WinUAE: "AGA color changes are 1 hires pixel delayed"). That
 /// sub-colour-clock offset is not yet modelled here.
+///
+/// STOP before retuning this. If a scene's colours or copper-driven picture
+/// look horizontally shifted, the cause is almost never this anchor -- it has
+/// been moved "to fix" demos several times and always had to be moved back
+/// (the real bug was bitplane fetch/DDF alignment, sprite arming, etc.). This
+/// value keeps copper colour writes aligned with the bitplane pixels they
+/// recolour and is the same on OCS and ECS; leave it at 0x34.
 const COLOR_WRITE_HPOS_FB0: i32 = 0x34;
 /// AGA BPLCON4's low sprite-palette byte follows Lisa's sprite colour lookup
 /// path, which reaches sprite output earlier than ordinary COLORxx palette
@@ -879,17 +886,27 @@ impl ControlState {
             self.hires() || self.shres(),
             self.ddfstrt,
         );
-        if !self.hires()
-            && !self.shres()
-            && self.fetch_quantum() == 1
-            && i32::from(ddf_start) < standard_ddf
-            && origin_shift > 0
-        {
-            // Single-word lo-res fetches that start before the standard $38
-            // slot expose whole 16-pixel groups. The standard one-sample
-            // lo-res phase bias must not push a standard-width DIW one sample
-            // past that completed early-DDF row at the right edge.
-            origin_shift -= 1;
+        if !self.hires() && !self.shres() && self.fetch_quantum() == 1 {
+            let ddf = i32::from(ddf_start);
+            if ddf < standard_ddf && origin_shift > 0 {
+                // Single-word lo-res fetches that start before the standard $38
+                // slot expose whole 16-pixel groups. The standard one-sample
+                // lo-res phase bias must not push a standard-width DIW one sample
+                // past that completed early-DDF row at the right edge.
+                origin_shift -= 1;
+            } else if ddf > standard_ddf && origin_shift < 0 && display_native_shift == 1 {
+                // Mirror of the above for a standard-width DIW whose DDFSTRT is
+                // *late*: the picture is positioned in whole fetch gulps, but the
+                // standard one-sample lo-res phase bias (DIWSTRT $81 vs the $80
+                // fetch reference, i.e. display_native_shift == 1) lands the
+                // clipped-sample count one off the gulp grid -- clipping the
+                // first cell column and orphaning a partial column at the right
+                // edge (e.g. a copper-fed bitplane mosaic fetched with DDFSTRT
+                // $48 in a standard DIW). Non-standard windows carry their own
+                // phase and are positioned by display_native_shift directly, so
+                // gate this on the standard +1 bias only.
+                origin_shift -= 1;
+            }
         }
         origin_shift
     }

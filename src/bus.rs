@@ -10324,6 +10324,16 @@ mod tests {
 
     const STANDARD_DIW_HSTART: i32 = 0x81;
     const STANDARD_VISIBLE_X0: usize = ((STANDARD_DIW_HSTART - RENDER_DIW_HSTART_FB0) * 2) as usize;
+    // STOP. If you are here because some scene's colours or copper-driven
+    // picture look horizontally shifted and you are tempted to nudge this
+    // value (or `COLOR_WRITE_HPOS_FB0` in src/video/bitplane.rs, which this
+    // mirrors): you are almost certainly wrong. This anchor is the Denise
+    // COLORxx output phase, calibrated so copper/CPU colour writes line up
+    // with the bitplane pixels they recolour (OCS == ECS; verified against
+    // MiniMig, MiSTer Minimig-AGA, WinUAE and vAmiga). We have moved it "to
+    // fix" a scene several times and every time had to move it back, because
+    // the real bug was elsewhere (bitplane fetch/DDF alignment, sprite arming,
+    // etc.). Find the actual cause; do not retune this number.
     const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x34;
     static BUS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
