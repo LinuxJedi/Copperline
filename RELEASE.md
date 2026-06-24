@@ -129,6 +129,28 @@ first. To build one by hand on a Windows host:
 packaging/windows/build-zip.ps1
 ```
 
+## macOS disk image
+
+The prebuilt macOS download is a disk image (`packaging/macos/`): a
+drag-to-Applications `Copperline.app` wrapped in a `.dmg`. The `macOS` workflow
+builds it on `macos-latest` and, on a `v*` tag, attaches
+`Copperline-X.Y.Z-macos-universal.dmg` to the GitHub Release automatically.
+Homebrew (above) remains the build-from-source channel; the disk image is the
+no-compiler alternative.
+
+The app bundle is a universal binary (the workflow builds both
+`aarch64-apple-darwin` and `x86_64-apple-darwin` and `lipo`-joins them), so one
+download runs natively on Apple Silicon and Intel. The bundled AROS ROM lives in
+`Contents/Resources/aros`, which `romsearch.rs` probes, so it runs out of the
+box. The image is ad-hoc signed (required for the arm64 slice to launch) but is
+intentionally NOT Developer ID signed or notarized, so first launch trips
+Gatekeeper; the right-click-Open workaround is in the image's `README.txt`. To
+build one by hand on a macOS host:
+
+```sh
+./packaging/macos/build-dmg.sh
+```
+
 ## Crate packaging
 
 `cargo package --no-verify --offline` can be used to inspect the source

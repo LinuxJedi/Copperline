@@ -50,3 +50,7 @@ copperline-video-*.avi
 /AppDir
 /.appimage-tools
 /*.AppImage
+
+# macOS disk image build artifact (packaging/macos/build-dmg.sh); the .app
+# bundle stages under /target, already ignored above.
+/*.dmg
