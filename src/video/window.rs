@@ -368,6 +368,18 @@ fn host_shortcut_modifier_pressed(modifiers: ModifiersState) -> bool {
     }
 }
 
+/// Display name for a GDB-style register index (see `debug_set_register`):
+/// D0-D7, A0-A7, SR, PC.
+fn gdb_reg_label(reg: usize) -> String {
+    match reg {
+        0..=7 => format!("D{reg}"),
+        8..=15 => format!("A{}", reg - 8),
+        16 => "SR".to_string(),
+        17 => "PC".to_string(),
+        _ => format!("r{reg}"),
+    }
+}
+
 fn window_title_mouse_captured() -> String {
     format!("{WINDOW_TITLE} - Mouse captured ({HOST_SHORTCUT_MODIFIER_LABEL}+G releases)")
 }
@@ -4637,6 +4649,7 @@ impl App {
             }
             UiControl::DebugMemPrev => self.activate_tool_control(ToolPanelKind::Debugger, control),
             UiControl::DebugMemNext => self.activate_tool_control(ToolPanelKind::Debugger, control),
+            UiControl::DebugPoke => self.activate_tool_control(ToolPanelKind::Debugger, control),
             UiControl::DebugEntry => {
                 if let Some(panel) = self.debugger_panel.as_mut() {
                     panel.entry_active = true;
@@ -4693,6 +4706,7 @@ impl App {
             }
             (ToolPanelKind::Debugger, UiControl::DebugMemPrev) => self.debugger_mem_page(-1),
             (ToolPanelKind::Debugger, UiControl::DebugMemNext) => self.debugger_mem_page(1),
+            (ToolPanelKind::Debugger, UiControl::DebugPoke) => self.debugger_poke(),
             (ToolPanelKind::Debugger, UiControl::DebugEntry) => {
                 if let Some(panel) = self.debugger_panel.as_mut() {
                     panel.entry_active = true;
@@ -4771,7 +4785,7 @@ impl App {
             return false;
         };
         if panel.entry_active {
-            if let Some(ch) = hex_char_for_key(code) {
+            if let Some(ch) = entry_char_for_key(code) {
                 panel.push_entry_char(ch);
                 self.request_redraw();
                 return true;
@@ -5585,6 +5599,54 @@ impl App {
                     panel.mem_addr.wrapping_add(delta)
                 } & 0x00FF_FFF0;
             }
+        }
+    }
+
+    /// Write the entry box's value live while paused: a memory word from
+    /// "ADDR VALUE" on the Memory tab, or a register from "REG VALUE" on the
+    /// CPU tab. The panel borrow is resolved into a plain action first so the
+    /// emulator can then be borrowed mutably to perform the write.
+    fn debugger_poke(&mut self) {
+        enum Poke {
+            Mem(u32, u16),
+            Reg(usize, u32),
+            MemHelp,
+            RegHelp,
+            None,
+        }
+        let action = match self.debugger_panel.as_ref() {
+            Some(panel) => match panel.tab {
+                ui::DebugTab::Memory => match panel.poke_target() {
+                    Some((addr, value)) => Poke::Mem(addr, value),
+                    None => Poke::MemHelp,
+                },
+                ui::DebugTab::Cpu => match panel.reg_poke() {
+                    Some((reg, value)) => Poke::Reg(reg, value),
+                    None => Poke::RegHelp,
+                },
+                _ => Poke::None,
+            },
+            None => Poke::None,
+        };
+        match action {
+            Poke::Mem(addr, value) => {
+                let written = self
+                    .emu
+                    .machine
+                    .debug_write_memory(addr, &value.to_be_bytes());
+                if written == 2 {
+                    self.show_osd(format!("Poked ${value:04X} -> ${addr:06X}"));
+                } else {
+                    self.show_osd(format!("${addr:06X} is not writable RAM"));
+                }
+            }
+            Poke::Reg(reg, value) => {
+                self.emu.machine.debug_set_register(reg, value);
+                self.show_osd(format!("{} <- ${value:X}", gdb_reg_label(reg)));
+            }
+            Poke::MemHelp => self.show_osd("Poke: type \"ADDR VALUE\" (hex) first"),
+            Poke::RegHelp => self.show_osd("Set Reg: type \"REG VALUE\" e.g. D0 1234"),
+            Poke::None => {}
         }
     }
 
@@ -6721,7 +6783,10 @@ fn take_integral_mouse_delta(value: &mut f64) -> i32 {
 }
 
 /// Hex digit for a key, for the debugger's address entry box.
-fn hex_char_for_key(code: KeyCode) -> Option<char> {
+/// Map a key to the character it types into the debugger entry box: hex digits,
+/// plus Space and P/S/R so the box can hold "ADDR VALUE" / "REG VALUE" for poke
+/// (`push_entry_char` filters anything it should not accept).
+fn entry_char_for_key(code: KeyCode) -> Option<char> {
     use KeyCode::*;
     Some(match code {
         Digit0 | Numpad0 => '0',
@@ -6740,6 +6805,11 @@ fn hex_char_for_key(code: KeyCode) -> Option<char> {
         KeyD => 'D',
         KeyE => 'E',
         KeyF => 'F',
+        // Extra register-name letters (PC/SR/SP) and the token separator.
+        KeyP => 'P',
+        KeyS => 'S',
+        KeyR => 'R',
+        Space => ' ',
         _ => return None,
     })
 }
@@ -8772,14 +8842,46 @@ mod tests {
             _ => panic!("debugger panel should be open"),
         }
 
-        // While the entry box is focused, S is a hex digit candidate, not
-        // a transport key: it must not step (S is not hex, so it is just
-        // swallowed by the modal panel).
+        // While the entry box is focused, S types the register-name letter
+        // 'S' (for SR/SP) into the box instead of stepping.
         if let Some(panel) = app.debugger_panel.as_mut() {
             panel.entry_active = true;
+            panel.entry.clear();
         }
         let pc_before = app.emu.machine.pc();
-        assert!(!app.ui_handle_key(KeyCode::KeyS));
+        assert!(app.ui_handle_key(KeyCode::KeyS));
         assert_eq!(app.emu.machine.pc(), pc_before);
+        assert_eq!(
+            app.debugger_panel.as_ref().map(|p| p.entry.as_str()),
+            Some("S")
+        );
+    }
+
+    #[test]
+    fn debugger_poke_writes_memory_and_registers() {
+        let mut app = test_app();
+        app.open_debugger();
+        // Map chip RAM at $0 so the low test address is writable RAM, not the
+        // boot ROM overlay.
+        app.emu.machine.disable_overlay();
+
+        // Memory tab: "ADDR VALUE" writes a word into chip RAM.
+        if let Some(panel) = app.debugger_panel.as_mut() {
+            panel.tab = super::ui::DebugTab::Memory;
+            panel.entry = "2000 BEEF".to_string();
+        }
+        app.debugger_poke();
+        assert_eq!(
+            app.emu.machine.debug_read_memory(0x2000, 2),
+            vec![0xBE, 0xEF]
+        );
+
+        // CPU tab: "REG VALUE" sets a register.
+        if let Some(panel) = app.debugger_panel.as_mut() {
+            panel.tab = super::ui::DebugTab::Cpu;
+            panel.entry = "D3 12345678".to_string();
+        }
+        app.debugger_poke();
+        assert_eq!(app.emu.machine.d(3), 0x1234_5678);
     }
 }
