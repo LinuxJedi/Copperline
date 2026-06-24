@@ -168,6 +168,10 @@ pub struct Emulation {
     /// [`crate::priority`]. The `COPPERLINE_REALTIME_PRIORITY` env var
     /// overrides this for one run.
     pub realtime_priority: bool,
+    /// How fast the UI "Warp Speed" (turbo) mode runs when engaged, expressed
+    /// as an output frame-skip level. See [`WarpSpeed`]. Adjustable at runtime
+    /// from the Emulator menu and the keyboard.
+    pub warp_speed: WarpSpeed,
 }
 
 /// Real-mode pacing budget model.
@@ -187,6 +191,90 @@ pub enum PacingBudget {
     /// mixes that average more than the assumed flat cost. Opt in via
     /// `pacing_budget = "instructions"` or `COPPERLINE_REAL_PACING_BUDGET=instructions`.
     Instructions,
+}
+
+/// Hard upper bound on emulated frames per presented frame in `WarpSpeed::Max`,
+/// so a host that emulates faster than it presents cannot spin the event loop
+/// arbitrarily long between input polls. `Max` is normally bounded first by its
+/// wall-clock budget (see `WarpSpeed::time_budget_ms`); this cap only matters
+/// when the host is fast enough to retire this many frames inside that budget.
+pub const WARP_MAX_FRAME_CAP: usize = 1024;
+
+/// Wall-clock budget (milliseconds) for one presented frame in `WarpSpeed::Max`.
+/// The event loop emulates frames back-to-back until this much host time has
+/// elapsed, then presents one frame at vsync. Kept under a 60 Hz refresh
+/// interval (16.6 ms) so input is still polled and a frame still presented every
+/// host refresh while the core runs flat out.
+pub const WARP_MAX_BUDGET_MS: u64 = 12;
+
+/// How fast the UI "Warp Speed" (turbo) mode runs when engaged.
+///
+/// Presentation is gated to the host monitor's refresh rate (the wgpu surface
+/// presents with vsync), so emulating exactly one frame per presented frame
+/// caps warp at the monitor rate -- about 1.2x for a 50 Hz PAL machine on a
+/// 60 Hz display. To decouple emulation speed from the monitor, warp emulates
+/// several frames per *presented* frame (output frame skip): the intermediate
+/// frames are computed but never rendered or presented, so the effective speed
+/// is the level times the refresh rate, host CPU permitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WarpSpeed {
+    /// Two emulated frames per presented frame.
+    X2,
+    /// Four emulated frames per presented frame.
+    X4,
+    /// Eight emulated frames per presented frame.
+    X8,
+    /// Sixteen emulated frames per presented frame.
+    X16,
+    /// As many frames as fit in `WARP_MAX_BUDGET_MS` of host time per presented
+    /// frame (bounded by `WARP_MAX_FRAME_CAP`): run flat out, present at vsync.
+    #[default]
+    Max,
+}
+
+impl WarpSpeed {
+    /// Cycle to the next level for the menu/keyboard "cycle" control:
+    /// 2x -> 4x -> 8x -> 16x -> Max -> 2x.
+    pub fn next(self) -> Self {
+        match self {
+            Self::X2 => Self::X4,
+            Self::X4 => Self::X8,
+            Self::X8 => Self::X16,
+            Self::X16 => Self::Max,
+            Self::Max => Self::X2,
+        }
+    }
+
+    /// Short label for menus and the on-screen status flash.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::X2 => "2x",
+            Self::X4 => "4x",
+            Self::X8 => "8x",
+            Self::X16 => "16x",
+            Self::Max => "Max",
+        }
+    }
+
+    /// Maximum emulated frames to retire per presented frame while warping.
+    pub fn frame_cap(self) -> usize {
+        match self {
+            Self::X2 => 2,
+            Self::X4 => 4,
+            Self::X8 => 8,
+            Self::X16 => 16,
+            Self::Max => WARP_MAX_FRAME_CAP,
+        }
+    }
+
+    /// Wall-clock budget (milliseconds) per presented frame, or `None` for the
+    /// fixed levels, which simply retire `frame_cap` frames then present.
+    pub fn time_budget_ms(self) -> Option<u64> {
+        match self {
+            Self::Max => Some(WARP_MAX_BUDGET_MS),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,6 +611,7 @@ impl Default for Config {
                 power_on: true,
                 pacing_budget: PacingBudget::Cycles,
                 realtime_priority: false,
+                warp_speed: WarpSpeed::default(),
             },
             chip_ram_bytes: 512 * 1024,
             fast_ram_bytes: 0,
@@ -820,6 +909,8 @@ struct RawEmulation {
     /// Best-effort realtime-like thread priority for the pacer and audio
     /// threads (default false). See `src/priority.rs`.
     realtime_priority: Option<bool>,
+    /// UI warp/turbo speed: "2x", "4x", "8x", "16x", or "max" (default).
+    warp_speed: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -968,6 +1059,10 @@ impl TryFrom<RawConfig> for Config {
                 .emulation
                 .realtime_priority
                 .unwrap_or(defaults.emulation.realtime_priority),
+            warp_speed: match raw.emulation.warp_speed.as_deref() {
+                None => defaults.emulation.warp_speed,
+                Some(s) => parse_warp_speed(s)?,
+            },
         };
         let chip_ram_bytes = match raw.memory.chip.as_deref() {
             None => defaults.chip_ram_bytes,
@@ -1147,6 +1242,20 @@ fn parse_pacing_budget(s: &str) -> Result<PacingBudget> {
         "instructions" | "retired-instructions" => Ok(PacingBudget::Instructions),
         _ => Err(anyhow!(
             "unknown emulation pacing_budget {:?}: expected \"cycles\" or \"instructions\"",
+            s
+        )),
+    }
+}
+
+fn parse_warp_speed(s: &str) -> Result<WarpSpeed> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "2x" | "2" => Ok(WarpSpeed::X2),
+        "4x" | "4" => Ok(WarpSpeed::X4),
+        "8x" | "8" => Ok(WarpSpeed::X8),
+        "16x" | "16" => Ok(WarpSpeed::X16),
+        "max" | "unlimited" => Ok(WarpSpeed::Max),
+        _ => Err(anyhow!(
+            "unknown emulation warp_speed {:?}: expected \"2x\", \"4x\", \"8x\", \"16x\", or \"max\"",
             s
         )),
     }
@@ -1599,7 +1708,47 @@ mod tests {
         let cfg = parse_config("")?;
         assert!(cfg.emulation.power_on);
         assert_eq!(cfg.emulation.pacing_budget, PacingBudget::Cycles);
+        assert_eq!(cfg.emulation.warp_speed, WarpSpeed::Max);
         Ok(())
+    }
+
+    #[test]
+    fn warp_speed_parses_levels_and_rejects_garbage() -> Result<()> {
+        for (text, expected) in [
+            ("2x", WarpSpeed::X2),
+            ("4x", WarpSpeed::X4),
+            ("8x", WarpSpeed::X8),
+            ("16x", WarpSpeed::X16),
+            ("max", WarpSpeed::Max),
+            ("MAX", WarpSpeed::Max),
+        ] {
+            let cfg = parse_config(&format!("[emulation]\nwarp_speed = {text:?}\n"))?;
+            assert_eq!(cfg.emulation.warp_speed, expected, "for {text:?}");
+        }
+        assert!(parse_config("[emulation]\nwarp_speed = \"32x\"\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn warp_speed_cycle_wraps_through_levels() {
+        // The menu/keyboard "cycle" control walks 2x -> 4x -> 8x -> 16x ->
+        // Max and back to 2x.
+        let order = [
+            WarpSpeed::X2,
+            WarpSpeed::X4,
+            WarpSpeed::X8,
+            WarpSpeed::X16,
+            WarpSpeed::Max,
+        ];
+        for window in order.windows(2) {
+            assert_eq!(window[0].next(), window[1]);
+        }
+        assert_eq!(WarpSpeed::Max.next(), WarpSpeed::X2);
+        // Fixed levels retire exactly their multiplier in frames; Max is
+        // bounded by a wall-clock budget rather than a small fixed count.
+        assert_eq!(WarpSpeed::X8.frame_cap(), 8);
+        assert!(WarpSpeed::X8.time_budget_ms().is_none());
+        assert_eq!(WarpSpeed::Max.time_budget_ms(), Some(WARP_MAX_BUDGET_MS));
     }
 
     #[test]

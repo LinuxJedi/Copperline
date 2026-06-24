@@ -13,6 +13,7 @@ use super::window::{
     BUTTON_EDGE_DARK, BUTTON_EDGE_LIGHT, BUTTON_FACE, BUTTON_FACE_HOVER,
 };
 use super::{font, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL, PRESENT_HEIGHT};
+use crate::config::WarpSpeed;
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -58,6 +59,7 @@ pub enum MenuItem {
     Debugger,
     JoystickInput,
     Warp,
+    WarpLimit,
     Record,
     RecordInput,
     SaveState,
@@ -65,12 +67,13 @@ pub enum MenuItem {
     LoadRom,
 }
 
-pub const MENU_ITEMS: [MenuItem; 12] = [
+pub const MENU_ITEMS: [MenuItem; 13] = [
     MenuItem::FrameAnalyzer,
     MenuItem::Debugger,
     MenuItem::Calibration,
     MenuItem::JoystickInput,
     MenuItem::Warp,
+    MenuItem::WarpLimit,
     MenuItem::Record,
     MenuItem::RecordInput,
     MenuItem::SaveState,
@@ -83,6 +86,7 @@ pub const MENU_ITEMS: [MenuItem; 12] = [
 fn menu_item_label(
     item: MenuItem,
     warp: bool,
+    warp_speed: WarpSpeed,
     recording: bool,
     input_recording: bool,
     joystick_input_mode: JoystickInputMode,
@@ -96,6 +100,9 @@ fn menu_item_label(
         MenuItem::JoystickInput => format!("Joystick Input  [{}]", joystick_input_mode.label()),
         MenuItem::Warp if warp => "Warp Speed      [on]".to_string(),
         MenuItem::Warp => "Warp Speed     [off]".to_string(),
+        // Right-pad so the closing bracket stays put as the value width
+        // changes (2x/8x vs 16x/Max), aligning with the Warp Speed row above.
+        MenuItem::WarpLimit => format!("Warp Limit     {:>5}", format!("[{}]", warp_speed.label())),
         MenuItem::Record if recording => "Stop Video Recording".to_string(),
         MenuItem::Record => "Record Video".to_string(),
         MenuItem::RecordInput if input_recording => "Stop Input Recording".to_string(),
@@ -364,7 +371,7 @@ pub enum UiControl {
 fn panel_dims(panel: &Panel) -> (usize, usize) {
     match panel {
         Panel::About => (560, 380),
-        Panel::Shortcuts => (600, 352),
+        Panel::Shortcuts => (600, 396),
         Panel::Calibration(_) => (620, 372),
         Panel::Debugger(_) => (684, 520),
         Panel::FrameAnalyzer(_) => (700, 526),
@@ -813,6 +820,7 @@ fn draw_menu(
     frame: &mut [u8],
     hover: Option<UiControl>,
     warp: bool,
+    warp_speed: WarpSpeed,
     recording: bool,
     input_recording: bool,
     joystick_input_mode: JoystickInputMode,
@@ -837,7 +845,14 @@ fn draw_menu(
             frame,
             item_rect.x + 8,
             item_rect.y + (MENU_ITEM_H - 16) / 2,
-            &menu_item_label(*item, warp, recording, input_recording, joystick_input_mode),
+            &menu_item_label(
+                *item,
+                warp,
+                warp_speed,
+                recording,
+                input_recording,
+                joystick_input_mode,
+            ),
             fg,
             2,
             scale,
@@ -920,7 +935,7 @@ fn draw_about(frame: &mut [u8], rect: Rect, view: &AboutView, scale: usize) {
     }
 }
 
-const SHORTCUT_ROWS: [(&str, &str, bool); 12] = [
+const SHORTCUT_ROWS: [(&str, &str, bool); 14] = [
     ("Q", "Quit", true),
     ("S", "Save screenshot", true),
     ("R", "Record video on/off", true),
@@ -931,6 +946,8 @@ const SHORTCUT_ROWS: [(&str, &str, bool); 12] = [
     ("G", "Capture mouse", true),
     ("B", "Debugger", true),
     ("J", "Joystick input mode", true),
+    ("W", "Warp speed on/off", true),
+    ("Shift+W", "Warp limit (2x..Max)", true),
     ("Esc", "Close menu/window", false),
     ("Ctrl+Ami+Ami", "Keyboard reset", false),
 ];
@@ -1797,6 +1814,7 @@ pub fn draw(
     hover: Option<UiControl>,
     data: Option<&PanelViewData>,
     warp: bool,
+    warp_speed: WarpSpeed,
     recording: bool,
     input_recording: bool,
     joystick_input_mode: JoystickInputMode,
@@ -1809,6 +1827,7 @@ pub fn draw(
             frame,
             hover,
             warp,
+            warp_speed,
             recording,
             input_recording,
             joystick_input_mode,
@@ -2204,6 +2223,7 @@ mod tests {
             None,
             None,
             true,
+            WarpSpeed::Max,
             false,
             false,
             JoystickInputMode::Auto,
@@ -2235,6 +2255,7 @@ mod tests {
             None,
             Some(&data),
             false,
+            WarpSpeed::Max,
             false,
             false,
             JoystickInputMode::Auto,
@@ -2254,6 +2275,7 @@ mod tests {
             None,
             Some(&PanelViewData::Shortcuts),
             false,
+            WarpSpeed::Max,
             false,
             false,
             JoystickInputMode::Auto,
@@ -2290,6 +2312,7 @@ mod tests {
             Some(UiControl::CalCancel),
             Some(&data),
             false,
+            WarpSpeed::Max,
             false,
             false,
             JoystickInputMode::Auto,
@@ -2333,6 +2356,7 @@ mod tests {
             Some(UiControl::DebugStep),
             Some(&data),
             false,
+            WarpSpeed::Max,
             false,
             false,
             JoystickInputMode::Auto,
@@ -2373,6 +2397,7 @@ mod tests {
             Some(UiControl::DebugRegToggle),
             Some(&data),
             false,
+            WarpSpeed::Max,
             false,
             false,
             JoystickInputMode::Auto,

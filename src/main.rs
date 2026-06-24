@@ -1158,6 +1158,7 @@ fn main() -> Result<()> {
         disk_write_protected,
         resolve_overscan(cfg.overscan),
         resolve_phosphor(cfg.phosphor),
+        cfg.emulation.warp_speed,
         about_machine_lines(&cfg),
     );
 

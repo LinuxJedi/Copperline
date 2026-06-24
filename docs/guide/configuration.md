@@ -119,6 +119,7 @@ clock works.
 power_on = true            # false = start powered off at the test screen
 pacing_budget = "cycles"   # "cycles" (hardware-accurate) or "instructions"
 realtime_priority = false  # true = raise the pacer/audio thread priority
+warp_speed = "max"         # turbo limit: "2x", "4x", "8x", "16x", or "max"
 ```
 
 The deterministic cycle-driven core is the only emulation timing. It is
@@ -153,6 +154,15 @@ carried no information.)
   `COPPERLINE_REALTIME_PRIORITY` overrides this for one run; set it to
   `0`/`false`/`off` to force it off, or to any other value (or leave it empty)
   to force it on.
+- `warp_speed` sets the default speed of Warp Speed (turbo) mode. The window
+  presents with vsync, so emulating one frame per presented frame would pin
+  warp to the host monitor's refresh rate. This option is an output frame
+  skip -- `"2x"`, `"4x"`, `"8x"`, `"16x"`, or `"max"` (default) -- so warp
+  retires that many emulated frames per presented frame, making warp roughly
+  the limit times the refresh rate (host CPU permitting). `"max"` runs flat
+  out and still presents at vsync. Adjust it live from the **Warp Limit**
+  menu item or `Cmd+Shift+W` / `Alt+Shift+W` (see [The window and its
+  controls](ui.md)).
 
 ## `[cpu]`
 

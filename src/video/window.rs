@@ -14,7 +14,7 @@ use super::{
 use crate::bus::{
     BeamWriteSource, FrontPanelStatus, RenderRegisterSnapshot, VideoRenderFrameTiming,
 };
-use crate::config::Overscan;
+use crate::config::{Overscan, WarpSpeed};
 use crate::emulator::Emulator;
 use crate::screenshot;
 
@@ -523,6 +523,11 @@ pub struct App {
     gamepad: crate::gamepad::GamepadReader,
     /// Host source policy for the emulated port-2 joystick/CD32 pad.
     joystick_input_mode: JoystickInputMode,
+    /// Output frame-skip level for warp/turbo mode: how many emulated frames
+    /// are retired per presented frame while warp is engaged. Presentation is
+    /// vsync-gated, so this is what decouples warp speed from the host monitor
+    /// refresh rate. Adjustable from the Emulator menu and the keyboard.
+    warp_speed: WarpSpeed,
     /// Whether the last normal input poll resolved a calibrated physical
     /// gamepad. Auto mode uses this to decide whether mapped keyboard keys
     /// should be consumed as joystick controls.
@@ -715,6 +720,7 @@ impl App {
         disk_write_protected: [bool; 4],
         overscan: Overscan,
         phosphor: f32,
+        warp_speed: WarpSpeed,
         about_machine_lines: Vec<String>,
     ) -> Self {
         // Headless capture runs drive themselves off emulated time, so a
@@ -785,6 +791,7 @@ impl App {
             overscan,
             gamepad: crate::gamepad::GamepadReader::new(),
             joystick_input_mode: JoystickInputMode::default(),
+            warp_speed,
             last_gamepad_active: false,
             keyboard_joy_held: KeyboardJoystickHeld::default(),
             ui: UiState::default(),
@@ -1233,6 +1240,17 @@ impl ApplicationHandler for App {
                     {
                         self.toggle_recording()
                     }
+                    (KeyCode::KeyW, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers)
+                            && self.modifiers.shift_key() =>
+                    {
+                        self.cycle_warp_speed()
+                    }
+                    (KeyCode::KeyW, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers) =>
+                    {
+                        self.toggle_warp()
+                    }
                     (other, state) => {
                         let pressed = state == ElementState::Pressed;
                         if pressed && self.ui_handle_key(other) {
@@ -1421,6 +1439,7 @@ impl ApplicationHandler for App {
                 let osd = self.active_osd_text();
                 let ui_hover = self.cursor_pos.and_then(|p| self.main_ui_control_at(p));
                 let warp = !self.emu.paced();
+                let warp_speed = self.warp_speed;
                 let recording = self.recorder.is_some();
                 let input_recording = self.input_recorder.is_some();
                 let ui_data = self.build_panel_view_data();
@@ -1443,6 +1462,7 @@ impl ApplicationHandler for App {
                         ui_hover,
                         ui_data.as_ref(),
                         warp,
+                        warp_speed,
                         recording,
                         input_recording,
                         self.joystick_input_mode,
@@ -1518,18 +1538,50 @@ impl ApplicationHandler for App {
         } else {
             self.pump_joystick_input();
         }
+        // Headless capture (screenshot/frame-dump) builds the framebuffer for
+        // the saved PNG but presents nothing: it already runs unthrottled at one
+        // frame per loop (request_redraw is skipped below), and every captured
+        // frame must be rendered, so warp's output frame-skip burst must not
+        // apply there.
+        let headless_capture = self.auto_shot.is_some() || self.frame_dump.is_some();
         // Run one scheduler quantum. Rebuild the host framebuffer only
         // when Agnus has crossed into a new frame; the expensive renderer
         // reconstructs a completed hardware frame, not an instruction slice.
         if running {
-            if let Err(e) = self.emu.step_frame() {
-                error!("emulator step halted: {e:?}");
-                self.cpu_halted = true;
-                self.sync_live_audio_suspension();
+            // Presentation is vsync-gated, so emulating exactly one frame per
+            // presented frame would cap warp at the host monitor refresh rate
+            // (about 1.2x for 50 Hz PAL on a 60 Hz display). In warp, retire
+            // several frames per presented frame (output frame skip): only the
+            // last frame of the burst is rendered and presented, so the
+            // effective speed is the warp level times the refresh rate, host
+            // CPU permitting. Real-time pacing and headless capture stay at one
+            // frame per loop.
+            let (frame_cap, time_budget) = self.warp_burst_plan(headless_capture);
+            let burst_start = Instant::now();
+            let mut frames_done = 0usize;
+            loop {
+                if let Err(e) = self.emu.step_frame() {
+                    error!("emulator step halted: {e:?}");
+                    self.cpu_halted = true;
+                    self.sync_live_audio_suspension();
+                    break;
+                }
+                frames_done += 1;
+                // A breakpoint/watchpoint hit pauses the machine and brings
+                // the debugger window up with the reason; end the burst so the
+                // stop surfaces at the frame where it happened.
+                if self.surface_debug_stop() {
+                    break;
+                }
+                if frames_done >= frame_cap {
+                    break;
+                }
+                if let Some(budget) = time_budget {
+                    if burst_start.elapsed() >= budget {
+                        break;
+                    }
+                }
             }
-            // A breakpoint/watchpoint hit pauses the machine and brings
-            // the debugger window up with the reason.
-            self.surface_debug_stop();
             self.ensure_tool_windows_for_open_panels(event_loop);
         }
         let now = Instant::now();
@@ -1540,11 +1592,10 @@ impl ApplicationHandler for App {
             rendered |= self.finish_render_for_current_frame();
         }
         self.capture_recorder_output(rendered);
-        // Headless capture (screenshot/frame-dump) builds the framebuffer
-        // for the saved PNG but never needs to present to the window;
-        // skipping request_redraw avoids the vsync gate so the run advances
-        // as fast as the host allows. Emulated state is identical either way.
-        let headless_capture = self.auto_shot.is_some() || self.frame_dump.is_some();
+        // Skipping request_redraw for headless capture avoids the vsync gate so
+        // the run advances as fast as the host allows; emulated state is
+        // identical either way. (`headless_capture` was resolved above, before
+        // the step, to decide the warp burst.)
         if rendered && !headless_capture {
             self.request_redraw();
         }
@@ -4544,6 +4595,7 @@ impl App {
                     ui::MenuItem::Debugger => self.open_debugger(),
                     ui::MenuItem::JoystickInput => self.cycle_joystick_input_mode(),
                     ui::MenuItem::Warp => self.toggle_warp(),
+                    ui::MenuItem::WarpLimit => self.cycle_warp_speed(),
                     ui::MenuItem::Record => self.toggle_recording(),
                     ui::MenuItem::RecordInput => self.toggle_input_recording(),
                     ui::MenuItem::SaveState => self.save_state_interactive(),
@@ -5018,12 +5070,47 @@ impl App {
         let warp = self.emu.paced();
         self.emu.set_paced(!warp);
         if warp {
-            info!("warp speed on (emulation unpaced)");
-            self.show_osd("Warp speed on");
+            let limit = self.warp_speed.label();
+            info!("warp speed on (emulation unpaced, limit {limit})");
+            self.show_osd(format!("Warp speed on ({limit})"));
         } else {
             info!("warp speed off (real-time pacing)");
             self.show_osd("Warp speed off");
         }
+    }
+
+    /// How many emulated frames to retire before presenting the next frame, and
+    /// an optional wall-clock budget that bounds that burst. Warp's output frame
+    /// skip applies only while warp is engaged and not doing headless capture;
+    /// real-time pacing and headless capture both run one frame per presented
+    /// frame. The `Max` level returns a budget so the burst presents at vsync
+    /// rather than spinning to its frame cap.
+    fn warp_burst_plan(&self, headless_capture: bool) -> (usize, Option<std::time::Duration>) {
+        if self.emu.paced() || headless_capture {
+            return (1, None);
+        }
+        (
+            self.warp_speed.frame_cap(),
+            self.warp_speed
+                .time_budget_ms()
+                .map(std::time::Duration::from_millis),
+        )
+    }
+
+    /// Cycle the warp/turbo output frame-skip level (2x -> 4x -> 8x -> 16x ->
+    /// Max). Takes effect immediately when warp is engaged; otherwise it just
+    /// arms the level the next warp toggle will use.
+    fn cycle_warp_speed(&mut self) {
+        self.warp_speed = self.warp_speed.next();
+        let limit = self.warp_speed.label();
+        info!("warp limit: {limit}");
+        let active = !self.emu.paced();
+        if active {
+            self.show_osd(format!("Warp limit: {limit}"));
+        } else {
+            self.show_osd(format!("Warp limit: {limit} (warp off)"));
+        }
+        self.request_redraw();
     }
 
     /// Interactive shortcut / menu state save: write the whole
@@ -6885,6 +6972,7 @@ mod tests {
     };
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::FrontPanelStatus;
+    use crate::config::WarpSpeed;
     use crate::video::{FB_HEIGHT, FB_PIXELS, FB_WIDTH};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -7057,6 +7145,43 @@ mod tests {
         assert!(should_render_emulated_frame(None, 0));
         assert!(!should_render_emulated_frame(Some(12), 12));
         assert!(should_render_emulated_frame(Some(12), 13));
+    }
+
+    #[test]
+    fn warp_burst_decouples_emulation_from_the_vsync_present() {
+        let mut app = test_app();
+        // test_app builds an unpaced (warp) emulator. Default warp level is
+        // Max: retire many frames per presented frame, bounded by a wall-clock
+        // budget so the loop still presents at vsync.
+        app.warp_speed = WarpSpeed::Max;
+        let (cap, budget) = app.warp_burst_plan(false);
+        assert!(cap > 1, "warp Max must skip output frames, got cap {cap}");
+        assert!(budget.is_some(), "Max bounds the burst by wall-clock time");
+
+        // A fixed level retires exactly its multiplier in frames, with no time
+        // bound -- predictable speed = level x refresh rate.
+        app.warp_speed = WarpSpeed::X4;
+        assert_eq!(app.warp_burst_plan(false), (4, None));
+
+        // Headless capture renders every frame, so the burst must not engage
+        // even though the core is unpaced.
+        assert_eq!(app.warp_burst_plan(true), (1, None));
+
+        // Real-time pacing presents one frame per loop regardless of level.
+        app.emu.set_paced(true);
+        assert_eq!(app.warp_burst_plan(false), (1, None));
+    }
+
+    #[test]
+    fn cycle_warp_speed_walks_the_levels() {
+        let mut app = test_app();
+        app.warp_speed = WarpSpeed::X8;
+        app.cycle_warp_speed();
+        assert_eq!(app.warp_speed, WarpSpeed::X16);
+        app.cycle_warp_speed();
+        assert_eq!(app.warp_speed, WarpSpeed::Max);
+        app.cycle_warp_speed();
+        assert_eq!(app.warp_speed, WarpSpeed::X2);
     }
 
     #[test]
@@ -8044,6 +8169,7 @@ mod tests {
             [true; 4],
             crate::config::Overscan::Full,
             0.0,
+            crate::config::WarpSpeed::Max,
             vec!["Machine: test".to_string()],
         )
     }

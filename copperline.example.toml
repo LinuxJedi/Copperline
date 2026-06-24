@@ -44,6 +44,15 @@ pacing_budget = "cycles"
 # one run (set it to 0/false/off to force it off).
 # realtime_priority = false
 
+# Default speed of Warp Speed (turbo) mode. The window presents with vsync,
+# so emulating one frame per presented frame would pin warp to the host
+# monitor's refresh rate. This is an output frame skip: warp retires this
+# many emulated frames per presented frame, making warp roughly the limit
+# times the refresh rate (host CPU permitting). One of "2x", "4x", "8x",
+# "16x", or "max" (default; run flat out, still presenting at vsync). Adjust
+# it live from the Warp Limit menu item or Cmd+Shift+W / Alt+Shift+W.
+# warp_speed = "max"
+
 
 [cpu]
 

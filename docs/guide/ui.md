@@ -20,6 +20,8 @@ The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
 | `Cmd+G` | `Alt+G` | Capture / release the host mouse (clicking the display also captures) |
 | `Cmd+B` | `Alt+B` | Open the [debugger window](../debugger/window) |
 | `Cmd+J` | `Alt+J` | Cycle joystick input mode: auto, keyboard, gamepad |
+| `Cmd+W` | `Alt+W` | Toggle Warp Speed (turbo) on / off |
+| `Cmd+Shift+W` | `Alt+Shift+W` | Cycle the Warp Speed limit: 2x, 4x, 8x, 16x, Max |
 | `Esc` | `Esc` | Close an open menu, tool window, or overlay panel; otherwise passed through to the Amiga |
 | `Ctrl+Amiga+Amiga` | `Ctrl+Amiga+Amiga` | Keyboard reset (warm reboot) |
 
@@ -87,8 +89,17 @@ tool window or overlay.
 - **Calibrate Gamepad...**: the guided calibration flow, described below.
 - **Joystick Input** (also `Cmd+J` / `Alt+J`): cycles between automatic
   selection, keyboard joystick emulation, and gamepad-only mode.
-- **Warp Speed**: runs the emulator unpaced, as fast as the host allows.
-  Toggling back re-anchors real-time pacing cleanly.
+- **Warp Speed** (also `Cmd+W` / `Alt+W`): runs the emulator unpaced for
+  fast-forward. Toggling back re-anchors real-time pacing cleanly.
+- **Warp Limit** (also `Cmd+Shift+W` / `Alt+Shift+W`): cycles how fast warp
+  runs. Because the window presents with vsync, emulating one frame per
+  presented frame would cap warp at the host monitor's refresh rate (about
+  1.2x for 50 Hz PAL on a 60 Hz display). The limit sets an output frame
+  skip -- 2x, 4x, 8x, 16x, or **Max** -- so warp retires that many emulated
+  frames per presented frame, making the effective speed roughly the limit
+  times the refresh rate (host CPU permitting). `Max` runs flat out and
+  still presents at vsync. The default is set by `[emulation] warp_speed`
+  (see [Configuration](configuration.md)).
 - **Record Video** (also `Cmd+R` / `Alt+R`): starts a video-with-audio
   recording; the same item (or shortcut again) stops it. See below.
 - **Record Input** (also `Cmd+Shift+R` / `Alt+Shift+R`): records every
