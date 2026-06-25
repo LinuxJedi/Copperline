@@ -61,6 +61,11 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.7.0" date="2026-06-25">
+      <description>
+        <p>A1000 and expanded A500 machine profiles, connected floppy-drive controls, debugger step-over/step-out, conditional breakpoints and state pokes, adjustable warp-speed frame skipping, macOS DMG builds, and Copper, Denise, Agnus, blitter, sprite, and floppy timing fixes.</p>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-06-23">
       <description>
         <p>Chip-bus frame analysis, remote GDB debugging, Linux Vulkan presentation checks, Zorro board identification, TV-visible overscan modelling, sprite and bitplane timing fixes, padded UAE-1ADF handling, and live-audio pacing improvements.</p>

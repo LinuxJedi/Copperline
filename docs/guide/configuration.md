@@ -134,7 +134,8 @@ Agnus-only ECS upgrade, not a full-ECS machine -- the OCS Denise means no
 superhires or `BRDRBLNK`, exactly as on the real board. Chip RAM defaults to
 the stock 512K but accepts up to 1M (`[memory] chip = "1M"`); more than 1M is
 rejected because the 8372A cannot address it. Booting with no `[machine]`
-section instead gives a plain OCS A500-like machine (8371 Agnus, OCS Denise).
+section uses the same Rev 6A defaults; select `A500OCS` or set
+`[chipset] revision = "OCS"` for the older 8371/8362 machine.
 
 ## `[emulation]`
 
