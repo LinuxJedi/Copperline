@@ -13,6 +13,7 @@
 //! blocks with hashed name chains, and file header / extension blocks whose
 //! data pointers reference raw 512-byte data blocks.
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,6 +77,7 @@ pub fn build_ffs_image(dir: &Path, volume_name: &str) -> anyhow::Result<Vec<u8>>
 /// One directory entry found by the host-tree scan.
 struct EntryPlan {
     name: Vec<u8>,
+    name_osstring: OsString,
     is_dir: bool,
     size: u64,
     mtime: (u32, u32, u32),
@@ -110,6 +112,45 @@ fn amiga_datestamp(time: SystemTime) -> (u32, u32, u32) {
     (days, mins, ticks)
 }
 
+fn osstring_to_latin1(os: &OsStr) -> Option<Vec<u8>> {
+    if os.is_empty() {
+        log::warn!("dirfs: skipping entry with empty name");
+        return None;
+    }
+    let s: &str = os
+        .try_into()
+        .map_err(|_| log::warn!("dirfs: failed to convert \"{}\" to utf8", os.display()))
+        .ok()?;
+    let s_len = s.len();
+    if s_len > 30 {
+        log::warn!(
+            "dirfs: skipping entry \"{}\" with more than 30 characters",
+            os.display()
+        );
+        return None;
+    }
+    let mut result = Vec::with_capacity(s_len);
+    for ch in s.chars() {
+        let code = ch as u32;
+        if code <= 0xFF {
+            let code_u8 = code as u8;
+            if code_u8 == b':' || code_u8 == b'/' {
+                log::warn!(
+                    "dirfs: skipping entry \"{}\" with invalid character(s)",
+                    os.display()
+                );
+                return None;
+            } else {
+                result.push(code_u8);
+            };
+        } else {
+            log::warn!("dirfs: failed to convert char \"{ch}\" to latin1");
+            return None;
+        }
+    }
+    Some(result)
+}
+
 /// Recursively scan a host directory, in byte-sorted name order so image
 /// builds are deterministic. Entries whose names cannot exist on an FFS
 /// volume (over 30 bytes, or containing ':' or '/') and non-file/dir
@@ -127,14 +168,11 @@ fn scan_tree(dir: &Path) -> anyhow::Result<Vec<EntryPlan>> {
         .map_err(|e| anyhow::anyhow!("reading directory {}: {e}", dir.display()))?;
     listing.sort_by_key(|e| e.file_name().into_encoded_bytes().to_vec());
     for entry in listing {
-        let name = entry.file_name().into_encoded_bytes().to_vec();
-        if name.is_empty() || name.len() > 30 || name.iter().any(|&c| c == b':' || c == b'/') {
-            log::warn!(
-                "dirfs: skipping {:?}: name not representable on an Amiga volume",
-                entry.path()
-            );
-            continue;
-        }
+        let name_osstring = entry.file_name();
+        let name = match osstring_to_latin1(&name_osstring) {
+            Some(n) => n,
+            None => continue,
+        };
         let meta = entry
             .metadata()
             .map_err(|e| anyhow::anyhow!("stat {}: {e}", entry.path().display()))?;
@@ -143,6 +181,7 @@ fn scan_tree(dir: &Path) -> anyhow::Result<Vec<EntryPlan>> {
         if file_type.is_dir() {
             out.push(EntryPlan {
                 name,
+                name_osstring,
                 is_dir: true,
                 size: 0,
                 mtime,
@@ -151,6 +190,7 @@ fn scan_tree(dir: &Path) -> anyhow::Result<Vec<EntryPlan>> {
         } else if file_type.is_file() {
             out.push(EntryPlan {
                 name,
+                name_osstring,
                 is_dir: false,
                 size: meta.len(),
                 mtime,
@@ -318,8 +358,7 @@ impl Builder {
         parent: u32,
     ) -> anyhow::Result<()> {
         for entry in entries {
-            let name_str = String::from_utf8_lossy(&entry.name).into_owned();
-            let host_path = host_dir.join(&name_str);
+            let host_path = host_dir.join(&entry.name_osstring);
             if entry.is_dir {
                 let key = self.alloc()?;
                 self.put32(key, 0, T_HEADER);
@@ -546,6 +585,7 @@ mod tests {
         std::fs::write(dir.join("ReadMe.txt"), b"hello amiga\n").unwrap();
         std::fs::write(dir.join("Sub/data.bin"), vec![0xA7u8; 100_000]).unwrap();
         std::fs::write(dir.join("Sub/Deeper/empty"), b"").unwrap();
+        std::fs::write(dir.join("spaß"), b"sharp_s").unwrap();
         dir
     }
 
@@ -571,6 +611,13 @@ mod tests {
         assert!(r.checksum_ok(readme, 20));
         assert_eq!(r.get32(readme, BSIZE - 4), ST_FILE);
         assert_eq!(r.read_file(readme), b"hello amiga\n");
+
+        // Non ASCII char
+        let german_fun = OsStr::new("spaß");
+        let amiga_fun = osstring_to_latin1(german_fun).expect("OsString conversion");
+        assert_eq!(amiga_fun, [b's', b'p', b'a', 0xdf]);
+        let spass = r.lookup(root, &amiga_fun).expect("No fun");
+        assert_eq!(r.read_file(spass), b"sharp_s");
 
         // Nested directory chain and a file large enough to need extension
         // blocks (100000 bytes = 196 data blocks > 72).
@@ -621,5 +668,21 @@ mod tests {
         // The last block of the slack area is free.
         assert!(bit((image.len() / BSIZE - 1) as u32));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn osstring_conversion() {
+        let half = OsStr::new("\u{bd}"); // ½
+        assert_eq!(osstring_to_latin1(half), Some(vec![0xbd]));
+        let copy = OsStr::new("\u{a9}"); // ©
+        assert_eq!(osstring_to_latin1(copy), Some(vec![0xa9]));
+        let heart = OsStr::new("I \u{2764} YOU!"); // ❤
+        assert!(osstring_to_latin1(heart).is_none());
+        let long = OsStr::new("AVeryLongNameThatDoesNotFitIntoAmigaFileSystem");
+        assert!(osstring_to_latin1(long).is_none());
+        let empty = OsStr::new("");
+        assert!(osstring_to_latin1(empty).is_none());
+        let colon = OsStr::new("co:lon");
+        assert!(osstring_to_latin1(colon).is_none());
     }
 }
