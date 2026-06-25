@@ -54,7 +54,8 @@ const STATE_MAGIC: &[u8; 8] = b"CLSSTATE";
 //   6: Memory gained the A1000 WCS (wcs + wcs_write_protected)
 //   7: Bus.a2091 Option replaced by Bus.devices Vec<BoardDevice>; the
 //      BoardBacking::A2091 variant became BoardBacking::Device(slot)
-pub const STATE_VERSION: u32 = 7;
+//   8: BoardDevice gained Wasm and A2065 variants (enum layout change)
+pub const STATE_VERSION: u32 = 8;
 
 /// Default state file name, timestamped like the screenshot/recorder names.
 pub fn auto_filename() -> std::path::PathBuf {

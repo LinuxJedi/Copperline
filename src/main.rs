@@ -7,6 +7,7 @@
 //!   If no ROM is given (neither argument nor `rom =` in the config), boots
 //!   the bundled AROS open-source Kickstart replacement (see src/romsearch.rs).
 
+mod a2065;
 mod a2091;
 mod akiko;
 mod audio;
@@ -32,6 +33,7 @@ mod harddrive;
 mod inputrec;
 mod inputsched;
 mod memory;
+mod net;
 mod priority;
 mod recorder;
 mod romsearch;
@@ -1113,6 +1115,18 @@ pub(crate) fn build_machine(
             wb.wasm_path.display()
         );
         devices.push(crate::zorro_device::BoardDevice::Wasm(board));
+    }
+    // A2065 Ethernet board (in-tree LANCE NIC): networking is non-deterministic.
+    if let Some(net_config) = cfg.a2065_net {
+        let slot = devices.len();
+        zorro.add_board(crate::zorro::BoardSpec::a2065(slot))?;
+        info!(
+            "a2065: Ethernet board on the Zorro chain (slot {slot}), net backend {net_config:?} \
+             -- networking is non-deterministic, replay/save-state reproducibility not guaranteed"
+        );
+        devices.push(crate::zorro_device::BoardDevice::A2065(
+            crate::a2065::A2065::new(net_config),
+        ));
     }
     // The A1000 has no Kickstart ROM: cfg.rom_path is its 64 KiB bootstrap
     // ROM, and a 256 KiB WCS is allocated for it to load Kickstart into from

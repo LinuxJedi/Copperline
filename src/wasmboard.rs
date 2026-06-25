@@ -39,6 +39,7 @@
 //! wasmtime build; the version is pinned in `Cargo.toml`.
 
 use crate::memory::Memory;
+use crate::net::{make_backend, NetBackend, NetConfig};
 use crate::zorro_device::{DeviceHost, ZorroDevice};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -59,14 +60,19 @@ pub struct WasmCaps {
     pub int2: bool,
     /// Asserts the INT6 (EXTER) line (advisory; the `int6` export is polled).
     pub int6: bool,
+    /// Host networking (`net_send`/`net_recv` imports). A net board is
+    /// non-deterministic; see [`crate::net`].
+    pub net: bool,
 }
 
-/// A plugin's non-autoconfig metadata: its display name and capabilities. The
-/// autoconfig identity lives in the board's [`crate::zorro::BoardSpec`].
+/// A plugin's non-autoconfig metadata: its display name, capabilities, and (for
+/// a NIC board) which host network backend to bring up. The autoconfig identity
+/// lives in the board's [`crate::zorro::BoardSpec`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WasmManifest {
     pub name: String,
     pub caps: WasmCaps,
+    pub net: NetConfig,
 }
 
 /// Store data for host imports. The Amiga-memory pointer is stored as a
@@ -76,6 +82,10 @@ struct HostCtx {
     /// Address of the live `Memory`, valid only during a plugin call.
     mem: usize,
     name: String,
+    /// Host network backend for a NIC plugin (the `net` capability). A host
+    /// resource, not serialized: brought up fresh from the manifest's
+    /// [`NetConfig`] on instantiation and reset.
+    net: Option<Box<dyn NetBackend>>,
 }
 
 /// The typed entry points a plugin may export.
@@ -123,6 +133,7 @@ impl WasmRuntime {
             HostCtx {
                 mem: 0,
                 name: manifest.name.clone(),
+                net: make_backend(manifest.net),
             },
         );
         let mut linker = Linker::new(engine);
@@ -246,6 +257,37 @@ fn register_host_fns(linker: &mut Linker<HostCtx>, caps: WasmCaps) -> Result<()>
             },
         )?;
     }
+
+    if caps.net {
+        // net_send(ptr, len): transmit the Ethernet frame in linear memory.
+        linker.func_wrap(
+            "env",
+            "net_send",
+            |mut caller: Caller<'_, HostCtx>, ptr: i32, len: i32| -> Result<()> {
+                let frame = read_wasm_bytes(&mut caller, ptr, len)?;
+                if let Some(net) = caller.data_mut().net.as_mut() {
+                    net.send(&frame);
+                }
+                Ok(())
+            },
+        )?;
+
+        // net_recv(ptr, cap) -> i32: copy the next inbound frame into linear
+        // memory at `ptr` (truncated to `cap` bytes) and return its length, or
+        // 0 when none is waiting.
+        linker.func_wrap(
+            "env",
+            "net_recv",
+            |mut caller: Caller<'_, HostCtx>, ptr: i32, cap: i32| -> Result<i32> {
+                let Some(frame) = caller.data_mut().net.as_mut().and_then(|n| n.poll()) else {
+                    return Ok(0);
+                };
+                let n = frame.len().min(cap.max(0) as usize);
+                write_wasm_bytes(&mut caller, ptr, &frame[..n])?;
+                Ok(n as i32)
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -304,6 +346,15 @@ pub struct WasmBoard {
 impl WasmBoard {
     /// Load and instantiate a plugin module from a `.wasm` file.
     pub fn from_file(path: &Path, manifest: WasmManifest) -> Result<Self> {
+        if manifest.net != NetConfig::None {
+            log::warn!(
+                "wasm[{}]: network backend {:?} active -- deterministic replay \
+                 and save-state reproducibility are not guaranteed while \
+                 traffic flows",
+                manifest.name,
+                manifest.net
+            );
+        }
         let engine = make_engine()?;
         let module = Module::from_file(&engine, path)
             .with_context(|| format!("compiling WASM plugin {}", path.display()))?;
@@ -505,7 +556,22 @@ mod tests {
                 dma,
                 int2: true,
                 int6: false,
+                net: false,
             },
+            net: NetConfig::None,
+        }
+    }
+
+    fn net_manifest(name: &str) -> WasmManifest {
+        WasmManifest {
+            name: name.into(),
+            caps: WasmCaps {
+                dma: false,
+                int2: false,
+                int6: false,
+                net: true,
+            },
+            net: NetConfig::Loopback,
         }
     }
 
@@ -627,6 +693,47 @@ mod tests {
         // write() triggers dma_read of 4 bytes from Amiga $40.
         board.write(0, 0, 0x40, &mut host);
         assert_eq!(board.read(0, 4, &mut host), 0xDEAD_BEEF);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A NIC test plugin: `write(_, _, val)` transmits a 4-byte frame
+    /// `[val, AA, BB, CC]`; `read` polls a frame into linear memory and returns
+    /// `(len << 16) | first_byte`. With the loopback backend, what is sent
+    /// comes straight back.
+    const NET_WAT: &str = r#"
+        (module
+          (import "env" "net_send" (func $net_send (param i32 i32)))
+          (import "env" "net_recv" (func $net_recv (param i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "write") (param $off i32) (param $size i32) (param $val i32)
+            (i32.store8 (i32.const 32) (local.get $val))
+            (i32.store8 (i32.const 33) (i32.const 0xAA))
+            (i32.store8 (i32.const 34) (i32.const 0xBB))
+            (i32.store8 (i32.const 35) (i32.const 0xCC))
+            (call $net_send (i32.const 32) (i32.const 4)))
+          (func (export "read") (param $off i32) (param $size i32) (result i32)
+            (local $n i32)
+            (local.set $n (call $net_recv (i32.const 64) (i32.const 128)))
+            (i32.or
+              (i32.shl (local.get $n) (i32.const 16))
+              (i32.load8_u (i32.const 64))))
+        )
+    "#;
+
+    #[test]
+    fn net_send_and_recv_round_trip_over_loopback() {
+        let path = write_wasm("net", NET_WAT);
+        let mut board = WasmBoard::from_file(&path, net_manifest("net")).unwrap();
+        let mut mem = empty_memory();
+        let mut host = DeviceHost::new(&mut mem);
+
+        // Transmit a frame; the loopback backend queues it straight back.
+        board.write(0, 0, 0x5E, &mut host);
+        // read() polls it: length 4, first byte 0x5E.
+        assert_eq!(board.read(0, 0, &mut host), (4 << 16) | 0x5E);
+        // No more frames waiting -> length 0 in the high half.
+        assert_eq!(board.read(0, 0, &mut host) >> 16, 0);
 
         let _ = std::fs::remove_file(&path);
     }

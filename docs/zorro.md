@@ -133,6 +133,35 @@ Plugins can be written in any language that targets `wasm32` (Rust, C, Zig,
 ...). An inert example module and its manifest can be generated with the
 ignored test `emit_example_plugin_wasm` (see `src/wasmboard.rs`).
 
+## Networking: the A2065 Ethernet board
+
+Copperline includes an in-tree Commodore A2065 Ethernet board (`src/a2065.rs`),
+an Am7990 LANCE NIC the AmigaOS SANA-II `a2065.device` drives. Fit it from the
+config:
+
+```toml
+[a2065]
+net = "loopback"   # host network backend; "none" for an isolated NIC
+```
+
+Unlike the DMAC boards, the LANCE does not master the Amiga bus: its init
+block, descriptor rings, and packet buffers live in the board's own 32 KiB RAM
+(which the CPU reaches through the board window), so the board is self-contained
+and owns its host network backend directly.
+
+Host network backends live in `src/net.rs` behind the `NetBackend` trait. Built
+in today is **loopback** (transmitted frames are queued straight back -- useful
+for a self-contained demo and for tests); a userspace NAT (libslirp/smoltcp) and
+a host TAP bridge are planned and will slot in behind `make_backend` under build
+features. TAP will require host privileges and interface setup; NAT will not.
+
+**Networking is non-deterministic.** Inbound frames arrive on the host's
+schedule, not the emulated clock, so a fitted A2065 (or any `net`-capable WASM
+plugin) breaks Copperline's byte-identical replay and save-state reproducibility
+while traffic flows -- the emulator logs this when the board is attached. Save
+states record only the chosen backend and bring up a fresh one on load
+(in-flight frames are dropped; the guest's TCP retransmits).
+
 ## How autoconfig works in Copperline
 
 Everything below happens automatically; it is documented so you can debug a

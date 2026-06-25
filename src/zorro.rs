@@ -17,6 +17,7 @@
 //! boards are implemented today; other backings plug in via
 //! [`BoardBacking`].
 
+use crate::net::NetConfig;
 use crate::wasmboard::{WasmCaps, WasmManifest};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -147,6 +148,23 @@ impl BoardSpec {
             serial: copperline_ident_serial(),
             size_bytes: 0x1_0000,
             backing: BoardBacking::Ram,
+            memlist: false,
+            diag_vec: None,
+        }
+    }
+
+    /// The A2065 Ethernet board: Commodore West Chester (manufacturer 514),
+    /// product 0x70, a 64K Zorro II window with no autoboot ROM. `slot` is the
+    /// index of the matching `A2065` device in `Bus::devices`.
+    pub fn a2065(slot: usize) -> Self {
+        Self {
+            name: "A2065 Ethernet".into(),
+            version: ZorroVersion::II,
+            manufacturer: 514,
+            product: 0x70,
+            serial: 0,
+            size_bytes: 0x1_0000,
+            backing: BoardBacking::Device(slot),
             memlist: false,
             diag_vec: None,
         }
@@ -531,6 +549,9 @@ struct RawBoardMeta {
     dma: Option<bool>,
     int2: Option<bool>,
     int6: Option<bool>,
+    /// Host network backend ("none"/"loopback"); presence grants the `net`
+    /// capability (the net_send/net_recv imports).
+    net: Option<String>,
 }
 
 /// A board parsed from a TOML metadata file: a RAM board (fully described by
@@ -615,13 +636,25 @@ pub fn load_board_metadata(path: &Path) -> Result<LoadedZorroBoard> {
             };
             spec.validate()
                 .with_context(|| format!("{}: invalid board", path.display()))?;
+            let net = match &raw.net {
+                Some(s) => crate::net::parse_net_config(s).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: net = {:?} is not a known backend (expected \"none\" or \"loopback\")",
+                        path.display(),
+                        s
+                    )
+                })?,
+                None => NetConfig::None,
+            };
             let manifest = WasmManifest {
                 name: spec.name.clone(),
                 caps: WasmCaps {
                     dma: raw.dma.unwrap_or(false),
                     int2: raw.int2.unwrap_or(false),
                     int6: raw.int6.unwrap_or(false),
+                    net: raw.net.is_some(),
                 },
+                net,
             };
             Ok(LoadedZorroBoard::Wasm {
                 spec,

@@ -114,6 +114,10 @@ pub struct Config {
     /// drive images on SCSI IDs 0-6. Works on any machine model (the board
     /// autoconfigs on the Zorro chain and carries its own scsi.device).
     pub scsi: ScsiConfig,
+    /// A2065 Ethernet board (`[a2065]`): when set, an A2065 NIC autoconfigs on
+    /// the Zorro chain using the named host network backend. Networking is
+    /// non-deterministic, so a fitted A2065 breaks byte-identical replay.
+    pub a2065_net: Option<crate::net::NetConfig>,
     pub floppy: FloppyConfig,
     /// Which floppy drive slots are electrically present. DF0 is the
     /// internal drive and is always present; DF1-DF3 are external drives
@@ -684,6 +688,7 @@ impl Default for Config {
             audio: AudioConfig::default(),
             ide: IdeConfig::default(),
             scsi: ScsiConfig::default(),
+            a2065_net: None,
             floppy: FloppyConfig::default(),
             floppy_connected: [true, false, false, false],
             floppy_playlists: std::array::from_fn(|_| Vec::new()),
@@ -895,6 +900,8 @@ pub(crate) struct RawConfig {
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) scsi: RawScsi,
     #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) a2065: RawA2065,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) floppy: RawFloppy,
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) display: RawDisplay,
@@ -956,6 +963,17 @@ pub(crate) struct RawScsi {
     pub(crate) unit5: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) unit6: Option<String>,
+}
+
+/// `[a2065]` Ethernet board. Fitting the board enables host networking, which
+/// is non-deterministic.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawA2065 {
+    /// Host network backend: "loopback" (self-contained), or "none" for an
+    /// isolated NIC. Absent means no A2065 board is fitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) net: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -1279,6 +1297,16 @@ impl TryFrom<RawConfig> for Config {
             bail!("[scsi] rom_odd needs rom (the even EPROM half)");
         }
 
+        let a2065_net = match &raw.a2065.net {
+            None => None,
+            Some(s) => Some(crate::net::parse_net_config(s).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[a2065] net = {:?} is not a known backend (expected \"none\" or \"loopback\")",
+                    s
+                )
+            })?),
+        };
+
         // The A500 Rev 6A is both the "A500" profile and the no-profile
         // default machine (the most common, most-targeted Amiga): the Fatter
         // 8372A Agnus with the original OCS 8362 Denise. An explicit [chipset]
@@ -1375,6 +1403,7 @@ impl TryFrom<RawConfig> for Config {
             audio,
             ide,
             scsi,
+            a2065_net,
             floppy,
             floppy_connected,
             floppy_playlists,
