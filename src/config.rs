@@ -26,6 +26,16 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 /// `rom = "..."` or the CLI argument) always replaces it.
 pub const BUNDLED_AROS_ROM: &str = "<bundled-aros>";
 
+/// A WASM plugin Zorro board resolved from config: its autoconfig identity
+/// (`spec`, with a placeholder device slot reassigned at build time), the
+/// `.wasm` module path, and the plugin manifest (name + capabilities).
+#[derive(Debug, Clone)]
+pub struct WasmBoardConfig {
+    pub spec: BoardSpec,
+    pub wasm_path: PathBuf,
+    pub manifest: crate::wasmboard::WasmManifest,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub rom_path: PathBuf,
@@ -49,9 +59,14 @@ pub struct Config {
     /// Zorro III autoconfig RAM (`[memory] z3`). Needs a CPU with a 32-bit
     /// address bus (68020/030/040; not the 24-bit 68000/68EC020).
     pub z3_ram_bytes: usize,
-    /// Extra Zorro boards loaded from `[[zorro]]` metadata files, in
+    /// Extra Zorro RAM boards loaded from `[[zorro]]` metadata files, in
     /// autoconfig chain order after the built-in RAM boards.
     pub zorro_boards: Vec<BoardSpec>,
+    /// WASM plugin boards loaded from `[[zorro]]` metadata files. Instantiated
+    /// and attached to the bus at machine-build time (their device-slot index
+    /// is assigned then); kept separate from RAM boards because they carry a
+    /// module and capabilities, not just an autoconfig identity.
+    pub wasm_boards: Vec<WasmBoardConfig>,
     /// Advertise the Copperline identification board on the Zorro autoconfig
     /// chain (manufacturer 5192 / product 2) so guest software such as
     /// identify.library can detect the emulator. Defaults to true; set
@@ -643,6 +658,7 @@ impl Default for Config {
             slow_ram_bytes: A500_TRAPDOOR_RAM_BYTES,
             z3_ram_bytes: 0,
             zorro_boards: Vec::new(),
+            wasm_boards: Vec::new(),
             identify_board: true,
             // The no-[machine] default models the most common and most-
             // targeted Amiga: the A500 Rev 6A (the ECS "Fatter" 8372A Agnus
@@ -1187,10 +1203,20 @@ impl TryFrom<RawConfig> for Config {
             Some(s) => parse_size(s, "Zorro III RAM")?,
         };
         let mut zorro_boards = Vec::new();
+        let mut wasm_boards = Vec::new();
         for entry in &raw.zorro {
-            zorro_boards.push(crate::zorro::load_board_metadata(Path::new(
-                &entry.metadata,
-            ))?);
+            match crate::zorro::load_board_metadata(Path::new(&entry.metadata))? {
+                crate::zorro::LoadedZorroBoard::Ram(spec) => zorro_boards.push(spec),
+                crate::zorro::LoadedZorroBoard::Wasm {
+                    spec,
+                    wasm_path,
+                    manifest,
+                } => wasm_boards.push(WasmBoardConfig {
+                    spec,
+                    wasm_path,
+                    manifest,
+                }),
+            }
         }
         let chipset = match raw.chipset.revision.as_deref() {
             None => defaults.chipset,
@@ -1292,7 +1318,10 @@ impl TryFrom<RawConfig> for Config {
         validate_fast_ram(fast_ram_bytes, chip_ram_bytes)?;
         validate_slow_ram(slow_ram_bytes)?;
         validate_z3_ram(z3_ram_bytes, cpu)?;
-        for board in &zorro_boards {
+        let board_specs = zorro_boards
+            .iter()
+            .chain(wasm_boards.iter().map(|w| &w.spec));
+        for board in board_specs {
             if board.version == ZorroVersion::III && !cpu_has_32bit_bus(cpu) {
                 bail!(
                     "zorro board {:?} is Zorro III, which needs a 32-bit CPU \
@@ -1316,6 +1345,7 @@ impl TryFrom<RawConfig> for Config {
             slow_ram_bytes,
             z3_ram_bytes,
             zorro_boards,
+            wasm_boards,
             identify_board: raw.identify.unwrap_or(defaults.identify_board),
             chipset,
             agnus_revision,

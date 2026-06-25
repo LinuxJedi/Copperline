@@ -43,7 +43,9 @@ mod serial;
 mod timestamp;
 mod timetravel;
 mod video;
+mod wasmboard;
 mod zorro;
+mod zorro_device;
 
 use anyhow::{anyhow, Result};
 use log::{info, warn};
@@ -1076,7 +1078,11 @@ pub(crate) fn build_machine(
     paced: bool,
 ) -> Result<Emulator> {
     let mut zorro = cfg.build_zorro_chain()?;
-    let mut scsi_board = if cfg.scsi.enabled() {
+    // Functional Zorro-chain boards. Each board's autoconfig identity goes on
+    // the chain (mapping its window to a device slot) while the device object
+    // is attached to the bus after it is built; the slot index ties them.
+    let mut devices: Vec<crate::zorro_device::BoardDevice> = Vec::new();
+    if cfg.scsi.enabled() {
         let rom_path = cfg.scsi.rom.as_ref().expect("config validated [scsi] rom");
         let rom = crate::a2091::A2091::load_rom(rom_path, cfg.scsi.rom_odd.as_deref())?;
         let mut board = crate::a2091::A2091::new(rom)?;
@@ -1085,15 +1091,29 @@ pub(crate) fn build_machine(
             board.attach_drive(unit, crate::scsi::ScsiDisk::open(path, unit)?);
             info!("scsi: unit {unit} {}", path.display());
         }
-        zorro.add_board(crate::zorro::BoardSpec::a2091())?;
+        let slot = devices.len();
+        zorro.add_board(crate::zorro::BoardSpec::a2091(slot))?;
         info!(
-            "scsi: A2091 controller on the Zorro chain, ROM {}",
+            "scsi: A2091 controller on the Zorro chain (slot {slot}), ROM {}",
             rom_path.display()
         );
-        Some(board)
-    } else {
-        None
-    };
+        devices.push(crate::zorro_device::BoardDevice::A2091(board));
+    }
+    // WASM plugin boards: assign each a device slot, put its autoconfig
+    // identity on the chain, and instantiate the module.
+    for wb in &cfg.wasm_boards {
+        let slot = devices.len();
+        let mut spec = wb.spec.clone();
+        spec.backing = crate::zorro::BoardBacking::Device(slot);
+        zorro.add_board(spec)?;
+        let board = crate::wasmboard::WasmBoard::from_file(&wb.wasm_path, wb.manifest.clone())?;
+        info!(
+            "zorro: WASM plugin {:?} on the Zorro chain (slot {slot}), module {}",
+            wb.manifest.name,
+            wb.wasm_path.display()
+        );
+        devices.push(crate::zorro_device::BoardDevice::Wasm(board));
+    }
     // The A1000 has no Kickstart ROM: cfg.rom_path is its 64 KiB bootstrap
     // ROM, and a 256 KiB WCS is allocated for it to load Kickstart into from
     // the Kickstart disk in DF0.
@@ -1146,8 +1166,8 @@ pub(crate) fn build_machine(
         }
         bus.attach_gayle(gayle);
     }
-    if let Some(board) = scsi_board.take() {
-        bus.attach_a2091(board);
+    if !devices.is_empty() {
+        bus.attach_devices(devices);
     }
     if cfg.cd32_pad {
         bus.input.cd32_pad_port2 = true;

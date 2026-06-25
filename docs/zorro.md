@@ -9,6 +9,20 @@ metadata files without writing any Rust. The built-in `[memory] fast` and
 device-backed board (see the device-board notes below and the `[scsi]`
 section of [](guide/configuration)).
 
+There are two board kinds:
+
+- **RAM boards** (`type = "ram"`) -- an autoconfig identity over a slab of
+  RAM, described entirely in TOML.
+- **WASM plugin boards** (`type = "wasm"`) -- *functional* boards (registers,
+  interrupts, DMA) whose behaviour is supplied by an external WebAssembly
+  module, loaded at runtime. These let you add a working board without
+  forking and recompiling Copperline. See
+  [WASM plugin boards](#wasm-plugin-boards) below.
+
+Functional boards (the A2091, the CDTV DMAC, and WASM plugins) all implement
+the `ZorroDevice` trait (`src/zorro_device.rs`): the bus drives every board
+through that one boundary for register access, ticking, interrupts, and DMA.
+
 ## Describing a board in TOML
 
 Reference a board metadata file from the main configuration:
@@ -28,7 +42,7 @@ The metadata file:
 # boards/megaram.toml
 name = "MegaRAM"        # human-readable, appears in logs
 zorro = 3               # 2 or 3
-type = "ram"            # board backing; only "ram" so far
+type = "ram"            # "ram" or "wasm"
 size = "64M"
 manufacturer = 0x07DB   # 16-bit autoconfig manufacturer ID
 product = 0x20          # 8-bit product code, unique per manufacturer
@@ -56,6 +70,68 @@ Field notes:
 The spec is validated on load (`BoardSpec::validate`,
 `src/zorro.rs`): bad sizes, unknown `zorro` versions, and unknown backing
 types are reported with the metadata file's path.
+
+## WASM plugin boards
+
+A `type = "wasm"` board is a *functional* board whose behaviour comes from an
+external WebAssembly module (`src/wasmboard.rs`), so you can ship a working
+board -- registers, interrupts, DMA -- as a `.wasm` file plus a TOML manifest,
+with no changes to Copperline.
+
+```toml
+# boards/example.toml
+name = "Example Board"
+zorro = 2
+type = "wasm"
+size = "64K"            # the board's autoconfig window size
+manufacturer = 0x1448
+product = 0x10
+wasm = "example.wasm"   # module path, relative to this metadata file
+dma  = true             # capabilities, all default false:
+int2 = true             #   dma  -> the dma_read/dma_write host imports
+int6 = false            #   int2 -> may assert INT2 (PORTS)
+                        #   int6 -> may assert INT6 (EXTER)
+```
+
+WASM is chosen because a module's entire mutable state lives in its linear
+memory -- a flat byte array that Copperline's save states snapshot and restore
+exactly like Amiga RAM, preserving deterministic replay. The engine is run with
+NaN canonicalization and without SIMD or threads for determinism; a plugin's
+persistent state must live in linear memory (WebAssembly globals are not
+captured). A save state stores the module's path and replays its memory image
+on load, so the `.wasm` file must remain where the manifest points.
+
+### Module ABI
+
+The host calls these exports (all optional except `memory`):
+
+| Export | Signature | Purpose |
+|--------|-----------|---------|
+| `memory` | (linear memory) | required; the board's state lives here |
+| `init` | `() -> ()` | called once after instantiation |
+| `read` | `(off i32, size i32) -> i32` | register read at a window offset |
+| `write` | `(off i32, size i32, value i32)` | register write |
+| `tick` | `(cck i32)` | advance by `cck` colour clocks |
+| `int2` | `() -> i32` | INT2 (PORTS) line state, non-zero = asserted |
+| `int6` | `() -> i32` | INT6 (EXTER) line state |
+
+The plugin may import these host functions from module `env` (gated by the
+manifest capabilities; importing one that was not granted fails to load):
+
+| Import | Signature | Capability |
+|--------|-----------|------------|
+| `log` | `(ptr i32, len i32)` | always available |
+| `dma_read` | `(addr i32, ptr i32, len i32)` | `dma`: Amiga `addr` -> plugin memory `ptr` |
+| `dma_write` | `(addr i32, ptr i32, len i32)` | `dma`: plugin memory `ptr` -> Amiga `addr` |
+
+Interrupt lines are level-sensitive and polled, exactly like the in-tree
+boards: a plugin holds `int2`/`int6` non-zero while the line is asserted, and
+the bus applies the 68000 interrupt-recognition latency automatically -- the
+plugin never pulses INTREQ.
+
+Plugins can be written in any language that targets `wasm32` (Rust, C, Zig,
+...). An inert example module and its manifest can be generated with the
+ignored test `emit_example_plugin_wasm` (see `src/wasmboard.rs`).
 
 ## How autoconfig works in Copperline
 
@@ -146,14 +222,19 @@ board); see the `identify` option in [](guide/configuration).
 
 ## Adding a board in Rust
 
-For board types that need code (a new `BoardBacking` beyond RAM), the flow
-is below; the A2091 (`BoardBacking::A2091`, `src/a2091.rs`) is the worked
-example of a device-backed board:
+Most functional boards should be WASM plugins (above). Add an *in-tree* board
+in Rust only when it needs host integration or performance that a plugin
+cannot give (the A2091 SCSI controller, `src/a2091.rs`, is the worked example).
+In-tree functional boards implement the `ZorroDevice` trait
+(`src/zorro_device.rs`) and are stored as a `BoardDevice` enum variant in
+`Bus::devices`; the chain maps each board's window to a
+`BoardBacking::Device(slot)` index into that vector.
 
-1. Extend `BoardBacking` (`src/zorro.rs`) with the new backing and teach
-   `ZorroChain`'s access paths (`region_at` callers in `src/bus.rs` and
-   `src/cpu.rs`) how reads/writes reach it.
-2. Provide a `BoardSpec` constructor, mirroring the existing ones:
+1. Implement `ZorroDevice` for the board (register `read`/`write`, `tick`,
+   `int2_line`/`int6_line`, `reset`); DMA goes through the `DeviceHost` passed
+   to each call. Add a `BoardDevice` variant wrapping it (`src/zorro_device.rs`).
+2. Provide a `BoardSpec` constructor with `backing: BoardBacking::Device(slot)`,
+   mirroring the existing ones:
 
    ```rust
    pub fn fast_ram(size_bytes: usize) -> Self {
@@ -171,8 +252,10 @@ example of a device-backed board:
    }
    ```
 
-3. Register it in `Config::build_zorro_chain` (`src/config.rs`) or accept
-   it from the metadata loader (`load_board_metadata`, `src/zorro.rs`).
+3. Instantiate the device in `build_machine` (`src/main.rs`): assign it a
+   slot, add its `BoardSpec` to the chain, and push the `BoardDevice` onto
+   `Bus::devices` (the A2091 block is the template). Bump
+   `savestate::STATE_VERSION` if the serialized layout changes.
 4. Add unit tests next to the existing ones in `src/zorro.rs`, which cover
    ROM nibble encoding, Zorro II/III base assignment, chain advance,
    shut-up, and power-on reset -- they are the best worked examples of the

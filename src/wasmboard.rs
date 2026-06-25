@@ -1,0 +1,654 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! WASM-hosted functional Zorro board: an external plugin compiled to
+//! `wasm32` that implements a board's behaviour, run under wasmtime.
+//!
+//! A plugin module exports its behaviour and imports a small set of host
+//! services (see the ABI below); its entire mutable state lives in WebAssembly
+//! linear memory, which is a flat byte array that snapshots and restores
+//! exactly like the Amiga RAM the emulator already serializes. That is why WASM
+//! fits Copperline's determinism / save-state contract.
+//!
+//! ## Module ABI
+//!
+//! Exports the plugin provides (all optional except `memory`):
+//! - `memory`                       the linear memory (required)
+//! - `init()`                       called once after instantiation
+//! - `read(off: i32, size: i32) -> i32`   register read in the board window
+//! - `write(off: i32, size: i32, value: i32)`  register write
+//! - `tick(cck: i32)`               advance by `cck` colour clocks
+//! - `int2() -> i32`                INT2 (PORTS) line state, 0/1
+//! - `int6() -> i32`                INT6 (EXTER) line state, 0/1
+//!
+//! Imports the host provides in module `env` (capability-gated):
+//! - `log(ptr: i32, len: i32)`                      always available
+//! - `dma_read(addr: i32, ptr: i32, len: i32)`      requires the `dma` capability
+//! - `dma_write(addr: i32, ptr: i32, len: i32)`     requires the `dma` capability
+//!
+//! `dma_read` copies `len` bytes from Amiga address `addr` into the plugin's
+//! linear memory at `ptr`; `dma_write` copies the other way. Both use the
+//! shared 24-bit chip/slow/Zorro decode in [`crate::zorro_device`].
+//!
+//! ## Determinism
+//!
+//! The wasmtime engine is configured for determinism (NaN canonicalization, no
+//! SIMD/threads). Persistent mutable state must live in linear memory: snapshots
+//! capture linear memory and its page count, not WebAssembly globals (the
+//! shadow-stack pointer is unwound to a constant between calls, so it needs no
+//! capture). Save-state replay of a plugin is only guaranteed within one
+//! wasmtime build; the version is pinned in `Cargo.toml`.
+
+use crate::memory::Memory;
+use crate::zorro_device::{DeviceHost, ZorroDevice};
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use wasmtime::{
+    Caller, Config, Engine, Extern, Linker, Memory as WasmMemory, Module, Store, TypedFunc,
+};
+
+/// Capabilities a plugin declares in its manifest; ungranted host imports are
+/// not linked, so a module that needs more than it declared fails to
+/// instantiate (loudly) rather than silently misbehaving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WasmCaps {
+    /// Bus-master DMA into Amiga memory (`dma_read`/`dma_write` imports).
+    pub dma: bool,
+    /// Asserts the INT2 (PORTS) line (advisory; the `int2` export is polled).
+    pub int2: bool,
+    /// Asserts the INT6 (EXTER) line (advisory; the `int6` export is polled).
+    pub int6: bool,
+}
+
+/// A plugin's non-autoconfig metadata: its display name and capabilities. The
+/// autoconfig identity lives in the board's [`crate::zorro::BoardSpec`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WasmManifest {
+    pub name: String,
+    pub caps: WasmCaps,
+}
+
+/// Store data for host imports. The Amiga-memory pointer is stored as a
+/// `usize` (0 = none) so the store stays `Send`; it is set to the live
+/// `&mut Memory` only for the duration of a plugin call (see [`WasmRuntime::enter`]).
+struct HostCtx {
+    /// Address of the live `Memory`, valid only during a plugin call.
+    mem: usize,
+    name: String,
+}
+
+/// The typed entry points a plugin may export.
+struct Exports {
+    read: Option<TypedFunc<(i32, i32), i32>>,
+    write: Option<TypedFunc<(i32, i32, i32), ()>>,
+    tick: Option<TypedFunc<i32, ()>>,
+    int2: Option<TypedFunc<(), i32>>,
+    int6: Option<TypedFunc<(), i32>>,
+}
+
+/// The live wasmtime state for one plugin board. Holds the engine and compiled
+/// module so a power-on reset can re-instantiate a fresh module (clearing the
+/// plugin's RAM) without recompiling.
+struct WasmRuntime {
+    engine: Engine,
+    module: Module,
+    manifest: WasmManifest,
+    store: Store<HostCtx>,
+    memory: WasmMemory,
+    exports: Exports,
+}
+
+impl WasmRuntime {
+    fn new(engine: Engine, module: Module, manifest: WasmManifest) -> Result<Self> {
+        let (store, memory, exports) = Self::instantiate(&engine, &module, &manifest)?;
+        Ok(Self {
+            engine,
+            module,
+            manifest,
+            store,
+            memory,
+            exports,
+        })
+    }
+
+    /// Build a fresh store/instance from an engine + compiled module.
+    fn instantiate(
+        engine: &Engine,
+        module: &Module,
+        manifest: &WasmManifest,
+    ) -> Result<(Store<HostCtx>, WasmMemory, Exports)> {
+        let mut store = Store::new(
+            engine,
+            HostCtx {
+                mem: 0,
+                name: manifest.name.clone(),
+            },
+        );
+        let mut linker = Linker::new(engine);
+        register_host_fns(&mut linker, manifest.caps)?;
+        let instance = linker
+            .instantiate(&mut store, module)
+            .context("instantiating WASM plugin")?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow!("WASM plugin exports no `memory`"))?;
+        let exports = Exports {
+            read: instance.get_typed_func(&mut store, "read").ok(),
+            write: instance.get_typed_func(&mut store, "write").ok(),
+            tick: instance.get_typed_func(&mut store, "tick").ok(),
+            int2: instance.get_typed_func(&mut store, "int2").ok(),
+            int6: instance.get_typed_func(&mut store, "int6").ok(),
+        };
+        if let Ok(init) = instance.get_typed_func::<(), ()>(&mut store, "init") {
+            init.call(&mut store, ())
+                .context("WASM plugin init() trapped")?;
+        }
+        Ok((store, memory, exports))
+    }
+
+    /// Re-instantiate from the kept engine + module (cold reset: clears RAM).
+    fn reset(&mut self) -> Result<()> {
+        let (store, memory, exports) =
+            Self::instantiate(&self.engine, &self.module, &self.manifest)?;
+        self.store = store;
+        self.memory = memory;
+        self.exports = exports;
+        Ok(())
+    }
+
+    /// Point the store at the live Amiga memory for the duration of a call.
+    fn enter(&mut self, mem: &mut Memory) {
+        self.store.data_mut().mem = mem as *mut Memory as usize;
+    }
+
+    /// Clear the Amiga-memory pointer once a call returns.
+    fn leave(&mut self) {
+        self.store.data_mut().mem = 0;
+    }
+
+    /// Snapshot linear memory and its current page count.
+    fn snapshot(&mut self) -> (u64, Vec<u8>) {
+        let pages = self.memory.size(&self.store);
+        let bytes = self.memory.data(&self.store).to_vec();
+        (pages, bytes)
+    }
+
+    /// Restore a snapshot: grow linear memory to the saved page count, then
+    /// write the saved bytes back.
+    fn restore(&mut self, pages: u64, bytes: &[u8]) -> Result<()> {
+        let cur = self.memory.size(&self.store);
+        if pages > cur {
+            self.memory
+                .grow(&mut self.store, pages - cur)
+                .context("growing WASM plugin memory on restore")?;
+        }
+        self.memory
+            .write(&mut self.store, 0, bytes)
+            .context("restoring WASM plugin memory")?;
+        Ok(())
+    }
+}
+
+/// Build the deterministic wasmtime engine. NaN canonicalization removes
+/// host-CPU NaN bit-pattern leakage; SIMD/relaxed-SIMD/threads are disabled
+/// (relaxed-SIMD is nondeterministic by spec, threads add shared-memory
+/// nondeterminism).
+fn make_engine() -> Result<Engine> {
+    let mut cfg = Config::new();
+    cfg.cranelift_nan_canonicalization(true);
+    cfg.wasm_simd(false);
+    cfg.wasm_relaxed_simd(false);
+    // The `threads` wasmtime feature is not built in (see Cargo.toml), so shared
+    // memory / atomics are unavailable -- no separate knob needed.
+    Engine::new(&cfg).context("creating WASM engine")
+}
+
+/// Register the host imports the plugin may call, gated by capability.
+fn register_host_fns(linker: &mut Linker<HostCtx>, caps: WasmCaps) -> Result<()> {
+    // log(ptr, len): always available.
+    linker.func_wrap(
+        "env",
+        "log",
+        |mut caller: Caller<'_, HostCtx>, ptr: i32, len: i32| -> Result<()> {
+            let buf = read_wasm_bytes(&mut caller, ptr, len)?;
+            let name = caller.data().name.clone();
+            log::info!("wasm[{name}]: {}", String::from_utf8_lossy(&buf));
+            Ok(())
+        },
+    )?;
+
+    if caps.dma {
+        // dma_read(addr, ptr, len): Amiga[addr..] -> wasm linear memory[ptr..].
+        linker.func_wrap(
+            "env",
+            "dma_read",
+            |mut caller: Caller<'_, HostCtx>, addr: i32, ptr: i32, len: i32| -> Result<()> {
+                let len = len.max(0) as usize;
+                let mut buf = vec![0u8; len];
+                with_amiga_memory(&caller, |amiga| {
+                    DeviceHost::new(amiga).dma_read(addr as u32, &mut buf);
+                });
+                write_wasm_bytes(&mut caller, ptr, &buf)
+            },
+        )?;
+
+        // dma_write(addr, ptr, len): wasm linear memory[ptr..] -> Amiga[addr..].
+        linker.func_wrap(
+            "env",
+            "dma_write",
+            |mut caller: Caller<'_, HostCtx>, addr: i32, ptr: i32, len: i32| -> Result<()> {
+                let buf = read_wasm_bytes(&mut caller, ptr, len)?;
+                with_amiga_memory(&caller, |amiga| {
+                    DeviceHost::new(amiga).dma_write(addr as u32, &buf);
+                });
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Run `f` with the live Amiga memory the store currently points at. No-op when
+/// the pointer is unset (a plugin should only DMA from within a host call).
+fn with_amiga_memory(caller: &Caller<'_, HostCtx>, f: impl FnOnce(&mut Memory)) {
+    let mem = caller.data().mem;
+    if mem == 0 {
+        return;
+    }
+    // SAFETY: `mem` is the address of the `&mut Memory` set by `WasmRuntime::enter`
+    // for the duration of this plugin call (see the ZorroDevice impl below). It is
+    // not aliased while the plugin runs -- the outer DeviceHost is not touched
+    // until the call returns -- and is cleared to 0 afterwards.
+    let amiga = unsafe { &mut *(mem as *mut Memory) };
+    f(amiga);
+}
+
+/// Read `len` bytes from the plugin's linear memory at `ptr`.
+fn read_wasm_bytes(caller: &mut Caller<'_, HostCtx>, ptr: i32, len: i32) -> Result<Vec<u8>> {
+    let memory = caller_memory(caller)?;
+    let len = len.max(0) as usize;
+    let mut buf = vec![0u8; len];
+    memory
+        .read(&mut *caller, ptr.max(0) as usize, &mut buf)
+        .context("reading WASM plugin memory")?;
+    Ok(buf)
+}
+
+/// Write `buf` into the plugin's linear memory at `ptr`.
+fn write_wasm_bytes(caller: &mut Caller<'_, HostCtx>, ptr: i32, buf: &[u8]) -> Result<()> {
+    let memory = caller_memory(caller)?;
+    memory
+        .write(&mut *caller, ptr.max(0) as usize, buf)
+        .context("writing WASM plugin memory")?;
+    Ok(())
+}
+
+fn caller_memory(caller: &mut Caller<'_, HostCtx>) -> Result<WasmMemory> {
+    caller
+        .get_export("memory")
+        .and_then(Extern::into_memory)
+        .ok_or_else(|| anyhow!("WASM plugin exports no `memory`"))
+}
+
+/// A functional Zorro board implemented by a WASM plugin module.
+///
+/// Serializes via a path-reopen shadow (like HDF/CD images): the snapshot
+/// carries the module path, manifest, and a linear-memory image; on load the
+/// module is recompiled from its path and the image replayed.
+pub struct WasmBoard {
+    module_path: PathBuf,
+    rt: RefCell<WasmRuntime>,
+}
+
+impl WasmBoard {
+    /// Load and instantiate a plugin module from a `.wasm` file.
+    pub fn from_file(path: &Path, manifest: WasmManifest) -> Result<Self> {
+        let engine = make_engine()?;
+        let module = Module::from_file(&engine, path)
+            .with_context(|| format!("compiling WASM plugin {}", path.display()))?;
+        let rt = WasmRuntime::new(engine, module, manifest)?;
+        Ok(Self {
+            module_path: path.to_path_buf(),
+            rt: RefCell::new(rt),
+        })
+    }
+
+    /// Call an exported function that takes no Amiga memory, returning its
+    /// `i32` result (0 if the export is absent or traps).
+    fn call_flag(&self, sel: impl FnOnce(&Exports) -> Option<TypedFunc<(), i32>>) -> bool {
+        let mut rt = self.rt.borrow_mut();
+        let Some(func) = sel(&rt.exports) else {
+            return false;
+        };
+        match func.call(&mut rt.store, ()) {
+            Ok(v) => v != 0,
+            Err(e) => {
+                log::warn!("wasm[{}]: int line query trapped: {e}", rt.manifest.name);
+                false
+            }
+        }
+    }
+}
+
+impl ZorroDevice for WasmBoard {
+    fn read(&mut self, off: u32, size: usize, host: &mut DeviceHost) -> u32 {
+        let rt = self.rt.get_mut();
+        let Some(func) = rt.exports.read.clone() else {
+            return 0xFFFF_FFFF;
+        };
+        rt.enter(host.memory_mut());
+        let result = func.call(&mut rt.store, (off as i32, size as i32));
+        rt.leave();
+        match result {
+            Ok(v) => v as u32,
+            Err(e) => {
+                log::warn!("wasm[{}]: read trapped: {e}", rt.manifest.name);
+                0xFFFF_FFFF
+            }
+        }
+    }
+
+    fn write(&mut self, off: u32, size: usize, value: u32, host: &mut DeviceHost) {
+        let rt = self.rt.get_mut();
+        let Some(func) = rt.exports.write.clone() else {
+            return;
+        };
+        rt.enter(host.memory_mut());
+        let result = func.call(&mut rt.store, (off as i32, size as i32, value as i32));
+        rt.leave();
+        if let Err(e) = result {
+            log::warn!("wasm[{}]: write trapped: {e}", rt.manifest.name);
+        }
+    }
+
+    fn tick(&mut self, cck: u32, host: &mut DeviceHost) {
+        let rt = self.rt.get_mut();
+        let Some(func) = rt.exports.tick.clone() else {
+            return;
+        };
+        rt.enter(host.memory_mut());
+        let result = func.call(&mut rt.store, cck as i32);
+        rt.leave();
+        if let Err(e) = result {
+            log::warn!("wasm[{}]: tick trapped: {e}", rt.manifest.name);
+        }
+    }
+
+    fn int2_line(&self) -> bool {
+        self.call_flag(|e| e.int2.clone())
+    }
+
+    fn int6_line(&self) -> bool {
+        self.call_flag(|e| e.int6.clone())
+    }
+
+    // Ticked every slice (the plugin decides what to do); a sparse next_event
+    // model is a future optimization.
+    fn is_idle(&self) -> bool {
+        false
+    }
+
+    fn reset(&mut self) {
+        if let Err(e) = self.rt.get_mut().reset() {
+            log::error!("wasm: plugin reset failed: {e}");
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        "wasm"
+    }
+}
+
+/// The serialized form of a [`WasmBoard`]: enough to recompile the module from
+/// its path and replay its linear memory.
+#[derive(Serialize, Deserialize)]
+struct WasmBoardState {
+    module_path: PathBuf,
+    manifest: WasmManifest,
+    pages: u64,
+    bytes: Vec<u8>,
+}
+
+impl Serialize for WasmBoard {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut rt = self.rt.borrow_mut();
+        let (pages, bytes) = rt.snapshot();
+        let state = WasmBoardState {
+            module_path: self.module_path.clone(),
+            manifest: rt.manifest.clone(),
+            pages,
+            bytes,
+        };
+        state.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WasmBoard {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let state = WasmBoardState::deserialize(deserializer)?;
+        let board = WasmBoard::from_file(&state.module_path, state.manifest)
+            .map_err(serde::de::Error::custom)?;
+        board
+            .rt
+            .borrow_mut()
+            .restore(state.pages, &state.bytes)
+            .map_err(serde::de::Error::custom)?;
+        Ok(board)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A golden test plugin: a 16-bit counter at window offset 0, incremented
+    /// by `tick`, readable/writable, asserting INT2 once it passes a threshold.
+    /// Its whole state is one i32 in linear memory at address 0.
+    const COUNTER_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "read") (param $off i32) (param $size i32) (result i32)
+            (i32.load (i32.const 0)))
+          (func (export "write") (param $off i32) (param $size i32) (param $val i32)
+            (i32.store (i32.const 0) (local.get $val)))
+          (func (export "tick") (param $cck i32)
+            (i32.store (i32.const 0)
+              (i32.add (i32.load (i32.const 0)) (i32.const 1))))
+          (func (export "int2") (result i32)
+            (i32.gt_u (i32.load (i32.const 0)) (i32.const 3)))
+        )
+    "#;
+
+    /// A DMA test plugin: `write(off, size, val)` reads 4 bytes from Amiga
+    /// address `val` into linear memory and stores their big-endian sum back so
+    /// `read` returns it; exercises the dma_read host import.
+    const DMA_WAT: &str = r#"
+        (module
+          (import "env" "dma_read" (func $dma_read (param i32 i32 i32)))
+          (memory (export "memory") 1)
+          (func (export "read") (param $off i32) (param $size i32) (result i32)
+            (i32.load (i32.const 0)))
+          (func (export "write") (param $off i32) (param $size i32) (param $addr i32)
+            ;; copy 4 bytes from Amiga[$addr] into linear memory at offset 16
+            (call $dma_read (local.get $addr) (i32.const 16) (i32.const 4))
+            ;; store the 32-bit big-endian value at offset 0
+            (i32.store (i32.const 0)
+              (i32.or
+                (i32.or
+                  (i32.shl (i32.load8_u (i32.const 16)) (i32.const 24))
+                  (i32.shl (i32.load8_u (i32.const 17)) (i32.const 16)))
+                (i32.or
+                  (i32.shl (i32.load8_u (i32.const 18)) (i32.const 8))
+                  (i32.load8_u (i32.const 19))))))
+        )
+    "#;
+
+    fn write_wasm(name: &str, wat: &str) -> PathBuf {
+        let bytes = wat::parse_str(wat).expect("valid WAT");
+        let path = std::env::temp_dir().join(format!(
+            "copperline-wasmboard-{name}-{}-{}.wasm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, &bytes).expect("write wasm");
+        path
+    }
+
+    fn manifest(name: &str, dma: bool) -> WasmManifest {
+        WasmManifest {
+            name: name.into(),
+            caps: WasmCaps {
+                dma,
+                int2: true,
+                int6: false,
+            },
+        }
+    }
+
+    fn empty_memory() -> Memory {
+        Memory {
+            chip_ram: vec![0u8; 0x1000],
+            slow_ram: Vec::new(),
+            rom: Vec::new(),
+            overlay: false,
+            zorro: crate::zorro::ZorroChain::default(),
+            extended_rom: Vec::new(),
+            extended_rom_base: 0,
+            wcs: Vec::new(),
+            wcs_write_protected: false,
+        }
+    }
+
+    #[test]
+    fn counter_plugin_reads_writes_and_ticks() {
+        let path = write_wasm("counter", COUNTER_WAT);
+        let mut board = WasmBoard::from_file(&path, manifest("counter", false)).unwrap();
+        let mut mem = empty_memory();
+        let mut host = DeviceHost::new(&mut mem);
+
+        assert_eq!(board.read(0, 2, &mut host), 0);
+        board.write(0, 2, 10, &mut host);
+        assert_eq!(board.read(0, 2, &mut host), 10);
+
+        // tick increments; int2 asserts once the counter passes 3.
+        let mut fresh = WasmBoard::from_file(&path, manifest("counter", false)).unwrap();
+        assert!(!fresh.int2_line());
+        for _ in 0..5 {
+            fresh.tick(1, &mut host);
+        }
+        assert_eq!(fresh.read(0, 2, &mut host), 5);
+        assert!(fresh.int2_line());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reset_clears_plugin_memory() {
+        let path = write_wasm("counter", COUNTER_WAT);
+        let mut board = WasmBoard::from_file(&path, manifest("counter", false)).unwrap();
+        let mut mem = empty_memory();
+        let mut host = DeviceHost::new(&mut mem);
+
+        board.write(0, 2, 42, &mut host);
+        assert_eq!(board.read(0, 2, &mut host), 42);
+        board.reset();
+        assert_eq!(board.read(0, 2, &mut host), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_state_round_trip_is_byte_identical() {
+        let path = write_wasm("counter", COUNTER_WAT);
+        let mut board = WasmBoard::from_file(&path, manifest("counter", false)).unwrap();
+        let mut mem = empty_memory();
+        let mut host = DeviceHost::new(&mut mem);
+        board.write(0, 2, 99, &mut host);
+
+        // Serialize, mutate the live board, then restore from the snapshot.
+        let blob = bincode::serialize(&board).unwrap();
+        board.write(0, 2, 7, &mut host);
+        assert_eq!(board.read(0, 2, &mut host), 7);
+
+        let restored: WasmBoard = bincode::deserialize(&blob).unwrap();
+        let mut rmem = empty_memory();
+        let mut rhost = DeviceHost::new(&mut rmem);
+        let mut restored = restored;
+        assert_eq!(restored.read(0, 2, &mut rhost), 99);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn memory_grow_round_trips_through_a_snapshot() {
+        // A plugin that grows its memory then writes a marker high up; the
+        // snapshot must capture the grown page count and the marker.
+        let grow_wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "write") (param i32 i32 i32)
+                (drop (memory.grow (i32.const 1)))
+                (i32.store (i32.const 65540) (i32.const 12345)))
+              (func (export "read") (param i32 i32) (result i32)
+                (i32.load (i32.const 65540)))
+            )
+        "#;
+        let path = write_wasm("grow", grow_wat);
+        let mut board = WasmBoard::from_file(&path, manifest("grow", false)).unwrap();
+        let mut mem = empty_memory();
+        let mut host = DeviceHost::new(&mut mem);
+        board.write(0, 0, 0, &mut host); // grow + write marker in the new page
+        assert_eq!(board.read(0, 0, &mut host), 12345);
+
+        let blob = bincode::serialize(&board).unwrap();
+        let mut restored: WasmBoard = bincode::deserialize(&blob).unwrap();
+        let mut rmem = empty_memory();
+        let mut rhost = DeviceHost::new(&mut rmem);
+        assert_eq!(restored.read(0, 0, &mut rhost), 12345);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dma_read_import_reaches_amiga_chip_ram() {
+        let path = write_wasm("dma", DMA_WAT);
+        let mut board = WasmBoard::from_file(&path, manifest("dma", true)).unwrap();
+        let mut mem = empty_memory();
+        mem.chip_ram[0x40] = 0xDE;
+        mem.chip_ram[0x41] = 0xAD;
+        mem.chip_ram[0x42] = 0xBE;
+        mem.chip_ram[0x43] = 0xEF;
+        let mut host = DeviceHost::new(&mut mem);
+
+        // write() triggers dma_read of 4 bytes from Amiga $40.
+        board.write(0, 0, 0x40, &mut host);
+        assert_eq!(board.read(0, 4, &mut host), 0xDEAD_BEEF);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Materialise an inert example plugin `.wasm` (autoconfigures, answers a
+    /// constant, no interrupts/DMA) to the path in `COPPERLINE_EMIT_WASM`, for
+    /// end-to-end boot testing and as a starting point for plugin authors.
+    /// Run with: `COPPERLINE_EMIT_WASM=/path/board.wasm cargo test --release \
+    /// emit_example_plugin_wasm -- --ignored`.
+    #[test]
+    #[ignore]
+    fn emit_example_plugin_wasm() {
+        let inert = r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "read") (param i32 i32) (result i32)
+                (i32.const 0x12345678))
+              (func (export "write") (param i32 i32 i32))
+              (func (export "tick") (param i32)))
+        "#;
+        let out = std::env::var("COPPERLINE_EMIT_WASM").expect("set COPPERLINE_EMIT_WASM");
+        std::fs::write(&out, wat::parse_str(inert).expect("valid WAT")).expect("write wasm");
+        eprintln!("wrote example plugin to {out}");
+    }
+}

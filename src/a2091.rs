@@ -25,7 +25,7 @@
 //! TODO: arbitrate DMAC bus-master cycles against the CPU on the expansion
 //! bus for cycle-accurate transfer timing.
 
-use crate::memory::{Memory, SLOW_RAM_BASE};
+use crate::memory::Memory;
 use crate::scsi::{DmaDir, ScsiDisk, Wd33c93};
 use anyhow::{bail, Result};
 use std::path::Path;
@@ -339,44 +339,16 @@ impl A2091 {
     }
 
     fn dma_read_word(&mut self, mem: &Memory, addr: u32) -> u16 {
-        let a = addr as usize;
-        if a + 1 < mem.chip_ram.len() {
-            return (u16::from(mem.chip_ram[a]) << 8) | u16::from(mem.chip_ram[a + 1]);
-        }
-        let slow = SLOW_RAM_BASE as usize;
-        if a >= slow && a + 1 < slow + mem.slow_ram.len() {
-            let o = a - slow;
-            return (u16::from(mem.slow_ram[o]) << 8) | u16::from(mem.slow_ram[o + 1]);
-        }
-        if let Some((board, off)) = mem.zorro.region_at(addr, 2) {
-            let ram = mem.zorro.board_ram(board);
-            return (u16::from(ram[off]) << 8) | u16::from(ram[off + 1]);
-        }
-        self.warn_dma_target(addr);
-        0xFFFF
+        crate::zorro_device::dma_read_word(mem, addr).unwrap_or_else(|| {
+            self.warn_dma_target(addr);
+            0xFFFF
+        })
     }
 
     fn dma_write_word(&mut self, mem: &mut Memory, addr: u32, w: u16) {
-        let a = addr as usize;
-        if a + 1 < mem.chip_ram.len() {
-            mem.chip_ram[a] = (w >> 8) as u8;
-            mem.chip_ram[a + 1] = w as u8;
-            return;
+        if !crate::zorro_device::dma_write_word(mem, addr, w) {
+            self.warn_dma_target(addr);
         }
-        let slow = SLOW_RAM_BASE as usize;
-        if a >= slow && a + 1 < slow + mem.slow_ram.len() {
-            let o = a - slow;
-            mem.slow_ram[o] = (w >> 8) as u8;
-            mem.slow_ram[o + 1] = w as u8;
-            return;
-        }
-        if let Some((board, off)) = mem.zorro.region_at(addr, 2) {
-            let ram = mem.zorro.board_ram_mut(board);
-            ram[off] = (w >> 8) as u8;
-            ram[off + 1] = w as u8;
-            return;
-        }
-        self.warn_dma_target(addr);
     }
 
     fn warn_dma_target(&mut self, addr: u32) {
@@ -384,6 +356,49 @@ impl A2091 {
             self.dma_warned = true;
             log::warn!("a2091: DMA to unmapped address {addr:#08X}; ignoring");
         }
+    }
+}
+
+impl crate::zorro_device::ZorroDevice for A2091 {
+    fn read(&mut self, off: u32, size: usize, host: &mut crate::zorro_device::DeviceHost) -> u32 {
+        Self::read(self, off, size, host.memory_mut())
+    }
+
+    fn write(
+        &mut self,
+        off: u32,
+        size: usize,
+        value: u32,
+        host: &mut crate::zorro_device::DeviceHost,
+    ) {
+        Self::write(self, off, size, value, host.memory_mut())
+    }
+
+    fn tick(&mut self, cck: u32, host: &mut crate::zorro_device::DeviceHost) {
+        Self::tick(self, cck, host.memory_mut())
+    }
+
+    fn int2_line(&self) -> bool {
+        Self::int2_line(self)
+    }
+
+    // The A2091 delivers delayed WD33C93 interrupts and pumps queued DMA from
+    // its tick, so it is never treated as idle: the bus ticks it every slice
+    // (matching its pre-trait unconditional tick).
+    fn is_idle(&self) -> bool {
+        false
+    }
+
+    fn take_activity(&mut self) -> bool {
+        Self::take_activity(self)
+    }
+
+    fn reset(&mut self) {
+        Self::reset(self)
+    }
+
+    fn kind(&self) -> &'static str {
+        "a2091"
     }
 }
 
@@ -481,7 +496,7 @@ mod tests {
     #[test]
     fn autoconfig_identity_carries_diag_vector_and_configures_a_device_window() {
         let mut chain = ZorroChain::default();
-        chain.add_board(BoardSpec::a2091()).unwrap();
+        chain.add_board(BoardSpec::a2091(0)).unwrap();
         // er_Type = Zorro II | DIAGVALID | 64K size code = 0xD1, presented
         // uninverted on the physical nibbles.
         assert_eq!(chain.config_read(AUTOCONFIG_BASE, 1), 0xD0);
@@ -505,7 +520,7 @@ mod tests {
         assert_eq!(chain.region_at(0x00E9_0000, 2), None);
         assert_eq!(
             chain.device_region_at(0x00E9_0040, 2),
-            Some((BoardBacking::A2091, 0x40))
+            Some((BoardBacking::Device(0), 0x40))
         );
         assert_eq!(chain.device_region_at(0x00EA_0000, 2), None);
     }

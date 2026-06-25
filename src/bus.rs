@@ -539,9 +539,12 @@ pub struct Bus {
     /// CDTV DMAC/CD controller (CDTV machine profile): an autoconfig
     /// board with the 6525 TPI and Matshita drive.
     pub cdtv: Option<crate::cdtv::CdtvController>,
-    /// A2091 SCSI controller (Zorro II autoconfig board, `[scsi]` config);
-    /// the chain maps its window, accesses route here.
-    pub a2091: Option<crate::a2091::A2091>,
+    /// Functional Zorro-chain boards (the A2091 SCSI controller, WASM plugin
+    /// boards). The chain maps each board's window to a
+    /// [`crate::zorro::BoardBacking::Device`] slot index into this vector, and
+    /// accesses route here through the [`crate::zorro_device::ZorroDevice`]
+    /// boundary. Serialized inline with the bus.
+    pub devices: Vec<crate::zorro_device::BoardDevice>,
     /// Emulated-time deadline keeping the front-panel HDD LED lit after the
     /// most recent Gayle IDE activity, so short synchronous transfers stay
     /// visible for a human-perceptible stretch.
@@ -1689,7 +1692,7 @@ impl Bus {
             gayle: None,
             akiko: None,
             cdtv: None,
-            a2091: None,
+            devices: Vec::new(),
             hdd_led_until_cck: 0,
             cd32_pad_shifter: 8,
             cd32_pad_fire_oldstate: 0,
@@ -1832,8 +1835,11 @@ impl Bus {
         self.akiko = Some(akiko);
     }
 
-    pub fn attach_a2091(&mut self, a2091: crate::a2091::A2091) {
-        self.a2091 = Some(a2091);
+    /// Attach the functional Zorro-chain boards. Their slot indices must match
+    /// the [`crate::zorro::BoardBacking::Device`] indices assigned when the
+    /// boards were added to the chain.
+    pub fn attach_devices(&mut self, devices: Vec<crate::zorro_device::BoardDevice>) {
+        self.devices = devices;
     }
 
     pub fn attach_cdtv(&mut self, cdtv: crate::cdtv::CdtvController) {
@@ -1995,8 +2001,8 @@ impl Bus {
         if let Some(cdtv) = self.cdtv.as_mut() {
             cdtv.reset();
         }
-        if let Some(a2091) = self.a2091.as_mut() {
-            a2091.reset();
+        for dev in &mut self.devices {
+            crate::zorro_device::ZorroDevice::reset(dev);
         }
         self.hdd_led_until_cck = 0;
         self.overlay_disable_pending = false;
@@ -2109,7 +2115,7 @@ impl Bus {
             power_led_on: pra & 0x02 == 0,
             fdd_led_on: self.floppy.activity_led_on(),
             fdd_track: self.floppy.selected_track(),
-            hdd_led: (self.gayle.is_some() || self.a2091.is_some())
+            hdd_led: (self.gayle.is_some() || self.has_scsi_device())
                 .then_some(self.emulated_cck < self.hdd_led_until_cck),
             cd_led: self
                 .cdtv
@@ -2123,6 +2129,13 @@ impl Bus {
     /// Whether the machine has a CD drive (CDTV DMAC or CD32 Akiko).
     pub fn cd_drive_present(&self) -> bool {
         self.cdtv.is_some() || self.akiko.is_some()
+    }
+
+    /// Whether a SCSI controller board is fitted (lights the HDD LED).
+    fn has_scsi_device(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|d| matches!(d, crate::zorro_device::BoardDevice::A2091(_)))
     }
 
     /// Whether a disc is mounted (or, on CDTV, waiting in the tray).
@@ -3028,19 +3041,40 @@ impl Bus {
             }
         }
 
+        // CDTV DMAC: advance through the ZorroDevice boundary (its tick streams
+        // CD audio from Paula's ring) and level-feed its INT2 line like Gayle's.
         if let Some(cdtv) = self.cdtv.as_mut() {
-            cdtv.tick(cck, self.paula.cd_audio_mut());
-            if cdtv.int2_line() {
+            {
+                let mut host = crate::zorro_device::DeviceHost::with_cd_audio(
+                    &mut self.mem,
+                    self.paula.cd_audio_mut(),
+                );
+                crate::zorro_device::ZorroDevice::tick(cdtv, cck, &mut host);
+            }
+            if crate::zorro_device::ZorroDevice::int2_line(cdtv) {
                 self.paula.intreq |= INT_PORTS;
             }
         }
 
-        // A2091 SCSI: deliver delayed WD33C93 interrupts (and any DMA that
-        // became ready) and level-feed its INT2 line like Gayle's.
-        if let Some(a2091) = self.a2091.as_mut() {
-            a2091.tick(cck, &mut self.mem);
-            if a2091.int2_line() {
-                self.paula.intreq |= INT_PORTS;
+        // Functional Zorro-chain boards (A2091 SCSI, WASM plugins): advance each
+        // -- delivering delayed interrupts and any DMA that became ready -- and
+        // level-feed its INT2/INT6 lines like Gayle's.
+        {
+            let Self {
+                devices,
+                mem,
+                paula,
+                ..
+            } = self;
+            for dev in devices.iter_mut() {
+                let mut host = crate::zorro_device::DeviceHost::new(&mut *mem);
+                crate::zorro_device::ZorroDevice::tick(dev, cck, &mut host);
+                if crate::zorro_device::ZorroDevice::int2_line(dev) {
+                    paula.intreq |= INT_PORTS;
+                }
+                if crate::zorro_device::ZorroDevice::int6_line(dev) {
+                    paula.intreq |= INT_EXTER;
+                }
             }
         }
 

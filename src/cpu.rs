@@ -1746,25 +1746,24 @@ impl CpuBus {
                 return value;
             }
         }
-        if self.bus.a2091.is_some() {
-            // A2091 SCSI: a configured Zorro device board window (registers,
-            // boot ROM, DMA strobes). Off the chip bus like Gayle.
-            if let Some((crate::zorro::BoardBacking::A2091, off)) =
-                self.bus.mem.zorro.device_region_at(addr, size)
-            {
-                self.bus.cpu_slow_external_access(Self::access_words(size));
-                let (value, activity) = match self.bus.a2091.as_mut() {
-                    Some(a2091) => {
-                        let v = a2091.read(off, size, &mut self.bus.mem);
-                        (v, a2091.take_activity())
-                    }
-                    None => (floating_read(size), false),
-                };
-                if activity {
-                    self.bus.note_hdd_activity();
-                }
-                return value;
+        // A configured functional Zorro board window (registers, boot ROM, DMA
+        // strobes): the chain maps it to a device slot. Off the chip bus like
+        // Gayle.
+        if let Some((crate::zorro::BoardBacking::Device(slot), off)) =
+            self.bus.mem.zorro.device_region_at(addr, size)
+        {
+            self.bus.cpu_slow_external_access(Self::access_words(size));
+            let (value, activity) = {
+                let mem = &mut self.bus.mem;
+                let dev = &mut self.bus.devices[slot];
+                let mut host = crate::zorro_device::DeviceHost::new(mem);
+                let v = crate::zorro_device::ZorroDevice::read(dev, off, size, &mut host);
+                (v, crate::zorro_device::ZorroDevice::take_activity(dev))
+            };
+            if activity {
+                self.bus.note_hdd_activity();
             }
+            return value;
         }
         if self.bus.akiko.is_some()
             && range_contains(crate::akiko::AKIKO_BASE, crate::akiko::AKIKO_SIZE, addr)
@@ -1782,7 +1781,15 @@ impl CpuBus {
         {
             self.bus.cpu_slow_external_access(Self::access_words(size));
             if let Some(cdtv) = self.bus.cdtv.as_mut() {
-                return cdtv.read(addr, size);
+                // The CDTV self-decodes its 64K window; pass the window offset
+                // through the ZorroDevice boundary (its read ignores memory).
+                let mut host = crate::zorro_device::DeviceHost::new(&mut self.bus.mem);
+                return crate::zorro_device::ZorroDevice::read(
+                    cdtv,
+                    addr & 0xFFFF,
+                    size,
+                    &mut host,
+                );
             }
         }
         if range_contains(CUSTOM_BASE, CUSTOM_SIZE, addr) {
@@ -1951,21 +1958,21 @@ impl CpuBus {
             }
             return;
         }
-        if self.bus.a2091.is_some() {
-            if let Some((crate::zorro::BoardBacking::A2091, off)) =
-                self.bus.mem.zorro.device_region_at(addr, size)
-            {
-                self.bus.cpu_slow_external_access(Self::access_words(size));
-                let mut activity = false;
-                if let Some(a2091) = self.bus.a2091.as_mut() {
-                    a2091.write(off, size, value, &mut self.bus.mem);
-                    activity = a2091.take_activity();
-                }
-                if activity {
-                    self.bus.note_hdd_activity();
-                }
-                return;
+        if let Some((crate::zorro::BoardBacking::Device(slot), off)) =
+            self.bus.mem.zorro.device_region_at(addr, size)
+        {
+            self.bus.cpu_slow_external_access(Self::access_words(size));
+            let activity = {
+                let mem = &mut self.bus.mem;
+                let dev = &mut self.bus.devices[slot];
+                let mut host = crate::zorro_device::DeviceHost::new(mem);
+                crate::zorro_device::ZorroDevice::write(dev, off, size, value, &mut host);
+                crate::zorro_device::ZorroDevice::take_activity(dev)
+            };
+            if activity {
+                self.bus.note_hdd_activity();
             }
+            return;
         }
         if self.bus.akiko.is_some()
             && range_contains(crate::akiko::AKIKO_BASE, crate::akiko::AKIKO_SIZE, addr)
@@ -1984,7 +1991,16 @@ impl CpuBus {
         {
             self.bus.cpu_slow_external_access(Self::access_words(size));
             if let Some(mut cdtv) = self.bus.cdtv.take() {
-                cdtv.write(addr, size, value, &mut self.bus.mem);
+                // Taken out to split the borrow from `mem`; routed through the
+                // ZorroDevice boundary with the self-decoded window offset.
+                let mut host = crate::zorro_device::DeviceHost::new(&mut self.bus.mem);
+                crate::zorro_device::ZorroDevice::write(
+                    &mut cdtv,
+                    addr & 0xFFFF,
+                    size,
+                    value,
+                    &mut host,
+                );
                 self.bus.cdtv = Some(cdtv);
             }
             return;
@@ -2191,15 +2207,6 @@ fn region_offset(len: usize, base: u64, address: u32, size: usize) -> Option<usi
         Some((addr - base) as usize)
     } else {
         None
-    }
-}
-
-fn floating_read(size: usize) -> u32 {
-    match size {
-        1 => 0xFF,
-        2 => 0xFFFF,
-        4 => 0xFFFF_FFFF,
-        _ => 0,
     }
 }
 

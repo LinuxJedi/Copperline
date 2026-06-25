@@ -36,6 +36,12 @@ ringbuf = "0.4"
 hound = "3.5"
 rfd = "0.17.2"
 gilrs = "0.11"
+# WASM plugin host for functional Zorro boards (src/wasmboard.rs). Lean feature
+# set: the Cranelift JIT + runtime only -- no WASI, component model, GC, threads,
+# or wat parsing in the shipped binary (kept deterministic; see the determinism
+# Config in wasmboard.rs). Pin the version: save-state replay of a plugin's
+# linear-memory snapshot is only guaranteed within one wasmtime build.
+wasmtime = { version = "=27.0.0", default-features = false, features = ["cranelift", "runtime"] }
 # Already pulled in transitively; used directly only for localtime_r (local
 # time-zone filename stamps) and, on macOS, the pthread QoS class used for the
 # optional realtime-priority feature (see src/priority.rs).
@@ -55,6 +61,11 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSD
 # the windows-sys it pulls in) never enters the macOS build.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 thread-priority = "3.1"
+
+[dev-dependencies]
+# Compile WAT to wasm bytes in the WASM-plugin-host tests, so golden test
+# plugins live as readable text in the tests rather than checked-in binaries.
+wat = "1"
 
 [lints.clippy]
 # Chipset pipeline functions take per-signal argument lists that mirror the

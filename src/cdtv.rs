@@ -33,7 +33,7 @@
 
 use crate::cdrom::{CdImage, LEADIN_SECTORS, RAW_SECTOR_BYTES};
 use crate::chipset::paula::CdAudioRing;
-use crate::memory::{Memory, SLOW_RAM_BASE};
+use crate::memory::Memory;
 
 // DMAC CNTR bits.
 const CNTR_TCEN: u8 = 1 << 7;
@@ -1046,43 +1046,15 @@ impl CdtvController {
     /// Zorro II board RAM (the CD driver allocates CD buffers in fast RAM when
     /// present). Unmapped targets warn once and drop the data.
     fn dma_write_word(&mut self, mem: &mut Memory, addr: u32, hi: u8, lo: u8) {
-        let a = addr as usize;
-        if a + 1 < mem.chip_ram.len() {
-            mem.chip_ram[a] = hi;
-            mem.chip_ram[a + 1] = lo;
-            return;
-        }
-        let slow = SLOW_RAM_BASE as usize;
-        if a >= slow && a + 1 < slow + mem.slow_ram.len() {
-            mem.slow_ram[a - slow] = hi;
-            mem.slow_ram[a - slow + 1] = lo;
-            return;
-        }
-        if let Some((board, off)) = mem.zorro.region_at(addr, 2) {
-            let ram = mem.zorro.board_ram_mut(board);
-            ram[off] = hi;
-            ram[off + 1] = lo;
-            return;
-        }
-        if !self.dma_warned {
+        let w = (u16::from(hi) << 8) | u16::from(lo);
+        if !crate::zorro_device::dma_write_word(mem, addr, w) && !self.dma_warned {
             self.dma_warned = true;
             log::warn!("cdtv: DMA to unmapped address {addr:#08X}; ignoring");
         }
     }
 
     fn dma_read_byte(mem: &Memory, addr: u32) -> u8 {
-        let a = addr as usize;
-        if a < mem.chip_ram.len() {
-            return mem.chip_ram[a];
-        }
-        let slow = SLOW_RAM_BASE as usize;
-        if a >= slow && a < slow + mem.slow_ram.len() {
-            return mem.slow_ram[a - slow];
-        }
-        if let Some((board, off)) = mem.zorro.region_at(addr, 1) {
-            return mem.zorro.board_ram(board)[off];
-        }
-        0xFF
+        crate::zorro_device::dma_read_byte(mem, addr).unwrap_or(0xFF)
     }
 
     fn run_dma(&mut self, mem: &mut Memory) {
@@ -1263,6 +1235,49 @@ impl CdtvController {
         }
         self.play_position += 1;
         self.last_play_pos = self.play_position;
+    }
+}
+
+impl crate::zorro_device::ZorroDevice for CdtvController {
+    // The CDTV self-decodes its window (base is 64K-aligned), so the dispatch
+    // passes the window offset, which `read_byte`/`write_byte` mask to the same
+    // low 16 bits the absolute address carried before.
+    fn read(&mut self, off: u32, size: usize, _host: &mut crate::zorro_device::DeviceHost) -> u32 {
+        Self::read(self, off, size)
+    }
+
+    fn write(
+        &mut self,
+        off: u32,
+        size: usize,
+        value: u32,
+        host: &mut crate::zorro_device::DeviceHost,
+    ) {
+        Self::write(self, off, size, value, host.memory_mut())
+    }
+
+    // The DMAC tick streams CD audio rather than touching guest memory, so it
+    // draws Paula's CD-audio ring from the host instead of `Memory`.
+    fn tick(&mut self, cck: u32, host: &mut crate::zorro_device::DeviceHost) {
+        Self::tick(self, cck, host.cd_audio())
+    }
+
+    fn int2_line(&self) -> bool {
+        Self::int2_line(self)
+    }
+
+    // Ticked every slice to advance CD audio and deliver the delayed
+    // DMA-completion interrupt (matches its pre-trait unconditional tick).
+    fn is_idle(&self) -> bool {
+        false
+    }
+
+    fn reset(&mut self) {
+        Self::reset(self)
+    }
+
+    fn kind(&self) -> &'static str {
+        "cdtv"
     }
 }
 
