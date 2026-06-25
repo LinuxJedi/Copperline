@@ -4,6 +4,7 @@ pub mod beam;
 pub mod bitplane;
 pub mod deinterlace;
 pub mod font;
+pub mod launcher;
 pub mod ui;
 pub mod window;
 

@@ -8,12 +8,13 @@
 //! `window.rs` routes events to it and builds the per-frame view data
 //! (register snapshots, disassembly text) the panels render.
 
+use super::launcher::{self, LauncherField, LauncherState, LauncherTab, RowKind};
 use super::window::{
     draw_rect_bevel, fill_rect, fill_rect_blend, rgba, scale_rect, JoystickInputMode, Rect,
     BUTTON_EDGE_DARK, BUTTON_EDGE_LIGHT, BUTTON_FACE, BUTTON_FACE_HOVER,
 };
 use super::{font, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL, PRESENT_HEIGHT};
-use crate::config::WarpSpeed;
+use crate::config::{MachineModel, WarpSpeed};
 use crate::debugger::{BreakCond, CondOp, CondOperand};
 
 // ---------------------------------------------------------------------------
@@ -66,9 +67,11 @@ pub enum MenuItem {
     SaveState,
     LoadState,
     LoadRom,
+    MachineConfig,
 }
 
-pub const MENU_ITEMS: [MenuItem; 13] = [
+pub const MENU_ITEMS: [MenuItem; 14] = [
+    MenuItem::MachineConfig,
     MenuItem::FrameAnalyzer,
     MenuItem::Debugger,
     MenuItem::Calibration,
@@ -111,6 +114,7 @@ fn menu_item_label(
         MenuItem::SaveState => "Save State".to_string(),
         MenuItem::LoadState => "Load State...".to_string(),
         MenuItem::LoadRom => "Load Kickstart ROM...".to_string(),
+        MenuItem::MachineConfig => "Machine Configuration...".to_string(),
     }
 }
 
@@ -269,6 +273,9 @@ pub enum Panel {
     Calibration(crate::gamepad::CalibrationSession),
     Debugger(DebuggerPanel),
     FrameAnalyzer(FrameAnalyzerPanel),
+    /// The pre-boot machine-configuration screen. Boxed: its state is far
+    /// larger than the other variants.
+    Launcher(Box<LauncherState>),
 }
 
 /// Menu/panel state owned by the window.
@@ -343,6 +350,11 @@ pub fn panel_control_at(panel: &Panel, pos: (i32, i32)) -> Option<UiControl> {
                 }
             }
         }
+        Panel::Launcher(state) => {
+            if let Some(control) = launcher_control_at(rect, state, pos) {
+                return Some(control);
+            }
+        }
         Panel::About | Panel::Shortcuts => {}
     }
     rect.contains(pos).then_some(UiControl::PanelBody)
@@ -402,6 +414,33 @@ pub enum UiControl {
         y: u16,
         scanline: bool,
     },
+    /// Configuration screen: pick a machine model.
+    LauncherModel(MachineModel),
+    /// Configuration screen: switch the category tab.
+    LauncherTab(LauncherTab),
+    /// Configuration screen: step a cycle/stepper field one value.
+    LauncherCycle {
+        field: LauncherField,
+        forward: bool,
+    },
+    /// Configuration screen: flip a toggle field.
+    LauncherToggle(LauncherField),
+    /// Configuration screen: open a file dialog for a path field.
+    LauncherBrowse(LauncherField),
+    /// Configuration screen: clear a path field.
+    LauncherClear(LauncherField),
+    /// Configuration screen: add a Zorro metadata board file.
+    LauncherZorroAdd,
+    /// Configuration screen: remove the Zorro board at this index.
+    LauncherZorroRemove(usize),
+    /// Configuration screen: load a .toml configuration.
+    LauncherLoad,
+    /// Configuration screen: save the configuration to a .toml file.
+    LauncherSave,
+    /// Configuration screen: reset to the selected profile's defaults.
+    LauncherDefaults,
+    /// Configuration screen: build and run the configured machine.
+    LauncherRun,
 }
 
 fn panel_dims(panel: &Panel) -> (usize, usize) {
@@ -411,6 +450,7 @@ fn panel_dims(panel: &Panel) -> (usize, usize) {
         Panel::Calibration(_) => (620, 372),
         Panel::Debugger(_) => (684, 520),
         Panel::FrameAnalyzer(_) => (700, 526),
+        Panel::Launcher(_) => (LAUNCHER_W, LAUNCHER_H),
     }
 }
 
@@ -421,6 +461,7 @@ fn panel_title(panel: &Panel) -> &'static str {
         Panel::Calibration(_) => "Gamepad Calibration",
         Panel::Debugger(_) => "Debugger",
         Panel::FrameAnalyzer(_) => "Frame Analyzer",
+        Panel::Launcher(_) => "Machine Configuration",
     }
 }
 
@@ -1843,6 +1884,611 @@ fn draw_frame_analyzer(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Machine-configuration (launcher) panel
+// ---------------------------------------------------------------------------
+
+const LAUNCHER_W: usize = 700;
+const LAUNCHER_H: usize = 520;
+const LAUNCH_MARGIN: usize = 8;
+const LAUNCH_MODEL_H: usize = 22;
+const LAUNCH_MODEL_GAP: usize = 4;
+/// Machines per row in the selector grid before it wraps; the grid rebalances
+/// so the buttons fill the width (eight models fit one row today, more wrap to
+/// two balanced rows -- room for the A3000/A4000 and beyond).
+const LAUNCH_MODEL_MAX_PER_ROW: usize = 8;
+/// Width of the left-hand vertical category-tab column.
+const LAUNCH_SIDEBAR_W: usize = 116;
+const LAUNCH_TAB_H: usize = 26;
+const LAUNCH_TAB_GAP: usize = 2;
+const LAUNCH_ROW_H: usize = 26;
+/// Label column width inside the settings pane (before a row's control).
+const LAUNCH_LABEL_W: usize = 150;
+const LAUNCH_ARROW_W: usize = 24;
+const LAUNCH_VALUE_W: usize = 132;
+const LAUNCH_TOGGLE_W: usize = 64;
+const LAUNCH_ACTION_W: usize = 84;
+const LAUNCH_ACTION_H: usize = 22;
+const LAUNCH_BROWSE_W: usize = 66;
+const LAUNCH_CLEAR_W: usize = 54;
+const LAUNCH_REMOVE_W: usize = 70;
+const LAUNCH_CONTROL_H: usize = 20;
+
+fn launcher_model_top(rect: Rect) -> usize {
+    rect.y + TITLE_H + 8
+}
+
+/// (rows, columns) of the machine-selector grid, balanced so the buttons fill
+/// the width evenly however many models there are.
+fn launcher_model_grid() -> (usize, usize) {
+    let count = launcher::MODELS.len();
+    let rows = count.div_ceil(LAUNCH_MODEL_MAX_PER_ROW).max(1);
+    (rows, count.div_ceil(rows))
+}
+
+fn launcher_model_rect(rect: Rect, i: usize) -> Rect {
+    let (_, per_row) = launcher_model_grid();
+    let avail = rect.w - 2 * LAUNCH_MARGIN;
+    let w = (avail - (per_row - 1) * LAUNCH_MODEL_GAP) / per_row;
+    let (row, col) = (i / per_row, i % per_row);
+    Rect {
+        x: rect.x + LAUNCH_MARGIN + col * (w + LAUNCH_MODEL_GAP),
+        y: launcher_model_top(rect) + row * (LAUNCH_MODEL_H + LAUNCH_MODEL_GAP),
+        w,
+        h: LAUNCH_MODEL_H,
+    }
+}
+
+fn launcher_model_strip_height() -> usize {
+    let (rows, _) = launcher_model_grid();
+    rows * (LAUNCH_MODEL_H + LAUNCH_MODEL_GAP)
+}
+
+/// Top of the configuration area (the vertical tab column and the settings
+/// pane both start here), below the machine grid and its divider.
+fn launcher_content_top(rect: Rect) -> usize {
+    launcher_model_top(rect) + launcher_model_strip_height() + 12
+}
+
+/// A category tab in the left sidebar.
+fn launcher_tab_rect(rect: Rect, i: usize) -> Rect {
+    Rect {
+        x: rect.x + LAUNCH_MARGIN,
+        y: launcher_content_top(rect) + i * (LAUNCH_TAB_H + LAUNCH_TAB_GAP),
+        w: LAUNCH_SIDEBAR_W,
+        h: LAUNCH_TAB_H,
+    }
+}
+
+/// Left edge of the settings pane (right of the tab column).
+fn launcher_pane_x(rect: Rect) -> usize {
+    rect.x + LAUNCH_MARGIN + LAUNCH_SIDEBAR_W + 12
+}
+
+/// X of a settings row's control column (after its label).
+fn launcher_control_x(rect: Rect) -> usize {
+    launcher_pane_x(rect) + LAUNCH_LABEL_W
+}
+
+fn launcher_row_y(rect: Rect, i: usize) -> usize {
+    launcher_content_top(rect) + i * LAUNCH_ROW_H
+}
+
+fn launcher_action_y(rect: Rect) -> usize {
+    rect.y + rect.h - LAUNCH_ACTION_H - 8
+}
+
+fn launcher_status_y(rect: Rect) -> usize {
+    launcher_action_y(rect).saturating_sub(16)
+}
+
+/// (prev arrow, value field, next arrow) for a cycle row.
+fn launcher_cycle_rects(rect: Rect, row_y: usize) -> (Rect, Rect, Rect) {
+    let y = row_y + 2;
+    let cx = launcher_control_x(rect);
+    let prev = Rect {
+        x: cx,
+        y,
+        w: LAUNCH_ARROW_W,
+        h: LAUNCH_CONTROL_H,
+    };
+    let value = Rect {
+        x: prev.x + LAUNCH_ARROW_W,
+        y,
+        w: LAUNCH_VALUE_W,
+        h: LAUNCH_CONTROL_H,
+    };
+    let next = Rect {
+        x: value.x + LAUNCH_VALUE_W,
+        y,
+        w: LAUNCH_ARROW_W,
+        h: LAUNCH_CONTROL_H,
+    };
+    (prev, value, next)
+}
+
+fn launcher_toggle_rect(rect: Rect, row_y: usize) -> Rect {
+    Rect {
+        x: launcher_control_x(rect),
+        y: row_y + 2,
+        w: LAUNCH_TOGGLE_W,
+        h: LAUNCH_CONTROL_H,
+    }
+}
+
+/// (Browse, Clear) buttons for a path row, right-aligned in the settings pane.
+fn launcher_path_rects(rect: Rect, row_y: usize) -> (Rect, Rect) {
+    let y = row_y + 2;
+    let clear = Rect {
+        x: rect.x + rect.w - LAUNCH_MARGIN - LAUNCH_CLEAR_W,
+        y,
+        w: LAUNCH_CLEAR_W,
+        h: LAUNCH_CONTROL_H,
+    };
+    let browse = Rect {
+        x: clear.x - 4 - LAUNCH_BROWSE_W,
+        y,
+        w: LAUNCH_BROWSE_W,
+        h: LAUNCH_CONTROL_H,
+    };
+    (browse, clear)
+}
+
+fn launcher_action_rects(rect: Rect) -> [(UiControl, Rect); 4] {
+    let y = launcher_action_y(rect);
+    let load = Rect {
+        x: rect.x + LAUNCH_MARGIN,
+        y,
+        w: LAUNCH_ACTION_W,
+        h: LAUNCH_ACTION_H,
+    };
+    let save = Rect {
+        x: load.x + LAUNCH_ACTION_W + 6,
+        y,
+        w: LAUNCH_ACTION_W,
+        h: LAUNCH_ACTION_H,
+    };
+    let run = Rect {
+        x: rect.x + rect.w - LAUNCH_MARGIN - LAUNCH_ACTION_W,
+        y,
+        w: LAUNCH_ACTION_W,
+        h: LAUNCH_ACTION_H,
+    };
+    let defaults = Rect {
+        x: run.x - 6 - LAUNCH_ACTION_W,
+        y,
+        w: LAUNCH_ACTION_W,
+        h: LAUNCH_ACTION_H,
+    };
+    [
+        (UiControl::LauncherLoad, load),
+        (UiControl::LauncherSave, save),
+        (UiControl::LauncherDefaults, defaults),
+        (UiControl::LauncherRun, run),
+    ]
+}
+
+/// The Zorro list sits below the Add button, which is pinned to the top of the
+/// pane, so board row `i` is at content row `i + 1`.
+fn launcher_zorro_remove_rect(rect: Rect, i: usize) -> Rect {
+    Rect {
+        x: rect.x + rect.w - LAUNCH_MARGIN - LAUNCH_REMOVE_W,
+        y: launcher_row_y(rect, i + 1) + 2,
+        w: LAUNCH_REMOVE_W,
+        h: LAUNCH_CONTROL_H,
+    }
+}
+
+fn launcher_zorro_add_rect(rect: Rect) -> Rect {
+    Rect {
+        x: launcher_pane_x(rect),
+        y: launcher_row_y(rect, 0) + 2,
+        w: 130,
+        h: LAUNCH_ACTION_H,
+    }
+}
+
+fn launcher_action_label(control: UiControl) -> &'static str {
+    match control {
+        UiControl::LauncherLoad => "Load...",
+        UiControl::LauncherSave => "Save...",
+        UiControl::LauncherDefaults => "Defaults",
+        UiControl::LauncherRun => "Run",
+        _ => "",
+    }
+}
+
+/// Hit-test the configuration panel. Returns the control under `pos`, or `None`
+/// to let the caller swallow the click on the panel body.
+fn launcher_control_at(rect: Rect, state: &LauncherState, pos: (i32, i32)) -> Option<UiControl> {
+    for (i, &model) in launcher::MODELS.iter().enumerate() {
+        if launcher_model_rect(rect, i).contains(pos) {
+            return Some(UiControl::LauncherModel(model));
+        }
+    }
+    for (i, &tab) in launcher::TABS.iter().enumerate() {
+        if launcher_tab_rect(rect, i).contains(pos) {
+            return Some(UiControl::LauncherTab(tab));
+        }
+    }
+    if state.tab == LauncherTab::Zorro {
+        let count = state.setup.zorro_boards().len();
+        for i in 0..count {
+            if launcher_zorro_remove_rect(rect, i).contains(pos) {
+                return Some(UiControl::LauncherZorroRemove(i));
+            }
+        }
+        if launcher_zorro_add_rect(rect).contains(pos) {
+            return Some(UiControl::LauncherZorroAdd);
+        }
+    } else {
+        for (i, r) in launcher::rows(state.tab).iter().enumerate() {
+            if !state.setup.applies(r.field) {
+                continue;
+            }
+            let row_y = launcher_row_y(rect, i);
+            match r.kind {
+                RowKind::Cycle => {
+                    let (prev, _value, next) = launcher_cycle_rects(rect, row_y);
+                    if prev.contains(pos) {
+                        return Some(UiControl::LauncherCycle {
+                            field: r.field,
+                            forward: false,
+                        });
+                    }
+                    if next.contains(pos) {
+                        return Some(UiControl::LauncherCycle {
+                            field: r.field,
+                            forward: true,
+                        });
+                    }
+                }
+                RowKind::Toggle => {
+                    if launcher_toggle_rect(rect, row_y).contains(pos) {
+                        return Some(UiControl::LauncherToggle(r.field));
+                    }
+                }
+                RowKind::Path => {
+                    let (browse, clear) = launcher_path_rects(rect, row_y);
+                    if browse.contains(pos) {
+                        return Some(UiControl::LauncherBrowse(r.field));
+                    }
+                    if clear.contains(pos) {
+                        return Some(UiControl::LauncherClear(r.field));
+                    }
+                }
+            }
+        }
+    }
+    for (control, button_rect) in launcher_action_rects(rect) {
+        if button_rect.contains(pos) {
+            return Some(control);
+        }
+    }
+    None
+}
+
+/// Truncate `text` (already a short file name) to fit `avail_px`, appending a
+/// `~` marker when clipped.
+fn truncate_to_width(text: &str, avail_px: usize) -> String {
+    let max_chars = avail_px / font::GLYPH_W;
+    let len = text.chars().count();
+    if len <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return String::new();
+    }
+    let kept: String = text.chars().take(max_chars - 1).collect();
+    format!("{kept}~")
+}
+
+/// A model-selector / tab button: a flat bevel that fills with the title-bar
+/// blue when active/selected. Tabs label left, model buttons centred.
+fn draw_launcher_chip(
+    frame: &mut [u8],
+    rect: Rect,
+    label: &str,
+    active: bool,
+    hover: bool,
+    align_left: bool,
+    scale: usize,
+) {
+    let face = if active {
+        PANEL_TITLE_BG
+    } else if hover {
+        BUTTON_FACE_HOVER
+    } else {
+        BUTTON_FACE
+    };
+    let scaled = scale_rect(rect, scale);
+    fill_rect(frame, scaled, face, scale);
+    draw_rect_bevel(frame, scaled, BUTTON_EDGE_LIGHT, BUTTON_EDGE_DARK, scale);
+    let color = if active {
+        PANEL_TITLE_TEXT
+    } else {
+        BUTTON_TEXT
+    };
+    let text_w = label.chars().count() * font::GLYPH_W;
+    let x = if align_left {
+        rect.x + 8
+    } else {
+        rect.x + rect.w.saturating_sub(text_w) / 2
+    };
+    let y = rect.y + rect.h.saturating_sub(font::GLYPH_H) / 2;
+    draw_panel_text(frame, x, y, label, color, 1, scale);
+}
+
+fn draw_launcher_row(
+    frame: &mut [u8],
+    rect: Rect,
+    setup: &launcher::MachineSetup,
+    r: &launcher::Row,
+    i: usize,
+    hover: Option<UiControl>,
+    scale: usize,
+) {
+    let row_y = launcher_row_y(rect, i);
+    let reason = setup.disabled_reason(r.field);
+    let label_color = if reason.is_none() {
+        PANEL_TEXT
+    } else {
+        PANEL_TEXT_DIM
+    };
+    draw_panel_text(
+        frame,
+        launcher_pane_x(rect),
+        row_y + 8,
+        r.label,
+        label_color,
+        1,
+        scale,
+    );
+    // Greyed: explain why instead of drawing controls (e.g. "needs 32-bit CPU").
+    if let Some(reason) = reason {
+        draw_panel_text(
+            frame,
+            launcher_control_x(rect),
+            row_y + 8,
+            reason,
+            PANEL_TEXT_DIM,
+            1,
+            scale,
+        );
+        return;
+    }
+    match r.kind {
+        RowKind::Cycle => {
+            let (prev, value, next) = launcher_cycle_rects(rect, row_y);
+            draw_text_button(
+                frame,
+                prev,
+                "<",
+                true,
+                hover
+                    == Some(UiControl::LauncherCycle {
+                        field: r.field,
+                        forward: false,
+                    }),
+                scale,
+            );
+            draw_text_button(
+                frame,
+                next,
+                ">",
+                true,
+                hover
+                    == Some(UiControl::LauncherCycle {
+                        field: r.field,
+                        forward: true,
+                    }),
+                scale,
+            );
+            let text = setup.value_label(r.field);
+            let tw = text.chars().count() * font::GLYPH_W;
+            let tx = value.x + value.w.saturating_sub(tw) / 2;
+            draw_panel_text(frame, tx, value.y + 6, &text, PANEL_TEXT_HILIGHT, 1, scale);
+        }
+        RowKind::Toggle => {
+            let button = launcher_toggle_rect(rect, row_y);
+            let label = if setup.toggle_value(r.field) {
+                "On"
+            } else {
+                "Off"
+            };
+            draw_text_button(
+                frame,
+                button,
+                label,
+                true,
+                hover == Some(UiControl::LauncherToggle(r.field)),
+                scale,
+            );
+        }
+        RowKind::Path => {
+            let (browse, clear) = launcher_path_rects(rect, row_y);
+            let value_x = launcher_control_x(rect);
+            let avail = browse.x.saturating_sub(value_x + 8);
+            let text = truncate_to_width(&setup.value_label(r.field), avail);
+            draw_panel_text(frame, value_x, browse.y + 6, &text, PANEL_TEXT, 1, scale);
+            draw_text_button(
+                frame,
+                browse,
+                "Browse",
+                true,
+                hover == Some(UiControl::LauncherBrowse(r.field)),
+                scale,
+            );
+            draw_text_button(
+                frame,
+                clear,
+                "Clear",
+                true,
+                hover == Some(UiControl::LauncherClear(r.field)),
+                scale,
+            );
+        }
+    }
+}
+
+fn draw_launcher_zorro(
+    frame: &mut [u8],
+    rect: Rect,
+    setup: &launcher::MachineSetup,
+    hover: Option<UiControl>,
+    scale: usize,
+) {
+    let pane_x = launcher_pane_x(rect);
+    // Add button pinned to the top of the pane; the board list (or the empty
+    // note) sits below it.
+    draw_text_button(
+        frame,
+        launcher_zorro_add_rect(rect),
+        "Add board...",
+        true,
+        hover == Some(UiControl::LauncherZorroAdd),
+        scale,
+    );
+    let boards = setup.zorro_boards();
+    if boards.is_empty() {
+        draw_panel_text(
+            frame,
+            pane_x,
+            launcher_row_y(rect, 1) + 8,
+            "No extra Zorro boards configured.",
+            PANEL_TEXT_DIM,
+            1,
+            scale,
+        );
+    }
+    for (i, board) in boards.iter().enumerate() {
+        let remove = launcher_zorro_remove_rect(rect, i);
+        let name = board
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| board.display().to_string());
+        let avail = remove.x.saturating_sub(pane_x + 8);
+        let name = truncate_to_width(&name, avail);
+        draw_panel_text(
+            frame,
+            pane_x,
+            launcher_row_y(rect, i + 1) + 8,
+            &name,
+            PANEL_TEXT,
+            1,
+            scale,
+        );
+        draw_text_button(
+            frame,
+            remove,
+            "Remove",
+            true,
+            hover == Some(UiControl::LauncherZorroRemove(i)),
+            scale,
+        );
+    }
+}
+
+/// A thin divider line.
+fn draw_launcher_divider(frame: &mut [u8], rect: Rect, scale: usize) {
+    fill_rect(frame, scale_rect(rect, scale), BUTTON_EDGE_DARK, scale);
+}
+
+fn draw_launcher(
+    frame: &mut [u8],
+    rect: Rect,
+    state: &LauncherState,
+    hover: Option<UiControl>,
+    scale: usize,
+) {
+    let setup = &state.setup;
+    // Machine selector grid. The A500 highlights when no profile is chosen
+    // (a no-profile machine is the A500 defaults).
+    let selected_model = setup.selected_model();
+    for (i, &model) in launcher::MODELS.iter().enumerate() {
+        draw_launcher_chip(
+            frame,
+            launcher_model_rect(rect, i),
+            launcher::model_label(model),
+            selected_model == model,
+            hover == Some(UiControl::LauncherModel(model)),
+            false,
+            scale,
+        );
+    }
+    // Divider under the machine grid; vertical divider between the tab column
+    // and the settings pane.
+    let content_top = launcher_content_top(rect);
+    draw_launcher_divider(
+        frame,
+        Rect {
+            x: rect.x + LAUNCH_MARGIN,
+            y: content_top - 6,
+            w: rect.w - 2 * LAUNCH_MARGIN,
+            h: 1,
+        },
+        scale,
+    );
+    draw_launcher_divider(
+        frame,
+        Rect {
+            x: rect.x + LAUNCH_MARGIN + LAUNCH_SIDEBAR_W + 5,
+            y: content_top,
+            w: 1,
+            h: launcher_status_y(rect).saturating_sub(content_top + 4),
+        },
+        scale,
+    );
+    // Vertical category-tab column.
+    for (i, &tab) in launcher::TABS.iter().enumerate() {
+        draw_launcher_chip(
+            frame,
+            launcher_tab_rect(rect, i),
+            tab.label(),
+            state.tab == tab,
+            hover == Some(UiControl::LauncherTab(tab)),
+            true,
+            scale,
+        );
+    }
+    // Active tab content in the settings pane.
+    if state.tab == LauncherTab::Zorro {
+        draw_launcher_zorro(frame, rect, setup, hover, scale);
+    } else {
+        for (i, r) in launcher::rows(state.tab).iter().enumerate() {
+            draw_launcher_row(frame, rect, setup, r, i, hover, scale);
+        }
+    }
+    // Status / error line.
+    if let Some(status) = &state.status {
+        let color = if status.error {
+            PANEL_TEXT_ACCENT
+        } else {
+            PANEL_TEXT_HILIGHT
+        };
+        draw_panel_text(
+            frame,
+            rect.x + 10,
+            launcher_status_y(rect),
+            &status.text,
+            color,
+            1,
+            scale,
+        );
+    }
+    // Action bar.
+    for (control, button_rect) in launcher_action_rects(rect) {
+        draw_text_button(
+            frame,
+            button_rect,
+            launcher_action_label(control),
+            true,
+            hover == Some(control),
+            scale,
+        );
+    }
+}
+
 pub fn draw_panel_layer(
     frame: &mut [u8],
     texture_scale: usize,
@@ -1866,6 +2512,9 @@ pub fn draw_panel_layer(
         (Panel::FrameAnalyzer(panel_state), Some(PanelViewData::FrameAnalyzer(view))) => {
             draw_frame_analyzer(frame, rect, panel_state, view, hover, texture_scale)
         }
+        // The configuration panel is self-contained (its state holds everything
+        // it renders), so it needs no per-frame view-data snapshot.
+        (Panel::Launcher(state), _) => draw_launcher(frame, rect, state, hover, texture_scale),
         _ => {}
     }
 }
@@ -2107,9 +2756,9 @@ mod tests {
         let pos = (first.x as i32 + 4, first.y as i32 + 4);
         assert_eq!(
             ui.control_at(pos),
-            Some(UiControl::MenuItem(MenuItem::FrameAnalyzer))
+            Some(UiControl::MenuItem(MenuItem::MachineConfig))
         );
-        let joystick = menu_item_rect(3);
+        let joystick = menu_item_rect(4);
         let pos = (joystick.x as i32 + 4, joystick.y as i32 + 4);
         assert_eq!(
             ui.control_at(pos),
@@ -2633,5 +3282,32 @@ mod tests {
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "debugger-break");
+
+        // Configuration screen: an A1200 on the Memory tab.
+        let mut frame = vec![0u8; w * h * 4];
+        let mut state = LauncherState::new(launcher::MachineSetup::default());
+        state.setup.select_model(Some(MachineModel::A1200));
+        state
+            .setup
+            .set_path(LauncherField::Rom, std::path::PathBuf::from("kick31.rom"));
+        state.tab = LauncherTab::Memory;
+        let ui = UiState {
+            menu_open: false,
+            panel: Some(Panel::Launcher(Box::new(state))),
+        };
+        draw(
+            &mut frame,
+            scale,
+            &ui,
+            Some(UiControl::LauncherRun),
+            None,
+            false,
+            WarpSpeed::Max,
+            false,
+            false,
+            JoystickInputMode::Auto,
+        );
+        assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
+        save(&frame, "launcher");
     }
 }

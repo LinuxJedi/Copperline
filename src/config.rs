@@ -7,9 +7,18 @@ use crate::chipset::agnus::{AgnusRevision, VideoStandard};
 use crate::chipset::denise::DeniseRevision;
 use crate::zorro::{zorro_ii_size_code, zorro_iii_size_bits, BoardSpec, ZorroChain, ZorroVersion};
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// Skip-serializing predicate for the raw config's nested `[section]` structs:
+/// a section that still equals its default carries no user-set field, so it is
+/// omitted from saved TOML entirely (keeping written files minimal, like the
+/// hand-written `*.example.toml`). Referenced from `#[serde(skip_serializing_if
+/// = "is_default")]` on each section field.
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
 
 /// Sentinel `rom_path` meaning "the user named no ROM": boot the bundled
 /// AROS open-source Kickstart replacement if it can be found, otherwise fail
@@ -75,8 +84,11 @@ pub struct Config {
     pub cd_insert_delay_secs: f64,
     /// CD32 NVRAM backing file (None = session-only EEPROM).
     pub cd32_nvram_path: Option<PathBuf>,
-    /// Whether the MSM6242 RTC at $DC0000 is fitted. Defaults to true
-    /// (legacy behaviour); the base A600 shipped without one.
+    /// Whether the MSM6242/OKI RTC at $DC0000 is fitted. Defaults to false:
+    /// the base A500/A500OCS, A600, A1200, A1000, and CD32 shipped without a
+    /// battery-backed clock. Only the A500+ (soldered on the Rev 8A board) and
+    /// the CDTV carry one by default; the A600HD and a clock-equipped A1200 set
+    /// `[machine] rtc = true`.
     pub rtc_present: bool,
     pub video_standard: VideoStandard,
     pub audio: AudioConfig,
@@ -648,7 +660,10 @@ impl Default for Config {
             cd_image_path: None,
             cd_insert_delay_secs: 0.0,
             cd32_nvram_path: None,
-            rtc_present: true,
+            // The default machine is the A500 Rev 6A, which had no battery
+            // clock; only the A500+/CDTV profiles fit one (see
+            // machine_profile_defaults).
+            rtc_present: false,
             video_standard: VideoStandard::Pal,
             audio: AudioConfig::default(),
             ide: IdeConfig::default(),
@@ -668,13 +683,18 @@ impl Config {
     /// overrides are injected into the raw TOML view before validation, so
     /// they go through exactly the same profile-defaulting, derivation, and
     /// range-checking as the equivalent config fields would.
-    pub fn load_with_overrides(path: Option<&Path>, overrides: &ConfigOverrides) -> Result<Self> {
+    /// The raw TOML view a config is loaded from, with the CLI overrides
+    /// already applied but before validation/derivation. `main` validates this
+    /// into a [`Config`] to build the machine and also keeps the raw view, so
+    /// the configuration screen can reopen showing the running machine's
+    /// settings and re-emit them on Save.
+    pub(crate) fn load_raw(path: Option<&Path>, overrides: &ConfigOverrides) -> Result<RawConfig> {
         let mut raw = match path {
             Some(p) => raw_from_path(p)?,
             None => RawConfig::default(),
         };
         overrides.apply_to(&mut raw);
-        raw.try_into()
+        Ok(raw)
     }
 
     /// Apply a CLI ROM-path override on top of whatever the config
@@ -730,7 +750,7 @@ impl Config {
 }
 
 /// Read and parse a config file into its raw TOML view.
-fn raw_from_path(path: &Path) -> Result<RawConfig> {
+pub(crate) fn raw_from_path(path: &Path) -> Result<RawConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading config {}", path.display()))?;
     toml::from_str(&text).map_err(|e| {
@@ -819,194 +839,263 @@ impl ConfigOverrides {
 
 // --- raw deserialization (one nested struct per [section]) ---------------
 
-#[derive(Debug, Default, Deserialize)]
+// `Serialize` lets the launcher write a configured machine back out as TOML
+// (the configuration screen's Save). The `skip_serializing_if` attributes keep
+// the output minimal -- only fields and sections the user actually set are
+// emitted, matching the style of the hand-written `*.example.toml`. The
+// `toml` serializer requires every top-level scalar key to be emitted before
+// any `[table]`, so the three top-level scalars (`rom`, `extended_rom`,
+// `identify`) are declared first, ahead of the section tables and the `zorro`
+// array of tables. Field declaration order otherwise mirrors deserialization,
+// which is order-independent.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawConfig {
-    rom: Option<String>,
+pub(crate) struct RawConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rom: Option<String>,
     /// Extended ROM image (CD32 512K at $E00000, CDTV 256K at $F00000).
-    extended_rom: Option<String>,
-    #[serde(default)]
-    cd: RawCd,
-    #[serde(default)]
-    cpu: RawCpu,
-    #[serde(default)]
-    emulation: RawEmulation,
-    #[serde(default)]
-    memory: RawMemory,
-    #[serde(default)]
-    machine: RawMachine,
-    #[serde(default)]
-    chipset: RawChipset,
-    #[serde(default)]
-    audio: RawAudio,
-    #[serde(default)]
-    ide: RawIde,
-    #[serde(default)]
-    scsi: RawScsi,
-    #[serde(default)]
-    floppy: RawFloppy,
-    #[serde(default)]
-    display: RawDisplay,
-    /// `[[zorro]]` board entries, configured in file order.
-    #[serde(default)]
-    zorro: Vec<RawZorroBoard>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) extended_rom: Option<String>,
     /// `identify = false` drops the Copperline identification board from the
     /// autoconfig chain (default: present).
-    identify: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) identify: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) cd: RawCd,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) cpu: RawCpu,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) emulation: RawEmulation,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) memory: RawMemory,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) machine: RawMachine,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) chipset: RawChipset,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) audio: RawAudio,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) ide: RawIde,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) scsi: RawScsi,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) floppy: RawFloppy,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) display: RawDisplay,
+    /// `[[zorro]]` board entries, configured in file order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) zorro: Vec<RawZorroBoard>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+impl RawConfig {
+    /// Serialize this raw config back to TOML text for the configuration
+    /// screen's Save. Only non-default fields are written (see the
+    /// `skip_serializing_if` attributes), so the result reads like the
+    /// hand-written example configs.
+    pub(crate) fn to_toml_string(&self) -> Result<String> {
+        toml::to_string_pretty(self).context("serializing configuration to TOML")
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawDisplay {
+pub(crate) struct RawDisplay {
     /// "tv" (default, mask deep overscan like a CRT bezel) or "full".
-    overscan: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) overscan: Option<String>,
     /// CRT phosphor persistence fraction, 0.0 (off, default) to 0.95.
-    phosphor: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) phosphor: Option<f32>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawIde {
-    master: Option<String>,
-    slave: Option<String>,
+pub(crate) struct RawIde {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) master: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) slave: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawScsi {
+pub(crate) struct RawScsi {
     /// A2091/A590 boot ROM image. For split even/odd EPROM dumps, `rom`
     /// is the even half and `rom_odd` the odd half.
-    rom: Option<String>,
-    rom_odd: Option<String>,
-    unit0: Option<String>,
-    unit1: Option<String>,
-    unit2: Option<String>,
-    unit3: Option<String>,
-    unit4: Option<String>,
-    unit5: Option<String>,
-    unit6: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rom: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rom_odd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unit0: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unit1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unit2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unit3: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unit4: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unit5: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unit6: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawCd {
+pub(crate) struct RawCd {
     /// Path to a cue sheet (BIN/CUE).
-    image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) image: Option<String>,
     /// Insert the disc this many emulated seconds after power-on
     /// instead of at boot (CDTV; some discs only boot when inserted
     /// after the boot screen).
-    insert_delay: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) insert_delay: Option<f64>,
     /// CD32 NVRAM (save game EEPROM) backing file. Defaults to
     /// "cd32-nvram.bin" on CD32 machines.
-    nvram: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) nvram: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawCpu {
-    model: Option<String>,
-    fpu: Option<bool>,
+pub(crate) struct RawCpu {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fpu: Option<bool>,
     /// Override the CPU clock in MHz. Defaults to the model's stock speed.
-    clock_mhz: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) clock_mhz: Option<f64>,
     /// Model the on-chip instruction cache (68020/030; default false).
-    icache: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) icache: Option<bool>,
     /// Model the on-chip data cache (68030 only; default false).
-    dcache: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dcache: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawEmulation {
+pub(crate) struct RawEmulation {
     /// Deprecated and ignored: "real" was the only remaining timing model,
     /// so the option carried no information. Still accepted (and warned
     /// about) so existing configs that name it keep parsing.
-    speed: Option<String>,
-    power_on: Option<bool>,
-    pacing_budget: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) speed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) power_on: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pacing_budget: Option<String>,
     /// Best-effort realtime-like thread priority for the pacer and audio
     /// threads (default false). See `src/priority.rs`.
-    realtime_priority: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) realtime_priority: Option<bool>,
     /// UI warp/turbo speed: "2x", "4x", "8x", "16x", or "max" (default).
-    warp_speed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) warp_speed: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMemory {
-    chip: Option<String>,
-    fast: Option<String>,
-    slow: Option<String>,
+pub(crate) struct RawMemory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) chip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fast: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) slow: Option<String>,
     /// Zorro III autoconfig RAM size (e.g. "16M"); 32-bit CPUs only.
-    z3: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) z3: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawZorroBoard {
+pub(crate) struct RawZorroBoard {
     /// Path to a TOML board metadata file (see `src/zorro.rs` for the
     /// schema), resolved relative to the working directory.
-    metadata: String,
+    pub(crate) metadata: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMachine {
+pub(crate) struct RawMachine {
     /// Machine profile name. Named `profile` (not `model`) so it never
     /// collides with `[cpu] model`: an uncommented profile line landing in
     /// the wrong table would otherwise be a confusing duplicate-key error.
     /// `model` stays accepted as a deprecated alias for old configs.
-    #[serde(alias = "model")]
-    profile: Option<String>,
-    /// Whether the $DC0000 RTC is fitted; defaults per profile (the base
-    /// A600 had none, the A600HD did -- default keeps it fitted so the
-    /// guest OS clock works).
-    rtc: Option<bool>,
+    #[serde(alias = "model", skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
+    /// Whether the $DC0000 RTC is fitted; defaults per profile (only the
+    /// A500+ and CDTV ship with one, so the base A500/A600/A1200/etc. default
+    /// to none). Set `rtc = true` to fit one, e.g. for an A600HD or a
+    /// clock-equipped A1200.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rtc: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawChipset {
-    revision: Option<String>,
-    video: Option<String>,
+pub(crate) struct RawChipset {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) video: Option<String>,
     /// Fine-grained chip overrides on top of the `revision` preset, for the
     /// mixed machines that really shipped (e.g. late A500: ECS Agnus with an
     /// OCS Denise). `agnus` accepts OCS / 8370 / 8371 / 8372 / 8372A / 8372B /
     /// 8374 / 8375 / ALICE; `denise` accepts OCS / 8362 / ECS / 8373 / LISA /
     /// 4203.
-    agnus: Option<String>,
-    denise: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agnus: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) denise: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawAudio {
-    floppy_sounds: Option<bool>,
-    floppy_sounds_volume: Option<u16>,
+pub(crate) struct RawAudio {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) floppy_sounds: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) floppy_sounds_volume: Option<u16>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawFloppy {
+pub(crate) struct RawFloppy {
     /// Number of wired floppy drives, DF0..DFN-1. DF0 is the internal drive,
     /// so the valid range is 1-4.
-    drives: Option<u8>,
-    df0: Option<RawFloppyDrive>,
-    df1: Option<RawFloppyDrive>,
-    df2: Option<RawFloppyDrive>,
-    df3: Option<RawFloppyDrive>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) drives: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) df0: Option<RawFloppyDrive>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) df1: Option<RawFloppyDrive>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) df2: Option<RawFloppyDrive>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) df3: Option<RawFloppyDrive>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawFloppyDrive {
-    enabled: Option<bool>,
-    path: Option<String>,
+pub(crate) struct RawFloppyDrive {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
     /// A playlist of images for this drive, cycled with the disk-swap
     /// key. When given, the first entry is the boot disk. May be used
     /// instead of `path`; if both appear, `path` is treated as the first
     /// entry followed by `paths`.
-    paths: Option<Vec<String>>,
-    write_protected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) write_protected: Option<bool>,
 }
 
 impl TryFrom<RawConfig> for Config {
@@ -1326,7 +1415,7 @@ fn parse_chipset(s: &str) -> Result<Chipset> {
     }
 }
 
-fn parse_machine_model(s: &str) -> Result<MachineModel> {
+pub(crate) fn parse_machine_model(s: &str) -> Result<MachineModel> {
     let norm = s.trim().to_ascii_uppercase().replace(['_', '-', ' '], "");
     match norm.as_str() {
         "A1000" => Ok(MachineModel::A1000),
@@ -1346,7 +1435,7 @@ fn parse_machine_model(s: &str) -> Result<MachineModel> {
 
 /// The defaults a `[machine] profile` supplies before the explicit
 /// `[cpu]`/`[chipset]`/`[memory]` sections override them.
-fn machine_profile_defaults(model: MachineModel) -> Config {
+pub(crate) fn machine_profile_defaults(model: MachineModel) -> Config {
     let mut d = Config {
         machine: Some(model),
         ..Config::default()
@@ -1371,7 +1460,7 @@ fn machine_profile_defaults(model: MachineModel) -> Config {
             d.chipset = Chipset::Ocs;
             d.chip_ram_bytes = 256 * 1024;
             d.slow_ram_bytes = 0;
-            d.rtc_present = false;
+            // No RTC (inherits the default-off).
         }
         // The early A500 (Rev 3/5) / A2000: the 512 KiB OCS "Fat Agnus"
         // (8370/8371) and OCS 8362 Denise, with the same 512 KiB chip +
@@ -1380,11 +1469,16 @@ fn machine_profile_defaults(model: MachineModel) -> Config {
         MachineModel::A500Ocs => {
             d.chipset = Chipset::Ocs;
         }
+        // The A500+ (Rev 8A) has a battery-backed OKI RTC soldered to the
+        // motherboard -- one of the few models that ships with a clock.
         MachineModel::A500Plus => {
             d.chipset = Chipset::Ecs;
             d.chip_ram_bytes = 1024 * 1024;
             d.slow_ram_bytes = 0;
+            d.rtc_present = true;
         }
+        // The base A600 shipped without an RTC (only the A600HD added one);
+        // it inherits the default-off, so `[machine] rtc = true` re-fits it.
         MachineModel::A600 => {
             d.chipset = Chipset::Ecs;
             d.chip_ram_bytes = 1024 * 1024;
@@ -1401,15 +1495,16 @@ fn machine_profile_defaults(model: MachineModel) -> Config {
         }
         // CDTV: A500-class board with the 1 MB ECS Agnus and 1 MB chip
         // RAM, plus the 256 KiB extended ROM at $F00000 (configure it via
-        // extended_rom = "..."). No Gayle.
+        // extended_rom = "..."). No Gayle. It carries a battery-backed clock.
         MachineModel::Cdtv => {
             d.chipset = Chipset::Ecs;
             d.chip_ram_bytes = 1024 * 1024;
             d.slow_ram_bytes = 0;
             d.cdtv_cd = true;
+            d.rtc_present = true;
         }
         // CD32: AGA, 68EC020 at 14 MHz, 2 MB chip RAM, Akiko, and the
-        // 512 KiB extended ROM at $E00000. No Gayle, no RTC.
+        // 512 KiB extended ROM at $E00000. No Gayle, no RTC (default-off).
         MachineModel::Cd32 => {
             d.chipset = Chipset::Aga;
             d.chip_ram_bytes = 2 * 1024 * 1024;
@@ -1417,7 +1512,6 @@ fn machine_profile_defaults(model: MachineModel) -> Config {
             d.cpu = CpuModel::M68EC020;
             d.cpu_clock_mhz = 14.18;
             d.akiko = true;
-            d.rtc_present = false;
             d.cd32_pad = true;
         }
     }
@@ -1485,8 +1579,30 @@ fn parse_video_standard(s: &str) -> Result<VideoStandard> {
     }
 }
 
+/// Format a byte count back into the compact human size the config screen
+/// writes into `[memory]` (the inverse of [`parse_size`] for the multiples it
+/// produces): exact GiB/MiB/KiB get a `G`/`M`/`K` suffix, anything else falls
+/// back to a raw byte count. Always emits a 4 KiB-aligned value the parser
+/// round-trips.
+pub(crate) fn format_size(bytes: usize) -> String {
+    const K: usize = 1024;
+    const M: usize = 1024 * 1024;
+    const G: usize = 1024 * 1024 * 1024;
+    if bytes == 0 {
+        "0".to_string()
+    } else if bytes.is_multiple_of(G) {
+        format!("{}G", bytes / G)
+    } else if bytes.is_multiple_of(M) {
+        format!("{}M", bytes / M)
+    } else if bytes.is_multiple_of(K) {
+        format!("{}K", bytes / K)
+    } else {
+        bytes.to_string()
+    }
+}
+
 /// Parse a human size like "512K", "1M", "2 MiB" or a raw byte count.
-fn parse_size(s: &str, what: &str) -> Result<usize> {
+pub(crate) fn parse_size(s: &str, what: &str) -> Result<usize> {
     let raw = s.trim();
     if raw.is_empty() {
         bail!("{} size is empty", what);
@@ -1720,6 +1836,96 @@ mod tests {
         raw.try_into()
     }
 
+    /// Build a config from CLI overrides only (no file), exercising the same
+    /// raw-load + validation path `main` uses.
+    fn load_overrides(overrides: &ConfigOverrides) -> Result<Config> {
+        Config::load_raw(None, overrides)?.try_into()
+    }
+
+    #[test]
+    fn format_size_inverts_parse_size() {
+        for (bytes, text) in [
+            (0usize, "0"),
+            (512 * 1024, "512K"),
+            (1024 * 1024, "1M"),
+            (2 * 1024 * 1024, "2M"),
+            (16 * 1024 * 1024, "16M"),
+            (1024 * 1024 * 1024, "1G"),
+        ] {
+            assert_eq!(format_size(bytes), text, "format_size({bytes})");
+            assert_eq!(
+                parse_size(&format_size(bytes), "test").unwrap(),
+                bytes,
+                "round-trip {bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_config_serialize_round_trips() {
+        // A populated raw config (the kind the configuration screen builds)
+        // serialized to TOML and parsed back must be identical -- this guards
+        // the Serialize field names/ordering against the deny_unknown_fields
+        // deserialize schema.
+        let raw = RawConfig {
+            rom: Some("kick.rom".to_string()),
+            extended_rom: Some("ext.rom".to_string()),
+            identify: Some(false),
+            machine: RawMachine {
+                profile: Some("A1200".to_string()),
+                rtc: Some(true),
+            },
+            cpu: RawCpu {
+                model: Some("68EC020".to_string()),
+                fpu: Some(true),
+                clock_mhz: Some(14.18),
+                icache: Some(true),
+                dcache: None,
+            },
+            memory: RawMemory {
+                chip: Some("2M".to_string()),
+                fast: Some("8M".to_string()),
+                slow: None,
+                z3: None,
+            },
+            chipset: RawChipset {
+                revision: Some("AGA".to_string()),
+                video: Some("PAL".to_string()),
+                agnus: None,
+                denise: None,
+            },
+            ide: RawIde {
+                master: Some("hd0.hdf".to_string()),
+                slave: None,
+            },
+            floppy: RawFloppy {
+                drives: Some(2),
+                df0: Some(RawFloppyDrive {
+                    enabled: Some(true),
+                    path: Some("game.adf".to_string()),
+                    paths: None,
+                    write_protected: Some(true),
+                }),
+                ..RawFloppy::default()
+            },
+            zorro: vec![RawZorroBoard {
+                metadata: "board.toml".to_string(),
+            }],
+            ..RawConfig::default()
+        };
+        let text = raw.to_toml_string().unwrap();
+        let back: RawConfig = toml::from_str(&text).unwrap();
+        assert_eq!(raw, back, "round-trip mismatch; TOML was:\n{text}");
+    }
+
+    #[test]
+    fn default_raw_config_serializes_to_empty() {
+        // Nothing set means nothing written: a default machine saves as an
+        // empty file (which re-parses to the defaults).
+        let text = RawConfig::default().to_toml_string().unwrap();
+        assert!(text.trim().is_empty(), "expected empty TOML, got:\n{text}");
+    }
+
     #[test]
     fn rom_fingerprint_distinguishes_same_shape_kickstarts() {
         // Two machines of identical shape but different boot ROMs must compare
@@ -1888,9 +2094,10 @@ mod tests {
     #[test]
     fn machine_profiles_supply_defaults_and_keep_overrides() -> Result<()> {
         // No [machine] section: the default machine is the A500 Rev 6A
-        // (ECS 8372A Agnus + OCS 8362 Denise), no gate array, RTC fitted,
-        // stock 512K chip + 512K trapdoor slow RAM. cfg.machine stays None --
-        // the profile id only changes with an explicit [machine] profile.
+        // (ECS 8372A Agnus + OCS 8362 Denise), no gate array, no RTC (the base
+        // A500 had no battery clock), stock 512K chip + 512K trapdoor slow RAM.
+        // cfg.machine stays None -- the profile id only changes with an
+        // explicit [machine] profile.
         let cfg = parse_config("")?;
         assert_eq!(cfg.machine, None);
         assert_eq!(cfg.chipset, Chipset::Ecs);
@@ -1899,7 +2106,7 @@ mod tests {
         assert_eq!(cfg.gate_array, GateArray::None);
         assert_eq!(cfg.chip_ram_bytes, 512 * 1024);
         assert_eq!(cfg.slow_ram_bytes, 512 * 1024);
-        assert!(cfg.rtc_present);
+        assert!(!cfg.rtc_present);
 
         let cfg = parse_config(
             r#"
@@ -1941,20 +2148,22 @@ mod tests {
         assert_eq!(cfg.agnus_revision, AgnusRevision::Ecs8375);
         assert_eq!(cfg.denise_revision, DeniseRevision::Ecs8373);
         assert_eq!(cfg.cpu, CpuModel::M68000);
-        assert!(cfg.rtc_present);
+        // The base A600 shipped without a battery clock.
+        assert!(!cfg.rtc_present);
 
-        // Explicit sections override profile defaults.
+        // Explicit sections override profile defaults: an A600HD re-fits the
+        // RTC the base A600 lacks.
         let cfg = parse_config(
             r#"
             [machine]
             profile = "A600"
-            rtc = false
+            rtc = true
             [memory]
             chip = "2M"
             "#,
         )?;
         assert_eq!(cfg.chip_ram_bytes, 2 * 1024 * 1024);
-        assert!(!cfg.rtc_present);
+        assert!(cfg.rtc_present);
 
         let cfg = parse_config(
             r#"
@@ -2809,7 +3018,7 @@ mod tests {
             model: Some("A1200".to_string()),
             ..Default::default()
         };
-        let cfg = Config::load_with_overrides(None, &overrides)?;
+        let cfg = load_overrides(&overrides)?;
         assert_eq!(cfg.machine, Some(MachineModel::A1200));
         assert_eq!(cfg.cpu, CpuModel::M68EC020);
         assert_eq!(cfg.chipset, Chipset::Aga);
@@ -2830,7 +3039,7 @@ mod tests {
             fast: Some("4M".to_string()),
             ..Default::default()
         };
-        let cfg = Config::load_with_overrides(None, &overrides)?;
+        let cfg = load_overrides(&overrides)?;
         assert_eq!(cfg.machine, Some(MachineModel::A500));
         assert_eq!(cfg.cpu, CpuModel::M68020);
         assert!(cfg.fpu);
@@ -2846,14 +3055,14 @@ mod tests {
             floppy_drives: Some(4),
             ..Default::default()
         };
-        let cfg = Config::load_with_overrides(None, &overrides)?;
+        let cfg = load_overrides(&overrides)?;
         assert_eq!(cfg.floppy_connected, [true, true, true, true]);
 
         let overrides = ConfigOverrides {
             floppy_drives: Some(5),
             ..Default::default()
         };
-        let err = Config::load_with_overrides(None, &overrides).unwrap_err();
+        let err = load_overrides(&overrides).unwrap_err();
         assert!(err.to_string().contains("between 1 and 4"), "{err:#}");
         Ok(())
     }
@@ -2867,7 +3076,7 @@ mod tests {
             fpu: Some(true),
             ..Default::default()
         };
-        let err = Config::load_with_overrides(None, &overrides).unwrap_err();
+        let err = load_overrides(&overrides).unwrap_err();
         assert!(err.to_string().contains("coprocessor interface"), "{err:#}");
 
         // An unknown chipset name is rejected by the shared parser.
@@ -2875,7 +3084,7 @@ mod tests {
             chipset: Some("OCS3".to_string()),
             ..Default::default()
         };
-        let err = Config::load_with_overrides(None, &overrides).unwrap_err();
+        let err = load_overrides(&overrides).unwrap_err();
         assert!(err.to_string().contains("unknown chipset"), "{err:#}");
     }
 

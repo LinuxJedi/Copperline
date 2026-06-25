@@ -924,8 +924,19 @@ fn main() -> Result<()> {
     if cli.calibrate_gamepad {
         return gamepad::run_calibration();
     }
-    let mut cfg =
-        load_config(cli.config_path.as_deref(), &cli.overrides)?.with_rom_override(cli.rom_path);
+    let (cfg, mut raw_cfg) = load_config(cli.config_path.as_deref(), &cli.overrides)?;
+    if let Some(p) = &cli.rom_path {
+        raw_cfg.rom = Some(p.to_string_lossy().into_owned());
+    }
+
+    // With nothing specified, open the configuration screen instead of booting
+    // a default machine. Decided before resolving the bundled ROM so the
+    // launcher opens even when no Kickstart/AROS is present.
+    if launcher_requested(&cli) {
+        return run_configuration_screen(raw_cfg);
+    }
+
+    let mut cfg = cfg.with_rom_override(cli.rom_path.clone());
     resolve_bundled_rom(&mut cfg)?;
     let disk_insert_after = resolve_disk_insert_after(&mut cfg, cli.disk_insert_after)?;
 
@@ -960,6 +971,110 @@ fn main() -> Result<()> {
         return run_live_audio_profile(secs);
     }
 
+    // Best-effort realtime-like scheduling for the latency-critical threads.
+    // Resolved once here (env var overrides the config) so the audio sink can
+    // promote its callback thread and the pacer thread can be raised below.
+    let realtime_priority = priority::requested(cfg.emulation.realtime_priority);
+    if realtime_priority {
+        info!("priority: realtime-like thread scheduling requested (best effort)");
+    }
+    let audio: Box<dyn AudioSink> = if let Some(ref wav_path) = cli.audio_wav {
+        Box::new(WavSink::new(wav_path)?)
+    } else if cli.audio_live {
+        Box::new(CpalSink::new(realtime_priority)?)
+    } else {
+        Box::new(NullSink)
+    };
+    // Headless capture runs (screenshot / frame dump) advance the
+    // deterministic core unthrottled; the interactive window paces to
+    // wall-clock time. The emulated result is identical either way.
+    let headless_capture = cli.screenshot_after.is_some()
+        || cli.frame_dump.is_some()
+        || cli.benchmark_until.is_some()
+        || cli.gdb.is_some();
+    let paced = !headless_capture;
+    info!("emulation timing: deterministic core, paced={paced}");
+    let mut emu = build_machine(&cfg, audio, paced)?;
+    if let Some(path) = &cli.load_state {
+        let outcome = emu.load_state(path)?;
+        info!(
+            "save state loaded: {} ({}, resuming at {:.1}s emulated time)",
+            path.display(),
+            outcome.summary,
+            emu.bus().emulated_seconds()
+        );
+    }
+    // Arm reverse debugging (snapshot ring + optional one-shot "last writer"
+    // watchpoint) from the COPPERLINE_DBG_RR*/RWATCH environment.
+    if let Some(rr) = debugger::reverse_config_from_env() {
+        if envcfg::var("COPPERLINE_RTC_FIXED_SECS").is_none() {
+            warn!(
+                "reverse debugging is armed but COPPERLINE_RTC_FIXED_SECS is unset; \
+                 the guest RTC reads host wall-clock time, so replay may diverge. \
+                 Set COPPERLINE_RTC_FIXED_SECS for deterministic reverse debugging."
+            );
+        }
+        emu.enable_time_travel(rr.budget_mb, rr.interval_frames);
+        if let Some(addr) = rr.watch_addr {
+            emu.arm_reverse_watch(addr, rr.target_secs);
+        }
+    }
+    if let Some(target_secs) = cli.benchmark_until {
+        return run_headless_benchmark(emu, target_secs);
+    }
+    if let Some(gdb) = cli.gdb {
+        return gdbstub::run(emu, gdb);
+    }
+    let disk_write_protected = std::array::from_fn(|idx| {
+        cfg.floppy.drives[idx]
+            .as_ref()
+            .map(|d| d.write_protected)
+            .unwrap_or(true)
+    });
+    let app = App::new(
+        emu,
+        cfg.emulation.power_on,
+        cli.screenshot_after,
+        cli.save_state_after,
+        cli.frame_dump,
+        cli.press_after,
+        cli.click_after,
+        cli.joy_after,
+        cli.mouse_after,
+        disk_insert_after,
+        cli.record_input,
+        cfg.floppy_playlists.clone(),
+        disk_write_protected,
+        resolve_overscan(cfg.overscan),
+        resolve_phosphor(cfg.phosphor),
+        cfg.emulation.warp_speed,
+        about_machine_lines(&cfg),
+        raw_cfg,
+    );
+
+    // Elevate the thread that is about to run the event loop and the pacer.
+    // Only when actually pacing to wall-clock time: headless capture advances
+    // the core unthrottled, so priority buys it nothing.
+    if realtime_priority && paced {
+        priority::elevate_pacer_thread();
+    }
+    info!(
+        "entering event loop. {HOST_SHORTCUT_MODIFIER_LABEL}+Q to quit, {HOST_SHORTCUT_MODIFIER_LABEL}+S to screenshot, {HOST_SHORTCUT_MODIFIER_LABEL}+G to capture/release mouse."
+    );
+    app.run()
+}
+
+/// Build a fully-configured [`Emulator`] from a validated [`Config`]: the
+/// Zorro autoconfig chain, RAM/ROM (and the A1000 bootstrap special case),
+/// optional SCSI/IDE/CD controllers, floppy drives, Paula (with the supplied
+/// audio sink), and the CPU with its caches and machine descriptor. Shared by
+/// the command-line boot path in `main` and the configuration screen's Run
+/// button, so a machine built either way is identical.
+pub(crate) fn build_machine(
+    cfg: &Config,
+    audio: Box<dyn AudioSink>,
+    paced: bool,
+) -> Result<Emulator> {
     let mut zorro = cfg.build_zorro_chain()?;
     let mut scsi_board = if cfg.scsi.enabled() {
         let rom_path = cfg.scsi.rom.as_ref().expect("config validated [scsi] rom");
@@ -1007,21 +1122,7 @@ fn main() -> Result<()> {
     };
     let mut floppy = FloppyController::from_config(&cfg.floppy)?;
     floppy.set_connected_drives(cfg.floppy_connected);
-    // Best-effort realtime-like scheduling for the latency-critical threads.
-    // Resolved once here (env var overrides the config) so the audio sink can
-    // promote its callback thread and the pacer thread can be raised below.
-    let realtime_priority = priority::requested(cfg.emulation.realtime_priority);
-    if realtime_priority {
-        info!("priority: realtime-like thread scheduling requested (best effort)");
-    }
     let serial = Box::new(StdoutSink::new());
-    let audio: Box<dyn AudioSink> = if let Some(ref wav_path) = cli.audio_wav {
-        Box::new(WavSink::new(wav_path)?)
-    } else if cli.audio_live {
-        Box::new(CpalSink::new(realtime_priority)?)
-    } else {
-        Box::new(NullSink)
-    };
     let mut paula = Paula::new(serial, audio);
     paula
         .drive_sounds_mut()
@@ -1093,15 +1194,6 @@ fn main() -> Result<()> {
             machine, cfg.gate_array, cfg.rtc_present
         );
     }
-    // Headless capture runs (screenshot / frame dump) advance the
-    // deterministic core unthrottled; the interactive window paces to
-    // wall-clock time. The emulated result is identical either way.
-    let headless_capture = cli.screenshot_after.is_some()
-        || cli.frame_dump.is_some()
-        || cli.benchmark_until.is_some()
-        || cli.gdb.is_some();
-    let paced = !headless_capture;
-    info!("emulation timing: deterministic core, paced={paced}");
     let cpu_clocks_per_cck = crate::config::clocks_per_cck_for_mhz(cfg.cpu_clock_mhz);
     let mut emu = Emulator::new(
         bus,
@@ -1113,76 +1205,108 @@ fn main() -> Result<()> {
     )?;
     emu.set_cache_emulation(cfg.cpu_icache, cfg.cpu_dcache);
     emu.set_machine_descriptor(cfg.descriptor());
-    if let Some(path) = &cli.load_state {
-        let outcome = emu.load_state(path)?;
-        info!(
-            "save state loaded: {} ({}, resuming at {:.1}s emulated time)",
-            path.display(),
-            outcome.summary,
-            emu.bus().emulated_seconds()
-        );
-    }
-    // Arm reverse debugging (snapshot ring + optional one-shot "last writer"
-    // watchpoint) from the COPPERLINE_DBG_RR*/RWATCH environment.
-    if let Some(rr) = debugger::reverse_config_from_env() {
-        if envcfg::var("COPPERLINE_RTC_FIXED_SECS").is_none() {
-            warn!(
-                "reverse debugging is armed but COPPERLINE_RTC_FIXED_SECS is unset; \
-                 the guest RTC reads host wall-clock time, so replay may diverge. \
-                 Set COPPERLINE_RTC_FIXED_SECS for deterministic reverse debugging."
-            );
-        }
-        emu.enable_time_travel(rr.budget_mb, rr.interval_frames);
-        if let Some(addr) = rr.watch_addr {
-            emu.arm_reverse_watch(addr, rr.target_secs);
-        }
-    }
-    if let Some(target_secs) = cli.benchmark_until {
-        return run_headless_benchmark(emu, target_secs);
-    }
-    if let Some(gdb) = cli.gdb {
-        return gdbstub::run(emu, gdb);
-    }
-    let disk_write_protected = std::array::from_fn(|idx| {
-        cfg.floppy.drives[idx]
-            .as_ref()
-            .map(|d| d.write_protected)
-            .unwrap_or(true)
-    });
-    let app = App::new(
-        emu,
-        cfg.emulation.power_on,
-        cli.screenshot_after,
-        cli.save_state_after,
-        cli.frame_dump,
-        cli.press_after,
-        cli.click_after,
-        cli.joy_after,
-        cli.mouse_after,
-        disk_insert_after,
-        cli.record_input,
-        cfg.floppy_playlists.clone(),
-        disk_write_protected,
-        resolve_overscan(cfg.overscan),
-        resolve_phosphor(cfg.phosphor),
-        cfg.emulation.warp_speed,
-        about_machine_lines(&cfg),
-    );
+    Ok(emu)
+}
 
-    // Elevate the thread that is about to run the event loop and the pacer.
-    // Only when actually pacing to wall-clock time: headless capture advances
-    // the core unthrottled, so priority buys it nothing.
-    if realtime_priority && paced {
-        priority::elevate_pacer_thread();
+/// Build the minimal placeholder machine that hosts the configuration screen
+/// before a real machine is built. It needs no ROM file (a tiny in-memory ROM
+/// that immediately stops) and a null audio sink so it claims no audio device
+/// while it sits powered off behind the launcher; the user's chosen machine
+/// replaces it when they press Run.
+fn build_placeholder_machine() -> Result<Emulator> {
+    use crate::memory::{ROM_BASE, ROM_SIZE};
+    let mut rom = vec![0u8; ROM_SIZE];
+    // Reset vector: a small stack pointer and a PC just past it; the rest is a
+    // STOP-then-NOP sled, so the placeholder CPU does nothing if ever stepped.
+    rom[0..4].copy_from_slice(&0x0007_FFFEu32.to_be_bytes());
+    rom[4..8].copy_from_slice(&(ROM_BASE as u32 + 8).to_be_bytes());
+    for word in rom[8..].chunks_exact_mut(2) {
+        word.copy_from_slice(&0x4E71u16.to_be_bytes());
     }
-    info!(
-        "entering event loop. {HOST_SHORTCUT_MODIFIER_LABEL}+Q to quit, {HOST_SHORTCUT_MODIFIER_LABEL}+S to screenshot, {HOST_SHORTCUT_MODIFIER_LABEL}+G to capture/release mouse."
+    let mem = Memory {
+        chip_ram: vec![0u8; 512 * 1024],
+        slow_ram: Vec::new(),
+        rom,
+        overlay: true,
+        zorro: crate::zorro::ZorroChain::default(),
+        extended_rom: Vec::new(),
+        extended_rom_base: 0,
+        wcs: Vec::new(),
+        wcs_write_protected: false,
+    };
+    let bus = Bus::new(
+        mem,
+        Paula::new(Box::new(StdoutSink::new()), Box::new(NullSink)),
+        FloppyController::default(),
     );
+    Emulator::new(
+        bus,
+        crate::config::CpuModel::M68000,
+        false,
+        crate::config::PacingBudget::Cycles,
+        2,
+        true,
+    )
+}
+
+/// Open the machine-configuration screen (the launcher shown when Copperline is
+/// started with no machine specified). A placeholder machine sits powered off
+/// behind the panel until the user presses Run, which builds and starts their
+/// chosen machine in place.
+fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
+    info!("no machine specified; opening the configuration screen");
+    let emu = build_placeholder_machine()?;
+    let mut app = App::new(
+        emu,
+        false,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        std::array::from_fn(|_| Vec::new()),
+        [true; 4],
+        resolve_overscan(config::Overscan::Tv),
+        resolve_phosphor(0.0),
+        config::WarpSpeed::default(),
+        vec!["Configure a machine, then press Run.".to_string()],
+        raw_cfg,
+    );
+    app.open_launcher();
     app.run()
 }
 
+/// Whether to show the configuration screen instead of booting: only on a bare
+/// interactive launch with nothing specified (no config file, ROM, overrides,
+/// scripted input, headless capture, or save-state load), and with live audio
+/// (the launcher's Run path uses the live audio sink).
+fn launcher_requested(cli: &CliArgs) -> bool {
+    cli.config_path.is_none()
+        && cli.rom_path.is_none()
+        && cli.overrides.is_empty()
+        && !Path::new("copperline.toml").exists()
+        && cli.screenshot_after.is_none()
+        && cli.save_state_after.is_none()
+        && cli.frame_dump.is_none()
+        && cli.benchmark_until.is_none()
+        && cli.gdb.is_none()
+        && cli.load_state.is_none()
+        && cli.press_after.is_empty()
+        && cli.click_after.is_empty()
+        && cli.joy_after.is_empty()
+        && cli.mouse_after.is_empty()
+        && cli.disk_insert_after.is_empty()
+        && cli.record_input.is_none()
+        && cli.audio_wav.is_none()
+        && cli.audio_live
+}
+
 /// Emulated-machine summary lines for the About window.
-fn about_machine_lines(cfg: &Config) -> Vec<String> {
+pub(crate) fn about_machine_lines(cfg: &Config) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(machine) = cfg.machine {
         lines.push(format!("Machine: {machine:?}"));
@@ -1302,7 +1426,7 @@ fn read_profile_audio_word(chip_ram: &[u8], address: u32) -> u16 {
 /// Resolve the phosphor persistence fraction: the `COPPERLINE_PHOSPHOR`
 /// env var (0.0..=0.95) overrides the `[display] phosphor` config for one
 /// run.
-fn resolve_phosphor(from_config: f32) -> f32 {
+pub(crate) fn resolve_phosphor(from_config: f32) -> f32 {
     match crate::envcfg::var("COPPERLINE_PHOSPHOR") {
         Some(v) => match v.trim().parse::<f32>() {
             Ok(p) if (0.0..=0.95).contains(&p) => p,
@@ -1321,7 +1445,7 @@ fn resolve_phosphor(from_config: f32) -> f32 {
 /// (full/tv) overrides the `[display] overscan` config for one run. The
 /// image-regression harness pins "full" so its baselines always carry the
 /// whole overscan field regardless of the config default.
-fn resolve_overscan(from_config: crate::config::Overscan) -> crate::config::Overscan {
+pub(crate) fn resolve_overscan(from_config: crate::config::Overscan) -> crate::config::Overscan {
     match envcfg::var("COPPERLINE_OVERSCAN") {
         Some(v) => match crate::config::parse_overscan(&v) {
             Ok(o) => o,
@@ -1334,7 +1458,14 @@ fn resolve_overscan(from_config: crate::config::Overscan) -> crate::config::Over
     }
 }
 
-fn load_config(explicit: Option<&Path>, overrides: &ConfigOverrides) -> Result<Config> {
+/// Load the config, returning both the validated [`Config`] used to build the
+/// machine and the raw TOML view it came from. The configuration screen keeps
+/// the raw view so its "Machine Configuration..." menu item can reopen showing
+/// the running machine's settings.
+fn load_config(
+    explicit: Option<&Path>,
+    overrides: &ConfigOverrides,
+) -> Result<(Config, config::RawConfig)> {
     // Resolve which file (if any) backs the config: the explicit --config
     // path, then ./copperline.toml if present, otherwise the built-in
     // defaults. CLI overrides layer on top of whichever it is.
@@ -1347,7 +1478,9 @@ fn load_config(explicit: Option<&Path>, overrides: &ConfigOverrides) -> Result<C
     } else {
         None
     };
-    Config::load_with_overrides(path, overrides)
+    let raw = Config::load_raw(path, overrides)?;
+    let cfg = Config::try_from(raw.clone())?;
+    Ok((cfg, raw))
 }
 
 /// Substitute the bundled AROS ROM when the user named no ROM. The default
@@ -1357,7 +1490,7 @@ fn load_config(explicit: Option<&Path>, overrides: &ConfigOverrides) -> Result<C
 /// extended ROM pair and rewrite the config to point at them, so every
 /// downstream consumer (start-up banner, window title, save states) sees the
 /// real paths. An explicit `extended_rom` still wins over the AROS one.
-fn resolve_bundled_rom(cfg: &mut Config) -> Result<()> {
+pub(crate) fn resolve_bundled_rom(cfg: &mut Config) -> Result<()> {
     if cfg.rom_path != Path::new(config::BUNDLED_AROS_ROM) {
         return Ok(());
     }
@@ -1386,6 +1519,29 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<CliArgs> {
         parse_args_from(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn placeholder_machine_builds() {
+        // The configuration screen's host machine must build without any ROM
+        // file or audio device (it sits powered off behind the launcher).
+        build_placeholder_machine().expect("placeholder machine builds");
+    }
+
+    #[test]
+    fn launcher_shows_only_when_nothing_is_specified() {
+        // A bare interactive launch (no config file present in this dir under
+        // test) opens the configuration screen...
+        let bare = parse(&[]).unwrap();
+        assert!(launcher_requested(&bare));
+        // ...but specifying a ROM, an override, or a headless capture boots
+        // directly instead.
+        assert!(!launcher_requested(&parse(&["KICK.ROM"]).unwrap()));
+        assert!(!launcher_requested(&parse(&["--model", "A1200"]).unwrap()));
+        assert!(!launcher_requested(
+            &parse(&["--screenshot-after", "5", "out.png"]).unwrap()
+        ));
+        assert!(!launcher_requested(&parse(&["--noaudio"]).unwrap()));
     }
 
     fn temp_script(name: &str, contents: &str) -> PathBuf {

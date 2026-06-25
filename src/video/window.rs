@@ -6,15 +6,17 @@
 //! wgpu presentation stay on the main thread.
 
 use super::deinterlace::{Deinterlacer, OUT_HEIGHT};
+use super::launcher::{LauncherField, LauncherState, MachineSetup, StatusMessage};
 use super::ui::{self, Panel, UiControl, UiState};
 use super::{
     bitplane, blend_rgba, font, FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH,
     HOST_SHORTCUT_MODIFIER_LABEL, MAX_FB_PIXELS, PRESENT_HEIGHT,
 };
+use crate::audio::{AudioSink, CpalSink};
 use crate::bus::{
     BeamWriteSource, FrontPanelStatus, RenderRegisterSnapshot, VideoRenderFrameTiming,
 };
-use crate::config::{Overscan, WarpSpeed};
+use crate::config::{Config, Overscan, RawConfig, WarpSpeed};
 use crate::emulator::Emulator;
 use crate::screenshot;
 
@@ -552,6 +554,10 @@ pub struct App {
     ui: UiState,
     /// Emulated-machine summary lines for the About window.
     about_machine_lines: Vec<String>,
+    /// Raw config of the running (or last-applied) machine, so the "Machine
+    /// Configuration..." menu item reopens the launcher showing the current
+    /// settings.
+    machine_config: RawConfig,
     /// Host pause state before the debugger forced a pause, restored when
     /// the debugger window closes (unless Run was used inside it).
     paused_before_debugger: bool,
@@ -734,6 +740,7 @@ impl App {
         phosphor: f32,
         warp_speed: WarpSpeed,
         about_machine_lines: Vec<String>,
+        machine_config: RawConfig,
     ) -> Self {
         // Headless capture runs drive themselves off emulated time, so a
         // powered-off start would simply hang. Force power on for those.
@@ -808,6 +815,7 @@ impl App {
             keyboard_joy_held: KeyboardJoystickHeld::default(),
             ui: UiState::default(),
             about_machine_lines,
+            machine_config,
             paused_before_debugger: false,
             paused_before_analyzer: false,
             last_debug_stop: None,
@@ -1755,6 +1763,14 @@ fn display_file_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// A one-line, length-bounded form of an error for the configuration panel's
+/// status line (the full chain still goes to the log).
+fn short_status_error(err: &anyhow::Error) -> String {
+    let msg = err.to_string();
+    let first_line = msg.lines().next().unwrap_or("").trim();
+    first_line.chars().take(96).collect()
 }
 
 fn set_mouse_button(emu: &mut Emulator, button: MouseButtonKind, pressed: bool) {
@@ -4613,6 +4629,7 @@ impl App {
                     ui::MenuItem::SaveState => self.save_state_interactive(),
                     ui::MenuItem::LoadState => self.load_state_from_dialog(),
                     ui::MenuItem::LoadRom => self.load_rom_from_dialog(),
+                    ui::MenuItem::MachineConfig => self.open_launcher(),
                 }
             }
             UiControl::PanelClose | UiControl::CalCancel => self.close_panel(),
@@ -4676,6 +4693,54 @@ impl App {
             UiControl::AnalyzerPick { x, y, scanline } => {
                 self.frame_analyzer_select(x, y, scanline)
             }
+            UiControl::LauncherModel(model) => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.setup.select_model(Some(model));
+                    state.status = None;
+                }
+            }
+            UiControl::LauncherTab(tab) => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.tab = tab;
+                }
+            }
+            UiControl::LauncherCycle { field, forward } => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.setup.cycle(field, forward);
+                    state.status = None;
+                }
+            }
+            UiControl::LauncherToggle(field) => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.setup.toggle(field);
+                    state.status = None;
+                }
+            }
+            UiControl::LauncherClear(field) => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.setup.clear_path(field);
+                    state.status = None;
+                }
+            }
+            UiControl::LauncherZorroRemove(idx) => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.setup.remove_zorro(idx);
+                    state.status = None;
+                }
+            }
+            UiControl::LauncherDefaults => {
+                if let Some(state) = self.launcher_state_mut() {
+                    let model = state.setup.model();
+                    state.setup = MachineSetup::default();
+                    state.setup.select_model(model);
+                    state.status = Some(StatusMessage::ok("Reset to defaults"));
+                }
+            }
+            UiControl::LauncherBrowse(field) => self.launcher_browse(field),
+            UiControl::LauncherZorroAdd => self.launcher_add_zorro(),
+            UiControl::LauncherLoad => self.launcher_load(),
+            UiControl::LauncherSave => self.launcher_save(),
+            UiControl::LauncherRun => self.launcher_run(),
         }
         self.request_redraw();
     }
@@ -5040,6 +5105,222 @@ impl App {
         self.analyzer_dragging = false;
         self.ui.panel = None;
         self.resize_for_active_panel();
+        self.request_redraw();
+    }
+
+    /// Open the machine-configuration screen, seeded from the running (or
+    /// last-applied) machine so it reflects the current settings.
+    pub(crate) fn open_launcher(&mut self) {
+        self.ui.menu_open = false;
+        self.ui.panel = Some(Panel::Launcher(Box::new(LauncherState::from_raw(
+            &self.machine_config,
+        ))));
+        self.resize_for_active_panel();
+        self.request_redraw();
+    }
+
+    fn launcher_state(&self) -> Option<&LauncherState> {
+        match self.ui.panel.as_ref() {
+            Some(Panel::Launcher(state)) => Some(state.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn launcher_state_mut(&mut self) -> Option<&mut LauncherState> {
+        match self.ui.panel.as_mut() {
+            Some(Panel::Launcher(state)) => Some(state.as_mut()),
+            _ => None,
+        }
+    }
+
+    fn set_launcher_status(&mut self, status: StatusMessage) {
+        if let Some(state) = self.launcher_state_mut() {
+            state.status = Some(status);
+        }
+    }
+
+    /// Open a native file dialog for a configuration-screen path field, seeded
+    /// at the field's current directory, and store the picked path.
+    fn launcher_browse(&mut self, field: LauncherField) {
+        let start_dir = self
+            .launcher_state()
+            .and_then(|s| s.setup.path(field))
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        self.suspend_live_audio_for_host_io();
+        let mut dialog = rfd::FileDialog::new().set_title("Select file");
+        dialog = match field {
+            LauncherField::Rom
+            | LauncherField::ExtendedRom
+            | LauncherField::ScsiRom
+            | LauncherField::ScsiRomOdd => dialog.add_filter("ROM images", &["rom", "bin"]),
+            LauncherField::Df0Image
+            | LauncherField::Df1Image
+            | LauncherField::Df2Image
+            | LauncherField::Df3Image => {
+                dialog.add_filter("Floppy images", &["adf", "adz", "dms", "scp", "gz", "ipf"])
+            }
+            LauncherField::CdImage => dialog.add_filter("CD images", &["cue", "iso", "bin"]),
+            LauncherField::Cd32Nvram => dialog.add_filter("NVRAM images", &["bin", "nv", "sav"]),
+            _ => dialog.add_filter("Hard disk images", &["hdf", "img", "bin"]),
+        };
+        if let Some(dir) = start_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let picked = dialog.pick_file();
+        if let Some(path) = picked {
+            if let Some(state) = self.launcher_state_mut() {
+                state.setup.set_path(field, path);
+                state.status = None;
+            }
+        }
+        self.finish_host_io_pause();
+    }
+
+    fn launcher_add_zorro(&mut self) {
+        self.suspend_live_audio_for_host_io();
+        let picked = rfd::FileDialog::new()
+            .set_title("Add Zorro board metadata")
+            .add_filter("Board metadata", &["toml"])
+            .pick_file();
+        if let Some(path) = picked {
+            if let Some(state) = self.launcher_state_mut() {
+                state.setup.add_zorro(path);
+                state.status = None;
+            }
+        }
+        self.finish_host_io_pause();
+    }
+
+    fn launcher_load(&mut self) {
+        self.suspend_live_audio_for_host_io();
+        let picked = rfd::FileDialog::new()
+            .set_title("Load configuration")
+            .add_filter("Copperline config", &["toml"])
+            .pick_file();
+        if let Some(path) = picked {
+            match MachineSetup::load_from(&path) {
+                Ok(setup) => {
+                    if let Some(state) = self.launcher_state_mut() {
+                        state.setup = setup;
+                        state.status = Some(StatusMessage::ok(format!(
+                            "Loaded {}",
+                            display_file_name(&path)
+                        )));
+                    }
+                }
+                Err(e) => {
+                    warn!("config load failed ({}): {e:#}", path.display());
+                    self.set_launcher_status(StatusMessage::err(format!(
+                        "Load failed: {}",
+                        short_status_error(&e)
+                    )));
+                }
+            }
+        }
+        self.finish_host_io_pause();
+    }
+
+    fn launcher_save(&mut self) {
+        let toml = match self.launcher_state().map(|s| s.setup.to_toml()) {
+            Some(Ok(text)) => text,
+            Some(Err(e)) => {
+                self.set_launcher_status(StatusMessage::err(format!(
+                    "Save failed: {}",
+                    short_status_error(&e)
+                )));
+                return;
+            }
+            None => return,
+        };
+        self.suspend_live_audio_for_host_io();
+        let picked = rfd::FileDialog::new()
+            .set_title("Save configuration")
+            .add_filter("Copperline config", &["toml"])
+            .set_file_name("machine.toml")
+            .save_file();
+        if let Some(path) = picked {
+            match std::fs::write(&path, toml) {
+                Ok(()) => self.set_launcher_status(StatusMessage::ok(format!(
+                    "Saved {}",
+                    display_file_name(&path)
+                ))),
+                Err(e) => {
+                    warn!("config save failed ({}): {e}", path.display());
+                    self.set_launcher_status(StatusMessage::err("Save failed (see log)"));
+                }
+            }
+        }
+        self.finish_host_io_pause();
+    }
+
+    /// Build and start the configured machine (the Run button). Validation,
+    /// AROS resolution, audio-device and machine-construction errors all stay
+    /// in the panel as a status line; only success swaps the live machine.
+    fn launcher_run(&mut self) {
+        let mut cfg = match self.launcher_state().map(|s| s.setup.build_config()) {
+            Some(Ok(cfg)) => cfg,
+            Some(Err(e)) => {
+                self.set_launcher_status(StatusMessage::err(short_status_error(&e)));
+                return;
+            }
+            None => return,
+        };
+        if let Err(e) = crate::resolve_bundled_rom(&mut cfg) {
+            self.set_launcher_status(StatusMessage::err(short_status_error(&e)));
+            return;
+        }
+        let realtime = crate::priority::requested(cfg.emulation.realtime_priority);
+        let audio: Box<dyn AudioSink> = match CpalSink::new(realtime) {
+            Ok(sink) => Box::new(sink),
+            Err(e) => {
+                self.set_launcher_status(StatusMessage::err(format!(
+                    "Audio init failed: {}",
+                    short_status_error(&e)
+                )));
+                return;
+            }
+        };
+        let emu = match crate::build_machine(&cfg, audio, true) {
+            Ok(emu) => emu,
+            Err(e) => {
+                self.set_launcher_status(StatusMessage::err(short_status_error(&e)));
+                return;
+            }
+        };
+        let raw = self
+            .launcher_state()
+            .map(|s| s.setup.to_raw())
+            .unwrap_or_default();
+        self.run_machine(emu, &cfg, raw);
+    }
+
+    /// Replace the live machine with a freshly built one (configuration screen
+    /// Run), refreshing the host-side presentation/runtime state to match and
+    /// powering it on. The previous (placeholder or running) machine, and its
+    /// audio sink, are dropped here.
+    fn run_machine(&mut self, emu: Emulator, cfg: &Config, raw: RawConfig) {
+        self.emu = emu;
+        self.machine_config = raw;
+        self.disk_playlists = cfg.floppy_playlists.clone();
+        self.disk_write_protected = std::array::from_fn(|i| {
+            cfg.floppy.drives[i]
+                .as_ref()
+                .map(|d| d.write_protected)
+                .unwrap_or(true)
+        });
+        self.disk_playlist_index = [0; 4];
+        self.overscan = crate::resolve_overscan(cfg.overscan);
+        self.warp_speed = cfg.emulation.warp_speed;
+        self.about_machine_lines = crate::about_machine_lines(cfg);
+        self.deinterlacer = Deinterlacer::with_phosphor(crate::resolve_phosphor(cfg.phosphor));
+        self.ui.menu_open = false;
+        self.ui.panel = None;
+        self.powered_on = true;
+        self.cpu_halted = false;
+        self.paused = false;
+        self.reset_render_pipeline();
+        self.resize_for_active_panel();
+        self.show_osd("Machine started");
         self.request_redraw();
     }
 
@@ -5681,6 +5962,8 @@ impl App {
             Panel::FrameAnalyzer(panel) => Some(ui::PanelViewData::FrameAnalyzer(Box::new(
                 self.build_frame_analyzer_view(panel),
             ))),
+            // The configuration panel renders straight from its own state.
+            Panel::Launcher(_) => None,
         }
     }
 
@@ -7109,7 +7392,7 @@ fn parse_u8(s: &str) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::ui::Panel;
+    use super::ui::{Panel, UiControl};
     use super::{
         bar_layout, center_present_frame_for_visible_start, center_present_frame_horizontally,
         control_at, copperline_icon_image, copperline_logo_image, copy_present_frame,
@@ -7133,6 +7416,7 @@ mod tests {
     use crate::config::WarpSpeed;
     use crate::video::{FB_HEIGHT, FB_PIXELS, FB_WIDTH};
     use std::cell::RefCell;
+    use std::path::PathBuf;
     use std::rc::Rc;
     use winit::keyboard::{KeyCode, ModifiersState};
 
@@ -8331,7 +8615,64 @@ mod tests {
             0.0,
             crate::config::WarpSpeed::Max,
             vec!["Machine: test".to_string()],
+            crate::config::RawConfig::default(),
         )
+    }
+
+    #[test]
+    fn launcher_panel_edits_machine_setup() {
+        use crate::config::MachineModel;
+        use crate::video::launcher::{LauncherField, LauncherTab};
+
+        let mut app = test_app();
+        app.open_launcher();
+        assert!(matches!(app.ui.panel, Some(Panel::Launcher(_))));
+
+        // Pick a machine, switch tabs, and flip a toggle through the same
+        // control dispatch the mouse uses.
+        app.activate_ui_control(UiControl::LauncherModel(MachineModel::A1200));
+        app.activate_ui_control(UiControl::LauncherTab(LauncherTab::Cpu));
+        app.activate_ui_control(UiControl::LauncherToggle(LauncherField::Fpu));
+
+        let state = match &app.ui.panel {
+            Some(Panel::Launcher(state)) => state,
+            _ => panic!("launcher closed unexpectedly"),
+        };
+        assert_eq!(state.setup.model(), Some(MachineModel::A1200));
+        assert_eq!(state.tab, LauncherTab::Cpu);
+        // The A1200's profile defaults (AGA, EC020, 2M chip) plus the FPU we
+        // toggled on are what a save would emit.
+        let raw = state.setup.to_raw();
+        assert_eq!(raw.machine.profile.as_deref(), Some("A1200"));
+        assert_eq!(raw.cpu.fpu, Some(true));
+        assert!(state.setup.build_config().is_ok());
+    }
+
+    #[test]
+    fn launcher_run_keeps_panel_open_on_error() {
+        use crate::video::launcher::LauncherField;
+
+        let mut app = test_app();
+        app.powered_on = false;
+        app.open_launcher();
+        // A floppy image that does not exist fails config validation.
+        if let Some(Panel::Launcher(state)) = app.ui.panel.as_mut() {
+            state
+                .setup
+                .set_path(LauncherField::Df0Image, PathBuf::from("/no/such/disk.adf"));
+        }
+        app.launcher_run();
+        match &app.ui.panel {
+            Some(Panel::Launcher(state)) => assert!(
+                state.status.as_ref().is_some_and(|s| s.error),
+                "expected an error status to keep the user in the launcher"
+            ),
+            _ => panic!("launcher should stay open on a validation error"),
+        }
+        assert!(
+            !app.powered_on,
+            "a failed Run must not power the machine on"
+        );
     }
 
     struct SuspensionSink {

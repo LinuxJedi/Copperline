@@ -93,7 +93,7 @@ model = "68000"
 # slow RAM) -- the most common and most-targeted Amiga.
 # [machine]
 # profile = "A600"      # A1000 | A500 | A500OCS | A500Plus | A600 | A1200 | CDTV | CD32
-# rtc = true            # $DC0000 RTC fitted (base A600 shipped without)
+# rtc = true            # add a $DC0000 battery RTC (default: only A500+/CDTV have one)
 
 
 # Extended ROM image for CDTV/CD32 machines: a 256 KiB image maps at

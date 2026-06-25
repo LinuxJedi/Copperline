@@ -89,7 +89,7 @@ missing.
 ```toml
 [machine]
 profile = "A1200" # A1000, A500, A500OCS, A500Plus (A500+), A600, A1200, CDTV, CD32
-rtc = true        # whether the $DC0000 battery RTC is fitted
+rtc = true        # add a battery RTC (default: only A500+/CDTV ship with one)
 ```
 
 A machine profile bundles the chipset, CPU, memory, gate array, and
@@ -108,15 +108,16 @@ gives a plain 8371/8362 OCS machine.
 | `A500` | Rev 6A: ECS 8372A Agnus, OCS 8362 Denise | 68000 @ 7.09 MHz | 512K (up to 1M) | 512K | -- |
 | `A500OCS` | OCS (8371 Fat Agnus, OCS Denise) | 68000 @ 7.09 MHz | 512K | 512K | early A500 / A2000 |
 | `A500Plus` | ECS (8375 Agnus, ECS Denise) | 68000 @ 7.09 MHz | 1M | 0 | RTC |
-| `A600` | ECS (8375 Agnus, ECS Denise) | 68000 @ 7.09 MHz | 1M | 0 | Gayle IDE, RTC |
-| `A1200` | AGA (Alice/Lisa) | 68EC020 @ 14.18 MHz | 2M | 0 | Gayle IDE, RTC |
-| `CDTV` | ECS | 68000 @ 7.09 MHz | 1M | 0 | DMAC CD controller, 256K extended ROM |
+| `A600` | ECS (8375 Agnus, ECS Denise) | 68000 @ 7.09 MHz | 1M | 0 | Gayle IDE |
+| `A1200` | AGA (Alice/Lisa) | 68EC020 @ 14.18 MHz | 2M | 0 | Gayle IDE |
+| `CDTV` | ECS | 68000 @ 7.09 MHz | 1M | 0 | DMAC CD controller, RTC, 256K extended ROM |
 | `CD32` | AGA (Alice/Lisa) | 68EC020 @ 14.18 MHz | 2M | 0 | Akiko, CD32 pad, NVRAM, 512K extended ROM |
 
-`rtc` exists because some machines shipped both ways: the base A600 had no
-RTC while the A600HD did. The default keeps it fitted so the Workbench
-clock works. The A500+ has an OKI RTC soldered to the motherboard, so its
-profile fits one; the A1000 has none.
+`rtc` exists because most Amigas shipped without a battery-backed clock and
+only some carried one. Only the `A500Plus` (an OKI RTC soldered to the Rev 8A
+board) and `CDTV` fit one by default; the base A500/A500OCS, A600, A1200,
+A1000, and CD32 have none. Set `rtc = true` to add one -- for an A600HD or a
+clock-equipped A1200, say -- so the Workbench clock keeps time.
 
 The `A1000` profile models the original Amiga, which has no Kickstart ROM.
 Its `rom` is instead the 64K bootstrap ROM ("Amiga ROM Bootstrap"); on

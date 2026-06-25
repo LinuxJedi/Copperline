@@ -1,0 +1,1298 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! The pre-boot machine-configuration screen's data model.
+//!
+//! When Copperline is started with no config (and from the "Machine
+//! Configuration..." menu item) a launcher panel lets the user pick a machine
+//! and configure everything about it before pressing Run. This module holds the
+//! editable model behind that panel; the panel's pixel layout and hit-testing
+//! live in [`crate::video::ui`], and the App integration (file dialogs, Run,
+//! Save) lives in [`crate::video::window`].
+//!
+//! [`MachineSetup`] is a fully-typed editable mirror of the configurable
+//! machine. It is built from, and converted back to, the loadable
+//! [`RawConfig`]: loading parses a file into a `RawConfig`, validates it through
+//! the existing `TryFrom<RawConfig> for Config` pipeline, then fills the typed
+//! fields; Run and Save go the other way via [`MachineSetup::to_raw`], so the
+//! configuration screen reuses all of the config layer's validation and
+//! profile-default logic instead of duplicating it. `to_raw` emits only the
+//! fields that differ from the selected profile's defaults, so a saved file
+//! reads like the hand-written `*.example.toml`.
+
+use crate::chipset::agnus::{AgnusRevision, VideoStandard};
+use crate::chipset::denise::DeniseRevision;
+use crate::config::{
+    format_size, machine_profile_defaults, Chipset, Config, CpuModel, MachineModel, Overscan,
+    PacingBudget, RawConfig, RawFloppyDrive, RawZorroBoard, WarpSpeed,
+};
+use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+/// The configuration screen's category tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherTab {
+    System,
+    Cpu,
+    Memory,
+    Rom,
+    Floppy,
+    Storage,
+    Cd,
+    Zorro,
+    AvEmulation,
+}
+
+/// Tab strip, left to right.
+pub const TABS: [LauncherTab; 9] = [
+    LauncherTab::System,
+    LauncherTab::Cpu,
+    LauncherTab::Memory,
+    LauncherTab::Rom,
+    LauncherTab::Floppy,
+    LauncherTab::Storage,
+    LauncherTab::Cd,
+    LauncherTab::Zorro,
+    LauncherTab::AvEmulation,
+];
+
+impl LauncherTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            LauncherTab::System => "System",
+            LauncherTab::Cpu => "CPU",
+            LauncherTab::Memory => "Memory",
+            LauncherTab::Rom => "ROM",
+            LauncherTab::Floppy => "Floppy",
+            LauncherTab::Storage => "Hard Disk",
+            LauncherTab::Cd => "CD",
+            LauncherTab::Zorro => "Zorro",
+            LauncherTab::AvEmulation => "A/V & Emu",
+        }
+    }
+}
+
+/// A single editable setting. Parameter-free variants keep the per-tab row
+/// tables and `UiControl` hit-testing simple (every control is one `Copy` enum
+/// value); the floppy/SCSI families are spelled out rather than indexed for the
+/// same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherField {
+    // System
+    Chipset,
+    Agnus,
+    Denise,
+    Video,
+    Rtc,
+    Identify,
+    // CPU
+    Cpu,
+    Fpu,
+    Clock,
+    Icache,
+    Dcache,
+    // Memory
+    ChipRam,
+    FastRam,
+    SlowRam,
+    Z3Ram,
+    // ROM
+    Rom,
+    ExtendedRom,
+    // Floppy
+    FloppyDrives,
+    Df0Image,
+    Df0WriteProtect,
+    Df1Image,
+    Df1WriteProtect,
+    Df2Image,
+    Df2WriteProtect,
+    Df3Image,
+    Df3WriteProtect,
+    // Hard disk
+    IdeMaster,
+    IdeSlave,
+    ScsiRom,
+    ScsiRomOdd,
+    ScsiUnit0,
+    ScsiUnit1,
+    ScsiUnit2,
+    ScsiUnit3,
+    ScsiUnit4,
+    ScsiUnit5,
+    ScsiUnit6,
+    // CD
+    CdImage,
+    CdInsertDelay,
+    Cd32Nvram,
+    // A/V and emulation
+    Overscan,
+    Phosphor,
+    FloppySounds,
+    FloppyVolume,
+    PowerOn,
+    PacingBudget,
+    RealtimePriority,
+    Warp,
+}
+
+/// How a row's value is edited, and therefore which widget the panel draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// A `[<] value [>]` picker / stepper.
+    Cycle,
+    /// An On/Off button.
+    Toggle,
+    /// A file path with Browse/Clear buttons.
+    Path,
+}
+
+/// One settings row: a label, the field it edits, and how to edit it.
+#[derive(Debug, Clone, Copy)]
+pub struct Row {
+    pub field: LauncherField,
+    pub label: &'static str,
+    pub kind: RowKind,
+}
+
+const fn row(field: LauncherField, label: &'static str, kind: RowKind) -> Row {
+    Row { field, label, kind }
+}
+
+use LauncherField as F;
+use RowKind::{Cycle, Toggle};
+// `RowKind::Path` is written out below so it does not collide with the
+// `std::path::Path` import.
+use RowKind::Path as PathRow;
+
+const SYSTEM_ROWS: [Row; 6] = [
+    row(F::Chipset, "Chipset", Cycle),
+    row(F::Agnus, "Agnus", Cycle),
+    row(F::Denise, "Denise", Cycle),
+    row(F::Video, "Video", Cycle),
+    row(F::Rtc, "Real-time clock", Toggle),
+    row(F::Identify, "Identify board", Toggle),
+];
+const CPU_ROWS: [Row; 5] = [
+    row(F::Cpu, "CPU", Cycle),
+    row(F::Fpu, "FPU (68881/2)", Toggle),
+    row(F::Clock, "Clock", Cycle),
+    row(F::Icache, "Instruction cache", Toggle),
+    row(F::Dcache, "Data cache", Toggle),
+];
+const MEMORY_ROWS: [Row; 4] = [
+    row(F::ChipRam, "Chip RAM", Cycle),
+    row(F::FastRam, "Fast RAM", Cycle),
+    row(F::SlowRam, "Slow RAM", Cycle),
+    row(F::Z3Ram, "Zorro III RAM", Cycle),
+];
+const ROM_ROWS: [Row; 2] = [
+    row(F::Rom, "Kickstart ROM", PathRow),
+    row(F::ExtendedRom, "Extended ROM", PathRow),
+];
+const FLOPPY_ROWS: [Row; 9] = [
+    row(F::FloppyDrives, "Drives", Cycle),
+    row(F::Df0Image, "DF0 image", PathRow),
+    row(F::Df0WriteProtect, "DF0 write-protect", Toggle),
+    row(F::Df1Image, "DF1 image", PathRow),
+    row(F::Df1WriteProtect, "DF1 write-protect", Toggle),
+    row(F::Df2Image, "DF2 image", PathRow),
+    row(F::Df2WriteProtect, "DF2 write-protect", Toggle),
+    row(F::Df3Image, "DF3 image", PathRow),
+    row(F::Df3WriteProtect, "DF3 write-protect", Toggle),
+];
+const STORAGE_ROWS: [Row; 11] = [
+    row(F::IdeMaster, "IDE master", PathRow),
+    row(F::IdeSlave, "IDE slave", PathRow),
+    row(F::ScsiRom, "SCSI boot ROM", PathRow),
+    row(F::ScsiRomOdd, "SCSI ROM (odd)", PathRow),
+    row(F::ScsiUnit0, "SCSI unit 0", PathRow),
+    row(F::ScsiUnit1, "SCSI unit 1", PathRow),
+    row(F::ScsiUnit2, "SCSI unit 2", PathRow),
+    row(F::ScsiUnit3, "SCSI unit 3", PathRow),
+    row(F::ScsiUnit4, "SCSI unit 4", PathRow),
+    row(F::ScsiUnit5, "SCSI unit 5", PathRow),
+    row(F::ScsiUnit6, "SCSI unit 6", PathRow),
+];
+const CD_ROWS: [Row; 3] = [
+    row(F::CdImage, "CD image", PathRow),
+    row(F::CdInsertDelay, "Insert delay", Cycle),
+    row(F::Cd32Nvram, "CD32 NVRAM", PathRow),
+];
+const AV_EMULATION_ROWS: [Row; 8] = [
+    row(F::Overscan, "Overscan", Cycle),
+    row(F::Phosphor, "Phosphor", Cycle),
+    row(F::FloppySounds, "Floppy sounds", Toggle),
+    row(F::FloppyVolume, "Floppy volume", Cycle),
+    row(F::PowerOn, "Power on at start", Toggle),
+    row(F::PacingBudget, "Pacing budget", Cycle),
+    row(F::RealtimePriority, "Realtime priority", Toggle),
+    row(F::Warp, "Warp speed", Cycle),
+];
+
+/// The rows shown on a tab, top to bottom. The `Zorro` tab has no rows: it is
+/// drawn as a board list with Add/Remove controls (see the panel code).
+pub fn rows(tab: LauncherTab) -> &'static [Row] {
+    match tab {
+        LauncherTab::System => &SYSTEM_ROWS,
+        LauncherTab::Cpu => &CPU_ROWS,
+        LauncherTab::Memory => &MEMORY_ROWS,
+        LauncherTab::Rom => &ROM_ROWS,
+        LauncherTab::Floppy => &FLOPPY_ROWS,
+        LauncherTab::Storage => &STORAGE_ROWS,
+        LauncherTab::Cd => &CD_ROWS,
+        LauncherTab::Zorro => &[],
+        LauncherTab::AvEmulation => &AV_EMULATION_ROWS,
+    }
+}
+
+/// Machine models offered in the selector strip, roughly chronological.
+pub const MODELS: [MachineModel; 8] = [
+    MachineModel::A1000,
+    MachineModel::A500Ocs,
+    MachineModel::A500,
+    MachineModel::A500Plus,
+    MachineModel::A600,
+    MachineModel::A1200,
+    MachineModel::Cdtv,
+    MachineModel::Cd32,
+];
+
+// --- value preset lists for the cycle/stepper controls -------------------
+
+const CHIPSETS: [Chipset; 3] = [Chipset::Ocs, Chipset::Ecs, Chipset::Aga];
+const AGNUS_CHOICES: [Option<AgnusRevision>; 5] = [
+    None,
+    Some(AgnusRevision::Ocs),
+    Some(AgnusRevision::Ecs8372Rev4),
+    Some(AgnusRevision::Ecs8375),
+    Some(AgnusRevision::AgaAlice),
+];
+const DENISE_CHOICES: [Option<DeniseRevision>; 4] = [
+    None,
+    Some(DeniseRevision::Ocs),
+    Some(DeniseRevision::Ecs8373),
+    Some(DeniseRevision::AgaLisa),
+];
+const VIDEO_CHOICES: [VideoStandard; 2] = [VideoStandard::Pal, VideoStandard::Ntsc];
+const CPUS: [CpuModel; 5] = [
+    CpuModel::M68000,
+    CpuModel::M68EC020,
+    CpuModel::M68020,
+    CpuModel::M68030,
+    CpuModel::M68040,
+];
+const CLOCK_PRESETS: [f64; 8] = [7.09, 14.0, 14.18, 25.0, 28.0, 33.0, 40.0, 50.0];
+const CHIP_PRESETS: [usize; 4] = [256 * 1024, 512 * 1024, 1024 * 1024, 2 * 1024 * 1024];
+const FAST_PRESETS: [usize; 9] = [
+    0,
+    64 * 1024,
+    128 * 1024,
+    256 * 1024,
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
+    8 * 1024 * 1024,
+];
+const SLOW_PRESETS: [usize; 3] = [0, 256 * 1024, 512 * 1024];
+const Z3_PRESETS: [usize; 8] = [
+    0,
+    16 * 1024 * 1024,
+    32 * 1024 * 1024,
+    64 * 1024 * 1024,
+    128 * 1024 * 1024,
+    256 * 1024 * 1024,
+    512 * 1024 * 1024,
+    1024 * 1024 * 1024,
+];
+const OVERSCANS: [Overscan; 2] = [Overscan::Tv, Overscan::Full];
+const PACINGS: [PacingBudget; 2] = [PacingBudget::Cycles, PacingBudget::Instructions];
+const WARPS: [WarpSpeed; 5] = [
+    WarpSpeed::X2,
+    WarpSpeed::X4,
+    WarpSpeed::X8,
+    WarpSpeed::X16,
+    WarpSpeed::Max,
+];
+
+/// A fully-typed, editable mirror of a configurable machine. See the module
+/// docs for how it round-trips through [`RawConfig`].
+#[derive(Debug, Clone)]
+pub struct MachineSetup {
+    /// Selected machine profile (`None` is the no-profile default, equivalent
+    /// to the `A500`).
+    model: Option<MachineModel>,
+    // System
+    chipset: Chipset,
+    /// Explicit Agnus override; `None` derives from the chipset/profile.
+    agnus: Option<AgnusRevision>,
+    /// Explicit Denise override; `None` derives from the chipset/profile.
+    denise: Option<DeniseRevision>,
+    video: VideoStandard,
+    rtc: bool,
+    identify: bool,
+    // CPU
+    cpu: CpuModel,
+    fpu: bool,
+    clock_mhz: f64,
+    icache: bool,
+    dcache: bool,
+    // Memory (bytes)
+    chip_ram: usize,
+    fast_ram: usize,
+    slow_ram: usize,
+    z3_ram: usize,
+    // ROM (None = bundled AROS for the boot ROM, none for extended)
+    rom: Option<PathBuf>,
+    extended_rom: Option<PathBuf>,
+    // Floppy
+    floppy_drives: u8,
+    /// Per-drive disk-swap playlists (entry 0 is the boot disk). A single
+    /// image is a one-element list.
+    df_playlists: [Vec<PathBuf>; 4],
+    df_write_protected: [bool; 4],
+    // Hard disk
+    ide_master: Option<PathBuf>,
+    ide_slave: Option<PathBuf>,
+    scsi_rom: Option<PathBuf>,
+    scsi_rom_odd: Option<PathBuf>,
+    scsi_units: [Option<PathBuf>; 7],
+    // CD
+    cd_image: Option<PathBuf>,
+    cd_insert_delay: f64,
+    cd32_nvram: Option<PathBuf>,
+    // A/V and emulation
+    overscan: Overscan,
+    phosphor: f32,
+    floppy_sounds: bool,
+    floppy_volume: u8,
+    power_on: bool,
+    pacing_budget: PacingBudget,
+    realtime_priority: bool,
+    warp: WarpSpeed,
+    // Extra Zorro boards by metadata-file path
+    zorro_boards: Vec<PathBuf>,
+}
+
+impl Default for MachineSetup {
+    fn default() -> Self {
+        // The empty raw config is always valid (the built-in defaults).
+        Self::from_raw(&RawConfig::default()).expect("default config is valid")
+    }
+}
+
+impl MachineSetup {
+    /// Build the typed model from a raw config, validating it through the
+    /// config pipeline first. The validated [`Config`] supplies the resolved
+    /// scalar values; the raw view supplies the things `Config` does not
+    /// preserve: whether the Agnus/Denise were explicit overrides, the
+    /// "no boot ROM = AROS" distinction, and the `[[zorro]]` board paths.
+    pub fn from_raw(raw: &RawConfig) -> Result<Self> {
+        let cfg: Config = raw.clone().try_into()?;
+        let df_write_protected = std::array::from_fn(|i| {
+            cfg.floppy.drives[i]
+                .as_ref()
+                .map(|d| d.write_protected)
+                .unwrap_or(true)
+        });
+        let connected = cfg.floppy_connected.iter().filter(|&&c| c).count().max(1) as u8;
+        Ok(Self {
+            model: cfg.machine,
+            chipset: cfg.chipset,
+            agnus: raw.chipset.agnus.is_some().then_some(cfg.agnus_revision),
+            denise: raw.chipset.denise.is_some().then_some(cfg.denise_revision),
+            video: cfg.video_standard,
+            rtc: cfg.rtc_present,
+            identify: cfg.identify_board,
+            cpu: cfg.cpu,
+            fpu: cfg.fpu,
+            clock_mhz: cfg.cpu_clock_mhz,
+            icache: cfg.cpu_icache,
+            dcache: cfg.cpu_dcache,
+            chip_ram: cfg.chip_ram_bytes,
+            fast_ram: cfg.fast_ram_bytes,
+            slow_ram: cfg.slow_ram_bytes,
+            z3_ram: cfg.z3_ram_bytes,
+            rom: raw.rom.as_deref().map(PathBuf::from),
+            extended_rom: raw.extended_rom.as_deref().map(PathBuf::from),
+            floppy_drives: raw.floppy.drives.unwrap_or(connected).clamp(1, 4),
+            df_playlists: cfg.floppy_playlists.clone(),
+            df_write_protected,
+            ide_master: cfg.ide.master.clone(),
+            ide_slave: cfg.ide.slave.clone(),
+            scsi_rom: cfg.scsi.rom.clone(),
+            scsi_rom_odd: cfg.scsi.rom_odd.clone(),
+            scsi_units: cfg.scsi.units.clone(),
+            cd_image: cfg.cd_image_path.clone(),
+            cd_insert_delay: cfg.cd_insert_delay_secs,
+            // Use the raw NVRAM path: Config defaults it to "cd32-nvram.bin"
+            // on CD32, which we do not want to persist as an explicit setting.
+            cd32_nvram: raw.cd.nvram.as_deref().map(PathBuf::from),
+            overscan: cfg.overscan,
+            phosphor: cfg.phosphor,
+            floppy_sounds: cfg.audio.floppy_sounds,
+            floppy_volume: cfg.audio.floppy_sounds_volume,
+            power_on: cfg.emulation.power_on,
+            pacing_budget: cfg.emulation.pacing_budget,
+            realtime_priority: cfg.emulation.realtime_priority,
+            warp: cfg.emulation.warp_speed,
+            zorro_boards: raw
+                .zorro
+                .iter()
+                .map(|b| PathBuf::from(&b.metadata))
+                .collect(),
+        })
+    }
+
+    /// Load a configuration file into the typed model, validating it.
+    pub fn load_from(path: &Path) -> Result<Self> {
+        Self::from_raw(&crate::config::raw_from_path(path)?)
+    }
+
+    /// The bare-profile config this setup is compared against when emitting
+    /// minimal TOML: the machine the selected profile produces with no
+    /// overrides, resolved through the same `TryFrom` as a real boot so the
+    /// comparison matches exactly (including derived clock/cache defaults).
+    fn baseline(&self) -> Config {
+        let mut raw = RawConfig::default();
+        raw.machine.profile = self.model.map(|m| model_name(m).to_string());
+        raw.try_into().unwrap_or_else(|_| {
+            self.model
+                .map_or_else(Config::default, machine_profile_defaults)
+        })
+    }
+
+    /// Convert back to a raw config, emitting only the fields that differ from
+    /// the selected profile's defaults (so saved files stay minimal).
+    pub fn to_raw(&self) -> RawConfig {
+        let base = self.baseline();
+        let mut raw = RawConfig::default();
+        if let Some(m) = self.model {
+            raw.machine.profile = Some(model_name(m).to_string());
+        }
+        // System
+        if self.chipset != base.chipset {
+            raw.chipset.revision = Some(chipset_name(self.chipset).to_string());
+        }
+        if let Some(a) = self.agnus {
+            raw.chipset.agnus = Some(agnus_name(a).to_string());
+        }
+        if let Some(d) = self.denise {
+            raw.chipset.denise = Some(denise_name(d).to_string());
+        }
+        if self.video != base.video_standard {
+            raw.chipset.video = Some(video_name(self.video).to_string());
+        }
+        if self.rtc != base.rtc_present {
+            raw.machine.rtc = Some(self.rtc);
+        }
+        if self.identify != base.identify_board {
+            raw.identify = Some(self.identify);
+        }
+        // CPU
+        if self.cpu != base.cpu {
+            raw.cpu.model = Some(cpu_name(self.cpu).to_string());
+        }
+        if self.fpu != base.fpu {
+            raw.cpu.fpu = Some(self.fpu);
+        }
+        if (self.clock_mhz - base.cpu_clock_mhz).abs() > 1e-9 {
+            raw.cpu.clock_mhz = Some(self.clock_mhz);
+        }
+        if self.icache != base.cpu_icache {
+            raw.cpu.icache = Some(self.icache);
+        }
+        if self.dcache != base.cpu_dcache {
+            raw.cpu.dcache = Some(self.dcache);
+        }
+        // Memory
+        if self.chip_ram != base.chip_ram_bytes {
+            raw.memory.chip = Some(format_size(self.chip_ram));
+        }
+        if self.fast_ram != base.fast_ram_bytes {
+            raw.memory.fast = Some(format_size(self.fast_ram));
+        }
+        if self.slow_ram != base.slow_ram_bytes {
+            raw.memory.slow = Some(format_size(self.slow_ram));
+        }
+        if self.z3_ram != base.z3_ram_bytes {
+            raw.memory.z3 = Some(format_size(self.z3_ram));
+        }
+        // ROM
+        raw.rom = self.rom.as_deref().map(path_string);
+        raw.extended_rom = self.extended_rom.as_deref().map(path_string);
+        // Floppy: cover any drive carrying media so the count never orphans it.
+        let media_max = self
+            .df_playlists
+            .iter()
+            .rposition(|p| !p.is_empty())
+            .map(|i| i as u8 + 1)
+            .unwrap_or(1);
+        let drives = self.floppy_drives.max(media_max);
+        if drives != 1 {
+            raw.floppy.drives = Some(drives);
+        }
+        raw.floppy.df0 = self.floppy_drive_raw(0);
+        raw.floppy.df1 = self.floppy_drive_raw(1);
+        raw.floppy.df2 = self.floppy_drive_raw(2);
+        raw.floppy.df3 = self.floppy_drive_raw(3);
+        // Hard disk
+        raw.ide.master = self.ide_master.as_deref().map(path_string);
+        raw.ide.slave = self.ide_slave.as_deref().map(path_string);
+        raw.scsi.rom = self.scsi_rom.as_deref().map(path_string);
+        raw.scsi.rom_odd = self.scsi_rom_odd.as_deref().map(path_string);
+        raw.scsi.unit0 = self.scsi_units[0].as_deref().map(path_string);
+        raw.scsi.unit1 = self.scsi_units[1].as_deref().map(path_string);
+        raw.scsi.unit2 = self.scsi_units[2].as_deref().map(path_string);
+        raw.scsi.unit3 = self.scsi_units[3].as_deref().map(path_string);
+        raw.scsi.unit4 = self.scsi_units[4].as_deref().map(path_string);
+        raw.scsi.unit5 = self.scsi_units[5].as_deref().map(path_string);
+        raw.scsi.unit6 = self.scsi_units[6].as_deref().map(path_string);
+        // CD
+        raw.cd.image = self.cd_image.as_deref().map(path_string);
+        if self.cd_insert_delay != 0.0 {
+            raw.cd.insert_delay = Some(self.cd_insert_delay);
+        }
+        raw.cd.nvram = self.cd32_nvram.as_deref().map(path_string);
+        // A/V and emulation
+        if self.overscan != base.overscan {
+            raw.display.overscan = Some(overscan_name(self.overscan).to_string());
+        }
+        if (self.phosphor - base.phosphor).abs() > 1e-6 {
+            raw.display.phosphor = Some(self.phosphor);
+        }
+        if self.floppy_sounds != base.audio.floppy_sounds {
+            raw.audio.floppy_sounds = Some(self.floppy_sounds);
+        }
+        if self.floppy_volume != base.audio.floppy_sounds_volume {
+            raw.audio.floppy_sounds_volume = Some(u16::from(self.floppy_volume));
+        }
+        if self.power_on != base.emulation.power_on {
+            raw.emulation.power_on = Some(self.power_on);
+        }
+        if self.pacing_budget != base.emulation.pacing_budget {
+            raw.emulation.pacing_budget = Some(pacing_name(self.pacing_budget).to_string());
+        }
+        if self.realtime_priority != base.emulation.realtime_priority {
+            raw.emulation.realtime_priority = Some(self.realtime_priority);
+        }
+        if self.warp != base.emulation.warp_speed {
+            raw.emulation.warp_speed = Some(self.warp.label().to_ascii_lowercase());
+        }
+        // Zorro boards
+        raw.zorro = self
+            .zorro_boards
+            .iter()
+            .map(|p| RawZorroBoard {
+                metadata: path_string(p),
+            })
+            .collect();
+        raw
+    }
+
+    fn floppy_drive_raw(&self, idx: usize) -> Option<RawFloppyDrive> {
+        let playlist = &self.df_playlists[idx];
+        if playlist.is_empty() {
+            // A write-protect flag on an empty drive is meaningless, so an
+            // untouched/empty drive emits no [floppy.dfN] table at all.
+            return None;
+        }
+        let (first, rest) = playlist.split_first().expect("non-empty checked above");
+        Some(RawFloppyDrive {
+            enabled: None,
+            path: Some(path_string(first)),
+            paths: (!rest.is_empty()).then(|| rest.iter().map(|p| path_string(p)).collect()),
+            // write_protected defaults to true; only an unprotected drive is
+            // written explicitly.
+            write_protected: (!self.df_write_protected[idx]).then_some(false),
+        })
+    }
+
+    /// Serialize the configured machine to TOML for the Save action.
+    pub fn to_toml(&self) -> Result<String> {
+        self.to_raw().to_toml_string()
+    }
+
+    /// Validate the configured machine, producing the [`Config`] the Run action
+    /// builds from (its boot ROM may still be the AROS sentinel; the caller
+    /// resolves that).
+    pub fn build_config(&self) -> Result<Config> {
+        self.to_raw().try_into()
+    }
+
+    pub fn model(&self) -> Option<MachineModel> {
+        self.model
+    }
+
+    /// The model to show as selected in the picker. With no profile chosen the
+    /// machine equals the A500 defaults, so the A500 button is highlighted.
+    pub fn selected_model(&self) -> MachineModel {
+        self.model.unwrap_or(MachineModel::A500)
+    }
+
+    /// Switch machine profile, resetting the profile-derived fields to the new
+    /// model's defaults and dropping media the new model cannot use (so a
+    /// later Run does not fail validation on a stale IDE/CD image). Boot media
+    /// the model can still carry (ROM, floppies, SCSI, Zorro) is kept.
+    pub fn select_model(&mut self, model: Option<MachineModel>) {
+        self.model = model;
+        let base = self.baseline();
+        self.chipset = base.chipset;
+        self.agnus = None;
+        self.denise = None;
+        self.video = base.video_standard;
+        self.rtc = base.rtc_present;
+        self.identify = base.identify_board;
+        self.cpu = base.cpu;
+        self.fpu = base.fpu;
+        self.clock_mhz = base.cpu_clock_mhz;
+        self.icache = base.cpu_icache;
+        self.dcache = base.cpu_dcache;
+        self.chip_ram = base.chip_ram_bytes;
+        self.fast_ram = base.fast_ram_bytes;
+        self.slow_ram = base.slow_ram_bytes;
+        self.z3_ram = base.z3_ram_bytes;
+        self.overscan = base.overscan;
+        self.phosphor = base.phosphor;
+        self.floppy_sounds = base.audio.floppy_sounds;
+        self.floppy_volume = base.audio.floppy_sounds_volume;
+        self.power_on = base.emulation.power_on;
+        self.pacing_budget = base.emulation.pacing_budget;
+        self.realtime_priority = base.emulation.realtime_priority;
+        self.warp = base.emulation.warp_speed;
+        if !self.has_gayle() {
+            self.ide_master = None;
+            self.ide_slave = None;
+        }
+        if !self.has_cd() {
+            self.cd_image = None;
+            self.cd_insert_delay = 0.0;
+        }
+        if model != Some(MachineModel::Cd32) {
+            self.cd32_nvram = None;
+        }
+    }
+
+    fn has_gayle(&self) -> bool {
+        matches!(self.model, Some(MachineModel::A600 | MachineModel::A1200))
+    }
+
+    fn has_cd(&self) -> bool {
+        matches!(self.model, Some(MachineModel::Cdtv | MachineModel::Cd32))
+    }
+
+    /// Whether a field is applicable to the current machine (greyed otherwise).
+    pub fn applies(&self, field: LauncherField) -> bool {
+        self.disabled_reason(field).is_none()
+    }
+
+    /// Why a field is greyed out for the current machine, shown in place of its
+    /// controls so the constraint is explained rather than just disabled.
+    /// `None` means the field is editable.
+    pub fn disabled_reason(&self, field: LauncherField) -> Option<&'static str> {
+        // `reason` is returned when the applicability condition is *false*.
+        let reason = |applicable: bool, why: &'static str| (!applicable).then_some(why);
+        match field {
+            F::Fpu => reason(self.cpu != CpuModel::M68000, "needs 68020+"),
+            F::Icache => reason(
+                matches!(
+                    self.cpu,
+                    CpuModel::M68EC020 | CpuModel::M68020 | CpuModel::M68030
+                ),
+                "needs 68020/030",
+            ),
+            F::Dcache => reason(self.cpu == CpuModel::M68030, "needs 68030"),
+            F::Z3Ram => reason(cpu_is_32bit(self.cpu), "needs 32-bit CPU"),
+            F::IdeMaster | F::IdeSlave => reason(self.has_gayle(), "needs A600/A1200"),
+            F::CdImage | F::CdInsertDelay => reason(self.has_cd(), "needs CDTV/CD32"),
+            F::Cd32Nvram => reason(self.model == Some(MachineModel::Cd32), "CD32 only"),
+            F::Df0Image | F::Df0WriteProtect => reason(self.floppy_drives >= 1, "drive off"),
+            F::Df1Image | F::Df1WriteProtect => reason(self.floppy_drives >= 2, "drive off"),
+            F::Df2Image | F::Df2WriteProtect => reason(self.floppy_drives >= 3, "drive off"),
+            F::Df3Image | F::Df3WriteProtect => reason(self.floppy_drives >= 4, "drive off"),
+            _ => None,
+        }
+    }
+
+    /// The current boolean of a toggle field.
+    pub fn toggle_value(&self, field: LauncherField) -> bool {
+        match field {
+            F::Rtc => self.rtc,
+            F::Identify => self.identify,
+            F::Fpu => self.fpu,
+            F::Icache => self.icache,
+            F::Dcache => self.dcache,
+            F::Df0WriteProtect => self.df_write_protected[0],
+            F::Df1WriteProtect => self.df_write_protected[1],
+            F::Df2WriteProtect => self.df_write_protected[2],
+            F::Df3WriteProtect => self.df_write_protected[3],
+            F::FloppySounds => self.floppy_sounds,
+            F::PowerOn => self.power_on,
+            F::RealtimePriority => self.realtime_priority,
+            _ => false,
+        }
+    }
+
+    /// The current path of a path field, if any.
+    pub fn path(&self, field: LauncherField) -> Option<&Path> {
+        match field {
+            F::Rom => self.rom.as_deref(),
+            F::ExtendedRom => self.extended_rom.as_deref(),
+            F::Df0Image => self.df_playlists[0].first().map(PathBuf::as_path),
+            F::Df1Image => self.df_playlists[1].first().map(PathBuf::as_path),
+            F::Df2Image => self.df_playlists[2].first().map(PathBuf::as_path),
+            F::Df3Image => self.df_playlists[3].first().map(PathBuf::as_path),
+            F::IdeMaster => self.ide_master.as_deref(),
+            F::IdeSlave => self.ide_slave.as_deref(),
+            F::ScsiRom => self.scsi_rom.as_deref(),
+            F::ScsiRomOdd => self.scsi_rom_odd.as_deref(),
+            F::ScsiUnit0 => self.scsi_units[0].as_deref(),
+            F::ScsiUnit1 => self.scsi_units[1].as_deref(),
+            F::ScsiUnit2 => self.scsi_units[2].as_deref(),
+            F::ScsiUnit3 => self.scsi_units[3].as_deref(),
+            F::ScsiUnit4 => self.scsi_units[4].as_deref(),
+            F::ScsiUnit5 => self.scsi_units[5].as_deref(),
+            F::ScsiUnit6 => self.scsi_units[6].as_deref(),
+            F::CdImage => self.cd_image.as_deref(),
+            F::Cd32Nvram => self.cd32_nvram.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The value text shown on a row (the current enum/size/number; the file
+    /// name or a placeholder for paths; On/Off for toggles).
+    pub fn value_label(&self, field: LauncherField) -> String {
+        match field {
+            F::Chipset => chipset_name(self.chipset).to_string(),
+            F::Agnus => match self.agnus {
+                None => "Auto".to_string(),
+                Some(a) => agnus_name(a).to_string(),
+            },
+            F::Denise => match self.denise {
+                None => "Auto".to_string(),
+                Some(d) => denise_name(d).to_string(),
+            },
+            F::Video => video_name(self.video).to_string(),
+            F::Cpu => cpu_name(self.cpu).to_string(),
+            F::Clock => format_mhz(self.clock_mhz),
+            F::ChipRam => size_label(self.chip_ram),
+            F::FastRam => size_label(self.fast_ram),
+            F::SlowRam => size_label(self.slow_ram),
+            F::Z3Ram => size_label(self.z3_ram),
+            F::FloppyDrives => self.floppy_drives.to_string(),
+            F::CdInsertDelay => {
+                if self.cd_insert_delay <= 0.0 {
+                    "At boot".to_string()
+                } else {
+                    format!("{:.0} s", self.cd_insert_delay)
+                }
+            }
+            F::Overscan => match self.overscan {
+                Overscan::Tv => "TV".to_string(),
+                Overscan::Full => "Full".to_string(),
+            },
+            F::Phosphor => {
+                if self.phosphor <= 0.0 {
+                    "Off".to_string()
+                } else {
+                    format!("{:.2}", self.phosphor)
+                }
+            }
+            F::FloppyVolume => format!("{}%", self.floppy_volume),
+            F::PacingBudget => match self.pacing_budget {
+                PacingBudget::Cycles => "Cycles".to_string(),
+                PacingBudget::Instructions => "Instructions".to_string(),
+            },
+            F::Warp => self.warp.label().to_string(),
+            // Path fields: the file name, or a placeholder.
+            F::Rom => self.path_label(field, "(bundled AROS)"),
+            _ if rows_contains_kind(field, RowKind::Path) => self.path_label(field, "(none)"),
+            // Toggles
+            _ => {
+                if self.toggle_value(field) {
+                    "On".to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
+        }
+    }
+
+    fn path_label(&self, field: LauncherField, empty: &str) -> String {
+        match self.path(field) {
+            Some(p) => p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string()),
+            None => empty.to_string(),
+        }
+    }
+
+    /// Step a cycle/stepper field forward (`forward`) or backward.
+    pub fn cycle(&mut self, field: LauncherField, forward: bool) {
+        match field {
+            F::Chipset => self.chipset = cycle_slice(&CHIPSETS, self.chipset, forward),
+            F::Agnus => self.agnus = cycle_slice(&AGNUS_CHOICES, self.agnus, forward),
+            F::Denise => self.denise = cycle_slice(&DENISE_CHOICES, self.denise, forward),
+            F::Video => self.video = cycle_slice(&VIDEO_CHOICES, self.video, forward),
+            F::Cpu => {
+                self.cpu = cycle_slice(&CPUS, self.cpu, forward);
+                // Re-derive the CPU-dependent toggles for the new part, as if
+                // the model had been picked fresh (the panel greys whichever
+                // do not apply).
+                self.fpu = self.cpu.default_fpu();
+                self.icache = self.cpu.has_instruction_cache();
+                self.dcache = self.cpu.has_data_cache();
+                self.clock_mhz = self.cpu.default_clock_mhz();
+                if !cpu_is_32bit(self.cpu) {
+                    self.z3_ram = 0;
+                }
+            }
+            F::Clock => self.clock_mhz = cycle_floats(&CLOCK_PRESETS, self.clock_mhz, forward),
+            F::ChipRam => self.chip_ram = cycle_slice(&CHIP_PRESETS, self.chip_ram, forward),
+            F::FastRam => self.fast_ram = cycle_nearest(&FAST_PRESETS, self.fast_ram, forward),
+            F::SlowRam => self.slow_ram = cycle_nearest(&SLOW_PRESETS, self.slow_ram, forward),
+            F::Z3Ram => self.z3_ram = cycle_nearest(&Z3_PRESETS, self.z3_ram, forward),
+            F::FloppyDrives => {
+                self.floppy_drives = step_u8(self.floppy_drives, forward, 1, 4);
+            }
+            F::CdInsertDelay => {
+                let secs = self.cd_insert_delay + if forward { 1.0 } else { -1.0 };
+                self.cd_insert_delay = secs.clamp(0.0, 60.0);
+            }
+            F::Phosphor => {
+                let p = self.phosphor + if forward { 0.05 } else { -0.05 };
+                // Snap to the 0.05 grid to avoid float drift accumulating.
+                self.phosphor = (p.clamp(0.0, 0.95) * 20.0).round() / 20.0;
+            }
+            F::FloppyVolume => self.floppy_volume = step_u8(self.floppy_volume, forward, 0, 100),
+            F::Overscan => self.overscan = cycle_slice(&OVERSCANS, self.overscan, forward),
+            F::PacingBudget => {
+                self.pacing_budget = cycle_slice(&PACINGS, self.pacing_budget, forward)
+            }
+            F::Warp => self.warp = cycle_slice(&WARPS, self.warp, forward),
+            _ => {}
+        }
+    }
+
+    /// Flip a toggle field (no-op if the field is not a toggle).
+    pub fn toggle(&mut self, field: LauncherField) {
+        match field {
+            F::Rtc => self.rtc = !self.rtc,
+            F::Identify => self.identify = !self.identify,
+            F::Fpu => self.fpu = !self.fpu,
+            F::Icache => self.icache = !self.icache,
+            F::Dcache => self.dcache = !self.dcache,
+            F::Df0WriteProtect => self.df_write_protected[0] = !self.df_write_protected[0],
+            F::Df1WriteProtect => self.df_write_protected[1] = !self.df_write_protected[1],
+            F::Df2WriteProtect => self.df_write_protected[2] = !self.df_write_protected[2],
+            F::Df3WriteProtect => self.df_write_protected[3] = !self.df_write_protected[3],
+            F::FloppySounds => self.floppy_sounds = !self.floppy_sounds,
+            F::PowerOn => self.power_on = !self.power_on,
+            F::RealtimePriority => self.realtime_priority = !self.realtime_priority,
+            _ => {}
+        }
+    }
+
+    /// Set a path field's value (a floppy image replaces that drive's
+    /// playlist with a single disk and wires the drive in).
+    pub fn set_path(&mut self, field: LauncherField, path: PathBuf) {
+        match field {
+            F::Rom => self.rom = Some(path),
+            F::ExtendedRom => self.extended_rom = Some(path),
+            F::Df0Image => self.set_floppy(0, path),
+            F::Df1Image => self.set_floppy(1, path),
+            F::Df2Image => self.set_floppy(2, path),
+            F::Df3Image => self.set_floppy(3, path),
+            F::IdeMaster => self.ide_master = Some(path),
+            F::IdeSlave => self.ide_slave = Some(path),
+            F::ScsiRom => self.scsi_rom = Some(path),
+            F::ScsiRomOdd => self.scsi_rom_odd = Some(path),
+            F::ScsiUnit0 => self.scsi_units[0] = Some(path),
+            F::ScsiUnit1 => self.scsi_units[1] = Some(path),
+            F::ScsiUnit2 => self.scsi_units[2] = Some(path),
+            F::ScsiUnit3 => self.scsi_units[3] = Some(path),
+            F::ScsiUnit4 => self.scsi_units[4] = Some(path),
+            F::ScsiUnit5 => self.scsi_units[5] = Some(path),
+            F::ScsiUnit6 => self.scsi_units[6] = Some(path),
+            F::CdImage => self.cd_image = Some(path),
+            F::Cd32Nvram => self.cd32_nvram = Some(path),
+            _ => {}
+        }
+    }
+
+    fn set_floppy(&mut self, idx: usize, path: PathBuf) {
+        self.df_playlists[idx] = vec![path];
+        // Wire the drive in if it was beyond the configured count.
+        self.floppy_drives = self.floppy_drives.max(idx as u8 + 1);
+    }
+
+    /// Clear a path field's value.
+    pub fn clear_path(&mut self, field: LauncherField) {
+        match field {
+            F::Rom => self.rom = None,
+            F::ExtendedRom => self.extended_rom = None,
+            F::Df0Image => self.df_playlists[0].clear(),
+            F::Df1Image => self.df_playlists[1].clear(),
+            F::Df2Image => self.df_playlists[2].clear(),
+            F::Df3Image => self.df_playlists[3].clear(),
+            F::IdeMaster => self.ide_master = None,
+            F::IdeSlave => self.ide_slave = None,
+            F::ScsiRom => self.scsi_rom = None,
+            F::ScsiRomOdd => self.scsi_rom_odd = None,
+            F::ScsiUnit0 => self.scsi_units[0] = None,
+            F::ScsiUnit1 => self.scsi_units[1] = None,
+            F::ScsiUnit2 => self.scsi_units[2] = None,
+            F::ScsiUnit3 => self.scsi_units[3] = None,
+            F::ScsiUnit4 => self.scsi_units[4] = None,
+            F::ScsiUnit5 => self.scsi_units[5] = None,
+            F::ScsiUnit6 => self.scsi_units[6] = None,
+            F::CdImage => self.cd_image = None,
+            F::Cd32Nvram => self.cd32_nvram = None,
+            _ => {}
+        }
+    }
+
+    pub fn zorro_boards(&self) -> &[PathBuf] {
+        &self.zorro_boards
+    }
+
+    pub fn add_zorro(&mut self, path: PathBuf) {
+        self.zorro_boards.push(path);
+    }
+
+    pub fn remove_zorro(&mut self, idx: usize) {
+        if idx < self.zorro_boards.len() {
+            self.zorro_boards.remove(idx);
+        }
+    }
+}
+
+/// A short status/error line shown along the bottom of the configuration panel.
+#[derive(Debug, Clone)]
+pub struct StatusMessage {
+    pub text: String,
+    pub error: bool,
+}
+
+impl StatusMessage {
+    pub fn ok(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            error: false,
+        }
+    }
+
+    pub fn err(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            error: true,
+        }
+    }
+}
+
+/// The full interactive state of the open configuration panel.
+#[derive(Debug, Clone)]
+pub struct LauncherState {
+    pub setup: MachineSetup,
+    pub tab: LauncherTab,
+    pub status: Option<StatusMessage>,
+}
+
+impl LauncherState {
+    pub fn new(setup: MachineSetup) -> Self {
+        Self {
+            setup,
+            tab: LauncherTab::System,
+            status: None,
+        }
+    }
+
+    /// Open the configuration panel seeded from a raw config (the running
+    /// machine, or the defaults). An invalid raw config falls back to the
+    /// defaults rather than refusing to open.
+    pub fn from_raw(raw: &RawConfig) -> Self {
+        Self::new(MachineSetup::from_raw(raw).unwrap_or_default())
+    }
+}
+
+// --- helpers --------------------------------------------------------------
+
+fn cpu_is_32bit(cpu: CpuModel) -> bool {
+    matches!(cpu, CpuModel::M68020 | CpuModel::M68030 | CpuModel::M68040)
+}
+
+/// Whether `field` appears anywhere with the given row kind. Used to classify a
+/// field (toggle vs path) without threading the tab through every call.
+fn rows_contains_kind(field: LauncherField, kind: RowKind) -> bool {
+    TABS.iter()
+        .flat_map(|&t| rows(t))
+        .any(|r| r.field == field && r.kind == kind)
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn cycle_slice<T: Copy + PartialEq>(items: &[T], current: T, forward: bool) -> T {
+    let n = items.len();
+    let idx = items.iter().position(|&x| x == current).unwrap_or(0);
+    let next = if forward {
+        (idx + 1) % n
+    } else {
+        (idx + n - 1) % n
+    };
+    items[next]
+}
+
+/// Cycle through float presets, snapping to the nearest preset first so a
+/// loaded off-grid value still steps sensibly.
+fn cycle_floats(items: &[f64], current: f64, forward: bool) -> f64 {
+    let idx = nearest_index_f64(items, current);
+    let n = items.len();
+    let next = if forward {
+        (idx + 1) % n
+    } else {
+        (idx + n - 1) % n
+    };
+    items[next]
+}
+
+/// Cycle through `usize` size presets, snapping a loaded off-grid value to the
+/// nearest preset before stepping.
+fn cycle_nearest(items: &[usize], current: usize, forward: bool) -> usize {
+    let idx = items
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &v)| v.abs_diff(current))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let n = items.len();
+    let next = if forward {
+        (idx + 1) % n
+    } else {
+        (idx + n - 1) % n
+    };
+    items[next]
+}
+
+fn nearest_index_f64(items: &[f64], value: f64) -> usize {
+    items
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (**a - value)
+                .abs()
+                .partial_cmp(&(**b - value).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+fn step_u8(current: u8, forward: bool, min: u8, max: u8) -> u8 {
+    if forward {
+        current.saturating_add(1).min(max)
+    } else {
+        current.saturating_sub(1).max(min)
+    }
+}
+
+fn format_mhz(mhz: f64) -> String {
+    if mhz.fract().abs() < 1e-6 {
+        format!("{mhz:.0} MHz")
+    } else {
+        format!("{mhz:.2} MHz")
+    }
+}
+
+fn size_label(bytes: usize) -> String {
+    if bytes == 0 {
+        "None".to_string()
+    } else {
+        format_size(bytes)
+    }
+}
+
+// Names that round-trip through the config parsers (used by to_raw).
+
+fn model_name(model: MachineModel) -> &'static str {
+    match model {
+        MachineModel::A500 => "A500",
+        MachineModel::A500Ocs => "A500OCS",
+        MachineModel::A500Plus => "A500Plus",
+        MachineModel::A600 => "A600",
+        MachineModel::A1200 => "A1200",
+        MachineModel::Cdtv => "CDTV",
+        MachineModel::Cd32 => "CD32",
+        MachineModel::A1000 => "A1000",
+    }
+}
+
+/// Friendlier label for the model selector buttons.
+pub fn model_label(model: MachineModel) -> &'static str {
+    match model {
+        MachineModel::A500 => "A500",
+        MachineModel::A500Ocs => "A500 OCS",
+        MachineModel::A500Plus => "A500+",
+        MachineModel::A600 => "A600",
+        MachineModel::A1200 => "A1200",
+        MachineModel::Cdtv => "CDTV",
+        MachineModel::Cd32 => "CD32",
+        MachineModel::A1000 => "A1000",
+    }
+}
+
+fn chipset_name(chipset: Chipset) -> &'static str {
+    match chipset {
+        Chipset::Ocs => "OCS",
+        Chipset::Ecs => "ECS",
+        Chipset::Aga => "AGA",
+    }
+}
+
+fn cpu_name(cpu: CpuModel) -> &'static str {
+    match cpu {
+        CpuModel::M68000 => "68000",
+        CpuModel::M68EC020 => "68EC020",
+        CpuModel::M68020 => "68020",
+        CpuModel::M68030 => "68030",
+        CpuModel::M68040 => "68040",
+    }
+}
+
+fn agnus_name(agnus: AgnusRevision) -> &'static str {
+    match agnus {
+        AgnusRevision::Ocs => "OCS",
+        AgnusRevision::Ecs8372Rev4 => "8372A",
+        AgnusRevision::Ecs8375 => "8375",
+        AgnusRevision::AgaAlice => "ALICE",
+    }
+}
+
+fn denise_name(denise: DeniseRevision) -> &'static str {
+    match denise {
+        DeniseRevision::Ocs => "OCS",
+        DeniseRevision::Ecs8373 => "ECS",
+        DeniseRevision::AgaLisa => "LISA",
+    }
+}
+
+fn video_name(video: VideoStandard) -> &'static str {
+    match video {
+        VideoStandard::Pal => "PAL",
+        VideoStandard::Ntsc => "NTSC",
+    }
+}
+
+fn overscan_name(overscan: Overscan) -> &'static str {
+    match overscan {
+        Overscan::Tv => "tv",
+        Overscan::Full => "full",
+    }
+}
+
+fn pacing_name(pacing: PacingBudget) -> &'static str {
+    match pacing {
+        PacingBudget::Cycles => "cycles",
+        PacingBudget::Instructions => "instructions",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_setup_is_the_a500_aros_machine() {
+        let s = MachineSetup::default();
+        assert_eq!(s.model, None);
+        // With no profile chosen the picker highlights the A500 (the default
+        // machine is the A500 defaults).
+        assert_eq!(s.selected_model(), MachineModel::A500);
+        assert_eq!(s.chipset, Chipset::Ecs);
+        assert_eq!(s.cpu, CpuModel::M68000);
+        assert_eq!(s.chip_ram, 512 * 1024);
+        assert_eq!(s.slow_ram, 512 * 1024);
+        assert!(s.rom.is_none(), "boot ROM defaults to bundled AROS");
+        // The base A500 had no battery-backed clock.
+        assert!(!s.toggle_value(LauncherField::Rtc));
+        // The greyed Zorro III RAM explains why on this 24-bit machine.
+        assert_eq!(
+            s.disabled_reason(LauncherField::Z3Ram),
+            Some("needs 32-bit CPU")
+        );
+        // A bare default emits no overrides at all.
+        let toml = s.to_toml().unwrap();
+        assert!(toml.trim().is_empty(), "expected empty TOML, got:\n{toml}");
+        assert!(s.build_config().is_ok());
+    }
+
+    #[test]
+    fn select_model_applies_profile_defaults_and_emits_only_the_profile() {
+        let mut s = MachineSetup::default();
+        s.select_model(Some(MachineModel::A1200));
+        assert_eq!(s.chipset, Chipset::Aga);
+        assert_eq!(s.cpu, CpuModel::M68EC020);
+        assert_eq!(s.chip_ram, 2 * 1024 * 1024);
+        // The base A1200 shipped without a populated RTC; the A500+ has one.
+        assert!(!s.toggle_value(LauncherField::Rtc));
+        s.select_model(Some(MachineModel::A500Plus));
+        assert!(s.toggle_value(LauncherField::Rtc));
+        s.select_model(Some(MachineModel::A1200));
+        let raw = s.to_raw();
+        assert_eq!(raw.machine.profile.as_deref(), Some("A1200"));
+        // Everything else matches the profile default, so nothing else is set.
+        assert!(raw.memory.chip.is_none());
+        assert!(raw.cpu.model.is_none());
+        assert!(raw.chipset.revision.is_none());
+        assert!(s.build_config().is_ok());
+    }
+
+    #[test]
+    fn cycling_chip_ram_walks_the_presets() {
+        let mut s = MachineSetup::default();
+        assert_eq!(s.chip_ram, 512 * 1024);
+        s.cycle(LauncherField::ChipRam, true);
+        assert_eq!(s.chip_ram, 1024 * 1024);
+        s.cycle(LauncherField::ChipRam, true);
+        assert_eq!(s.chip_ram, 2 * 1024 * 1024);
+        s.cycle(LauncherField::ChipRam, false);
+        assert_eq!(s.chip_ram, 1024 * 1024);
+    }
+
+    #[test]
+    fn agnus_override_round_trips_through_raw() {
+        let mut s = MachineSetup::default();
+        s.cycle(LauncherField::Agnus, true); // None -> Some(OCS)
+        assert_eq!(s.agnus, Some(AgnusRevision::Ocs));
+        let raw = s.to_raw();
+        assert_eq!(raw.chipset.agnus.as_deref(), Some("OCS"));
+        let back = MachineSetup::from_raw(&raw).unwrap();
+        assert_eq!(back.agnus, Some(AgnusRevision::Ocs));
+    }
+
+    #[test]
+    fn build_config_surfaces_validation_errors() {
+        // Z3 RAM on a 68000 (24-bit bus) is rejected by the config validator;
+        // the model leans on that rather than re-checking.
+        let mut s = MachineSetup::default();
+        s.cycle(LauncherField::Z3Ram, true);
+        assert_eq!(s.z3_ram, 16 * 1024 * 1024);
+        let err = s.build_config().unwrap_err().to_string();
+        assert!(err.contains("Zorro III"), "{err}");
+    }
+
+    #[test]
+    fn setting_a_floppy_path_round_trips_and_wires_the_drive() {
+        let mut s = MachineSetup::default();
+        s.set_path(LauncherField::Df1Image, PathBuf::from("/disks/b.adf"));
+        assert!(s.floppy_drives >= 2, "DF1 media wires in a second drive");
+        let raw = s.to_raw();
+        assert_eq!(raw.floppy.drives, Some(2));
+        assert_eq!(
+            raw.floppy.df1.as_ref().and_then(|d| d.path.as_deref()),
+            Some("/disks/b.adf")
+        );
+    }
+}

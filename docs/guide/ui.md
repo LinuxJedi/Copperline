@@ -79,6 +79,9 @@ are drawn over the display. While either kind is open, key presses and display
 clicks stay in the UI instead of reaching the Amiga; `Esc` closes the focused
 tool window or overlay.
 
+- **Machine Configuration...**: opens the configuration screen
+  ([below](#machine-configuration-screen)) to reconfigure the machine and
+  relaunch it. The same screen opens automatically on a no-machine start.
 - **Frame Analyzer...**: pauses the machine and opens a separate diagnostic
   window showing which chip-bus owner had each Agnus colour clock across
   the captured frame, including overscan and blanking; see
@@ -124,6 +127,61 @@ tool window or overlay.
 
 The Keyboard Shortcuts window.
 ```
+
+(machine-configuration-screen)=
+## Machine configuration screen
+
+Starting Copperline with no machine specified -- no `./copperline.toml`, no
+`--config`, no ROM or override, and not a headless run -- opens the
+configuration screen instead of booting. It is also available any time from the
+menu's **Machine Configuration...** item, seeded with the running machine's
+settings.
+
+```{figure} ../images/ui-preview-launcher.png
+:alt: The machine configuration screen
+:width: 75%
+
+The configuration screen: the machine selector across the top, category tabs
+down the left, settings on the right, and the action bar along the bottom. Here
+an A1200 is selected on the Memory tab; Zorro III RAM is greyed with the reason
+"needs 32-bit CPU" (the A1200's 68EC020 has a 24-bit bus).
+```
+
+The layout is:
+
+- **Machine selector** (top). Pick a machine -- A1000, A500 (OCS), A500, A500+,
+  A600, A1200, CDTV, or CD32. With no profile chosen the A500 is highlighted,
+  since that is the machine the defaults describe. Selecting a machine applies
+  that profile's defaults (chipset, CPU, RAM, gate array, RTC) to every tab;
+  settings that no longer apply (an IDE image on a non-Gayle machine, a CD image
+  on a machine with no CD drive) are dropped so they cannot block a launch.
+- **Category tabs** (left sidebar). *System* (chipset and Agnus/Denise
+  overrides, video standard, RTC, identify board), *CPU* (model, FPU, clock,
+  caches), *Memory* (chip/fast/slow/Zorro III RAM), *ROM* (Kickstart and
+  extended ROM), *Floppy* (drive count and per-drive image and write-protect),
+  *Hard Disk* (IDE master/slave and the A2091 SCSI ROM and units), *CD* (image,
+  insert delay, CD32 NVRAM), *Zorro* (extra autoconfig boards by metadata file),
+  and *A/V & Emu* (overscan, phosphor, floppy sounds and volume, power-on,
+  pacing, realtime priority, warp speed).
+- **Settings rows** (right pane). `[<]`/`[>]` step through a value, On/Off
+  buttons flip a toggle, and **Browse**/**Clear** set or remove a file path
+  through a native file dialog. A setting that does not apply to the chosen
+  machine is greyed and shows why in place of its control -- "needs 32-bit CPU"
+  for Zorro III RAM, "needs 68020+" for the FPU, "needs A600/A1200" for IDE.
+- **Action bar** (bottom). **Load...** and **Save...** read and write a `.toml`
+  config
+  through a file dialog (Save writes a minimal file, only the settings that
+  differ from the chosen profile's defaults, so it reads like the example
+  configs). **Defaults** resets to the selected profile. **Run** validates the
+  configuration and boots it; if anything is wrong -- an unusable RAM size, a
+  missing disk image, an option the chosen machine cannot use -- the reason is
+  shown on the status line and you stay on the screen to fix it.
+
+Saved files use the same schema as a hand-written `copperline.toml`
+(see [](configuration.md)), so the screen and the config file are
+interchangeable: configure a machine and save it, or load an existing config to
+tweak it. **Run** builds the machine in place, so the configuration screen and a
+direct `--config` launch produce an identical machine.
 
 ## Recording video
 

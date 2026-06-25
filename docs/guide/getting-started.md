@@ -115,16 +115,22 @@ cargo test --release -- --ignored   # integration tests (need local ROMs/disks)
 ./target/release/copperline
 ```
 
-With no arguments, Copperline looks for `./copperline.toml` in the current
-directory. If it is not present, built-in defaults are used: a 68000 at
-~7.09 MHz with 512 KiB chip RAM, PAL, and the bundled AROS ROM (when no
-ROM is named, Copperline locates the AROS image that ships with it -- see
-[](configuration#top-level)). The default machine is the A500 Rev 6A -- the
-most common and most-targeted Amiga: the ECS "Fatter" 8372A Agnus (1 MiB
-chip reach plus the software PAL/NTSC switch) with the original OCS 8362
-Denise, 512 KiB chip RAM plus 512 KiB of trapdoor slow RAM. Use `--slow 0`
-or `[memory] slow = "0"` for a bare 512 KiB machine, or `[chipset] revision
-= "OCS"` for a plain 8371/8362 OCS A500.
+With no arguments and no `./copperline.toml` in the current directory,
+Copperline opens the **configuration screen** -- a launcher that lets you pick
+a machine, configure everything about it, load and save `.toml` configs, and
+press **Run** to boot. See [](ui#machine-configuration-screen) for a full tour.
+The screen starts from the built-in defaults: the A500 Rev 6A -- the most
+common and most-targeted Amiga: a 68000 at ~7.09 MHz, the ECS "Fatter" 8372A
+Agnus (1 MiB chip reach plus the software PAL/NTSC switch) with the original
+OCS 8362 Denise, 512 KiB chip RAM plus 512 KiB of trapdoor slow RAM, PAL, and
+the bundled AROS ROM (when no ROM is named, Copperline locates the AROS image
+that ships with it -- see [](configuration#top-level)).
+
+Copperline boots directly, skipping the configuration screen, whenever a
+machine is specified: a `./copperline.toml` in the current directory, an
+explicit `--config` file, a ROM or override on the command line, or any
+headless/scripted run. You can reopen the configuration screen at any time from
+the menu (see [](ui#machine-configuration-screen)).
 
 You can boot your own ROM with a positional argument, or point at a specific
 config file:
