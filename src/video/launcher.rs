@@ -25,8 +25,136 @@ use crate::config::{
     format_size, machine_profile_defaults, Chipset, Config, CpuModel, MachineModel, Overscan,
     PacingBudget, RawConfig, RawFloppyDrive, RawZorroBoard, WarpSpeed,
 };
+use crate::zorro::{ConfigOption, ConfigOptionKind, LoadedZorroBoard};
 use anyhow::Result;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// A Zorro board entry in the launcher: its metadata-file path, the config
+/// option schema parsed from that manifest (empty for RAM boards or on load
+/// error), and the user's per-board setting overrides (layered over the
+/// manifest defaults). Editing in the config panel mutates `overrides`.
+#[derive(Debug, Clone)]
+pub struct ZorroBoardSetup {
+    metadata: PathBuf,
+    options: Vec<ConfigOption>,
+    /// Effective manifest defaults (option defaults overlaid by `[config]`,
+    /// file paths resolved), the baseline the user's overrides layer over.
+    defaults: BTreeMap<String, String>,
+    overrides: BTreeMap<String, String>,
+}
+
+impl ZorroBoardSetup {
+    /// Load a board's option schema + defaults from its manifest. RAM boards
+    /// and load failures yield an entry with no editable options.
+    fn load(metadata: PathBuf) -> Self {
+        let (options, defaults) = match crate::zorro::load_board_metadata(&metadata) {
+            Ok(LoadedZorroBoard::Wasm {
+                options,
+                default_config,
+                ..
+            }) => (options, default_config),
+            _ => (Vec::new(), BTreeMap::new()),
+        };
+        Self {
+            metadata,
+            options,
+            defaults,
+            overrides: BTreeMap::new(),
+        }
+    }
+
+    /// File name (or full path) for display.
+    pub fn name(&self) -> String {
+        self.metadata
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.metadata.display().to_string())
+    }
+
+    pub fn options(&self) -> &[ConfigOption] {
+        &self.options
+    }
+
+    /// The current value of option `opt`: the user's override, else the
+    /// effective manifest default, else empty.
+    pub fn value(&self, opt: usize) -> String {
+        let Some(o) = self.options.get(opt) else {
+            return String::new();
+        };
+        self.overrides
+            .get(&o.key)
+            .or_else(|| self.defaults.get(&o.key))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn set(&mut self, opt: usize, value: String) {
+        if let Some(o) = self.options.get(opt) {
+            self.overrides.insert(o.key.clone(), value);
+        }
+    }
+
+    /// Drop the override, reverting the option to its manifest default.
+    fn clear(&mut self, opt: usize) {
+        if let Some(o) = self.options.get(opt) {
+            self.overrides.remove(&o.key);
+        }
+    }
+
+    /// Step an enum/int option by one (forward or back).
+    fn cycle(&mut self, opt: usize, forward: bool) {
+        let Some(o) = self.options.get(opt) else {
+            return;
+        };
+        let next = match &o.kind {
+            ConfigOptionKind::Enum(choices) if !choices.is_empty() => {
+                let cur = self.value(opt);
+                let idx = choices.iter().position(|c| *c == cur).unwrap_or(0);
+                let n = choices.len();
+                let idx = if forward {
+                    (idx + 1) % n
+                } else {
+                    (idx + n - 1) % n
+                };
+                choices[idx].clone()
+            }
+            ConfigOptionKind::Int => {
+                let cur: i64 = self.value(opt).trim().parse().unwrap_or(0);
+                let next = if forward { cur + 1 } else { cur - 1 };
+                next.to_string()
+            }
+            _ => return,
+        };
+        self.set(opt, next);
+    }
+
+    /// Flip a bool option.
+    fn toggle(&mut self, opt: usize) {
+        if matches!(
+            self.options.get(opt).map(|o| &o.kind),
+            Some(ConfigOptionKind::Bool)
+        ) {
+            let on = self.value(opt).trim().eq_ignore_ascii_case("true");
+            self.set(opt, (!on).to_string());
+        }
+    }
+
+    /// The TOML override value for an option, typed per its kind, or `None`
+    /// when the user has left it at the manifest default.
+    fn override_toml(&self, o: &ConfigOption) -> Option<toml::Value> {
+        let raw = self.overrides.get(&o.key)?;
+        Some(match o.kind {
+            ConfigOptionKind::Bool => toml::Value::Boolean(raw.trim().eq_ignore_ascii_case("true")),
+            ConfigOptionKind::Int => raw
+                .trim()
+                .parse::<i64>()
+                .map(toml::Value::Integer)
+                .unwrap_or_else(|_| toml::Value::String(raw.clone())),
+            _ => toml::Value::String(raw.clone()),
+        })
+    }
+}
 
 /// The configuration screen's category tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,8 +498,8 @@ pub struct MachineSetup {
     pacing_budget: PacingBudget,
     realtime_priority: bool,
     warp: WarpSpeed,
-    // Extra Zorro boards by metadata-file path
-    zorro_boards: Vec<PathBuf>,
+    // Extra Zorro boards (metadata path + plugin config schema/overrides)
+    zorro_boards: Vec<ZorroBoardSetup>,
 }
 
 impl Default for MachineSetup {
@@ -439,7 +567,17 @@ impl MachineSetup {
             zorro_boards: raw
                 .zorro
                 .iter()
-                .map(|b| PathBuf::from(&b.metadata))
+                .map(|b| {
+                    let mut board = ZorroBoardSetup::load(PathBuf::from(&b.metadata));
+                    if let Some(overrides) = &b.config {
+                        for (key, value) in overrides {
+                            board
+                                .overrides
+                                .insert(key.clone(), crate::zorro::toml_value_to_string(value));
+                        }
+                    }
+                    board
+                })
                 .collect(),
         })
     }
@@ -579,12 +717,22 @@ impl MachineSetup {
         if self.warp != base.emulation.warp_speed {
             raw.emulation.warp_speed = Some(self.warp.label().to_ascii_lowercase());
         }
-        // Zorro boards
+        // Zorro boards: emit the metadata path plus any per-board overrides
+        // (typed per the option schema), only when the user changed something.
         raw.zorro = self
             .zorro_boards
             .iter()
-            .map(|p| RawZorroBoard {
-                metadata: path_string(p),
+            .map(|b| {
+                let mut table = toml::Table::new();
+                for o in &b.options {
+                    if let Some(v) = b.override_toml(o) {
+                        table.insert(o.key.clone(), v);
+                    }
+                }
+                RawZorroBoard {
+                    metadata: path_string(&b.metadata),
+                    config: (!table.is_empty()).then_some(table),
+                }
             })
             .collect();
         raw
@@ -953,17 +1101,45 @@ impl MachineSetup {
         }
     }
 
-    pub fn zorro_boards(&self) -> &[PathBuf] {
+    pub fn zorro_boards(&self) -> &[ZorroBoardSetup] {
         &self.zorro_boards
     }
 
     pub fn add_zorro(&mut self, path: PathBuf) {
-        self.zorro_boards.push(path);
+        self.zorro_boards.push(ZorroBoardSetup::load(path));
     }
 
     pub fn remove_zorro(&mut self, idx: usize) {
         if idx < self.zorro_boards.len() {
             self.zorro_boards.remove(idx);
+        }
+    }
+
+    /// Step an enum/int option on a board.
+    pub fn zorro_option_cycle(&mut self, board: usize, opt: usize, forward: bool) {
+        if let Some(b) = self.zorro_boards.get_mut(board) {
+            b.cycle(opt, forward);
+        }
+    }
+
+    /// Flip a bool option on a board.
+    pub fn zorro_option_toggle(&mut self, board: usize, opt: usize) {
+        if let Some(b) = self.zorro_boards.get_mut(board) {
+            b.toggle(opt);
+        }
+    }
+
+    /// Set a board option's value (a file path, or typed text).
+    pub fn zorro_option_set(&mut self, board: usize, opt: usize, value: String) {
+        if let Some(b) = self.zorro_boards.get_mut(board) {
+            b.set(opt, value);
+        }
+    }
+
+    /// Revert a board option to its manifest default.
+    pub fn zorro_option_clear(&mut self, board: usize, opt: usize) {
+        if let Some(b) = self.zorro_boards.get_mut(board) {
+            b.clear(opt);
         }
     }
 }
@@ -997,6 +1173,10 @@ pub struct LauncherState {
     pub setup: MachineSetup,
     pub tab: LauncherTab,
     pub status: Option<StatusMessage>,
+    /// The string/int plugin option being typed into (board index, option
+    /// index) and the edit buffer, when a text field has focus.
+    editing: Option<(usize, usize)>,
+    edit_buffer: String,
 }
 
 impl LauncherState {
@@ -1005,7 +1185,56 @@ impl LauncherState {
             setup,
             tab: LauncherTab::System,
             status: None,
+            editing: None,
+            edit_buffer: String::new(),
         }
+    }
+
+    /// The (board, option) currently being text-edited, if any.
+    pub fn editing(&self) -> Option<(usize, usize)> {
+        self.editing
+    }
+
+    /// The current edit buffer (for drawing the focused field).
+    pub fn edit_buffer(&self) -> &str {
+        &self.edit_buffer
+    }
+
+    /// Focus a board option for text entry, seeding the buffer with its value.
+    pub fn begin_edit(&mut self, board: usize, opt: usize) {
+        self.edit_buffer = self
+            .setup
+            .zorro_boards()
+            .get(board)
+            .map(|b| b.value(opt))
+            .unwrap_or_default();
+        self.editing = Some((board, opt));
+        self.status = None;
+    }
+
+    pub fn edit_push(&mut self, c: char) {
+        if self.editing.is_some() {
+            self.edit_buffer.push(c);
+        }
+    }
+
+    pub fn edit_backspace(&mut self) {
+        if self.editing.is_some() {
+            self.edit_buffer.pop();
+        }
+    }
+
+    /// Commit the edit buffer to the focused board option.
+    pub fn edit_commit(&mut self) {
+        if let Some((board, opt)) = self.editing.take() {
+            let value = std::mem::take(&mut self.edit_buffer);
+            self.setup.zorro_option_set(board, opt, value);
+        }
+    }
+
+    pub fn edit_cancel(&mut self) {
+        self.editing = None;
+        self.edit_buffer.clear();
     }
 
     /// Open the configuration panel seeded from a raw config (the running
@@ -1202,6 +1431,93 @@ fn pacing_name(pacing: PacingBudget) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_board_manifest() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "copperline-launcher-board-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+            name = "Test Plugin"
+            zorro = 2
+            type = "wasm"
+            size = "64K"
+            manufacturer = 5192
+            product = 16
+            wasm = "x.wasm"
+            [config]
+            speed = "fast"
+            verbose = false
+            [[option]]
+            key = "speed"
+            label = "Speed"
+            type = "enum"
+            choices = ["slow", "fast"]
+            [[option]]
+            key = "verbose"
+            label = "Verbose"
+            type = "bool"
+            [[option]]
+            key = "count"
+            label = "Count"
+            type = "int"
+            default = 3
+            [[option]]
+            key = "rom"
+            label = "ROM"
+            type = "file"
+        "#,
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn plugin_board_options_load_edit_and_round_trip() {
+        let path = write_board_manifest();
+        let mut board = ZorroBoardSetup::load(path.clone());
+        assert_eq!(board.options().len(), 4);
+        // Defaults: [config] for speed/verbose, the option default for count.
+        assert_eq!(board.value(0), "fast");
+        assert_eq!(board.value(1), "false");
+        assert_eq!(board.value(2), "3");
+        assert_eq!(board.value(3), ""); // unset file
+
+        board.cycle(0, true); // enum fast -> slow (wraps)
+        assert_eq!(board.value(0), "slow");
+        board.toggle(1); // bool false -> true
+        assert_eq!(board.value(1), "true");
+        board.cycle(2, false); // int 3 -> 2
+        assert_eq!(board.value(2), "2");
+        board.set(3, "/tmp/board.rom".into());
+        assert_eq!(board.value(3), "/tmp/board.rom");
+        board.clear(2); // revert int to its default
+        assert_eq!(board.value(2), "3");
+
+        // Overrides serialize back, typed per the option schema.
+        let mut setup = MachineSetup::default();
+        setup.zorro_boards = vec![board];
+        let raw = setup.to_raw();
+        let cfg = raw.zorro[0].config.as_ref().expect("overrides emitted");
+        assert_eq!(cfg.get("speed").unwrap().as_str(), Some("slow"));
+        assert_eq!(cfg.get("verbose").unwrap().as_bool(), Some(true));
+        assert_eq!(cfg.get("rom").unwrap().as_str(), Some("/tmp/board.rom"));
+        // "count" was reverted to default, so it is not emitted.
+        assert!(cfg.get("count").is_none());
+
+        // And those overrides round-trip back through from_raw.
+        let reloaded = MachineSetup::from_raw(&raw).unwrap();
+        assert_eq!(reloaded.zorro_boards()[0].value(0), "slow");
+        assert_eq!(reloaded.zorro_boards()[0].value(1), "true");
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn default_setup_is_the_a500_aros_machine() {

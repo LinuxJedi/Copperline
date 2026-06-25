@@ -4724,10 +4724,42 @@ impl App {
             }
             UiControl::LauncherZorroRemove(idx) => {
                 if let Some(state) = self.launcher_state_mut() {
+                    state.edit_cancel();
                     state.setup.remove_zorro(idx);
                     state.status = None;
                 }
             }
+            UiControl::LauncherBoardCycle {
+                board,
+                opt,
+                forward,
+            } => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.edit_cancel();
+                    state.setup.zorro_option_cycle(board, opt, forward);
+                    state.status = None;
+                }
+            }
+            UiControl::LauncherBoardToggle { board, opt } => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.edit_cancel();
+                    state.setup.zorro_option_toggle(board, opt);
+                    state.status = None;
+                }
+            }
+            UiControl::LauncherBoardClear { board, opt } => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.edit_cancel();
+                    state.setup.zorro_option_clear(board, opt);
+                    state.status = None;
+                }
+            }
+            UiControl::LauncherBoardEdit { board, opt } => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.begin_edit(board, opt);
+                }
+            }
+            UiControl::LauncherBoardBrowse { board, opt } => self.launcher_board_browse(board, opt),
             UiControl::LauncherDefaults => {
                 if let Some(state) = self.launcher_state_mut() {
                     let model = state.setup.model();
@@ -4810,6 +4842,11 @@ impl App {
     fn ui_handle_key(&mut self, code: KeyCode) -> bool {
         if self.ui.active() {
             if code == KeyCode::Escape {
+                // While typing into a plugin option, Escape cancels the edit
+                // rather than closing the panel.
+                if self.launcher_cancel_edit_if_active() {
+                    return true;
+                }
                 if self.ui.menu_open {
                     self.ui.menu_open = false;
                     self.request_redraw();
@@ -4818,10 +4855,57 @@ impl App {
                 }
                 return true;
             }
+            // Route keys to a focused plugin-option text field, if any.
+            if self.launcher_handle_edit_key(code) {
+                return true;
+            }
             return false;
         }
         self.default_tool_key_kind()
             .is_some_and(|kind| self.ui_handle_tool_key(kind, code))
+    }
+
+    /// Cancel an in-progress plugin-option text edit, if one is focused.
+    fn launcher_cancel_edit_if_active(&mut self) -> bool {
+        let cancelled = matches!(
+            self.launcher_state_mut(),
+            Some(state) if state.editing().is_some()
+        );
+        if cancelled {
+            if let Some(state) = self.launcher_state_mut() {
+                state.edit_cancel();
+            }
+            self.request_redraw();
+        }
+        cancelled
+    }
+
+    /// Feed a key to a focused plugin-option text field. Returns false (so the
+    /// key falls through) when no field is being edited.
+    fn launcher_handle_edit_key(&mut self, code: KeyCode) -> bool {
+        let handled = {
+            let Some(state) = self.launcher_state_mut() else {
+                return false;
+            };
+            if state.editing().is_none() {
+                return false;
+            }
+            if let Some(ch) = entry_char_for_key(code) {
+                state.edit_push(ch);
+            } else {
+                match code {
+                    KeyCode::Backspace => state.edit_backspace(),
+                    KeyCode::Enter | KeyCode::NumpadEnter => state.edit_commit(),
+                    // Swallow other keys while a field has focus.
+                    _ => {}
+                }
+            }
+            true
+        };
+        if handled {
+            self.request_redraw();
+        }
+        handled
     }
 
     fn default_tool_key_kind(&self) -> Option<ToolPanelKind> {
@@ -5185,6 +5269,24 @@ impl App {
         if let Some(path) = picked {
             if let Some(state) = self.launcher_state_mut() {
                 state.setup.add_zorro(path);
+                state.status = None;
+            }
+        }
+        self.finish_host_io_pause();
+    }
+
+    /// Pick a file for a plugin board's file-typed config option.
+    fn launcher_board_browse(&mut self, board: usize, opt: usize) {
+        self.suspend_live_audio_for_host_io();
+        let picked = rfd::FileDialog::new()
+            .set_title("Choose plugin file")
+            .pick_file();
+        if let Some(path) = picked {
+            if let Some(state) = self.launcher_state_mut() {
+                state.edit_cancel();
+                state
+                    .setup
+                    .zorro_option_set(board, opt, path.to_string_lossy().into_owned());
                 state.status = None;
             }
         }

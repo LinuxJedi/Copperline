@@ -433,6 +433,32 @@ pub enum UiControl {
     LauncherZorroAdd,
     /// Configuration screen: remove the Zorro board at this index.
     LauncherZorroRemove(usize),
+    /// Plugin config: step an enum/int option of a Zorro board.
+    LauncherBoardCycle {
+        board: usize,
+        opt: usize,
+        forward: bool,
+    },
+    /// Plugin config: flip a bool option of a Zorro board.
+    LauncherBoardToggle {
+        board: usize,
+        opt: usize,
+    },
+    /// Plugin config: pick a file for a file-typed board option.
+    LauncherBoardBrowse {
+        board: usize,
+        opt: usize,
+    },
+    /// Plugin config: revert a board option to its manifest default.
+    LauncherBoardClear {
+        board: usize,
+        opt: usize,
+    },
+    /// Plugin config: focus a string/int board option for text entry.
+    LauncherBoardEdit {
+        board: usize,
+        opt: usize,
+    },
     /// Configuration screen: load a .toml configuration.
     LauncherLoad,
     /// Configuration screen: save the configuration to a .toml file.
@@ -2068,13 +2094,49 @@ fn launcher_action_rects(rect: Rect) -> [(UiControl, Rect); 4] {
     ]
 }
 
-/// The Zorro list sits below the Add button, which is pinned to the top of the
-/// pane, so board row `i` is at content row `i + 1`.
-fn launcher_zorro_remove_rect(rect: Rect, i: usize) -> Rect {
+/// One drawable/clickable item in the Zorro tab. The flat layout list keeps
+/// drawing and hit-testing in exact sync (immediate-mode UI).
+#[derive(Clone, Copy)]
+enum ZorroItem {
+    Header(usize),
+    Option { board: usize, opt: usize },
+}
+
+/// Flatten the Zorro boards into (content-row, item) pairs. Row 0 is the Add
+/// button, pinned to the top; each board header and its option rows follow.
+fn launcher_zorro_layout(setup: &launcher::MachineSetup) -> Vec<(usize, ZorroItem)> {
+    let mut items = Vec::new();
+    let mut row = 1;
+    for (i, board) in setup.zorro_boards().iter().enumerate() {
+        items.push((row, ZorroItem::Header(i)));
+        row += 1;
+        for opt in 0..board.options().len() {
+            items.push((row, ZorroItem::Option { board: i, opt }));
+            row += 1;
+        }
+    }
+    items
+}
+
+/// The Remove button for a board header drawn at content `row`.
+fn launcher_zorro_remove_rect(rect: Rect, row: usize) -> Rect {
     Rect {
         x: rect.x + rect.w - LAUNCH_MARGIN - LAUNCH_REMOVE_W,
-        y: launcher_row_y(rect, i + 1) + 2,
+        y: launcher_row_y(rect, row) + 2,
         w: LAUNCH_REMOVE_W,
+        h: LAUNCH_CONTROL_H,
+    }
+}
+
+/// The clickable value box for a string option at `row_y` (control column to
+/// the right margin).
+fn launcher_board_value_rect(rect: Rect, row_y: usize) -> Rect {
+    let x = launcher_control_x(rect);
+    let right = rect.x + rect.w - LAUNCH_MARGIN;
+    Rect {
+        x,
+        y: row_y + 2,
+        w: right.saturating_sub(x),
         h: LAUNCH_CONTROL_H,
     }
 }
@@ -2112,10 +2174,55 @@ fn launcher_control_at(rect: Rect, state: &LauncherState, pos: (i32, i32)) -> Op
         }
     }
     if state.tab == LauncherTab::Zorro {
-        let count = state.setup.zorro_boards().len();
-        for i in 0..count {
-            if launcher_zorro_remove_rect(rect, i).contains(pos) {
-                return Some(UiControl::LauncherZorroRemove(i));
+        use crate::zorro::ConfigOptionKind as K;
+        for (row, item) in launcher_zorro_layout(&state.setup) {
+            let row_y = launcher_row_y(rect, row);
+            match item {
+                ZorroItem::Header(i) => {
+                    if launcher_zorro_remove_rect(rect, row).contains(pos) {
+                        return Some(UiControl::LauncherZorroRemove(i));
+                    }
+                }
+                ZorroItem::Option { board, opt } => {
+                    match &state.setup.zorro_boards()[board].options()[opt].kind {
+                        K::Bool => {
+                            if launcher_toggle_rect(rect, row_y).contains(pos) {
+                                return Some(UiControl::LauncherBoardToggle { board, opt });
+                            }
+                        }
+                        K::Enum(_) | K::Int => {
+                            let (prev, _v, next) = launcher_cycle_rects(rect, row_y);
+                            if prev.contains(pos) {
+                                return Some(UiControl::LauncherBoardCycle {
+                                    board,
+                                    opt,
+                                    forward: false,
+                                });
+                            }
+                            if next.contains(pos) {
+                                return Some(UiControl::LauncherBoardCycle {
+                                    board,
+                                    opt,
+                                    forward: true,
+                                });
+                            }
+                        }
+                        K::File => {
+                            let (browse, clear) = launcher_path_rects(rect, row_y);
+                            if browse.contains(pos) {
+                                return Some(UiControl::LauncherBoardBrowse { board, opt });
+                            }
+                            if clear.contains(pos) {
+                                return Some(UiControl::LauncherBoardClear { board, opt });
+                            }
+                        }
+                        K::String => {
+                            if launcher_board_value_rect(rect, row_y).contains(pos) {
+                                return Some(UiControl::LauncherBoardEdit { board, opt });
+                            }
+                        }
+                    }
+                }
             }
         }
         if launcher_zorro_add_rect(rect).contains(pos) {
@@ -2334,10 +2441,11 @@ fn draw_launcher_row(
 fn draw_launcher_zorro(
     frame: &mut [u8],
     rect: Rect,
-    setup: &launcher::MachineSetup,
+    state: &LauncherState,
     hover: Option<UiControl>,
     scale: usize,
 ) {
+    let setup = &state.setup;
     let pane_x = launcher_pane_x(rect);
     // Add button pinned to the top of the pane; the board list (or the empty
     // note) sits below it.
@@ -2349,8 +2457,7 @@ fn draw_launcher_zorro(
         hover == Some(UiControl::LauncherZorroAdd),
         scale,
     );
-    let boards = setup.zorro_boards();
-    if boards.is_empty() {
+    if setup.zorro_boards().is_empty() {
         draw_panel_text(
             frame,
             pane_x,
@@ -2361,31 +2468,166 @@ fn draw_launcher_zorro(
             scale,
         );
     }
-    for (i, board) in boards.iter().enumerate() {
-        let remove = launcher_zorro_remove_rect(rect, i);
-        let name = board
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| board.display().to_string());
-        let avail = remove.x.saturating_sub(pane_x + 8);
-        let name = truncate_to_width(&name, avail);
-        draw_panel_text(
-            frame,
-            pane_x,
-            launcher_row_y(rect, i + 1) + 8,
-            &name,
-            PANEL_TEXT,
-            1,
-            scale,
-        );
-        draw_text_button(
-            frame,
-            remove,
-            "Remove",
-            true,
-            hover == Some(UiControl::LauncherZorroRemove(i)),
-            scale,
-        );
+    for (row, item) in launcher_zorro_layout(setup) {
+        let row_y = launcher_row_y(rect, row);
+        match item {
+            ZorroItem::Header(i) => {
+                let board = &setup.zorro_boards()[i];
+                let remove = launcher_zorro_remove_rect(rect, row);
+                let name = truncate_to_width(&board.name(), remove.x.saturating_sub(pane_x + 8));
+                draw_panel_text(frame, pane_x, row_y + 8, &name, PANEL_TEXT, 1, scale);
+                draw_text_button(
+                    frame,
+                    remove,
+                    "Remove",
+                    true,
+                    hover == Some(UiControl::LauncherZorroRemove(i)),
+                    scale,
+                );
+            }
+            ZorroItem::Option { board, opt } => {
+                draw_launcher_board_option(frame, rect, state, board, opt, row_y, hover, scale);
+            }
+        }
+    }
+}
+
+/// Draw one plugin config-option row (indented under its board): a label plus
+/// the widget its kind calls for.
+fn draw_launcher_board_option(
+    frame: &mut [u8],
+    rect: Rect,
+    state: &LauncherState,
+    board: usize,
+    opt: usize,
+    row_y: usize,
+    hover: Option<UiControl>,
+    scale: usize,
+) {
+    use crate::zorro::ConfigOptionKind as K;
+    let setup = &state.setup;
+    let option = &setup.zorro_boards()[board].options()[opt];
+    // Indented label.
+    let label_x = launcher_pane_x(rect) + 12;
+    let label = truncate_to_width(
+        &option.label,
+        launcher_control_x(rect).saturating_sub(label_x + 6),
+    );
+    draw_panel_text(frame, label_x, row_y + 8, &label, PANEL_TEXT, 1, scale);
+
+    let value = setup.zorro_boards()[board].value(opt);
+    match &option.kind {
+        K::Bool => {
+            let on = value.trim().eq_ignore_ascii_case("true");
+            draw_text_button(
+                frame,
+                launcher_toggle_rect(rect, row_y),
+                if on { "On" } else { "Off" },
+                true,
+                hover == Some(UiControl::LauncherBoardToggle { board, opt }),
+                scale,
+            );
+        }
+        K::Enum(_) | K::Int => {
+            let (prev, val, next) = launcher_cycle_rects(rect, row_y);
+            draw_text_button(
+                frame,
+                prev,
+                "<",
+                true,
+                hover
+                    == Some(UiControl::LauncherBoardCycle {
+                        board,
+                        opt,
+                        forward: false,
+                    }),
+                scale,
+            );
+            let shown = truncate_to_width(&value, val.w.saturating_sub(8));
+            draw_panel_text(
+                frame,
+                val.x + 6,
+                row_y + 8,
+                &shown,
+                PANEL_TEXT_HILIGHT,
+                1,
+                scale,
+            );
+            draw_text_button(
+                frame,
+                next,
+                ">",
+                true,
+                hover
+                    == Some(UiControl::LauncherBoardCycle {
+                        board,
+                        opt,
+                        forward: true,
+                    }),
+                scale,
+            );
+        }
+        K::File => {
+            let (browse, clear) = launcher_path_rects(rect, row_y);
+            let shown = if value.is_empty() {
+                "(none)".to_string()
+            } else {
+                std::path::Path::new(&value)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or(value.clone())
+            };
+            let avail = browse.x.saturating_sub(launcher_control_x(rect) + 6);
+            let shown = truncate_to_width(&shown, avail);
+            draw_panel_text(
+                frame,
+                launcher_control_x(rect),
+                row_y + 8,
+                &shown,
+                PANEL_TEXT,
+                1,
+                scale,
+            );
+            draw_text_button(
+                frame,
+                browse,
+                "Browse",
+                true,
+                hover == Some(UiControl::LauncherBoardBrowse { board, opt }),
+                scale,
+            );
+            draw_text_button(
+                frame,
+                clear,
+                "Clear",
+                true,
+                hover == Some(UiControl::LauncherBoardClear { board, opt }),
+                scale,
+            );
+        }
+        K::String => {
+            let editing = state.editing() == Some((board, opt));
+            let vbox = launcher_board_value_rect(rect, row_y);
+            draw_rect_bevel(
+                frame,
+                scale_rect(vbox, scale),
+                BUTTON_EDGE_DARK,
+                BUTTON_EDGE_LIGHT,
+                scale,
+            );
+            let text = if editing {
+                format!("{}_", state.edit_buffer())
+            } else {
+                value.clone()
+            };
+            let color = if editing {
+                PANEL_TEXT_HILIGHT
+            } else {
+                PANEL_TEXT
+            };
+            let shown = truncate_to_width(&text, vbox.w.saturating_sub(8));
+            draw_panel_text(frame, vbox.x + 4, row_y + 8, &shown, color, 1, scale);
+        }
     }
 }
 
@@ -2453,7 +2695,7 @@ fn draw_launcher(
     }
     // Active tab content in the settings pane.
     if state.tab == LauncherTab::Zorro {
-        draw_launcher_zorro(frame, rect, setup, hover, scale);
+        draw_launcher_zorro(frame, rect, state, hover, scale);
     } else {
         for (i, r) in launcher::rows(state.tab).iter().enumerate() {
             draw_launcher_row(frame, rect, setup, r, i, hover, scale);
@@ -3309,5 +3551,73 @@ mod tests {
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "launcher");
+
+        // Configuration screen: the Zorro tab with a WASM plugin board whose
+        // config-option schema renders an editable field per option.
+        let manifest_path = std::env::temp_dir().join(format!(
+            "copperline-ui-preview-board-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &manifest_path,
+            r#"
+            name = "Demo NIC"
+            zorro = 2
+            type = "wasm"
+            size = "64K"
+            manufacturer = 5192
+            product = 16
+            wasm = "demo.wasm"
+            [config]
+            mode = "bridged"
+            [[option]]
+            key = "mode"
+            label = "Mode"
+            type = "enum"
+            choices = ["bridged", "nat"]
+            [[option]]
+            key = "verbose"
+            label = "Verbose"
+            type = "bool"
+            [[option]]
+            key = "mtu"
+            label = "MTU"
+            type = "int"
+            default = 1500
+            [[option]]
+            key = "rom"
+            label = "Boot ROM"
+            type = "file"
+            [[option]]
+            key = "mac"
+            label = "MAC address"
+            type = "string"
+            default = "02:00:10:00:00:01"
+        "#,
+        )
+        .unwrap();
+        let mut frame = vec![0u8; w * h * 4];
+        let mut state = LauncherState::new(launcher::MachineSetup::default());
+        state.setup.add_zorro(manifest_path.clone());
+        state.tab = LauncherTab::Zorro;
+        let ui = UiState {
+            menu_open: false,
+            panel: Some(Panel::Launcher(Box::new(state))),
+        };
+        draw(
+            &mut frame,
+            scale,
+            &ui,
+            None,
+            None,
+            false,
+            WarpSpeed::Max,
+            false,
+            false,
+            JoystickInputMode::Auto,
+        );
+        assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
+        save(&frame, "launcher-zorro");
+        let _ = std::fs::remove_file(&manifest_path);
     }
 }

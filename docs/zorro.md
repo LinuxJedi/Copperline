@@ -133,6 +133,45 @@ Plugins can be written in any language that targets `wasm32` (Rust, C, Zig,
 ...). An inert example module and its manifest can be generated with the
 ignored test `emit_example_plugin_wasm` (see `src/wasmboard.rs`).
 
+### Plugin settings, files, and the config panel
+
+A plugin can take settings and files. The manifest declares defaults in a
+`[config]` table and a schema in `[[option]]` entries:
+
+```toml
+[config]                 # defaults
+mode = "bridged"
+mtu = 1500
+[[option]]               # schema (drives the launcher's config panel)
+key = "mode"
+label = "Mode"
+type = "enum"            # string | bool | int | file | enum
+choices = ["bridged", "nat"]
+[[option]]
+key = "rom"
+label = "Boot ROM"
+type = "file"            # the host loads the file and exposes it as a resource
+```
+
+At runtime the module reads a setting via the `config_get` host import, and a
+file-typed option's bytes via `resource_len` / `resource_read` (keyed by the
+option's `key`). For an autoboot ROM, the plugin copies the `rom` resource into
+its linear memory at `init` and serves those bytes from `read()`, with `diag_vec`
+set in the manifest -- just like the in-tree A2091.
+
+The user overrides settings per board in the main config, layered over the
+manifest defaults:
+
+```toml
+[[zorro]]
+metadata = "boards/nic.toml"
+config = { mode = "nat", rom = "boot.rom" }
+```
+
+The machine-configuration launcher renders the `[[option]]` schema as an
+editable field per option (enum/int steppers, a bool toggle, a file picker, and
+a text box for strings), writing changes back as these per-board overrides.
+
 ## Networking: the A2065 Ethernet board
 
 Copperline includes an in-tree Commodore A2065 Ethernet board (`src/a2065.rs`),

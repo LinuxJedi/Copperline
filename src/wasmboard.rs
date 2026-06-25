@@ -44,6 +44,7 @@ use crate::zorro_device::{DeviceHost, ZorroDevice};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Memory as WasmMemory, Module, Store, TypedFunc,
@@ -73,6 +74,12 @@ pub struct WasmManifest {
     pub name: String,
     pub caps: WasmCaps,
     pub net: NetConfig,
+    /// Effective plugin settings (manifest defaults merged with the user's
+    /// per-board overrides), exposed to the module via the `config_get` import.
+    pub config: BTreeMap<String, String>,
+    /// Config keys whose values are host file paths; the host loads each file
+    /// and exposes it to the module via `resource_read` under the same key.
+    pub file_keys: Vec<String>,
 }
 
 /// Store data for host imports. The Amiga-memory pointer is stored as a
@@ -86,6 +93,10 @@ struct HostCtx {
     /// resource, not serialized: brought up fresh from the manifest's
     /// [`NetConfig`] on instantiation and reset.
     net: Option<Box<dyn NetBackend>>,
+    /// Effective plugin settings, read by the `config_get` import.
+    config: BTreeMap<String, String>,
+    /// Loaded file resources, read by the `resource_*` imports.
+    resources: HashMap<String, Vec<u8>>,
 }
 
 /// The typed entry points a plugin may export.
@@ -104,6 +115,8 @@ struct WasmRuntime {
     engine: Engine,
     module: Module,
     manifest: WasmManifest,
+    /// File resources loaded once from the manifest's file-typed config values.
+    resources: HashMap<String, Vec<u8>>,
     store: Store<HostCtx>,
     memory: WasmMemory,
     exports: Exports,
@@ -111,11 +124,13 @@ struct WasmRuntime {
 
 impl WasmRuntime {
     fn new(engine: Engine, module: Module, manifest: WasmManifest) -> Result<Self> {
-        let (store, memory, exports) = Self::instantiate(&engine, &module, &manifest)?;
+        let resources = load_resources(&manifest)?;
+        let (store, memory, exports) = Self::instantiate(&engine, &module, &manifest, &resources)?;
         Ok(Self {
             engine,
             module,
             manifest,
+            resources,
             store,
             memory,
             exports,
@@ -127,6 +142,7 @@ impl WasmRuntime {
         engine: &Engine,
         module: &Module,
         manifest: &WasmManifest,
+        resources: &HashMap<String, Vec<u8>>,
     ) -> Result<(Store<HostCtx>, WasmMemory, Exports)> {
         let mut store = Store::new(
             engine,
@@ -134,6 +150,8 @@ impl WasmRuntime {
                 mem: 0,
                 name: manifest.name.clone(),
                 net: make_backend(manifest.net),
+                config: manifest.config.clone(),
+                resources: resources.clone(),
             },
         );
         let mut linker = Linker::new(engine);
@@ -161,7 +179,7 @@ impl WasmRuntime {
     /// Re-instantiate from the kept engine + module (cold reset: clears RAM).
     fn reset(&mut self) -> Result<()> {
         let (store, memory, exports) =
-            Self::instantiate(&self.engine, &self.module, &self.manifest)?;
+            Self::instantiate(&self.engine, &self.module, &self.manifest, &self.resources)?;
         self.store = store;
         self.memory = memory;
         self.exports = exports;
@@ -201,6 +219,24 @@ impl WasmRuntime {
     }
 }
 
+/// Load the file resources a manifest's file-typed config values name. Like the
+/// module itself and HDF/CD images, these are reopened by path (here and again
+/// on a save-state load), not carried in the snapshot.
+fn load_resources(manifest: &WasmManifest) -> Result<HashMap<String, Vec<u8>>> {
+    let mut map = HashMap::new();
+    for key in &manifest.file_keys {
+        match manifest.config.get(key) {
+            Some(path) if !path.is_empty() => {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("loading WASM plugin resource {key:?} from {path}"))?;
+                map.insert(key.clone(), bytes);
+            }
+            _ => {} // an unset file option is simply absent
+        }
+    }
+    Ok(map)
+}
+
 /// Build the deterministic wasmtime engine. NaN canonicalization removes
 /// host-CPU NaN bit-pattern leakage; SIMD/relaxed-SIMD/threads are disabled
 /// (relaxed-SIMD is nondeterministic by spec, threads add shared-memory
@@ -226,6 +262,79 @@ fn register_host_fns(linker: &mut Linker<HostCtx>, caps: WasmCaps) -> Result<()>
             let name = caller.data().name.clone();
             log::info!("wasm[{name}]: {}", String::from_utf8_lossy(&buf));
             Ok(())
+        },
+    )?;
+
+    // config_get(key_ptr, key_len, out_ptr, out_cap) -> i32: copy the setting's
+    // value into linear memory (truncated to out_cap) and return its full
+    // length, or -1 if the key is absent. Always available.
+    linker.func_wrap(
+        "env",
+        "config_get",
+        |mut caller: Caller<'_, HostCtx>,
+         key_ptr: i32,
+         key_len: i32,
+         out_ptr: i32,
+         out_cap: i32|
+         -> Result<i32> {
+            let key = read_wasm_bytes(&mut caller, key_ptr, key_len)?;
+            let key = String::from_utf8_lossy(&key).into_owned();
+            let Some(value) = caller.data().config.get(&key).cloned() else {
+                return Ok(-1);
+            };
+            let bytes = value.as_bytes();
+            let n = bytes.len().min(out_cap.max(0) as usize);
+            write_wasm_bytes(&mut caller, out_ptr, &bytes[..n])?;
+            Ok(bytes.len() as i32)
+        },
+    )?;
+
+    // resource_len(name_ptr, name_len) -> i32: byte length of a file resource,
+    // or -1 if absent.
+    linker.func_wrap(
+        "env",
+        "resource_len",
+        |mut caller: Caller<'_, HostCtx>, name_ptr: i32, name_len: i32| -> Result<i32> {
+            let name = read_wasm_bytes(&mut caller, name_ptr, name_len)?;
+            let name = String::from_utf8_lossy(&name).into_owned();
+            Ok(caller
+                .data()
+                .resources
+                .get(&name)
+                .map(|b| b.len() as i32)
+                .unwrap_or(-1))
+        },
+    )?;
+
+    // resource_read(name_ptr, name_len, off, out_ptr, len) -> i32: copy
+    // resource[off..off+len] into linear memory; returns the byte count, or -1
+    // if the resource is absent.
+    linker.func_wrap(
+        "env",
+        "resource_read",
+        |mut caller: Caller<'_, HostCtx>,
+         name_ptr: i32,
+         name_len: i32,
+         off: i32,
+         out_ptr: i32,
+         len: i32|
+         -> Result<i32> {
+            let name = read_wasm_bytes(&mut caller, name_ptr, name_len)?;
+            let name = String::from_utf8_lossy(&name).into_owned();
+            let chunk = match caller.data().resources.get(&name) {
+                Some(bytes) => {
+                    let off = off.max(0) as usize;
+                    let end = off.saturating_add(len.max(0) as usize).min(bytes.len());
+                    if off >= bytes.len() {
+                        Vec::new()
+                    } else {
+                        bytes[off..end].to_vec()
+                    }
+                }
+                None => return Ok(-1),
+            };
+            write_wasm_bytes(&mut caller, out_ptr, &chunk)?;
+            Ok(chunk.len() as i32)
         },
     )?;
 
@@ -559,6 +668,8 @@ mod tests {
                 net: false,
             },
             net: NetConfig::None,
+            config: BTreeMap::new(),
+            file_keys: Vec::new(),
         }
     }
 
@@ -572,6 +683,8 @@ mod tests {
                 net: true,
             },
             net: NetConfig::Loopback,
+            config: BTreeMap::new(),
+            file_keys: Vec::new(),
         }
     }
 
@@ -720,6 +833,58 @@ mod tests {
               (i32.load8_u (i32.const 64))))
         )
     "#;
+
+    /// A plugin that reads a setting and a file resource at init: `init` puts
+    /// the config value's first byte at mem[256], the resource length at
+    /// mem[257], and the resource's first 4 bytes at mem[258..]; `read(off)`
+    /// returns mem[256 + off].
+    const CONFIG_WAT: &str = r#"
+        (module
+          (import "env" "config_get" (func $config_get (param i32 i32 i32 i32) (result i32)))
+          (import "env" "resource_len" (func $resource_len (param i32 i32) (result i32)))
+          (import "env" "resource_read" (func $resource_read (param i32 i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "buffers")
+          (data (i32.const 16) "rom")
+          (func (export "init")
+            (drop (call $config_get (i32.const 0) (i32.const 7) (i32.const 256) (i32.const 64)))
+            (i32.store8 (i32.const 257) (call $resource_len (i32.const 16) (i32.const 3)))
+            (drop (call $resource_read (i32.const 16) (i32.const 3) (i32.const 0) (i32.const 258) (i32.const 4))))
+          (func (export "read") (param $off i32) (param $size i32) (result i32)
+            (i32.load8_u (i32.add (i32.const 256) (local.get $off))))
+        )
+    "#;
+
+    #[test]
+    fn config_and_resource_imports_reach_the_plugin() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let rom_path = std::env::temp_dir().join(format!(
+            "copperline-wasm-rom-{}-{nanos}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&rom_path, [0xCA, 0xFE, 0xBA, 0xBE]).unwrap();
+
+        let path = write_wasm("cfg", CONFIG_WAT);
+        let mut manifest = manifest("cfg", false);
+        manifest.config.insert("buffers".into(), "8".into());
+        manifest
+            .config
+            .insert("rom".into(), rom_path.to_string_lossy().into_owned());
+        manifest.file_keys = vec!["rom".into()];
+
+        let mut board = WasmBoard::from_file(&path, manifest).unwrap();
+        let mut mem = empty_memory();
+        let mut host = DeviceHost::new(&mut mem);
+        assert_eq!(board.read(0, 1, &mut host), 0x38); // config "buffers" = "8"
+        assert_eq!(board.read(1, 1, &mut host), 4); // resource_len("rom")
+        assert_eq!(board.read(2, 1, &mut host), 0xCA); // rom[0]
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rom_path);
+    }
 
     #[test]
     fn net_send_and_recv_round_trip_over_loopback() {

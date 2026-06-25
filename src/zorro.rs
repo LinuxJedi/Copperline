@@ -21,6 +21,7 @@ use crate::net::NetConfig;
 use crate::wasmboard::{WasmCaps, WasmManifest};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const AUTOCONFIG_BASE: u64 = 0x00E8_0000;
@@ -531,6 +532,20 @@ fn floating_bus(size: usize) -> u64 {
 /// dma = true           # optional capabilities (default false)
 /// int2 = true
 /// int6 = false
+///
+/// # Plugin settings passed to the module (defaults; the user overrides them
+/// # per-board in the main config). A "file" option is loaded by the host and
+/// # exposed to the plugin as a named resource.
+/// [config]
+/// mac = "02:00:10:00:00:01"
+/// [[option]]
+/// key = "mac"
+/// label = "MAC address"
+/// type = "string"      # string | bool | int | file | enum
+/// [[option]]
+/// key = "rom"
+/// label = "Boot ROM"
+/// type = "file"
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -552,6 +567,56 @@ struct RawBoardMeta {
     /// Host network backend ("none"/"loopback"); presence grants the `net`
     /// capability (the net_send/net_recv imports).
     net: Option<String>,
+    /// Default plugin settings (free-form key/value).
+    config: Option<toml::Table>,
+    /// Config option schema, for the launcher's config panel.
+    #[serde(default)]
+    option: Vec<RawOption>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOption {
+    key: String,
+    label: Option<String>,
+    #[serde(rename = "type")]
+    kind: String,
+    default: Option<toml::Value>,
+    choices: Option<Vec<String>>,
+}
+
+/// One editable plugin setting, declared by a `[[option]]` in the manifest, used
+/// to render the launcher's config panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigOption {
+    pub key: String,
+    pub label: String,
+    pub kind: ConfigOptionKind,
+    pub default: Option<String>,
+}
+
+/// The editing widget a [`ConfigOption`] wants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigOptionKind {
+    String,
+    Bool,
+    Int,
+    /// A host file path; loaded by the host and exposed to the plugin as a
+    /// resource keyed by the option's `key`.
+    File,
+    /// A choice from a fixed list.
+    Enum(Vec<String>),
+}
+
+/// Stringify a TOML scalar for the plugin's flat string-valued config map.
+pub(crate) fn toml_value_to_string(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Integer(n) => n.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// A board parsed from a TOML metadata file: a RAM board (fully described by
@@ -566,6 +631,12 @@ pub enum LoadedZorroBoard {
         spec: BoardSpec,
         wasm_path: PathBuf,
         manifest: WasmManifest,
+        /// The config-option schema for the launcher panel.
+        options: Vec<ConfigOption>,
+        /// Default settings from `[config]` (option defaults applied, file
+        /// values resolved relative to the metadata file); the user's per-board
+        /// overrides are layered on top at config-resolution time.
+        default_config: BTreeMap<String, String>,
     },
 }
 
@@ -646,6 +717,8 @@ pub fn load_board_metadata(path: &Path) -> Result<LoadedZorroBoard> {
                 })?,
                 None => NetConfig::None,
             };
+            let options = parse_options(&raw.option, path)?;
+            let default_config = build_default_config(raw.config.as_ref(), &options, path);
             let manifest = WasmManifest {
                 name: spec.name.clone(),
                 caps: WasmCaps {
@@ -655,11 +728,21 @@ pub fn load_board_metadata(path: &Path) -> Result<LoadedZorroBoard> {
                     net: raw.net.is_some(),
                 },
                 net,
+                // The merge with the user's per-board overrides happens at
+                // config-resolution time; defaults travel separately for now.
+                config: BTreeMap::new(),
+                file_keys: options
+                    .iter()
+                    .filter(|o| o.kind == ConfigOptionKind::File)
+                    .map(|o| o.key.clone())
+                    .collect(),
             };
             Ok(LoadedZorroBoard::Wasm {
                 spec,
                 wasm_path,
                 manifest,
+                options,
+                default_config,
             })
         }
         other => bail!(
@@ -668,6 +751,73 @@ pub fn load_board_metadata(path: &Path) -> Result<LoadedZorroBoard> {
             other
         ),
     }
+}
+
+/// Parse the `[[option]]` schema from a manifest.
+fn parse_options(raw: &[RawOption], path: &Path) -> Result<Vec<ConfigOption>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for o in raw {
+        let kind = match o.kind.trim().to_ascii_lowercase().as_str() {
+            "string" => ConfigOptionKind::String,
+            "bool" => ConfigOptionKind::Bool,
+            "int" => ConfigOptionKind::Int,
+            "file" => ConfigOptionKind::File,
+            "enum" => {
+                let choices = o.choices.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: option {:?} type = \"enum\" needs choices = [...]",
+                        path.display(),
+                        o.key
+                    )
+                })?;
+                ConfigOptionKind::Enum(choices)
+            }
+            other => bail!(
+                "{}: option {:?} has unknown type {:?} (expected string/bool/int/file/enum)",
+                path.display(),
+                o.key,
+                other
+            ),
+        };
+        out.push(ConfigOption {
+            key: o.key.clone(),
+            label: o.label.clone().unwrap_or_else(|| o.key.clone()),
+            kind,
+            default: o.default.as_ref().map(toml_value_to_string),
+        });
+    }
+    Ok(out)
+}
+
+/// Build the default settings map: option defaults, overlaid by any `[config]`
+/// entries, with file-typed values resolved relative to the metadata file.
+fn build_default_config(
+    config: Option<&toml::Table>,
+    options: &[ConfigOption],
+    path: &Path,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for o in options {
+        if let Some(d) = &o.default {
+            map.insert(o.key.clone(), d.clone());
+        }
+    }
+    if let Some(table) = config {
+        for (k, v) in table {
+            map.insert(k.clone(), toml_value_to_string(v));
+        }
+    }
+    if let Some(dir) = path.parent() {
+        for o in options {
+            if o.kind == ConfigOptionKind::File {
+                if let Some(val) = map.get(&o.key) {
+                    let resolved = dir.join(val).to_string_lossy().into_owned();
+                    map.insert(o.key.clone(), resolved);
+                }
+            }
+        }
+    }
+    map
 }
 
 fn parse_board_size(s: &str) -> Result<usize> {
@@ -909,6 +1059,7 @@ mod tests {
             spec,
             wasm_path,
             manifest,
+            ..
         } = loaded
         else {
             panic!("expected a WASM board");

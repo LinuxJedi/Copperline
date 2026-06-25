@@ -1052,6 +1052,10 @@ pub(crate) struct RawZorroBoard {
     /// Path to a TOML board metadata file (see `src/zorro.rs` for the
     /// schema), resolved relative to the working directory.
     pub(crate) metadata: String,
+    /// Per-board plugin setting overrides, layered over the manifest's
+    /// `[config]` defaults (WASM plugin boards only). The launcher edits these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) config: Option<toml::Table>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -1228,12 +1232,25 @@ impl TryFrom<RawConfig> for Config {
                 crate::zorro::LoadedZorroBoard::Wasm {
                     spec,
                     wasm_path,
-                    manifest,
-                } => wasm_boards.push(WasmBoardConfig {
-                    spec,
-                    wasm_path,
-                    manifest,
-                }),
+                    mut manifest,
+                    default_config,
+                    options: _,
+                } => {
+                    // Effective config = manifest defaults, with the user's
+                    // per-board overrides layered on top.
+                    let mut config = default_config;
+                    if let Some(overrides) = &entry.config {
+                        for (key, value) in overrides {
+                            config.insert(key.clone(), crate::zorro::toml_value_to_string(value));
+                        }
+                    }
+                    manifest.config = config;
+                    wasm_boards.push(WasmBoardConfig {
+                        spec,
+                        wasm_path,
+                        manifest,
+                    });
+                }
             }
         }
         let chipset = match raw.chipset.revision.as_deref() {
@@ -1969,6 +1986,7 @@ mod tests {
             },
             zorro: vec![RawZorroBoard {
                 metadata: "board.toml".to_string(),
+                config: None,
             }],
             ..RawConfig::default()
         };
