@@ -35,7 +35,7 @@ range checks as the equivalent TOML fields:
 
 | Flag | Overrides | Accepts |
 |---|---|---|
-| `--model NAME` | `[machine] profile` | `A500`, `A500Plus`, `A600`, `A1200`, `CDTV`, `CD32` |
+| `--model NAME` | `[machine] profile` | `A1000`, `A500`, `A500OCS`, `A500Plus`, `A600`, `A1200`, `CDTV`, `CD32` |
 | `--chipset NAME` | `[chipset] revision` | `OCS`, `ECS`, `AGA` |
 | `--cpu MODEL` | `[cpu] model` | `68000`, `68EC020`, `68020`, `68030`, `68040` |
 | `--cpu-clock MHZ` | `[cpu] clock_mhz` | a number of MHz |
@@ -88,7 +88,7 @@ missing.
 
 ```toml
 [machine]
-profile = "A1200" # A500, A500Plus (A500+), A600, A1200, CDTV, CD32
+profile = "A1200" # A1000, A500, A500OCS, A500Plus (A500+), A600, A1200, CDTV, CD32
 rtc = true        # whether the $DC0000 battery RTC is fitted
 ```
 
@@ -96,13 +96,18 @@ A machine profile bundles the chipset, CPU, memory, gate array, and
 peripheral defaults of a real machine. The key is `profile` (the deprecated
 `model` alias still parses) so it never collides with `[cpu] model`. Explicit `[cpu]`, `[chipset]`, and
 `[memory]` sections override individual profile defaults. Without a
-`[machine]` section you get A500-like defaults (OCS, 68000, 512K chip RAM,
-512K trapdoor slow RAM).
+`[machine]` section you get the A500 Rev 6A default (the same as the `A500`
+profile: ECS 8372A Agnus, OCS 8362 Denise, 68000, 512K chip RAM, 512K
+trapdoor slow RAM) -- the most common and most-targeted Amiga. An explicit
+`[chipset] revision` overrides the per-machine chips, so `revision = "OCS"`
+gives a plain 8371/8362 OCS machine.
 
 | Profile | Chipset | CPU | Chip RAM | Slow RAM | Extras |
 |---|---|---|---|---|---|
-| `A500` | OCS | 68000 @ 7.09 MHz | 512K | 512K | -- |
-| `A500Plus` | ECS (8372A Agnus, ECS Denise) | 68000 @ 7.09 MHz | 1M | 0 | -- |
+| `A1000` | OCS (8361/8367 Agnus, OCS Denise) | 68000 @ 7.09 MHz | 256K | 0 | WCS, boot ROM + Kickstart disk |
+| `A500` | Rev 6A: ECS 8372A Agnus, OCS 8362 Denise | 68000 @ 7.09 MHz | 512K (up to 1M) | 512K | -- |
+| `A500OCS` | OCS (8371 Fat Agnus, OCS Denise) | 68000 @ 7.09 MHz | 512K | 512K | early A500 / A2000 |
+| `A500Plus` | ECS (8375 Agnus, ECS Denise) | 68000 @ 7.09 MHz | 1M | 0 | RTC |
 | `A600` | ECS (8375 Agnus, ECS Denise) | 68000 @ 7.09 MHz | 1M | 0 | Gayle IDE, RTC |
 | `A1200` | AGA (Alice/Lisa) | 68EC020 @ 14.18 MHz | 2M | 0 | Gayle IDE, RTC |
 | `CDTV` | ECS | 68000 @ 7.09 MHz | 1M | 0 | DMAC CD controller, 256K extended ROM |
@@ -110,7 +115,26 @@ peripheral defaults of a real machine. The key is `profile` (the deprecated
 
 `rtc` exists because some machines shipped both ways: the base A600 had no
 RTC while the A600HD did. The default keeps it fitted so the Workbench
-clock works.
+clock works. The A500+ has an OKI RTC soldered to the motherboard, so its
+profile fits one; the A1000 has none.
+
+The `A1000` profile models the original Amiga, which has no Kickstart ROM.
+Its `rom` is instead the 64K bootstrap ROM ("Amiga ROM Bootstrap"); on
+power-up the bootstrap loads Kickstart from the Kickstart disk in DF0 into
+256K of writable control store (WCS) at `$FC0000`, write-protects it, and runs
+it -- exactly as the real machine does. So an A1000 config names the bootstrap
+ROM as `rom` and puts the Kickstart disk in `[floppy.df0]`; leave it in and the
+machine boots to Kickstart (which then asks for a Workbench disk). See the
+ready-made `a1000.example.toml`.
+
+The `A500` profile models the common Rev 6A board: the ECS "Fatter" 8372A
+Agnus (a 1 MiB chip-RAM reach and the software-selectable PAL/NTSC switch via
+`BEAMCON0`) paired with the original OCS 8362 Denise. It is therefore an
+Agnus-only ECS upgrade, not a full-ECS machine -- the OCS Denise means no
+superhires or `BRDRBLNK`, exactly as on the real board. Chip RAM defaults to
+the stock 512K but accepts up to 1M (`[memory] chip = "1M"`); more than 1M is
+rejected because the 8372A cannot address it. Booting with no `[machine]`
+section instead gives a plain OCS A500-like machine (8371 Agnus, OCS Denise).
 
 ## `[emulation]`
 

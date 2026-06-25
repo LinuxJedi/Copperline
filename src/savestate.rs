@@ -51,7 +51,8 @@ const STATE_MAGIC: &[u8; 8] = b"CLSSTATE";
 //   3: keyboard MCU clock-based handshake timing (state shape change)
 //   4: PollStats.custom HashMap replaced by a flat Vec table
 //   5: MachineDescriptor header (machine-shape guard rail)
-pub const STATE_VERSION: u32 = 5;
+//   6: Memory gained the A1000 WCS (wcs + wcs_write_protected)
+pub const STATE_VERSION: u32 = 6;
 
 /// Default state file name, timestamped like the screenshot/recorder names.
 pub fn auto_filename() -> std::path::PathBuf {
@@ -149,6 +150,8 @@ mod tests {
                 zorro: ZorroChain::default(),
                 extended_rom: Vec::new(),
                 extended_rom_base: 0,
+                wcs: Vec::new(),
+                wcs_write_protected: false,
             },
             Paula::new(Box::new(NullSerialSink), Box::new(NullSink)),
             FloppyController::default(),

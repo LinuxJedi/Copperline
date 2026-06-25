@@ -6,7 +6,9 @@ use crate::bus::{Bus, CpuBusAccessKind};
 use crate::chipset::cia::CiaSideEffect;
 use crate::chipset::paula::{pending_ipl, INT_MASTER};
 use crate::config::CpuModel;
-use crate::memory::{AUTOCONFIG_BASE, AUTOCONFIG_SIZE, CHIP_RAM_BASE, ROM_BASE, SLOW_RAM_BASE};
+use crate::memory::{
+    AUTOCONFIG_BASE, AUTOCONFIG_SIZE, CHIP_RAM_BASE, ROM_BASE, SLOW_RAM_BASE, WCS_BASE,
+};
 use anyhow::{anyhow, Result};
 use log::{debug, trace};
 use m68k::{AddressBus, CpuCore, CpuType, NoOpHleHandler, StepResult};
@@ -1518,6 +1520,9 @@ impl CpuBus {
         if let Some(off) = region_offset(self.bus.mem.rom.len(), ROM_BASE, addr, 1) {
             return self.bus.mem.rom[off];
         }
+        if let Some(off) = region_offset(self.bus.mem.wcs.len(), WCS_BASE, addr, 1) {
+            return self.bus.mem.wcs[off];
+        }
         if let Some(off) = region_offset(
             self.bus.mem.extended_rom.len(),
             self.bus.mem.extended_rom_base,
@@ -1692,6 +1697,12 @@ impl CpuBus {
             self.bus.cpu_external_access(Self::access_words(size));
             return read_be(&self.bus.mem.rom, off, size);
         }
+        // A1000 WCS at $FC0000 (empty -> no match on other machines): the
+        // 256 KiB writable control store the boot ROM loads Kickstart into.
+        if let Some(off) = region_offset(self.bus.mem.wcs.len(), WCS_BASE, addr, size) {
+            self.bus.cpu_external_access(Self::access_words(size));
+            return read_be(&self.bus.mem.wcs, off, size);
+        }
         if let Some(off) = region_offset(
             self.bus.mem.extended_rom.len(),
             self.bus.mem.extended_rom_base,
@@ -1855,6 +1866,21 @@ impl CpuBus {
         }
         if region_offset(self.bus.mem.rom.len(), ROM_BASE, addr, size).is_some() {
             self.bus.cpu_external_access(Self::access_words(size));
+            // A1000: a CPU write anywhere in the boot-ROM window ($F80000-
+            // $FBFFFF) flips the latch to write-protect the WCS. The boot code
+            // does this once the Kickstart image is in place at $FC0000.
+            if !self.bus.mem.wcs.is_empty() {
+                self.bus.mem.wcs_write_protected = true;
+            }
+            return;
+        }
+        // A1000 WCS at $FC0000: writable until the boot ROM locks the latch.
+        if let Some(off) = region_offset(self.bus.mem.wcs.len(), WCS_BASE, addr, size) {
+            self.bus.cpu_external_access(Self::access_words(size));
+            if !self.bus.mem.wcs_write_protected {
+                write_be(&mut self.bus.mem.wcs, off, size, value);
+                self.dbg_note_memw(addr, size);
+            }
             return;
         }
         if region_offset(
@@ -2253,6 +2279,8 @@ mod tests {
                 zorro,
                 extended_rom: Vec::new(),
                 extended_rom_base: 0,
+                wcs: Vec::new(),
+                wcs_write_protected: false,
             },
             Paula::new(Box::new(StdoutSink::new()), Box::new(NullSink)),
             FloppyController::default(),
@@ -2486,6 +2514,8 @@ mod tests {
                     zorro: ZorroChain::default(),
                     extended_rom: Vec::new(),
                     extended_rom_base: 0,
+                    wcs: Vec::new(),
+                    wcs_write_protected: false,
                 },
                 Paula::new(Box::new(StdoutSink::new()), Box::new(NullSink)),
                 FloppyController::default(),

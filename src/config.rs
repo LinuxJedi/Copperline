@@ -389,11 +389,17 @@ pub enum Chipset {
 /// clock, memory sizes, RTC presence, and gate array. Explicit `[cpu]`/
 /// `[chipset]`/`[memory]` sections override the profile defaults where
 /// compatible; the profile owns what those sections cannot express (Gayle,
-/// RTC presence). With no `[machine]` section the defaults are A500-like:
-/// OCS, 68000, 512 KiB chip RAM, and 512 KiB trapdoor slow RAM.
+/// RTC presence). With no `[machine]` section the defaults match the `A500`
+/// profile: the A500 Rev 6A (ECS 8372A Agnus, OCS 8362 Denise, 68000,
+/// 512 KiB chip RAM, and 512 KiB trapdoor slow RAM).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MachineModel {
+    /// A500 Rev 6A: the ECS "Fatter" 8372A Agnus (1 MiB chip reach, software
+    /// PAL/NTSC switch) with the original OCS 8362 Denise.
     A500,
+    /// Early A500 (Rev 3/5), equivalent to an A2000: the 512 KiB OCS "Fat
+    /// Agnus" (8370/8371) with OCS 8362 Denise.
+    A500Ocs,
     A500Plus,
     A600,
     A1200,
@@ -405,6 +411,13 @@ pub enum MachineModel {
     /// 512 KiB extended ROM at $E00000. Enables Akiko and the CD32 CD-ROM
     /// path.
     Cd32,
+    /// A1000: the original Amiga. OCS 8361/8367 Agnus + OCS 8362 Denise, and
+    /// no Kickstart ROM -- the `rom` is the 64 KiB bootstrap ROM, which loads
+    /// Kickstart from the Kickstart disk in DF0 into 256 KiB of writable
+    /// control store (WCS) at $FC0000 and then write-protects it. 256 KiB
+    /// stock chip RAM, no trapdoor slow RAM, no RTC. (Added last so the
+    /// serialized discriminants of the other models do not shift.)
+    A1000,
 }
 
 /// Identity of a ROM image: its length and a CRC-32 of its bytes. Enough to
@@ -619,8 +632,12 @@ impl Default for Config {
             z3_ram_bytes: 0,
             zorro_boards: Vec::new(),
             identify_board: true,
-            chipset: Chipset::Ocs,
-            agnus_revision: AgnusRevision::Ocs,
+            // The no-[machine] default models the most common and most-
+            // targeted Amiga: the A500 Rev 6A (the ECS "Fatter" 8372A Agnus
+            // with the original OCS 8362 Denise). Selecting `[chipset]
+            // revision` or a different `[machine] profile` opts out.
+            chipset: Chipset::Ecs,
+            agnus_revision: AgnusRevision::Ecs8372Rev4,
             denise_revision: DeniseRevision::Ocs,
             machine: None,
             gate_array: GateArray::None,
@@ -1147,17 +1164,37 @@ impl TryFrom<RawConfig> for Config {
             bail!("[scsi] rom_odd needs rom (the even EPROM half)");
         }
 
+        // The A500 Rev 6A is both the "A500" profile and the no-profile
+        // default machine (the most common, most-targeted Amiga): the Fatter
+        // 8372A Agnus with the original OCS 8362 Denise. An explicit [chipset]
+        // revision is an intentional override, so it re-derives the chips from
+        // the generic preset instead -- e.g. revision = "OCS" forces a plain
+        // 8371/8362 machine even under profile = "A500". cfg.machine, the gate
+        // array, and the descriptor machine id are unaffected.
+        let a500_default =
+            raw.chipset.revision.is_none() && matches!(machine, None | Some(MachineModel::A500));
         let agnus_revision = match raw.chipset.agnus.as_deref() {
-            // The A600 board carries the 2 MB-capable 8375 regardless of
-            // fitted chip RAM; other machines pick by preset + RAM size
-            // (the A1200's AGA preset resolves to Alice).
             None => match machine {
-                Some(MachineModel::A600) => AgnusRevision::Ecs8375,
+                // The A500+ (Rev 8A) and A600 boards have the 2 MB "Super Fat"
+                // 8375 soldered on, regardless of preset or fitted chip RAM.
+                Some(MachineModel::A500Plus | MachineModel::A600) => AgnusRevision::Ecs8375,
+                // The A500 Rev 6A / default machine has the 1 MB 8372A. Pinning
+                // it keeps the authentic 1 MiB chip-RAM ceiling, so fitting
+                // more is rejected by validate_chip_ram rather than silently
+                // promoted to an 8375.
+                _ if a500_default => AgnusRevision::Ecs8372Rev4,
+                // Everything else -- the A1200's AGA preset (Alice) or an
+                // explicit revision preset -- picks by preset + fitted chip RAM.
                 _ => default_agnus_revision(chipset, chip_ram_bytes),
             },
             Some(s) => parse_agnus_revision(s)?,
         };
         let denise_revision = match raw.chipset.denise.as_deref() {
+            // The A500 Rev 6A / default machine pairs its ECS Agnus with the
+            // original 8362 OCS Denise (no superhires/BRDRBLNK). Every other
+            // machine, and any explicit revision preset, takes the Denise that
+            // matches its preset.
+            None if a500_default => DeniseRevision::Ocs,
             None => default_denise_revision(chipset),
             Some(s) => parse_denise_revision(s)?,
         };
@@ -1292,14 +1329,16 @@ fn parse_chipset(s: &str) -> Result<Chipset> {
 fn parse_machine_model(s: &str) -> Result<MachineModel> {
     let norm = s.trim().to_ascii_uppercase().replace(['_', '-', ' '], "");
     match norm.as_str() {
+        "A1000" => Ok(MachineModel::A1000),
         "A500" => Ok(MachineModel::A500),
+        "A500OCS" => Ok(MachineModel::A500Ocs),
         "A500PLUS" | "A500+" => Ok(MachineModel::A500Plus),
         "A600" => Ok(MachineModel::A600),
         "A1200" => Ok(MachineModel::A1200),
         "CDTV" => Ok(MachineModel::Cdtv),
         "CD32" => Ok(MachineModel::Cd32),
         _ => Err(anyhow!(
-            "unknown machine model {:?}: expected A500 / A500Plus / A600 / A1200 / CDTV / CD32",
+            "unknown machine model {:?}: expected A1000 / A500 / A500OCS / A500Plus / A600 / A1200 / CDTV / CD32",
             s
         )),
     }
@@ -1313,10 +1352,34 @@ fn machine_profile_defaults(model: MachineModel) -> Config {
         ..Config::default()
     };
     match model {
-        // The common expanded OCS A500: 512 KiB chip plus 512 KiB trapdoor
-        // slow RAM. A bare 512 KiB machine is still available with
-        // `[memory] slow = "0"` or `--slow 0`.
-        MachineModel::A500 => {}
+        // The A500 Rev 6A board: the ECS "Fatter" 8372A Agnus (1 MiB chip
+        // reach plus the software PAL/NTSC switch) paired with the original
+        // OCS 8362 Denise, and the common 512 KiB chip + 512 KiB trapdoor
+        // slow RAM. The 8372A makes up to 1 MiB chip RAM possible (chip =
+        // "1M" / --chip 1M); the Denise stays OCS, so this is an Agnus-only
+        // ECS machine, not a full-ECS A500+. The 8372A/8362 pairing is pinned
+        // in the agnus/denise derivation below. A bare 512 KiB machine is
+        // still available with `[memory] slow = "0"` or `--slow 0`.
+        MachineModel::A500 => {
+            d.chipset = Chipset::Ecs;
+        }
+        // The original Amiga: OCS 8361/8367 Agnus + OCS 8362 Denise, 256 KiB
+        // stock chip RAM, no trapdoor slow RAM, no RTC. The `rom` is the
+        // 64 KiB bootstrap ROM and the Kickstart disk goes in DF0; the boot
+        // ROM loads it into the WCS at $FC0000 (see Memory::load_a1000).
+        MachineModel::A1000 => {
+            d.chipset = Chipset::Ocs;
+            d.chip_ram_bytes = 256 * 1024;
+            d.slow_ram_bytes = 0;
+            d.rtc_present = false;
+        }
+        // The early A500 (Rev 3/5) / A2000: the 512 KiB OCS "Fat Agnus"
+        // (8370/8371) and OCS 8362 Denise, with the same 512 KiB chip +
+        // 512 KiB trapdoor slow RAM. This is the pre-Rev-6A machine the
+        // default used to be; `revision = "OCS"` gives the same chips.
+        MachineModel::A500Ocs => {
+            d.chipset = Chipset::Ocs;
+        }
         MachineModel::A500Plus => {
             d.chipset = Chipset::Ecs;
             d.chip_ram_bytes = 1024 * 1024;
@@ -1824,9 +1887,15 @@ mod tests {
 
     #[test]
     fn machine_profiles_supply_defaults_and_keep_overrides() -> Result<()> {
-        // No [machine] section: A500-like defaults, no gate array, RTC fitted.
+        // No [machine] section: the default machine is the A500 Rev 6A
+        // (ECS 8372A Agnus + OCS 8362 Denise), no gate array, RTC fitted,
+        // stock 512K chip + 512K trapdoor slow RAM. cfg.machine stays None --
+        // the profile id only changes with an explicit [machine] profile.
         let cfg = parse_config("")?;
         assert_eq!(cfg.machine, None);
+        assert_eq!(cfg.chipset, Chipset::Ecs);
+        assert_eq!(cfg.agnus_revision, AgnusRevision::Ecs8372Rev4);
+        assert_eq!(cfg.denise_revision, DeniseRevision::Ocs);
         assert_eq!(cfg.gate_array, GateArray::None);
         assert_eq!(cfg.chip_ram_bytes, 512 * 1024);
         assert_eq!(cfg.slow_ram_bytes, 512 * 1024);
@@ -1839,7 +1908,11 @@ mod tests {
             "#,
         )?;
         assert_eq!(cfg.machine, Some(MachineModel::A500));
-        assert_eq!(cfg.chipset, Chipset::Ocs);
+        // Rev 6A board: ECS Agnus (the 1 MiB 8372A) with the original OCS
+        // Denise, stock 512 KiB chip + 512 KiB trapdoor slow RAM.
+        assert_eq!(cfg.chipset, Chipset::Ecs);
+        assert_eq!(cfg.agnus_revision, AgnusRevision::Ecs8372Rev4);
+        assert_eq!(cfg.denise_revision, DeniseRevision::Ocs);
         assert_eq!(cfg.chip_ram_bytes, 512 * 1024);
         assert_eq!(cfg.slow_ram_bytes, 512 * 1024);
 
@@ -1892,8 +1965,13 @@ mod tests {
         assert_eq!(cfg.chipset, Chipset::Ecs);
         assert_eq!(cfg.chip_ram_bytes, 1024 * 1024);
         assert_eq!(cfg.slow_ram_bytes, 0);
-        assert_eq!(cfg.agnus_revision, AgnusRevision::Ecs8372Rev4);
+        // The A500+ (Rev 8A) board carries the 2 MB-capable 8375, like the
+        // A600, even though it ships with 1 MB chip RAM fitted.
+        assert_eq!(cfg.agnus_revision, AgnusRevision::Ecs8375);
+        assert_eq!(cfg.denise_revision, DeniseRevision::Ecs8373);
         assert_eq!(cfg.gate_array, GateArray::None);
+        // The A500+ has an OKI RTC soldered to the motherboard.
+        assert!(cfg.rtc_present);
 
         let cfg = parse_config(
             r#"
@@ -1915,6 +1993,108 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown machine model"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn a500_rev6a_agnus_allows_up_to_1mb_chip() -> Result<()> {
+        // The Fatter 8372A reaches 1 MiB, so the 1 MiB chip-RAM mod is a
+        // valid A500 configuration and still carries the 8372A (not the
+        // 2 MiB 8375) alongside the OCS Denise.
+        let cfg = parse_config(
+            r#"
+            [machine]
+            profile = "A500"
+            [memory]
+            chip = "1M"
+            slow = "0"
+            "#,
+        )?;
+        assert_eq!(cfg.chip_ram_bytes, 1024 * 1024);
+        assert_eq!(cfg.agnus_revision, AgnusRevision::Ecs8372Rev4);
+        assert_eq!(cfg.denise_revision, DeniseRevision::Ocs);
+
+        // 2 MiB chip exceeds the 8372A's 1 MiB address reach: rejected
+        // rather than silently promoted to a 2 MiB 8375.
+        let err = parse_config(
+            r#"
+            [machine]
+            profile = "A500"
+            [memory]
+            chip = "2M"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Agnus address reach"), "{err:#}");
+
+        // An explicit [chipset] revision overrides the profile's board chips:
+        // profile = "A500" + revision = "OCS" is a plain 8371/8362 OCS
+        // machine, not the Fatter-Agnus Rev 6A.
+        let cfg = parse_config(
+            r#"
+            [machine]
+            profile = "A500"
+            [chipset]
+            revision = "OCS"
+            "#,
+        )?;
+        assert_eq!(cfg.chipset, Chipset::Ocs);
+        assert_eq!(cfg.agnus_revision, AgnusRevision::Ocs);
+        assert_eq!(cfg.denise_revision, DeniseRevision::Ocs);
+        Ok(())
+    }
+
+    #[test]
+    fn a500ocs_profile_is_a_plain_512k_ocs_machine() -> Result<()> {
+        // The early A500 (Rev 3/5) / A2000: 8370/8371 Fat Agnus + OCS Denise,
+        // 512 KiB chip + 512 KiB trapdoor slow RAM, no gate array.
+        let cfg = parse_config(
+            r#"
+            [machine]
+            profile = "A500OCS"
+            "#,
+        )?;
+        assert_eq!(cfg.machine, Some(MachineModel::A500Ocs));
+        assert_eq!(cfg.chipset, Chipset::Ocs);
+        assert_eq!(cfg.agnus_revision, AgnusRevision::Ocs);
+        assert_eq!(cfg.denise_revision, DeniseRevision::Ocs);
+        assert_eq!(cfg.chip_ram_bytes, 512 * 1024);
+        assert_eq!(cfg.slow_ram_bytes, 512 * 1024);
+        assert_eq!(cfg.gate_array, GateArray::None);
+
+        // The OCS Fat Agnus tops out at 512 KiB chip RAM.
+        let err = parse_config(
+            r#"
+            [machine]
+            profile = "A500OCS"
+            [memory]
+            chip = "1M"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("chipset maximum"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn a1000_profile_is_an_ocs_machine_with_wcs_defaults() -> Result<()> {
+        // The original Amiga: OCS 8361/8367 Agnus + OCS 8362 Denise, 256 KiB
+        // stock chip RAM, no slow RAM, no RTC, no gate array. The `rom` is the
+        // 64 KiB bootstrap ROM (loaded by Memory::load_a1000, not here).
+        let cfg = parse_config(
+            r#"
+            [machine]
+            profile = "A1000"
+            "#,
+        )?;
+        assert_eq!(cfg.machine, Some(MachineModel::A1000));
+        assert_eq!(cfg.chipset, Chipset::Ocs);
+        assert_eq!(cfg.agnus_revision, AgnusRevision::Ocs);
+        assert_eq!(cfg.denise_revision, DeniseRevision::Ocs);
+        assert_eq!(cfg.chip_ram_bytes, 256 * 1024);
+        assert_eq!(cfg.slow_ram_bytes, 0);
+        assert!(!cfg.rtc_present);
+        assert_eq!(cfg.gate_array, GateArray::None);
         Ok(())
     }
 

@@ -979,7 +979,14 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let mut mem = Memory::load(&cfg.rom_path, cfg.chip_ram_bytes, cfg.slow_ram_bytes, zorro)?;
+    // The A1000 has no Kickstart ROM: cfg.rom_path is its 64 KiB bootstrap
+    // ROM, and a 256 KiB WCS is allocated for it to load Kickstart into from
+    // the Kickstart disk in DF0.
+    let mut mem = if cfg.machine == Some(crate::config::MachineModel::A1000) {
+        Memory::load_a1000(&cfg.rom_path, cfg.chip_ram_bytes, cfg.slow_ram_bytes, zorro)?
+    } else {
+        Memory::load(&cfg.rom_path, cfg.chip_ram_bytes, cfg.slow_ram_bytes, zorro)?
+    };
     if let Some(path) = &cfg.extended_rom_path {
         let image = std::fs::read(path)
             .map_err(|e| anyhow!("reading extended ROM {}: {e}", path.display()))?;

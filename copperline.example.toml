@@ -84,11 +84,15 @@ model = "68000"
 
 # Optional machine profile: a validated bundle of chipset revisions, CPU,
 # memory sizes, RTC presence, and gate array. Explicit [cpu]/[chipset]/
-# [memory] sections still override the profile defaults. Without this
-# section the A500-like defaults apply (512 KiB chip plus 512 KiB
-# trapdoor slow RAM).
+# [memory] sections still override the profile defaults. The "A500" profile
+# models a Rev 6A board: the ECS "Fatter" 8372A Agnus (1 MiB chip reach plus
+# the software PAL/NTSC switch) with the original OCS 8362 Denise, 512 KiB
+# chip + 512 KiB trapdoor slow RAM (fit up to 1 MiB chip with chip = "1M").
+# Without any [machine] section the default machine is that same Rev 6A
+# A500 (ECS 8372A Agnus, OCS 8362 Denise, 512 KiB chip + 512 KiB trapdoor
+# slow RAM) -- the most common and most-targeted Amiga.
 # [machine]
-# profile = "A600"      # A500 | A500Plus | A600 | A1200 | CDTV | CD32
+# profile = "A600"      # A1000 | A500 | A500OCS | A500Plus | A600 | A1200 | CDTV | CD32
 # rtc = true            # $DC0000 RTC fitted (base A600 shipped without)
 
 
@@ -176,8 +180,11 @@ slow = "512K"
 # are implemented (remaining edge-case gaps are noted in
 # docs/internals/chipset.md). The preset picks matching chips:
 # OCS = OCS Agnus + OCS Denise, ECS = ECS Agnus (8372A, or 8375 with
-# >1M chip RAM) + ECS Denise 8373, AGA = Alice + Lisa.
-revision = "OCS"
+# >1M chip RAM) + ECS Denise 8373, AGA = Alice + Lisa. Omit it to take the
+# machine's real chips (the default and the A500 profile are a Rev 6A:
+# 8372A Agnus + OCS Denise). Setting it is an override that wins over the
+# profile -- e.g. revision = "OCS" forces a plain 8371/8362 machine.
+# revision = "OCS"
 
 # Optional per-chip overrides on top of the preset, for mixed machines
 # that really shipped (e.g. a late A500: ECS Agnus + OCS Denise).

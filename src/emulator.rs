@@ -1948,6 +1948,8 @@ mod tests {
                 zorro: crate::zorro::ZorroChain::default(),
                 extended_rom: Vec::new(),
                 extended_rom_base: 0,
+                wcs: Vec::new(),
+                wcs_write_protected: false,
             },
             crate::chipset::paula::Paula::new(Box::new(crate::serial::NullSerialSink), audio),
             crate::floppy::FloppyController::default(),
@@ -2000,6 +2002,8 @@ mod tests {
                 zorro: crate::zorro::ZorroChain::default(),
                 extended_rom: Vec::new(),
                 extended_rom_base: 0,
+                wcs: Vec::new(),
+                wcs_write_protected: false,
             },
             crate::chipset::paula::Paula::new(
                 Box::new(crate::serial::NullSerialSink),

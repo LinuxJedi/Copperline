@@ -446,6 +446,8 @@ mod tests {
             zorro: ZorroChain::default(),
             extended_rom: Vec::new(),
             extended_rom_base: 0,
+            wcs: Vec::new(),
+            wcs_write_protected: false,
         }
     }
 

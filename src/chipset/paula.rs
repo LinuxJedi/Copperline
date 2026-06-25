@@ -586,6 +586,11 @@ impl Paula {
         self.led_filter_enabled = enabled;
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn led_filter_enabled(&self) -> bool {
+        self.led_filter_enabled
+    }
+
     pub fn set_output_volume_percent(&mut self, percent: u8) {
         self.output_volume = f32::from(percent.min(100)) / 100.0;
     }

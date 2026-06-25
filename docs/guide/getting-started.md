@@ -117,12 +117,14 @@ cargo test --release -- --ignored   # integration tests (need local ROMs/disks)
 
 With no arguments, Copperline looks for `./copperline.toml` in the current
 directory. If it is not present, built-in defaults are used: a 68000 at
-~7.09 MHz with 512 KiB chip RAM, OCS, PAL, and the bundled AROS ROM (when no
+~7.09 MHz with 512 KiB chip RAM, PAL, and the bundled AROS ROM (when no
 ROM is named, Copperline locates the AROS image that ships with it -- see
-[](configuration#top-level)). The default machine is a 1 MB A500: 512 KiB
-chip RAM plus 512 KiB of trapdoor slow RAM, matching the memory expansion
-many OCS demos expect. Use `--slow 0` or `[memory] slow = "0"` for a bare
-512 KiB A500.
+[](configuration#top-level)). The default machine is the A500 Rev 6A -- the
+most common and most-targeted Amiga: the ECS "Fatter" 8372A Agnus (1 MiB
+chip reach plus the software PAL/NTSC switch) with the original OCS 8362
+Denise, 512 KiB chip RAM plus 512 KiB of trapdoor slow RAM. Use `--slow 0`
+or `[memory] slow = "0"` for a bare 512 KiB machine, or `[chipset] revision
+= "OCS"` for a plain 8371/8362 OCS A500.
 
 You can boot your own ROM with a positional argument, or point at a specific
 config file:

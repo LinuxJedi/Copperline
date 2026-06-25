@@ -2085,6 +2085,10 @@ impl Bus {
         self.bitplane_bplcon0_delay = None;
         self.bitplane_ddfstart_miss = None;
         self.mem.overlay = true;
+        // A 68000 RESET returns the A1000 WCS latch to boot mode (boot ROM at
+        // $F80000, WCS writable) without clearing the WCS, so the boot ROM can
+        // re-run the Kickstart it already loaded instead of reading the disk.
+        self.mem.wcs_write_protected = false;
         self.floppy.reset_external_drives();
         self.floppy.write_prb(0xFF);
     }
@@ -3434,12 +3438,17 @@ impl Bus {
             _ => {}
         }
         if reg == REG_PRA || reg == REG_DDRA {
-            // CIA-A PRA bit 1 is /LED. On post-A1000 Amigas this line
-            // also controls the optional analogue audio low-pass filter:
-            // low = LED bright + filter enabled, high = LED dim/off +
-            // filter bypassed.
-            let pra = self.cia_a.read(REG_PRA);
-            self.paula.set_led_filter_enabled(pra & 0x02 == 0);
+            // CIA-A PRA bit 1 is /LED. On post-A1000 Amigas this line also
+            // switches the analogue audio low-pass filter: low = LED bright +
+            // filter engaged, high = LED dim/off + filter bypassed. The A1000
+            // does not have that circuit -- its filter is fixed and the LED is
+            // not on this line -- so the LED never switches the filter there.
+            // The A1000 is the machine with a WCS fitted at $FC0000.
+            let is_a1000 = !self.mem.wcs.is_empty();
+            if !is_a1000 {
+                let pra = self.cia_a.read(REG_PRA);
+                self.paula.set_led_filter_enabled(pra & 0x02 == 0);
+            }
             self.cd32_pad_cia_clock();
         }
         eff
@@ -10503,6 +10512,8 @@ mod tests {
                 zorro: crate::zorro::ZorroChain::default(),
                 extended_rom: Vec::new(),
                 extended_rom_base: 0,
+                wcs: Vec::new(),
+                wcs_write_protected: false,
             },
             Paula::new(Box::new(NoopSerial), Box::new(NoopAudio)),
             FloppyController::default(),
@@ -10520,6 +10531,8 @@ mod tests {
                 zorro: crate::zorro::ZorroChain::default(),
                 extended_rom: Vec::new(),
                 extended_rom_base: 0,
+                wcs: Vec::new(),
+                wcs_write_protected: false,
             },
             Paula::new(
                 Box::new(NoopSerial),
@@ -17934,6 +17947,32 @@ mod tests {
 
         let _ = bus.cia_a_write(pra, 1, 0xC1);
         assert!(bus.front_panel_status().power_led_on);
+    }
+
+    #[test]
+    fn a1000_led_line_does_not_switch_the_audio_filter() {
+        use crate::chipset::cia::REG_DDRA;
+        let ddra = (REG_DDRA as u64) << 8;
+        let pra = (REG_PRA as u64) << 8;
+
+        // A post-A1000 machine: CIA-A PRA bit 1 (/LED) switches the analogue
+        // audio low-pass filter. Drive bits 0 (/OVL, kept high) and 1 as
+        // outputs, then toggle /LED. The filter starts engaged.
+        let mut normal = empty_bus();
+        assert!(normal.paula.led_filter_enabled());
+        let _ = normal.cia_a_write(ddra, 1, 0x03);
+        let _ = normal.cia_a_write(pra, 1, 0x03); // /LED high -> filter bypassed
+        assert!(!normal.paula.led_filter_enabled());
+        let _ = normal.cia_a_write(pra, 1, 0x01); // /LED low -> filter engaged
+        assert!(normal.paula.led_filter_enabled());
+
+        // The A1000 (identified by its WCS) lacks that circuit: its fixed
+        // filter stays engaged no matter what the LED line does.
+        let mut a1000 = empty_bus();
+        a1000.mem.wcs = vec![0u8; crate::memory::WCS_SIZE];
+        let _ = a1000.cia_a_write(ddra, 1, 0x03);
+        let _ = a1000.cia_a_write(pra, 1, 0x03); // /LED high: no effect on the filter
+        assert!(a1000.paula.led_filter_enabled());
     }
 
     #[test]

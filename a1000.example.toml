@@ -1,0 +1,19 @@
+# Amiga 1000 (the original Amiga, 1985).
+#
+# The A1000 has no Kickstart ROM. Instead a 64 KiB bootstrap ROM (the
+# "Amiga ROM Bootstrap") loads Kickstart from the Kickstart disk in DF0 into
+# 256 KiB of writable control store (WCS) at $FC0000, write-protects it, and
+# runs it -- exactly as the real machine does. So `rom` here is the bootstrap
+# ROM, and the Kickstart disk goes in DF0.
+#
+# Defaults to the 256 KiB stock chip RAM (set chip = "512K" for the common
+# front expansion). Leave the Kickstart disk in DF0 and the bootstrap loads it
+# on power-up; once Kickstart is up it asks for a Workbench disk.
+
+rom = "Amiga 1000 ROM Bootstrap (1985)(Commodore)(A1000)[!].rom"
+
+[machine]
+profile = "A1000"
+
+[floppy.df0]
+path = "Kickstart-Disk v1.1 r32.34 (1986)(Commodore)(A1000)(PAL).adf"
