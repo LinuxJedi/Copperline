@@ -502,20 +502,11 @@ mod tests {
         put(board, mem, iadr + 6, 0x0605);
         // RX ring: RLEN log2 = 0 (1 entry) in bits 13-15.
         put(board, mem, iadr + 0x10, rx_ring as u16);
-        put(
-            board,
-            mem,
-            iadr + 0x12,
-            (0 << 13) | ((rx_ring >> 16) as u16 & 0xFF),
-        );
+        // High word: RLEN log2 = 0 (1 entry) in bits 13-15, RDRA[23:16] in 0-7.
+        put(board, mem, iadr + 0x12, (rx_ring >> 16) as u16 & 0xFF);
         // TX ring: TLEN log2 = 0.
         put(board, mem, iadr + 0x14, tx_ring as u16);
-        put(
-            board,
-            mem,
-            iadr + 0x16,
-            (0 << 13) | ((tx_ring >> 16) as u16 & 0xFF),
-        );
+        put(board, mem, iadr + 0x16, (tx_ring >> 16) as u16 & 0xFF);
 
         // RX descriptor 0: buffer @ rx_buf, OWN=chip, BCNT = -256.
         put(board, mem, rx_ring, rx_buf as u16);
@@ -579,10 +570,11 @@ mod tests {
                 u32::from(0xF000 | (((!64u16) + 1) & 0x0FFF)),
                 &mut host,
             );
+            // Status byte in the high byte; HADR (low byte) is 0.
             board.write(
                 RAM_BASE + 0x202,
                 2,
-                u32::from((u16::from(DESC_OWN | DESC_STP | DESC_ENP) << 8) | 0),
+                u32::from(u16::from(DESC_OWN | DESC_STP | DESC_ENP) << 8),
                 &mut host,
             );
         }
@@ -612,9 +604,10 @@ mod tests {
 
         // Inject a frame into the backend, then tick to deliver it.
         board.net.as_mut().unwrap().send(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        let mut host = DeviceHost::new(&mut mem);
-        board.tick(1, &mut host);
-        drop(host);
+        {
+            let mut host = DeviceHost::new(&mut mem);
+            board.tick(1, &mut host);
+        }
 
         // RINT set and INT2 asserted (INEA on).
         assert_ne!(read_csr(&mut board, &mut mem, 0) & CSR0_RINT, 0);
@@ -634,9 +627,10 @@ mod tests {
         write_csr(&mut board, &mut mem, 0, CSR0_INIT);
         write_csr(&mut board, &mut mem, 0, CSR0_STRT | CSR0_INEA);
         board.net.as_mut().unwrap().send(&[1, 2, 3, 4]);
-        let mut host = DeviceHost::new(&mut mem);
-        board.tick(1, &mut host);
-        drop(host);
+        {
+            let mut host = DeviceHost::new(&mut mem);
+            board.tick(1, &mut host);
+        }
         assert!(board.int2_line());
 
         write_csr(&mut board, &mut mem, 0, CSR0_STOP);

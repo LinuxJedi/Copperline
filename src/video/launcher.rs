@@ -1501,8 +1501,10 @@ mod tests {
         assert_eq!(board.value(2), "3");
 
         // Overrides serialize back, typed per the option schema.
-        let mut setup = MachineSetup::default();
-        setup.zorro_boards = vec![board];
+        let setup = MachineSetup {
+            zorro_boards: vec![board],
+            ..MachineSetup::default()
+        };
         let raw = setup.to_raw();
         let cfg = raw.zorro[0].config.as_ref().expect("overrides emitted");
         assert_eq!(cfg.get("speed").unwrap().as_str(), Some("slow"));
