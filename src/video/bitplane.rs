@@ -894,18 +894,6 @@ impl ControlState {
                 // lo-res phase bias must not push a standard-width DIW one sample
                 // past that completed early-DDF row at the right edge.
                 origin_shift -= 1;
-            } else if ddf > standard_ddf && origin_shift < 0 && display_native_shift == 1 {
-                // Mirror of the above for a standard-width DIW whose DDFSTRT is
-                // *late*: the picture is positioned in whole fetch gulps, but the
-                // standard one-sample lo-res phase bias (DIWSTRT $81 vs the $80
-                // fetch reference, i.e. display_native_shift == 1) lands the
-                // clipped-sample count one off the gulp grid -- clipping the
-                // first cell column and orphaning a partial column at the right
-                // edge (e.g. a copper-fed bitplane mosaic fetched with DDFSTRT
-                // $48 in a standard DIW). Non-standard windows carry their own
-                // phase and are positioned by display_native_shift directly, so
-                // gate this on the standard +1 bias only.
-                origin_shift -= 1;
             }
         }
         origin_shift
@@ -2744,8 +2732,7 @@ fn bitplane_dma_output_start_x(
     }
     line_fetch_plan_for_word(base_control, control_segments, 0, dma_planes)
         .iter()
-        .find_map(|(hpos, plane)| (plane == 0).then_some(beam_to_framebuffer_x_unclamped(hpos)))
-        .map(|x| x.clamp(0, FB_WIDTH as i32) as usize)
+        .find_map(|(hpos, plane)| (plane == 0).then_some(bitplane_fetch_framebuffer_x(hpos)))
 }
 
 #[cfg(test)]
@@ -2826,6 +2813,10 @@ fn beam_event_at_or_before_beam(event: &BeamRegisterWrite, vpos: u32, hpos: u32)
 
 fn bitplane_fetch_hpos(control: ControlState, word_idx: usize) -> u32 {
     bitplane_fetch_hpos_for_plane(control, word_idx, 0)
+}
+
+fn bitplane_fetch_framebuffer_x(hpos: u32) -> usize {
+    ((hpos as i32 * 2 - DIW_HSTART_FB0) * 2).clamp(0, FB_WIDTH as i32) as usize
 }
 
 fn apply_bitplane_pointer_write(ptrs: &mut [u32; 8], off: u16, val: u16) {
@@ -8047,6 +8038,18 @@ mod tests {
         };
         assert_eq!(inset_fetch.fetch_start_native_x(false, 2), 14);
         assert_eq!(inset_fetch.native_x_offset(false, 2), 0);
+
+        let late_fetch_standard_window = RenderState {
+            bplcon0: 0,
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | 0x0081,
+            ddfstrt: 0x0048,
+            ..blank_state()
+        };
+        assert_eq!(
+            late_fetch_standard_window.fetch_start_native_x(false, 2),
+            31
+        );
+        assert_eq!(late_fetch_standard_window.native_x_offset(false, 2), 0);
     }
 
     #[test]
@@ -8081,8 +8084,7 @@ mod tests {
         };
         let inset_words = inset_ddf.words_per_row(native_frame_width_for_control(inset_ddf));
         let first_bpl1dat_x =
-            beam_to_framebuffer_x_unclamped(bitplane_fetch_hpos_for_plane(inset_ddf, 0, 0))
-                .clamp(0, FB_WIDTH as i32) as usize;
+            bitplane_fetch_framebuffer_x(bitplane_fetch_hpos_for_plane(inset_ddf, 0, 0));
 
         assert_ne!(
             inset_ddf.fetch_start_native_x(inset_ddf.diw_h_start(), 2),

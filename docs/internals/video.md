@@ -38,9 +38,15 @@ pre-advances that hidden sample before painting the DIW edge. Single-word
 lo-res fetches that start before the standard `$38` DDF slot expose complete
 16-pixel groups; the standard one-sample phase bias is trimmed when it would
 push a standard-width DIW past the completed early-DDF row at the right edge.
+Late single-word lo-res DDF keeps the standard DIW `$81` one-sample phase;
+the renderer must not subtract an extra sample just to align the clipped
+start to a fetch-unit boundary.
 When DDFSTRT is late enough that DIW opens before DMA has delivered the
 first BPL1DAT word for the row, playfield output remains border-colour until
 that plane-0 fetch reaches Denise instead of sampling stale shifter contents.
+That gate is placed in the bitplane/DIW coordinate domain, not the normal
+Copper/register-write output domain, because it follows the fetch slot that
+loads BPL1DAT.
 If a manual BPL1DAT write starts a word before that DMA load point, replay
 stops the manual word where the DMA word replaces Denise's shifter.
 BPLCON1-delayed samples at the left edge of a contiguous bitplane-DMA block

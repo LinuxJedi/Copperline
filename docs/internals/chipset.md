@@ -29,13 +29,15 @@ to the 8-CCK fetch-unit count: $34/$D4 fetches 21 words, $28/$D4 fetches
 rather than moving DDFSTRT down to an absolute grid. In
 lo-res, the plane-order slots for a wide unit are packed into the unit's
 first eight CCKs; the remaining CCKs are free for other bus users. If a
-bitplane fetch block occupies sprite 7's late DMA slot at $30, sprite 7 DMA
-is blocked for that line; the condition is derived from the fetch-block
-sequence, not from a single DDFSTRT value. SANITY Roots II's AGA 256-colour
-effects are regression examples for both sides of this: the hi-res FMODE=3
-pictures need raw-DDFSTRT unit rounding to preserve their 40-word rows, and
-the lo-res FMODE=3 landscape needs packed first-eight CCK plane slots
-instead of spreading those slots across the 32-CCK unit.
+bitplane fetch block that started before sprite 7's late DMA slot is still
+active at $30, sprite 7 DMA is blocked for that line; a DDFSTRT value of
+$30 itself matches on the following odd cycle and does not steal the already
+decided sprite slot. The condition is derived from the fetch-block sequence,
+not from a single DDFSTRT value. SANITY Roots II's AGA 256-colour effects are
+regression examples for both sides of this: the hi-res FMODE=3 pictures need
+raw-DDFSTRT unit rounding to preserve their 40-word rows, and the lo-res
+FMODE=3 landscape needs packed first-eight CCK plane slots instead of
+spreading those slots across the 32-CCK unit.
 
 Agnus revisions are modelled independently of Denise (machines shipped
 mixed): OCS (8370/8371), ECS 8372A (1M chip RAM reach), ECS 8375 (2M), and

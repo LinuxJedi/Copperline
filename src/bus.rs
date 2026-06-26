@@ -15908,6 +15908,41 @@ mod tests {
     }
 
     #[test]
+    fn sprite_dma_capture_keeps_sprite_seven_when_ddfstrt_matches_sprite_slot() {
+        let mut bus = empty_bus();
+        let (pos, ctl) = sprite_control_words(0x2C, 0x2D, 0x0083);
+        let sprite6_ptr = 0x0200usize;
+        let sprite7_ptr = 0x0300usize;
+        for ptr in [sprite6_ptr, sprite7_ptr] {
+            write_chip_word(&mut bus, ptr, pos);
+            write_chip_word(&mut bus, ptr + 2, ctl);
+            write_chip_word(&mut bus, ptr + 8, 0);
+            write_chip_word(&mut bus, ptr + 10, 0);
+        }
+        write_chip_word(&mut bus, sprite6_ptr + 4, 0x6666);
+        write_chip_word(&mut bus, sprite6_ptr + 6, 0x7777);
+        write_chip_word(&mut bus, sprite7_ptr + 4, 0x8888);
+        write_chip_word(&mut bus, sprite7_ptr + 6, 0x9999);
+
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_BPLEN | DMACON_SPREN;
+        bus.agnus.vpos = 0x2C;
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[3] - 1;
+        bus.denise.bplcon0 = 0x3000;
+        bus.denise.ddfstrt = 0x0030;
+        bus.denise.ddfstop = 0x0038;
+        bus.denise.sprpt[6] = sprite6_ptr as u32;
+        bus.denise.sprpt[7] = sprite7_ptr as u32;
+        bus.display_dma_sprpt[6] = sprite6_ptr as u32;
+        bus.display_dma_sprpt[7] = sprite7_ptr as u32;
+
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert!(lines.iter().any(|line| line.sprite == 6));
+        assert!(lines.iter().any(|line| line.sprite == 7));
+    }
+
+    #[test]
     fn sprite_dma_capture_repeats_last_fetched_line_after_dma_disable_until_vstop() {
         let mut bus = empty_bus();
         let sprite_ptr = 0x0100usize;

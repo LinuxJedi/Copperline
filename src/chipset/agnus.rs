@@ -517,7 +517,7 @@ pub fn sprite_dma_disabled_by_bitplane_ddf(
     let blocks = bitplane_fetch_blocks(u32::from(ddfstop) - ddfstart, unit) as u32;
     let last_block_start = ddfstart + blocks.saturating_sub(1) * unit;
     let sprite7_block_start = 0x0030;
-    ddfstart <= sprite7_block_start
+    ddfstart < sprite7_block_start
         && last_block_start >= sprite7_block_start
         && (sprite7_block_start - ddfstart).is_multiple_of(unit)
 }
@@ -1591,13 +1591,23 @@ mod tests {
 
     #[test]
     fn early_bitplane_ddfstart_disables_only_sprite_seven_dma() {
-        assert!(sprite_dma_disabled_by_bitplane_ddf(
+        assert!(!sprite_dma_disabled_by_bitplane_ddf(
             7,
             AgnusRevision::Ocs,
             0x1000,
             0,
             DMACON_DMAEN | DMACON_BPLEN,
             0x0030,
+            0x0038,
+            false,
+        ));
+        assert!(sprite_dma_disabled_by_bitplane_ddf(
+            7,
+            AgnusRevision::Ocs,
+            0x1000,
+            0,
+            DMACON_DMAEN | DMACON_BPLEN,
+            0x0028,
             0x0038,
             false,
         ));
