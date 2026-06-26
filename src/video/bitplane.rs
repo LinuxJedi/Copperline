@@ -58,26 +58,24 @@ const DIW_HSTART_FETCH_REFERENCE_HIRES: i32 = 0x83;
 // and bitplane pixels still register against each other after widening.
 const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// COLORxx writes feed Denise's final colour-selection/output path. Denise
-/// keeps copper/CPU colour-register changes phase-aligned with the bitplane
-/// serializer output: a colour write and the bitplane pixels it recolours reach
-/// the DAC together. (MiniMig models this explicitly with a one-lores-pixel
-/// bitplane delay added "for alignment of bitplane data and copper colour
-/// change"; WinUAE applies colour changes in the same beam slot as the
-/// bitplane pixels.) OCS Denise (8362) and ECS Denise (8373) share this timing
-/// exactly -- the only OCS/ECS colour-path difference is the OCS 12-bit value
-/// mask -- so this anchor is revision-independent across OCS/ECS.
+/// applies copper/CPU colour-register changes in the palette/output phase,
+/// ahead of register writes that feed the bitplane shifter. This anchor keeps
+/// COLORxx changes one lores pixel ahead of the generic beam/write domain,
+/// matching vAmiga's model where COLORxx is recorded at the current output
+/// pixel while BPLCON/DDF/sprite data paths carry explicit pixel delays. OCS
+/// Denise (8362) and ECS Denise (8373) share this timing exactly -- the only
+/// OCS/ECS colour-path difference is the OCS 12-bit value mask -- so this
+/// anchor is revision-independent across OCS/ECS.
 ///
 /// TODO: AGA Lisa delays colour changes by one hires pixel relative to
 /// OCS/ECS (WinUAE: "AGA color changes are 1 hires pixel delayed"). That
 /// sub-colour-clock offset is not yet modelled here.
 ///
 /// STOP before retuning this. If a scene's colours or copper-driven picture
-/// look horizontally shifted, the cause is almost never this anchor -- it has
-/// been moved "to fix" demos several times and always had to be moved back
-/// (the real bug was bitplane fetch/DDF alignment, sprite arming, etc.). This
-/// value keeps copper colour writes aligned with the bitplane pixels they
-/// recolour and is the same on OCS and ECS; leave it at 0x34.
-const COLOR_WRITE_HPOS_FB0: i32 = 0x34;
+/// look horizontally shifted, the cause is usually bitplane fetch/DDF
+/// alignment, sprite arming, or a missed write-domain delay, not this final
+/// colour-output anchor.
+const COLOR_WRITE_HPOS_FB0: i32 = 0x35;
 /// AGA BPLCON4's low sprite-palette byte follows Lisa's sprite colour lookup
 /// path, which reaches sprite output earlier than ordinary COLORxx palette
 /// writes. Keep it separate from COLOR replay so copper palette gradients stay
@@ -1629,6 +1627,7 @@ impl BeamSpriteState {
         let held = self.held[sprite];
         let hstart = sprite_hstart(pos, ctl);
         let hsub_70ns = sprite_hsub_70ns(ctl);
+        let base_x = sprite_nominal_base_framebuffer_x(pos, ctl);
         // A held sprite was already active when SPREN was cleared. With no
         // sprite DMA slot running, the DMA descriptor's stop comparator cannot
         // retire the latched data; later SPRxPOS writes simply reposition it.
@@ -1646,6 +1645,13 @@ impl BeamSpriteState {
                 x_start,
                 x_stop,
             });
+        }
+        // SPRxDATA/SPRxDATB writes update Denise's data latches, but the
+        // serializer only copies those latches when the horizontal sprite
+        // comparator fires. A write after that compare is for a later compare,
+        // not the remaining pixels of the current word.
+        if x_start as i32 > base_x {
+            return None;
         }
         if !self.direct_data_armed[sprite] {
             let vstart = sprite_vstart(pos, ctl);
@@ -3128,17 +3134,12 @@ fn manual_sprite_lines_from_events_with_visible_line0(
             visible_line0,
             rows,
         );
-        let flush_mode = if (off - 0x140) & 0x0006 == 0 {
-            ManualSpriteFlushMode::PreserveStartedOutput
-        } else {
-            ManualSpriteFlushMode::ClipAtEnd
-        };
         flush_manual_sprite_lines(
             sprite,
             &regs,
             next_beam[sprite],
             event_beam,
-            flush_mode,
+            ManualSpriteFlushMode::PreserveStartedOutput,
             &mut lines,
         );
         if !include_latched_sprite_state
@@ -3360,7 +3361,7 @@ fn flush_manual_sprite_lines(
         if mode == ManualSpriteFlushMode::PreserveStartedOutput && beam_y == end_line {
             let pos = regs.sprpos[sprite];
             let ctl = regs.sprctl[sprite];
-            let base_x = (sprite_hstart(pos, ctl) - DIW_HSTART_FB0) * 2;
+            let base_x = sprite_nominal_base_framebuffer_x(pos, ctl);
             if x_stop as i32 >= base_x {
                 x_stop = FB_WIDTH;
             }
@@ -6261,6 +6262,10 @@ fn sprite_base_framebuffer_x(
     base_x + i32::from(hsub_70ns && control.shres())
 }
 
+fn sprite_nominal_base_framebuffer_x(pos: u16, ctl: u16) -> i32 {
+    (sprite_hstart(pos, ctl) - DIW_HSTART_FB0) * 2 + i32::from(sprite_hsub_70ns(ctl))
+}
+
 fn sprite_display_enable_x_for_y(
     sprite_display_enable_x_by_y: &[Option<usize>],
     y: usize,
@@ -7567,7 +7572,7 @@ mod tests {
         );
         assert_eq!(
             beam_to_framebuffer_x_unclamped(COLOR_WRITE_HPOS_FB0 as u32),
-            48
+            52
         );
         assert_eq!(
             sprite_palette_control_framebuffer_x(SPRITE_PALETTE_CONTROL_HPOS_FB0 as u32),
@@ -9480,7 +9485,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_sprite_data_writes_affect_only_later_pixels_on_same_line() {
+    fn manual_sprite_data_write_after_compare_waits_for_next_scanline() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -9498,7 +9503,12 @@ mod tests {
             0xA000,
         )];
         let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
-        assert_eq!(manual_sprite_lines[0][0].x_start, 4);
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .all(|line| line.beam_y != PAL_VISIBLE_LINE0));
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .any(|line| line.beam_y == PAL_VISIBLE_LINE0 + 1 && line.x_start == 0));
 
         let base_controls = [ControlState::from_render_state(&initial_state); FB_HEIGHT];
         let mut render_state = initial_state;
@@ -9534,11 +9544,12 @@ mod tests {
         );
 
         assert_eq!(fb[0], rgb12_to_rgba8(0));
-        assert_eq!(fb[4], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[4], rgb12_to_rgba8(0));
+        assert_eq!(fb[FB_WIDTH], rgb12_to_rgba8(0x0F00));
     }
 
     #[test]
-    fn manual_sprite_data_arms_before_datb_updates_later_pixels() {
+    fn manual_sprite_datb_write_after_compare_waits_for_next_scanline() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -9601,11 +9612,12 @@ mod tests {
         );
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[4], rgb12_to_rgba8(0x00F0));
+        assert_eq!(fb[4], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[FB_WIDTH], rgb12_to_rgba8(0x00F0));
     }
 
     #[test]
-    fn manual_sprite_control_write_disarms_output_until_data_write() {
+    fn manual_sprite_control_write_after_compare_preserves_loaded_word() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -9670,9 +9682,10 @@ mod tests {
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
         assert_eq!(fb[7], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[8], rgb12_to_rgba8(0));
-        assert_eq!(fb[15], rgb12_to_rgba8(0));
+        assert_eq!(fb[8], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[15], rgb12_to_rgba8(0x0F00));
         assert_eq!(fb[16], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[32], rgb12_to_rgba8(0));
     }
 
     #[test]
@@ -9743,7 +9756,7 @@ mod tests {
     }
 
     #[test]
-    fn attached_manual_sprite_writes_replay_later_odd_data_bits() {
+    fn attached_manual_sprite_data_after_compare_waits_for_next_scanline() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -9813,11 +9826,11 @@ mod tests {
         );
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[4], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[4], rgb12_to_rgba8(0));
     }
 
     #[test]
-    fn attached_manual_sprite_writes_preserve_even_pixels_before_odd_arms() {
+    fn attached_manual_sprite_data_after_compare_preserves_loaded_even_pixels() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -9875,7 +9888,7 @@ mod tests {
         );
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[4], rgb12_to_rgba8(0x00F0));
+        assert_eq!(fb[4], rgb12_to_rgba8(0x0F00));
     }
 
     #[test]
@@ -10519,7 +10532,7 @@ mod tests {
     }
 
     #[test]
-    fn sprite_register_data_write_replaces_dma_latch_on_same_beam_line() {
+    fn sprite_register_data_write_after_compare_preserves_dma_latch_on_same_beam_line() {
         let mut state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -10584,8 +10597,9 @@ mod tests {
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
         assert_eq!(fb[7], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[8], rgb12_to_rgba8(0));
-        assert_eq!(fb[31], rgb12_to_rgba8(0));
+        assert_eq!(fb[8], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[31], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[32], rgb12_to_rgba8(0));
     }
 
     #[test]
@@ -11944,7 +11958,7 @@ mod tests {
 
         let line = (0x50 - 0x2C) as usize;
         let sprite_x = sprite_palette_control_framebuffer_x(hpos);
-        assert_eq!(sprite_x, color_write_framebuffer_x(hpos).saturating_sub(8));
+        assert_eq!(sprite_x, color_write_framebuffer_x(hpos).saturating_sub(4));
         let beam_x = beam_to_framebuffer_x_unclamped(hpos) as usize;
         assert!(sprite_x < beam_x);
         assert_eq!(control_segments[line].len(), 2);

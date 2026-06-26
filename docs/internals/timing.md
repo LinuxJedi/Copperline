@@ -98,14 +98,19 @@ serialize it if mid-line sprite-DMA resume accuracy is tightened. Tests:
 Beam-timed SPRxPOS writes are replayed in Denise's horizontal-comparator
 domain, seven colour clocks ahead of the normal register-output position.
 This matters for manual sprite reuse with sprite DMA disabled: Copper lists
-can write consecutive SPRxPOS values whose HSTARTs exactly abut, while later
-SPRxDATA/SPRxDATB writes still take effect only from their ordinary beam
-position. A same-line POS write also does not truncate a manual sprite word
-that has already started shifting; it re-arms a later compare while the
-active word completes. Tests:
+can write consecutive SPRxPOS values whose HSTARTs exactly abut. SPRxDATA
+and SPRxDATB writes update Denise's data latches at their ordinary beam
+position, but the sprite serializer copies those latches only when the
+horizontal comparator fires. A same-line DATA/DATB write after that compare
+therefore waits for a later compare or scanline instead of replacing the
+word already shifting. Same-line POS/CTL writes also do not truncate a
+manual sprite word that has already started shifting; they re-arm a later
+compare while the active word completes. Tests:
 `manual_sprite_position_write_before_hstart_uses_sprite_compare_domain`,
 `manual_sprite_position_writes_use_denise_compare_lag`,
-`manual_sprite_position_write_does_not_truncate_started_word`.
+`manual_sprite_position_write_does_not_truncate_started_word`,
+`manual_sprite_data_write_after_compare_waits_for_next_scanline`,
+`sprite_register_data_write_after_compare_preserves_dma_latch_on_same_beam_line`.
 
 ## The Copper
 
@@ -141,22 +146,22 @@ shared by the live bus path and the blitter-deadline predictor's cloned
 simulation, so prediction and execution cannot drift apart.
 
 For the low-res renderer, a same-line `COLORxx` write at beam `hpos`
-starts affecting pixels at `(hpos - $34) * 4` (`COLOR_WRITE_HPOS_FB0` in
+starts affecting pixels at `(hpos - $35) * 4` (`COLOR_WRITE_HPOS_FB0` in
 `src/video/bitplane.rs`); beam-timed placement is anchored at
 `COPPER_WAIT_HPOS_FB0` ($28), and bitplane-control writes add the
 fetch-to-display pipeline offset (`BITPLANE_CONTROL_PIPELINE_FB`). This
-anchor keeps a copper colour change aligned with the bitplane pixels it
-recolours: Denise (and MiniMig, which adds a one-lores-pixel bitplane delay
-"for alignment of bitplane data and copper colour change") emits the new
-colour in the same beam slot as those pixels. OCS Denise (8362) and ECS
-Denise (8373) share this timing; the only OCS/ECS colour-path difference is
-the OCS 12-bit value mask. (AGA Lisa delays colour changes by one hires
-pixel relative to OCS/ECS per WinUAE; that sub-colour-clock offset is not
-yet modelled.) AGA BPLCON4's sprite palette-base byte uses Lisa's earlier
-sprite colour-lookup path at `(hpos - $36) * 4`
-(`SPRITE_PALETTE_CONTROL_HPOS_FB0`). Tests:
+models COLORxx on Denise's final palette/output phase, one lores pixel
+ahead of writes that feed delayed shifter/control paths. OCS Denise (8362)
+and ECS Denise (8373) share this timing; the only OCS/ECS colour-path
+difference is the OCS 12-bit value mask. (AGA Lisa delays colour changes by
+one hires pixel relative to OCS/ECS per WinUAE; that sub-colour-clock offset
+is not yet modelled.) AGA BPLCON4's sprite palette-base byte uses Lisa's
+earlier sprite colour-lookup path at `(hpos - $36) * 4`
+(`SPRITE_PALETTE_CONTROL_HPOS_FB0`), one lores pixel ahead of ordinary
+COLORxx replay. Tests:
 `copper_move_writes_visible_registers_on_second_dma_slot`,
-`copper_move_spends_four_color_clocks_leaving_alternate_cycles_free`.
+`copper_move_spends_four_color_clocks_leaving_alternate_cycles_free`,
+`color_register_writes_use_final_output_position`.
 
 ### WAIT/SKIP edge cases
 

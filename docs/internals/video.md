@@ -63,18 +63,20 @@ when those two x positions differ, then applies the full BPLCON4 value on
 the normal control segment.
 
 Manual and held-sprite replay has a smaller split of its own. SPRxDATA and
-SPRxDATB writes affect only later pixels in the normal register-output
-domain, and SPRxCTL still disarms output at that point. SPRxPOS writes,
-however, re-arm the sprite horizontal comparator: if the write occurs before
-the newly programmed HSTART, the sprite can still begin at that HSTART. The
+SPRxDATB writes update Denise's data latches in the normal register-output
+domain, but the sprite serializer copies those latches only when the
+horizontal comparator fires. A DATA/DATB write after that compare is for a
+later compare or scanline, not the word already shifting. SPRxPOS writes
+re-arm the sprite horizontal comparator: if the write occurs before the
+newly programmed HSTART, the sprite can still begin at that HSTART. The
 replay clips those position intervals in the sprite-comparator domain
 (seven CCK ahead of the normal register-output position) so adjacent manual
 sprite words can abut at their HSTARTs and staggered even/odd attached-pair
 position writes do not create artificial half-pair strips. Once a manual
-sprite word has started shifting, a later same-line SPRxPOS write can arm a
-future compare but does not truncate that active word. A POS write that
-lands exactly on the HSTART compare boundary is on the already-started side
-of that rule.
+sprite word has started shifting, later same-line POS/CTL writes can arm a
+future compare but do not truncate that active word. A POS write that lands
+exactly on the HSTART compare boundary is on the already-started side of
+that rule.
 
 When sprite DMA was observed for the frame, captured DMA lines are the
 authoritative data source for DMA-fetched spans. Manual replay is seeded by
