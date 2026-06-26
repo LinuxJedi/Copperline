@@ -81,11 +81,12 @@ const COLOR_WRITE_HPOS_FB0: i32 = 0x35;
 /// writes. Keep it separate from COLOR replay so copper palette gradients stay
 /// in the Denise palette-output phase on OCS/ECS.
 const SPRITE_PALETTE_CONTROL_HPOS_FB0: i32 = 0x36;
-/// SPRxPOS writes update the Denise horizontal comparator seven CCK ahead of
-/// the normal register/output beam domain. Manual sprite replays use this
-/// earlier domain so adjacent position writes can abut at their programmed
-/// HSTARTs.
-const SPRITE_POSITION_WRITE_PIPELINE_CCK: u32 = 7;
+/// SPRxPOS and SPRxDATx writes feed Denise's sprite comparator/latches seven
+/// CCK ahead of the normal register/output beam domain. Manual sprite replays
+/// use this earlier domain so adjacent position writes can abut at their
+/// programmed HSTARTs, and data writes that beat the comparator load the same
+/// scanline.
+const SPRITE_REGISTER_WRITE_PIPELINE_CCK: u32 = 7;
 /// Framebuffer-x offset between the copper/register coordinate
 /// ([`COPPER_WAIT_HPOS_FB0`], used to place beam-timed register writes) and the
 /// bitplane/DIW coordinate ([`DIW_HSTART_FB0`], used to place fetched bitplane
@@ -3301,6 +3302,10 @@ fn manual_sprite_event_beam_for_sprite_write(
         // domain delays attached pairs whose even/odd position writes are
         // staggered by the Copper.
         0x0 => manual_sprite_position_event_beam(vpos, hpos, visible_line0, rows),
+        // SPRxDATA/SPRxDATB update the latches copied by Denise's horizontal
+        // sprite comparator. If the write reaches that path before the
+        // comparator fires, the new data belongs to the current scanline.
+        0x4 | 0x6 => manual_sprite_data_event_beam(vpos, hpos, visible_line0, rows),
         _ => manual_sprite_event_beam(vpos, hpos, visible_line0, rows),
     }
 }
@@ -3336,9 +3341,31 @@ fn manual_sprite_position_event_beam(
     (vpos, x)
 }
 
+fn manual_sprite_data_event_beam(
+    vpos: u32,
+    hpos: u32,
+    visible_line0: i32,
+    rows: usize,
+) -> (i32, usize) {
+    let visible_end = visible_line0 + rows as i32;
+    let vpos = vpos as i32;
+    if vpos < visible_line0 {
+        return (visible_line0, 0);
+    }
+    if vpos >= visible_end {
+        return (visible_end, 0);
+    }
+    let x = sprite_data_write_framebuffer_x(hpos);
+    (vpos, x)
+}
+
 fn sprite_position_write_framebuffer_x(hpos: u32) -> usize {
-    let hpos = hpos.saturating_sub(SPRITE_POSITION_WRITE_PIPELINE_CCK);
+    let hpos = hpos.saturating_sub(SPRITE_REGISTER_WRITE_PIPELINE_CCK);
     ((hpos as i32 * 2 - DIW_HSTART_FB0) * 2).clamp(0, FB_WIDTH as i32) as usize
+}
+
+fn sprite_data_write_framebuffer_x(hpos: u32) -> usize {
+    sprite_position_write_framebuffer_x(hpos)
 }
 
 fn flush_manual_sprite_lines(
@@ -9457,7 +9484,7 @@ mod tests {
         initial_state.sprdata[0] = 0xFFFF;
         initial_state.spr_armed[0] = true;
 
-        let boundary_hpos = u32::from(first_hstart / 2) + SPRITE_POSITION_WRITE_PIPELINE_CCK;
+        let boundary_hpos = u32::from(first_hstart / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK;
         let manual_sprite_lines = manual_sprite_lines_from_events(
             &initial_state,
             &[
@@ -9485,6 +9512,107 @@ mod tests {
     }
 
     #[test]
+    fn manual_sprite_data_write_before_compare_uses_sprite_compare_domain() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let hstart = 240;
+        let (pos, ctl) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, hstart);
+        initial_state.sprpos[2] = pos;
+        initial_state.sprctl[2] = ctl;
+        initial_state.palette.write_ocs(25, 0x0F00);
+
+        let event_hpos = 116;
+        let data_x = sprite_data_write_framebuffer_x(event_hpos);
+        let colour_output_x = beam_to_framebuffer_x_unclamped(event_hpos) as usize;
+        let base_x = sprite_nominal_base_framebuffer_x(pos, ctl) as usize;
+        assert!(data_x < base_x);
+        assert!(colour_output_x > base_x);
+
+        let manual_sprite_lines = manual_sprite_lines_from_events(
+            &initial_state,
+            &[cpu_event(beam_y as u32, event_hpos, 0x154, 0x8000)],
+        );
+
+        let line = manual_sprite_lines[2]
+            .iter()
+            .find(|line| line.beam_y == beam_y)
+            .expect("data write before the comparator affects the current scanline");
+        assert_eq!(line.x_start, data_x);
+        assert_eq!(line.data, 0x8000);
+        assert_eq!(
+            sprite_line_pixel_bits_at(
+                line,
+                base_x as i32,
+                ControlState::from_render_state(&initial_state),
+                &[],
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn attached_manual_sprite_data_write_before_compare_uses_sprite_compare_domain() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let hstart = 240;
+        let (pos, ctl) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, hstart);
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+        initial_state.sprpos[1] = pos;
+        initial_state.sprctl[1] = ctl | 0x0080;
+        initial_state.palette.write_ocs(20, 0x0F00);
+
+        let event_hpos = 116;
+        let data_x = sprite_data_write_framebuffer_x(event_hpos);
+        let colour_output_x = beam_to_framebuffer_x_unclamped(event_hpos) as usize;
+        let base_x = sprite_nominal_base_framebuffer_x(pos, ctl) as usize;
+        assert!(data_x < base_x);
+        assert!(colour_output_x > base_x);
+
+        let events = [
+            cpu_event(beam_y as u32, event_hpos, 0x144, 0),
+            cpu_event(beam_y as u32, event_hpos, 0x14C, 0x8000),
+        ];
+        let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
+
+        let base_controls = [ControlState::from_render_state(&initial_state); FB_HEIGHT];
+        let mut render_state = initial_state;
+        apply_move(&mut render_state, 0x144, 0);
+        apply_move(&mut render_state, 0x14C, 0x8000);
+        let ram = vec![0u8; 512 * 1024];
+        let base_palettes = [render_state.palette; FB_HEIGHT];
+        let palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let playfield_mask = vec![0u8; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut fb = vec![rgb12_to_rgba8(0); FB_PIXELS];
+
+        render_sprites_with_manual_lines(
+            &render_state,
+            &ram,
+            &mut fb,
+            SpriteClip {
+                x_start: 0,
+                x_stop: FB_WIDTH,
+                y_start: 0,
+                y_stop: FB_HEIGHT,
+            },
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &playfield_mask,
+            &mut collision_pixels,
+            sprite_pointer_refreshes_from_mask([false; 8]),
+            &[],
+            false,
+            Some(&manual_sprite_lines),
+        );
+
+        assert_eq!(fb[base_x], rgb12_to_rgba8(0x0F00));
+    }
+
+    #[test]
     fn manual_sprite_data_write_after_compare_waits_for_next_scanline() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
@@ -9496,9 +9624,12 @@ mod tests {
         initial_state.sprctl[0] = ctl;
         initial_state.palette.write_ocs(17, 0x0F00);
 
+        let after_compare_hpos =
+            (DIW_HSTART_FB0 as u32 / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK + 2;
+        assert!(sprite_data_write_framebuffer_x(after_compare_hpos) > 0);
         let events = [cpu_event(
             PAL_VISIBLE_LINE0 as u32,
-            (COPPER_WAIT_HPOS_FB0 + 1) as u32,
+            after_compare_hpos,
             0x144,
             0xA000,
         )];
@@ -9561,6 +9692,9 @@ mod tests {
         initial_state.palette.write_ocs(17, 0x0F00);
         initial_state.palette.write_ocs(19, 0x00F0);
 
+        let after_compare_hpos =
+            (DIW_HSTART_FB0 as u32 / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK + 2;
+        assert!(sprite_data_write_framebuffer_x(after_compare_hpos) > 0);
         let events = [
             cpu_event(
                 PAL_VISIBLE_LINE0 as u32,
@@ -9568,12 +9702,7 @@ mod tests {
                 0x144,
                 0xFFFF,
             ),
-            cpu_event(
-                PAL_VISIBLE_LINE0 as u32,
-                (COPPER_WAIT_HPOS_FB0 + 1) as u32,
-                0x146,
-                0xFFFF,
-            ),
+            cpu_event(PAL_VISIBLE_LINE0 as u32, after_compare_hpos, 0x146, 0xFFFF),
         ];
         let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
 
@@ -9769,6 +9898,9 @@ mod tests {
         initial_state.sprctl[1] = ctl | 0x0080;
         initial_state.palette.write_ocs(20, 0x0F00);
 
+        let after_compare_hpos =
+            (DIW_HSTART_FB0 as u32 / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK + 2;
+        assert!(sprite_data_write_framebuffer_x(after_compare_hpos) > 0);
         let events = [
             cpu_event(
                 PAL_VISIBLE_LINE0 as u32,
@@ -9782,12 +9914,7 @@ mod tests {
                 0x14C,
                 0x8000,
             ),
-            cpu_event(
-                PAL_VISIBLE_LINE0 as u32,
-                (COPPER_WAIT_HPOS_FB0 + 1) as u32,
-                0x14C,
-                0x2000,
-            ),
+            cpu_event(PAL_VISIBLE_LINE0 as u32, after_compare_hpos, 0x14C, 0x2000),
         ];
         let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
 
@@ -9846,9 +9973,12 @@ mod tests {
         initial_state.palette.write_ocs(17, 0x0F00);
         initial_state.palette.write_ocs(21, 0x00F0);
 
+        let after_compare_hpos =
+            (DIW_HSTART_FB0 as u32 / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK + 2;
+        assert!(sprite_data_write_framebuffer_x(after_compare_hpos) > 0);
         let events = [cpu_event(
             PAL_VISIBLE_LINE0 as u32,
-            (COPPER_WAIT_HPOS_FB0 + 1) as u32,
+            after_compare_hpos,
             0x14C,
             0x2000,
         )];
@@ -10563,11 +10693,14 @@ mod tests {
             datb_ext: [0; 3],
             width_words: 1,
         }];
+        let after_compare_hpos =
+            (DIW_HSTART_FB0 as u32 / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK + 2;
+        assert!(sprite_data_write_framebuffer_x(after_compare_hpos) > 0);
         let manual_sprite_lines = manual_sprite_lines_from_events(
             &state,
             &[beam_event(
                 PAL_VISIBLE_LINE0 as u32,
-                (COPPER_WAIT_HPOS_FB0 + 2) as u32,
+                after_compare_hpos,
                 0x0144,
                 0x0000,
             )],
