@@ -50,8 +50,10 @@ loads BPL1DAT.
 If a manual BPL1DAT write starts a word before that DMA load point, replay
 stops the manual word where the DMA word replaces Denise's shifter.
 BPLCON1-delayed samples at the left edge of a contiguous bitplane-DMA block
-come from the previous line's shifter tail; block-start lines still blank that
-scroll-in because there is no carried playfield data.
+come from the previous line's shifter tail when current-line DMA is already
+feeding Denise at the display edge. Block-start lines, and lines whose output
+is held until a delayed first BPL1DAT load, blank that scroll-in because no
+current-line shifter data has reached the visible gate yet.
 A BPLCON1 write whose normal register position is already at or beyond DIW's
 right edge is not pulled left into the current line's bitplane-scroll domain;
 it updates following lines without retapping the visible HAM tail of the

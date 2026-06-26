@@ -2735,6 +2735,19 @@ fn bitplane_dma_output_start_x(
         .find_map(|(hpos, plane)| (plane == 0).then_some(bitplane_fetch_framebuffer_x(hpos)))
 }
 
+fn bitplane_carry_words_for_line(
+    block_start: bool,
+    display_start_x: usize,
+    dma_output_start_x: Option<usize>,
+    previous_playfield_tail_words: [Option<u16>; 8],
+) -> [Option<u16>; 8] {
+    if block_start || dma_output_start_x.is_some_and(|start| start > display_start_x) {
+        [None; 8]
+    } else {
+        previous_playfield_tail_words
+    }
+}
+
 #[cfg(test)]
 fn line_fetch_hpos_for_word(
     base_control: ControlState,
@@ -4746,11 +4759,19 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 }
             }
             let block_start = last_playfield_line != Some(y.wrapping_sub(1));
-            let carry_words = if block_start {
-                [None; 8]
-            } else {
-                previous_playfield_tail_words
-            };
+            let dma_output_start_x = bitplane_dma_output_start_x(
+                base_controls[y],
+                row_control_segments,
+                x_start,
+                words_per_row,
+                dma_planes.min(nplanes),
+            );
+            let carry_words = bitplane_carry_words_for_line(
+                block_start,
+                x_start,
+                dma_output_start_x,
+                previous_playfield_tail_words,
+            );
             let line_plan = DenisePlannedPlayfieldLine::new(
                 y,
                 x_start,
@@ -4759,13 +4780,6 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 fetched_pixels,
             )
             .with_carry_words(carry_words);
-            let dma_output_start_x = bitplane_dma_output_start_x(
-                base_controls[y],
-                row_control_segments,
-                x_start,
-                words_per_row,
-                dma_planes.min(nplanes),
-            );
             let bpl_output_start_x = dma_output_start_x.unwrap_or(0);
             dma_output_start_x_by_line[y] = dma_output_start_x;
             last_playfield_line = Some(y);
@@ -7255,6 +7269,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn present_h_shift_for_leaves_narrow_late_fetch_untouched() {
+        // A normal DIW can be used around a tiny one-word late-DDF object. The
+        // fetched object must stay in beam position; presentation centring must
+        // not copy its right edge into the deep-left overscan border.
+        assert_eq!(
+            present_h_shift_for(&ocs_snapshot(0x3481, 0x24D1, 0x0050, 0x0058)),
+            0
+        );
+    }
+
     fn put_word(ram: &mut [u8], pc: usize, word: u16) {
         ram[pc..pc + 2].copy_from_slice(&word.to_be_bytes());
     }
@@ -8151,6 +8176,25 @@ mod tests {
         assert_eq!(with_carry.sample(control, 0).idx, 1);
         assert_eq!(with_carry.sample(control, 1).idx, 0);
         assert_eq!(with_carry.sample(control, 3).idx, 1);
+    }
+
+    #[test]
+    fn bplcon1_delay_drops_carry_when_first_bpl1dat_is_late() {
+        let mut previous_tail = [None; 8];
+        previous_tail[0] = Some(0x0001);
+
+        assert_eq!(
+            bitplane_carry_words_for_line(false, 64, Some(64), previous_tail),
+            previous_tail
+        );
+        assert_eq!(
+            bitplane_carry_words_for_line(false, 64, Some(158), previous_tail),
+            [None; 8]
+        );
+        assert_eq!(
+            bitplane_carry_words_for_line(true, 64, Some(64), previous_tail),
+            [None; 8]
+        );
     }
 
     #[test]
