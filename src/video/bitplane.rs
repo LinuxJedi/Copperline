@@ -23,6 +23,7 @@ use crate::chipset::denise::{
     Palette, COLOR_RGB_MASK, COLOR_TRANSPARENCY_BIT,
 };
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -921,6 +922,7 @@ struct ControlSegment {
 #[derive(Clone, Copy)]
 struct ManualBplSegment {
     line: usize,
+    hpos: u32,
     x: i32,
     planes: [u16; 8],
     palette: Palette,
@@ -2149,6 +2151,7 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
         if off == 0x110 && (0..base_palettes.len() as i32).contains(&visible_line) {
             manual_bpl_segments.push(ManualBplSegment {
                 line,
+                hpos: event.hpos,
                 x: beam_to_framebuffer_x_unclamped(event.hpos),
                 planes: state.bpldat,
                 palette,
@@ -2785,6 +2788,121 @@ fn apply_bitplane_data_write(bpldat: &mut [u16; 8], off: u16, val: u16) {
     }
 }
 
+fn seed_manual_bpl_segments_from_latches(
+    segments: &mut [ManualBplSegment],
+    frame_start_bpldat: [u16; 8],
+    render_events: &[BeamRegisterWrite],
+    base_controls: &[ControlState],
+    control_segments: &[Vec<ControlSegment>],
+    captured_bitplane_rows: &[Option<CapturedBitplaneRow>],
+    visible_line0: i32,
+) {
+    if segments.is_empty() {
+        return;
+    }
+
+    let mut segment_indices_by_beam: HashMap<(usize, u32), Vec<usize>> = HashMap::new();
+    for (idx, segment) in segments.iter().enumerate() {
+        segment_indices_by_beam
+            .entry((segment.line, segment.hpos))
+            .or_default()
+            .push(idx);
+    }
+    for indices in segment_indices_by_beam.values_mut() {
+        indices.reverse();
+    }
+
+    let rows = base_controls.len().min(control_segments.len());
+    let mut bpldat = frame_start_bpldat;
+    let mut event_idx = 0usize;
+
+    for line in 0..rows {
+        let beam_y_i = visible_line0 + line as i32;
+        if beam_y_i < 0 {
+            continue;
+        }
+        let beam_y = beam_y_i as u32;
+        while let Some(event) = render_events.get(event_idx) {
+            if event.vpos >= beam_y {
+                break;
+            }
+            apply_bitplane_data_write(&mut bpldat, event.offset & 0x01FE, event.value);
+            event_idx += 1;
+        }
+
+        let row_control_segments = &control_segments[line];
+        let words_per_row = line_words_per_row(base_controls[line], row_control_segments);
+        let dma_planes = line_max_dma_planes(base_controls[line], row_control_segments);
+        let mut fetches = Vec::new();
+        if dma_planes != 0 && line_has_valid_ddf_window(base_controls[line], row_control_segments) {
+            if let Some(captured) = captured_bitplane_rows.get(line).and_then(Option::as_ref) {
+                let fetch_plans = line_fetch_plans_for_line(
+                    base_controls[line],
+                    row_control_segments,
+                    words_per_row,
+                    dma_planes,
+                );
+                for (word_idx, plan) in fetch_plans
+                    .iter()
+                    .enumerate()
+                    .take(words_per_row.min(captured.words_per_row))
+                {
+                    for (hpos, plane) in plan.iter() {
+                        if plane < dma_planes.min(8)
+                            && plane < captured.nplanes
+                            && word_idx < captured.planes[plane].len()
+                        {
+                            fetches.push((hpos, plane, word_idx));
+                        }
+                    }
+                }
+                fetches.sort_unstable();
+            }
+        }
+
+        let mut fetch_idx = 0usize;
+        loop {
+            let next_event_hpos = render_events
+                .get(event_idx)
+                .and_then(|event| (event.vpos == beam_y).then_some(event.hpos));
+            let next_fetch = fetches.get(fetch_idx).copied();
+            match (next_event_hpos, next_fetch) {
+                (Some(event_hpos), Some((fetch_hpos, plane, word_idx)))
+                    if fetch_hpos < event_hpos =>
+                {
+                    bpldat[plane] = captured_bitplane_rows[line]
+                        .as_ref()
+                        .and_then(|row| row.planes[plane].get(word_idx).copied())
+                        .unwrap_or(0);
+                    fetch_idx += 1;
+                }
+                (Some(_), _) => {
+                    let event = render_events[event_idx];
+                    let off = event.offset & 0x01FE;
+                    apply_bitplane_data_write(&mut bpldat, off, event.value);
+                    if off == 0x110 {
+                        if let Some(indices) = segment_indices_by_beam.get_mut(&(line, event.hpos))
+                        {
+                            if let Some(segment_idx) = indices.pop() {
+                                segments[segment_idx].planes = bpldat;
+                            }
+                        }
+                    }
+                    event_idx += 1;
+                }
+                (None, Some((_fetch_hpos, plane, word_idx))) => {
+                    bpldat[plane] = captured_bitplane_rows[line]
+                        .as_ref()
+                        .and_then(|row| row.planes[plane].get(word_idx).copied())
+                        .unwrap_or(0);
+                    fetch_idx += 1;
+                }
+                (None, None) => break,
+            }
+        }
+    }
+}
+
 struct TimedChipRam<'a> {
     ram: Cow<'a, [u8]>,
     writes: &'a [BeamChipRamWrite],
@@ -2959,6 +3077,13 @@ fn manual_sprite_lines_from_events_with_visible_line0(
     include_latched_sprite_state: bool,
 ) -> Vec<Vec<SpriteLine>> {
     let mut regs = BeamSpriteState::from_render_state(initial_state, held);
+    if !include_latched_sprite_state {
+        for sprite in 0..8 {
+            if held[sprite].is_none() {
+                regs.spr_armed[sprite] = false;
+            }
+        }
+    }
     let visible_end = visible_line0 + rows as i32;
     let mut next_beam: [(i32, usize); 8] = std::array::from_fn(|sprite| {
         if include_latched_sprite_state || held[sprite].is_some() {
@@ -3016,6 +3141,14 @@ fn manual_sprite_lines_from_events_with_visible_line0(
             flush_mode,
             &mut lines,
         );
+        if !include_latched_sprite_state
+            && held[sprite].is_none()
+            && (off - 0x140) & 0x0006 == 0
+            && event.hpos < SPRITE_DMA_PAIR_CAPTURE_HPOS[sprite / 2]
+        {
+            regs.spr_armed[sprite] = false;
+            regs.direct_data_armed[sprite] = false;
+        }
         regs.apply_write(off, event.value);
         next_beam[sprite] = event_beam;
     }
@@ -3146,11 +3279,8 @@ fn merge_dma_seeded_manual_sprite_lines(
         if seeded.is_empty() {
             continue;
         }
-        let mut seeded_beams: Vec<i32> = seeded.iter().map(|line| line.beam_y).collect();
-        seeded_beams.sort_unstable();
-        seeded_beams.dedup();
         let target = &mut manual_lines[sprite];
-        target.retain(|line| seeded_beams.binary_search(&line.beam_y).is_err());
+        clip_sprite_lines_around_register_lines(seeded, target);
         target.append(seeded);
         target.sort_by_key(|line| (line.beam_y, line.x_start, line.x_stop));
     }
@@ -4607,6 +4737,15 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
     );
 
     let manual_bpl_started = Instant::now();
+    seed_manual_bpl_segments_from_latches(
+        &mut manual_bpl_segments,
+        frame_start_bpldat,
+        render_events,
+        &base_controls,
+        &control_segments,
+        captured_bitplane_rows,
+        visible_line0,
+    );
     render_timing.manual_bpl_segments = manual_bpl_segments.len() as u64;
     render_manual_bpl_segments_with_visible_line0(
         &manual_bpl_segments,
@@ -6149,11 +6288,10 @@ fn sprite_pixel_inside_display_window(
     if x < enable_x {
         return false;
     }
-    // OCS/ECS Denise starts sprite display for this scanline after the first
-    // BPL1DAT load, whether that load came from bitplane DMA or a manual
-    // copper/CPU write. DIW still clips horizontally, but a manual BPL1DAT
-    // write can make sprites visible on lines where the vertical bitplane
-    // window is closed.
+    // OCS/ECS Denise clips normal sprites to the horizontal display window.
+    // Bitplane DMA opens that gate at DIW's left edge even when DDFSTRT delays
+    // the first playfield word; a manual BPL1DAT write can still open it on a
+    // scanline where the vertical bitplane window is closed.
     let (x_start, x_stop) = control.display_window_x();
     x >= x_start && x < x_stop
 }
@@ -8895,6 +9033,41 @@ mod tests {
     }
 
     #[test]
+    fn manual_sprite_position_write_does_not_seed_from_frame_start_data_latch() {
+        let mut initial_state = blank_state();
+        let (old_pos, ctl) = sprite_control_words(
+            PAL_VISIBLE_LINE0 as u16,
+            PAL_VISIBLE_LINE0 as u16 + 1,
+            DIW_HSTART_FB0 as u16,
+        );
+        let (new_pos, _) = sprite_control_words(
+            PAL_VISIBLE_LINE0 as u16,
+            PAL_VISIBLE_LINE0 as u16 + 1,
+            (DIW_HSTART_FB0 + 16) as u16,
+        );
+        initial_state.sprpos[0] = old_pos;
+        initial_state.sprctl[0] = ctl;
+        initial_state.sprdata[0] = 0xFFFF;
+        initial_state.spr_armed[0] = true;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[cpu_event(
+                PAL_VISIBLE_LINE0 as u32,
+                COPPER_WAIT_HPOS_FB0 as u32,
+                0x140,
+                new_pos,
+            )],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0].is_empty());
+    }
+
+    #[test]
     fn manual_sprite_replay_starts_from_beam_timed_data_write() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
@@ -8922,6 +9095,92 @@ mod tests {
         assert!(manual_sprite_lines[0]
             .iter()
             .any(|line| line.beam_y == PAL_VISIBLE_LINE0));
+    }
+
+    #[test]
+    fn early_line_position_write_does_not_reuse_previous_manual_sprite_data() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let (pos, ctl) =
+            sprite_control_words(beam_y as u16, beam_y as u16 + 4, DIW_HSTART_FB0 as u16);
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+
+        let (next_pos, _) = sprite_control_words(
+            (beam_y + 1) as u16,
+            (beam_y + 2) as u16,
+            (DIW_HSTART_FB0 + 32) as u16,
+        );
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[
+                cpu_event(beam_y as u32, COPPER_WAIT_HPOS_FB0 as u32, 0x144, 0xFFFF),
+                cpu_event((beam_y + 1) as u32, 4, 0x140, next_pos),
+            ],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .any(|line| line.beam_y == beam_y && line.data == 0xFFFF));
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .all(|line| line.beam_y != beam_y + 1));
+    }
+
+    #[test]
+    fn dma_seeded_sprite_reuse_keeps_later_register_data_on_same_line() {
+        let beam_y = PAL_VISIBLE_LINE0;
+        let mut manual_lines = vec![Vec::new(); 8];
+        manual_lines[0].push(SpriteLine {
+            hstart: DIW_HSTART_FB0 + 96,
+            hsub_70ns: false,
+            beam_y,
+            data: 0xFFFF,
+            datb: 0,
+            data_ext: [0; 3],
+            datb_ext: [0; 3],
+            width_words: 1,
+            attached: false,
+            x_start: 208,
+            x_stop: FB_WIDTH,
+        });
+
+        let mut dma_seeded = vec![Vec::new(); 8];
+        dma_seeded[0].push(SpriteLine {
+            hstart: DIW_HSTART_FB0 + 96,
+            hsub_70ns: false,
+            beam_y,
+            data: 0x8000,
+            datb: 0,
+            data_ext: [0; 3],
+            datb_ext: [0; 3],
+            width_words: 1,
+            attached: false,
+            x_start: 112,
+            x_stop: 240,
+        });
+
+        merge_dma_seeded_manual_sprite_lines(&mut manual_lines, dma_seeded);
+
+        assert!(manual_lines[0].iter().any(|line| {
+            line.beam_y == beam_y
+                && line.data == 0xFFFF
+                && line.x_start == 208
+                && line.x_stop == FB_WIDTH
+        }));
+        assert!(manual_lines[0].iter().any(|line| {
+            line.beam_y == beam_y
+                && line.data == 0x8000
+                && line.x_start == 112
+                && line.x_stop == 208
+        }));
+        assert!(manual_lines[0]
+            .iter()
+            .all(|line| line.data != 0x8000 || line.x_stop <= 208));
     }
 
     #[test]
@@ -11484,6 +11743,7 @@ mod tests {
         planes[0] = 0x8000;
         let segments = [ManualBplSegment {
             line: 0,
+            hpos: 0,
             x: 0,
             planes,
             palette,
@@ -11527,6 +11787,7 @@ mod tests {
         planes[0] = 0x4000;
         let segments = [ManualBplSegment {
             line: 0,
+            hpos: 0,
             x: 0,
             planes,
             palette,
@@ -11573,6 +11834,7 @@ mod tests {
         planes[0] = 0x8000;
         let segments = [ManualBplSegment {
             line: 0,
+            hpos: 0,
             x: 0,
             planes,
             palette,
@@ -11993,6 +12255,51 @@ mod tests {
                 "word {word_idx}"
             );
         }
+    }
+
+    #[test]
+    fn manual_bpl1dat_snapshots_dma_updated_bpldat_latches() {
+        let mut state = RenderState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x3000,
+            ddfstrt: 0x0038,
+            ddfstop: 0x0038,
+            ..blank_state()
+        };
+        state.bpldat[1] = 0x4000;
+        let base_control = ControlState::from_render_state(&state);
+        let base_controls = [base_control; FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let hpos = 0x0040;
+        let mut segments = [ManualBplSegment {
+            line: 0,
+            hpos,
+            x: beam_to_framebuffer_x_unclamped(hpos),
+            planes: [0; 8],
+            palette: state.palette,
+        }];
+        let mut captured_rows = vec![None; FB_HEIGHT];
+        let mut planes: [Vec<u16>; 8] = std::array::from_fn(|_| vec![0]);
+        planes[1][0] = 0x8000;
+        captured_rows[0] = Some(CapturedBitplaneRow {
+            nplanes: 3,
+            words_per_row: 1,
+            planes,
+        });
+        let events = [beam_event(PAL_VISIBLE_LINE0 as u32, hpos, 0x0110, 0x0000)];
+
+        seed_manual_bpl_segments_from_latches(
+            &mut segments,
+            state.bpldat,
+            &events,
+            &base_controls,
+            &control_segments,
+            &captured_rows,
+            PAL_VISIBLE_LINE0,
+        );
+
+        assert_eq!(segments[0].planes[0], 0x0000);
+        assert_eq!(segments[0].planes[1], 0x8000);
     }
 
     #[test]
