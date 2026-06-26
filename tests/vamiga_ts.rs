@@ -154,7 +154,10 @@ fn run_case(
         .into());
     }
 
-    assert_png_dimensions(&png_path, 640, 480)?;
+    // Copperline presents at the fixed multisync geometry (716x537) rather than
+    // the old 640x480 framebuffer; a screenshot that is any other size means the
+    // presentation path changed shape.
+    assert_png_dimensions(&png_path, 716, 537)?;
     if let Some(baseline_root) = baseline_root {
         let mut expected = baseline_root.join(&case.rel_path);
         expected.set_extension("png");
