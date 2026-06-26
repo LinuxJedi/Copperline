@@ -1081,6 +1081,7 @@ struct DenisePlannedPlayfieldLine<'a> {
     x_stop: usize,
     plane_words: &'a [Vec<u16>],
     fetched_pixels: usize,
+    carry_words: [Option<u16>; 8],
 }
 
 impl<'a> DenisePlannedPlayfieldLine<'a> {
@@ -1097,7 +1098,13 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
             x_stop,
             plane_words,
             fetched_pixels,
+            carry_words: [None; 8],
         }
+    }
+
+    fn with_carry_words(mut self, carry_words: [Option<u16>; 8]) -> Self {
+        self.carry_words = carry_words;
+        self
     }
 
     #[cfg(test)]
@@ -1135,6 +1142,15 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
             let delay = delays[plane];
             if native_x < delay {
                 active = true;
+                let carry_offset = delay - native_x;
+                if carry_offset <= 16 {
+                    if let Some(word) = self.carry_words.get(plane).copied().flatten() {
+                        let bit = carry_offset - 1;
+                        if word & (1 << bit) != 0 {
+                            idx |= 1 << plane;
+                        }
+                    }
+                }
                 continue;
             }
             let fetch_x = native_x - delay;
@@ -2688,6 +2704,7 @@ fn line_fetch_plans_for_line(
     plans
 }
 
+#[cfg(test)]
 fn bitplane_output_start_x(
     base_control: ControlState,
     control_segments: &[ControlSegment],
@@ -2695,8 +2712,25 @@ fn bitplane_output_start_x(
     words_per_row: usize,
     dma_planes: usize,
 ) -> usize {
+    bitplane_dma_output_start_x(
+        base_control,
+        control_segments,
+        display_start_x,
+        words_per_row,
+        dma_planes,
+    )
+    .unwrap_or(0)
+}
+
+fn bitplane_dma_output_start_x(
+    base_control: ControlState,
+    control_segments: &[ControlSegment],
+    display_start_x: usize,
+    words_per_row: usize,
+    dma_planes: usize,
+) -> Option<usize> {
     if dma_planes == 0 || words_per_row == 0 {
-        return 0;
+        return None;
     }
     let mut display_control = base_control;
     for segment in control_segments {
@@ -2706,13 +2740,12 @@ fn bitplane_output_start_x(
     }
     let pixel_repeat = display_control.framebuffer_pixel_repeat();
     if display_control.fetch_start_native_x(display_control.diw_h_start(), pixel_repeat) == 0 {
-        return 0;
+        return Some(display_start_x);
     }
     line_fetch_plan_for_word(base_control, control_segments, 0, dma_planes)
         .iter()
         .find_map(|(hpos, plane)| (plane == 0).then_some(beam_to_framebuffer_x_unclamped(hpos)))
         .map(|x| x.clamp(0, FB_WIDTH as i32) as usize)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -4401,6 +4434,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
     let mut playfield_mask = vec![0u8; FB_WIDTH * rows];
     let mut collision_pixels = vec![CollisionPixel::default(); FB_WIDTH * rows];
     let mut clxdat = 0u16;
+    let mut dma_output_start_x_by_line = vec![None; rows];
 
     let background_started = Instant::now();
     fill_background_with_visible_line0(
@@ -4512,6 +4546,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         // predecessor was border (no carried-over shifter data) can suppress
         // the BPLCON1 scroll pulling its leading pre-fetch words into view.
         let mut last_playfield_line: Option<usize> = None;
+        let mut previous_playfield_tail_words: [Option<u16>; 8] = [None; 8];
         for y in 0..rows {
             let row_control_segments = &control_segments[y];
             let Some((x_start, x_stop)) = line_display_window_bounds(
@@ -4719,21 +4754,29 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                     }
                 }
             }
+            let block_start = last_playfield_line != Some(y.wrapping_sub(1));
+            let carry_words = if block_start {
+                [None; 8]
+            } else {
+                previous_playfield_tail_words
+            };
             let line_plan = DenisePlannedPlayfieldLine::new(
                 y,
                 x_start,
                 x_stop,
                 &row_words[..nplanes],
                 fetched_pixels,
-            );
-            let bpl_output_start_x = bitplane_output_start_x(
+            )
+            .with_carry_words(carry_words);
+            let dma_output_start_x = bitplane_dma_output_start_x(
                 base_controls[y],
                 row_control_segments,
                 x_start,
                 words_per_row,
                 dma_planes.min(nplanes),
             );
-            let block_start = last_playfield_line != Some(y.wrapping_sub(1));
+            let bpl_output_start_x = dma_output_start_x.unwrap_or(0);
+            dma_output_start_x_by_line[y] = dma_output_start_x;
             last_playfield_line = Some(y);
             render_planned_playfield_line(
                 &line_plan,
@@ -4758,6 +4801,11 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 let m = control.modulo_for_plane(p, beam_y as i32);
                 ptrs[p] = ((ptrs[p] as i64).wrapping_add(m as i64) as u32) & ram_mask;
             }
+            previous_playfield_tail_words = std::array::from_fn(|plane| {
+                (plane < nplanes)
+                    .then(|| row_words[plane].last().copied())
+                    .flatten()
+            });
         }
         if let (Some(planes), Some(index)) = (export_planes.as_ref(), export_index.as_ref()) {
             let frame = input.emulated_frames;
@@ -4820,6 +4868,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         &palette_segments,
         &base_controls,
         &control_segments,
+        &dma_output_start_x_by_line,
         visible_line0,
         input.emulated_seconds,
         input.emulated_frames,
@@ -5362,6 +5411,7 @@ fn render_manual_bpl_segments(
     base_controls: &[ControlState],
     control_segments: &[Vec<ControlSegment>],
 ) {
+    let dma_output_start_x_by_line = vec![None; base_controls.len()];
     render_manual_bpl_segments_with_visible_line0(
         segments,
         fb,
@@ -5372,6 +5422,7 @@ fn render_manual_bpl_segments(
         palette_segments,
         base_controls,
         control_segments,
+        &dma_output_start_x_by_line,
         PAL_VISIBLE_LINE0,
         0.0,
         0,
@@ -5389,6 +5440,7 @@ fn render_manual_bpl_segments_with_visible_line0(
     palette_segments: &[Vec<PaletteSegment>],
     base_controls: &[ControlState],
     control_segments: &[Vec<ControlSegment>],
+    dma_output_start_x_by_line: &[Option<usize>],
     visible_line0: i32,
     emulated_seconds: f64,
     emulated_frames: u64,
@@ -5424,6 +5476,7 @@ fn render_manual_bpl_segments_with_visible_line0(
             palette_segments,
             base_controls,
             control_segments,
+            dma_output_start_x_by_line,
             &mut ham_color,
             &mut ham_select,
             &mut ham_select_pixels,
@@ -5482,6 +5535,7 @@ fn draw_manual_bpl_word(
     palette_segments: &[Vec<PaletteSegment>],
     base_controls: &[ControlState],
     control_segments: &[Vec<ControlSegment>],
+    dma_output_start_x_by_line: &[Option<usize>],
     ham_color: &mut u32,
     ham_select: &mut u8,
     ham_select_pixels: &mut [u8],
@@ -5495,6 +5549,11 @@ fn draw_manual_bpl_word(
     const MAX_MANUAL_BPL_NATIVE_SAMPLES: usize = MANUAL_BPL_WORD_BITS + MAX_BPLCON1_DELAY;
 
     let shifter = DeniseManualBitplaneShifter::new(seg.planes, MANUAL_BPL_WORD_BITS);
+    let dma_output_start_x = dma_output_start_x_by_line
+        .get(seg.line)
+        .copied()
+        .flatten()
+        .filter(|&x| seg.x < x as i32);
     let mut x_cursor = seg.x;
     let mut native_idx = 0usize;
     while native_idx < MAX_MANUAL_BPL_NATIVE_SAMPLES {
@@ -5530,6 +5589,9 @@ fn draw_manual_bpl_word(
                 return false;
             }
             let x = x as usize;
+            if dma_output_start_x.is_some_and(|dma_x| x >= dma_x) {
+                return false;
+            }
             let pixel_control =
                 control_at_x(base_controls[seg.line], &control_segments[seg.line], x);
             let (window_x_start, window_x_stop) = pixel_control.display_window_x();
@@ -5574,6 +5636,9 @@ fn draw_manual_bpl_word(
                 continue;
             }
             let x = x as usize;
+            if dma_output_start_x.is_some_and(|dma_x| x >= dma_x) {
+                continue;
+            }
             let pixel_control =
                 control_at_x(base_controls[seg.line], &control_segments[seg.line], x);
             let (window_x_start, window_x_stop) = pixel_control.display_window_x();
@@ -8006,7 +8071,7 @@ mod tests {
                 standard_words,
                 standard_ddf.dma_planes(),
             ),
-            0
+            standard_ddf.display_window_x().0
         );
 
         let inset_ddf = ControlState {
@@ -8055,6 +8120,35 @@ mod tests {
             }),
             8
         );
+    }
+
+    #[test]
+    fn bplcon1_delay_uses_previous_line_shifter_tail_when_contiguous() {
+        let control = ControlState {
+            bplcon0: 0x1000,
+            bplcon1: 3,
+            ..ControlState::default()
+        };
+        let plane_words = [vec![0x8000]];
+        let no_carry = DenisePlannedPlayfieldLine::new(0, 0, 32, &plane_words, 16);
+
+        assert_eq!(
+            no_carry.sample(control, 0),
+            DeniseBitplaneSample {
+                idx: 0,
+                nplanes: 1,
+                active: true,
+            }
+        );
+
+        let mut carry_words = [None; 8];
+        carry_words[0] = Some(0x0004);
+        let with_carry = DenisePlannedPlayfieldLine::new(0, 0, 32, &plane_words, 16)
+            .with_carry_words(carry_words);
+
+        assert_eq!(with_carry.sample(control, 0).idx, 1);
+        assert_eq!(with_carry.sample(control, 1).idx, 0);
+        assert_eq!(with_carry.sample(control, 3).idx, 1);
     }
 
     #[test]
@@ -12544,6 +12638,67 @@ mod tests {
 
         assert_eq!(segments[0].planes[0], 0x0000);
         assert_eq!(segments[0].planes[1], 0x8000);
+    }
+
+    #[test]
+    fn manual_bpl1dat_before_dma_output_stops_at_dma_shifter_load() {
+        let mut palette = Palette::new();
+        palette.write_ocs(1, 0x0F00);
+        let control = ControlState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x1000,
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16,
+            diwstop: (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | STANDARD_DIW_HSTOP as u16,
+            ddfstrt: 0x0050,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        let base_palettes = [palette; FB_HEIGHT];
+        let palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let base_controls = [control; FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let dma_output_x = bitplane_dma_output_start_x(
+            control,
+            &[],
+            control.display_window_x().0,
+            control.words_per_row(native_frame_width_for_control(control)),
+            control.dma_planes(),
+        )
+        .unwrap();
+        let mut fb = vec![rgb12_to_rgba8(0x000F); FB_PIXELS];
+        let mut playfield_mask = vec![0u8; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut clxdat = 0u16;
+        let mut planes = [0u16; 8];
+        planes[0] = 0xFFFF;
+        let segments = [ManualBplSegment {
+            line: 0,
+            hpos: 0,
+            x: dma_output_x as i32 - 8,
+            planes,
+            palette,
+        }];
+        let mut dma_output_start_x_by_line = vec![None; FB_HEIGHT];
+        dma_output_start_x_by_line[0] = Some(dma_output_x);
+
+        render_manual_bpl_segments_with_visible_line0(
+            &segments,
+            &mut fb,
+            &mut playfield_mask,
+            &mut collision_pixels,
+            &mut clxdat,
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &dma_output_start_x_by_line,
+            PAL_VISIBLE_LINE0,
+            0.0,
+            0,
+        );
+
+        assert_eq!(fb[dma_output_x - 2], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[dma_output_x], rgb12_to_rgba8(0x000F));
     }
 
     #[test]

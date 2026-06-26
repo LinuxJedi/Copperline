@@ -41,6 +41,11 @@ push a standard-width DIW past the completed early-DDF row at the right edge.
 When DDFSTRT is late enough that DIW opens before DMA has delivered the
 first BPL1DAT word for the row, playfield output remains border-colour until
 that plane-0 fetch reaches Denise instead of sampling stale shifter contents.
+If a manual BPL1DAT write starts a word before that DMA load point, replay
+stops the manual word where the DMA word replaces Denise's shifter.
+BPLCON1-delayed samples at the left edge of a contiguous bitplane-DMA block
+come from the previous line's shifter tail; block-start lines still blank that
+scroll-in because there is no carried playfield data.
 A BPLCON1 write whose normal register position is already at or beyond DIW's
 right edge is not pulled left into the current line's bitplane-scroll domain;
 it updates following lines without retapping the visible HAM tail of the
