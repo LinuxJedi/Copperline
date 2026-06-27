@@ -49,6 +49,9 @@ that plane-0 fetch reaches Denise instead of sampling stale shifter contents.
 That gate is placed in the bitplane/DIW coordinate domain, not the normal
 Copper/register-write output domain, because it follows the fetch slot that
 loads BPL1DAT.
+Once that first DMA word is visible, the renderer samples the enabled
+bitplanes from the complete latched word; it does not expose the first word
+plane-by-plane according to each plane's individual DMA slot.
 If a manual BPL1DAT write starts a word before that DMA load point, replay
 stops the manual word where the DMA word replaces Denise's shifter.
 BPLCON1-delayed samples at the left edge of a contiguous bitplane-DMA block
