@@ -1741,7 +1741,12 @@ impl ApplicationHandler for App {
         }
         if let Some((secs, path)) = self.auto_shot.take() {
             if self.emu.bus().emulated_seconds() >= secs as f64 {
+                let emulated_frame = self.emu.bus().emulated_frames();
                 self.finish_render_for_current_frame();
+                if self.last_rendered_emulated_frame != Some(emulated_frame) {
+                    self.auto_shot = Some((secs, path));
+                    return;
+                }
                 self.save_screenshot(&path);
                 self.emu.report_stats();
                 self.emu.bus().poll_stats.dump_top("at screenshot");
@@ -6745,6 +6750,9 @@ impl App {
             return false;
         }
         self.finish_render_for_current_frame();
+        if self.last_rendered_emulated_frame != Some(emulated_frame) {
+            return false;
+        }
 
         let Some(state) = self.frame_dump.as_mut() else {
             return false;
@@ -6968,6 +6976,9 @@ impl App {
         if !self.powered_on {
             return false;
         }
+        if !self.emu.bus().frame_render_available() {
+            return false;
+        }
         let target = self.emu.bus().emulated_frames();
         let mut rendered = self.render_emulated_frame_if_needed();
         while self.render_worker.is_some() && self.last_rendered_emulated_frame != Some(target) {
@@ -6977,6 +6988,9 @@ impl App {
     }
 
     fn render_emulated_frame_if_needed(&mut self) -> bool {
+        if !self.emu.bus().frame_render_available() {
+            return false;
+        }
         if self.render_worker.is_some() {
             return self.render_emulated_frame_threaded();
         }
@@ -8842,19 +8856,44 @@ mod tests {
             "copperline-app-recording-{}.avi",
             std::process::id()
         ));
-        app.start_recording_to(path.clone());
-        assert!(app.recorder.is_some(), "recorder should be active");
-
-        let frames_to_record = 5;
-        for _ in 0..frames_to_record {
+        for warmup_step in 0..4 {
             app.emu.step_frame().expect("step frame");
             let rendered = if app.render_worker.is_some() {
                 app.finish_render_for_current_frame()
             } else {
                 app.render_emulated_frame_if_needed()
             };
-            assert!(rendered, "each step quantum should complete a frame");
+            if rendered {
+                break;
+            }
+            assert!(
+                warmup_step < 3,
+                "fixture should produce an initial renderable frame"
+            );
+        }
+
+        app.start_recording_to(path.clone());
+        assert!(app.recorder.is_some(), "recorder should be active");
+
+        let frames_to_record = 5;
+        let mut rendered_frames = 0;
+        let mut step_quanta = 0;
+        while rendered_frames < frames_to_record {
+            app.emu.step_frame().expect("step frame");
+            let rendered = if app.render_worker.is_some() {
+                app.finish_render_for_current_frame()
+            } else {
+                app.render_emulated_frame_if_needed()
+            };
             app.capture_recorder_output(rendered);
+            if rendered {
+                rendered_frames += 1;
+            }
+            step_quanta += 1;
+            assert!(
+                step_quanta <= frames_to_record * 2,
+                "fixture should keep producing renderable frames"
+            );
         }
         app.stop_recording();
         assert!(app.recorder.is_none());

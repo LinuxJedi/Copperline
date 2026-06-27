@@ -187,14 +187,16 @@ migration machinery; old states are simply invalidated.
 
 ## Snapshot point and atomicity
 
-The app-level contract is that states are taken between emulated frames:
-the window event loop and the headless timers both act only after
-`step_frame` returns, and `--save-state-after` fires at the first frame
-boundary past its deadline. Strictly, the serialized surface is complete
-enough that any inter-instruction point round-trips (the unit test saves
-mid-frame after arbitrary `step_slice` counts); the frame boundary is
-kept as the documented contract because it is what the calling code
-guarantees and it keeps presentation state trivially rebuildable.
+The app-level contract is that states are taken at presentation-quantum
+boundaries: the window event loop and the headless timers both act only
+after `step_frame` returns, and `--save-state-after` fires at the first
+quantum past its deadline. A quantum can land inside an emulated field, so
+the serialized surface must round-trip any inter-instruction point (the
+unit test saves mid-frame after arbitrary `step_slice` counts). When a load
+resumes anywhere other than the start of a field, the hardware state
+continues exactly from that beam position, but the renderer marks that
+partly reconstructed field non-presentable and waits for the next complete
+field before updating screenshots, frame dumps, or the window.
 
 `savestate::save` takes `&M68kMachine` and does not mutate emulated
 state. `savestate::load` parses fully before applying, then moves host

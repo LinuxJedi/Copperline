@@ -49,6 +49,9 @@ timing).
 
 Sprite DMA retains its latched POS/CTL descriptor independently from the
 SPRxPT registers while a sprite data stream is active or waiting for VSTART.
+Standard PAL/NTSC hard vertical blank inhibits sprite DMA at the top of the
+field, so descriptor fetches are not replayed until PAL line $19 or NTSC line
+$14.
 If software rewrites SPRxPT on a later beam line while that descriptor is
 still pending, the retained POS/CTL stays latched and the new SPRxPT value
 retargets the descriptor's post-control data stream. A same-line rewrite

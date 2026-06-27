@@ -81,10 +81,14 @@ are detailed under [](#cpu-contention) below.
 ### Sprite DMA control rewrites
 
 Sprite DMA fetches POS/CTL at the fixed pair slots, then data words for
-the active line. Software can still rewrite SPRxPOS/SPRxCTL while a
-descriptor is pending or before a later pair slot to reposition an already
-active sprite on that scanline. Those writes update the live horizontal and
-vertical comparators, but they do not restart the sprite data stream: the
+the active line. Standard hard vertical blank suppresses those fetches until
+PAL line $19 or NTSC line $14, so frame-start SPRxPT writes made before that
+boundary still name a memory descriptor rather than retargeting a descriptor
+that could not yet have been fetched. Software can still rewrite
+SPRxPOS/SPRxCTL while a descriptor is pending or before a later pair slot to
+reposition an already active sprite on that scanline. Those writes update the
+live horizontal and vertical comparators, but they do not restart the sprite
+data stream: the
 data pointer stays with the descriptor that armed the sprite, and active
 row offsets remain relative to that descriptor. Copperline therefore keeps
 a runtime-only data-origin VSTART alongside the live comparator VSTART,

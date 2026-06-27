@@ -225,6 +225,8 @@ const COPPER_BUS_LOCKOUT_HPOS: u32 = 0x00E1;
 const COPER_CPU_IRQ_DELAY_CCK: u32 = 2;
 const RENDER_VISIBLE_START_VPOS: u32 = 0x2C;
 const RENDER_MIN_OVERSCAN_START_VPOS: u32 = 0x1C;
+const PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS: u32 = 0x19;
+const NTSC_SPRITE_DMA_FIRST_ACTIVE_VPOS: u32 = 0x14;
 const RENDER_VISIBLE_LINES: usize = FB_HEIGHT;
 const RENDER_FRAMEBUFFER_WIDTH: i32 = FB_WIDTH as i32;
 // Capture-side twin of `bitplane::DIW_HSTART_FB0`; held 8 colour clocks (16
@@ -717,6 +719,8 @@ pub struct Bus {
     current_frame_sprite_dma_observed: bool,
     last_frame_sprite_dma_observed: bool,
     current_frame_display_snapshot_taken: bool,
+    #[serde(skip)]
+    current_frame_render_blocked: bool,
     current_frame_visible_start_vpos: u32,
     last_frame_visible_start_vpos: u32,
     /// Display geometry latched at the frame wrap (standard fixed canvas
@@ -1799,6 +1803,7 @@ impl Bus {
             current_frame_sprite_dma_observed: false,
             last_frame_sprite_dma_observed: false,
             current_frame_display_snapshot_taken: false,
+            current_frame_render_blocked: false,
             current_frame_visible_start_vpos: RENDER_VISIBLE_START_VPOS,
             last_frame_visible_start_vpos: RENDER_VISIBLE_START_VPOS,
             current_frame_geometry: FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, false),
@@ -2108,6 +2113,7 @@ impl Bus {
         self.current_frame_sprite_dma_observed = false;
         self.last_frame_sprite_dma_observed = false;
         self.current_frame_display_snapshot_taken = false;
+        self.current_frame_render_blocked = false;
         self.current_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
         self.last_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
         self.current_frame_geometry = FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, false);
@@ -2256,6 +2262,8 @@ impl Bus {
         self.last_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
         self.current_frame_sprite_dma_observed = false;
         self.last_frame_sprite_dma_observed = false;
+        self.current_frame_render_blocked = self.agnus.vpos != 0 || self.agnus.hpos != 0;
+        self.sprite_dma_frame_start_ptr = self.display_dma_sprpt;
         self.display_dma_sprite_state = [DisplaySpriteDmaState::default(); 8];
         self.current_frame_bus_trace.clear();
         self.last_frame_bus_trace = None;
@@ -3297,6 +3305,10 @@ impl Bus {
     pub fn frame_render_base(&self) -> RenderRegisterSnapshot {
         self.last_frame_render_base
             .unwrap_or(self.current_frame_render_base)
+    }
+
+    pub fn frame_render_available(&self) -> bool {
+        self.last_frame_render_base.is_some()
     }
 
     pub fn frame_visible_start_vpos(&self) -> u32 {
@@ -6800,10 +6812,17 @@ impl Bus {
         self.accumulate_live_collisions_to_frame_end();
         self.log_bus_accounting_frame();
         self.finish_frame_bus_trace();
-        self.last_frame_render_base = Some(self.current_frame_render_base);
-        self.last_frame_visible_start_vpos = self.current_frame_visible_start_vpos;
-        self.last_frame_geometry = self.current_frame_geometry;
-        self.last_frame_render_events = std::mem::take(&mut self.current_frame_render_events);
+        let promote_render_frame = !self.current_frame_render_blocked;
+        if promote_render_frame {
+            self.last_frame_render_base = Some(self.current_frame_render_base);
+            self.last_frame_visible_start_vpos = self.current_frame_visible_start_vpos;
+            self.last_frame_geometry = self.current_frame_geometry;
+            self.last_frame_render_events = std::mem::take(&mut self.current_frame_render_events);
+        } else {
+            self.last_frame_render_base = None;
+            self.last_frame_render_events.clear();
+            self.current_frame_render_events.clear();
+        }
         self.current_frame_collision_events.clear();
         self.current_frame_collision_control_events.clear();
         self.current_frame_collision_bpldat_events.clear();
@@ -6811,12 +6830,19 @@ impl Bus {
         self.current_frame_collision_control_index = None;
         self.current_frame_collision_bpldat_index = None;
         self.current_frame_collision_sprite_index = None;
-        self.last_frame_chip_ram_writes = std::mem::take(&mut self.current_frame_chip_ram_writes);
-        self.last_frame_beam_top_palette = self.current_frame_beam_top_palette;
-        self.last_frame_beam_top_palette_end = self.beam_top_palette;
-        self.last_frame_beam_bottom_palette = self.beam_bottom_palette;
-        self.last_frame_beam_bottom_palette_valid = self.beam_bottom_palette_valid;
-        self.last_frame_beam_bottom_palette_events = self.beam_bottom_palette_events.clone();
+        if promote_render_frame {
+            self.last_frame_chip_ram_writes =
+                std::mem::take(&mut self.current_frame_chip_ram_writes);
+            self.last_frame_beam_top_palette = self.current_frame_beam_top_palette;
+            self.last_frame_beam_top_palette_end = self.beam_top_palette;
+            self.last_frame_beam_bottom_palette = self.beam_bottom_palette;
+            self.last_frame_beam_bottom_palette_valid = self.beam_bottom_palette_valid;
+            self.last_frame_beam_bottom_palette_events = self.beam_bottom_palette_events.clone();
+        } else {
+            self.last_frame_chip_ram_writes.clear();
+            self.current_frame_chip_ram_writes.clear();
+            self.last_frame_beam_bottom_palette_events.clear();
+        }
         // Promote the just-finished frame's chip-RAM snapshot to `last` by
         // swapping buffers instead of copying 2 MB. `capture_current_frame_
         // display_start` already filled `current_frame_chip_ram` for any frame
@@ -6824,31 +6850,55 @@ impl Bus {
         // recycle the old `last` buffer as the next `current`. A frame that
         // never displayed (no capture taken) has no meaningful snapshot, so
         // fall back to a live copy for the renderer's blank/border output.
-        if self.current_frame_display_snapshot_taken
+        if promote_render_frame
+            && self.current_frame_display_snapshot_taken
             && self.current_frame_chip_ram.len() == self.mem.chip_ram.len()
         {
             std::mem::swap(
                 &mut self.last_frame_chip_ram,
                 &mut self.current_frame_chip_ram,
             );
-        } else {
+        } else if promote_render_frame {
             self.last_frame_chip_ram.clear();
             self.last_frame_chip_ram
                 .extend_from_slice(&self.mem.chip_ram);
+        } else {
+            self.last_frame_chip_ram.clear();
         }
-        self.last_frame_bitplane_rows = std::mem::replace(
+        let current_bitplane_rows = std::mem::replace(
             &mut self.current_frame_bitplane_rows,
             empty_captured_bitplane_rows(),
         );
-        self.last_frame_sprite_lines = std::mem::take(&mut self.current_frame_sprite_lines);
-        self.last_frame_held_sprites = std::mem::take(&mut self.current_frame_held_sprites);
+        self.last_frame_bitplane_rows = if promote_render_frame {
+            current_bitplane_rows
+        } else {
+            empty_captured_bitplane_rows()
+        };
+        self.last_frame_sprite_lines = if promote_render_frame {
+            std::mem::take(&mut self.current_frame_sprite_lines)
+        } else {
+            self.current_frame_sprite_lines.clear();
+            Vec::new()
+        };
+        self.last_frame_held_sprites = if promote_render_frame {
+            std::mem::take(&mut self.current_frame_held_sprites)
+        } else {
+            self.current_frame_held_sprites = [None; 8];
+            [None; 8]
+        };
         clear_captured_sprite_lines_by_y(&mut self.current_frame_sprite_lines_by_y);
         self.current_frame_sprite_collision_sources = empty_sprite_collision_sources();
-        self.last_frame_sprite_display_enable_x_by_y = std::mem::replace(
+        let current_sprite_display_enable_x_by_y = std::mem::replace(
             &mut self.current_frame_sprite_display_enable_x_by_y,
             empty_sprite_display_enable_x_by_y(),
         );
-        self.last_frame_sprite_dma_observed = self.current_frame_sprite_dma_observed;
+        self.last_frame_sprite_display_enable_x_by_y = if promote_render_frame {
+            current_sprite_display_enable_x_by_y
+        } else {
+            empty_sprite_display_enable_x_by_y()
+        };
+        self.last_frame_sprite_dma_observed =
+            promote_render_frame && self.current_frame_sprite_dma_observed;
         self.current_frame_sprite_dma_observed = false;
         // The next frame's snapshot is taken lazily at its display start
         // (`capture_current_frame_display_start`), which clears and refills
@@ -6858,6 +6908,7 @@ impl Bus {
         self.current_frame_chip_ram.clear();
         self.current_frame_beam_top_palette = self.beam_top_palette;
         self.current_frame_display_snapshot_taken = false;
+        self.current_frame_render_blocked = false;
         self.current_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
         self.current_frame_render_base = self.capture_render_snapshot();
         // Carry each sprite channel's DMA pointer across the frame boundary the
@@ -6922,9 +6973,11 @@ impl Bus {
             .extend_from_slice(&self.mem.chip_ram);
         self.current_frame_beam_top_palette = self.beam_top_palette;
         self.current_frame_display_snapshot_taken = true;
-        self.advance_display_dma_for_clipped_rows();
-        self.advance_sprite_dma_to_visible_start();
-        self.capture_held_sprites_for_visible_window();
+        if !self.current_frame_render_blocked {
+            self.advance_display_dma_for_clipped_rows();
+            self.advance_sprite_dma_to_visible_start();
+            self.capture_held_sprites_for_visible_window();
+        }
     }
 
     /// After the offscreen sprite-DMA replay, snapshot any sprite that has
@@ -6993,9 +7046,15 @@ impl Bus {
         }
         let state = self.display_dma_sprite_state[sprite];
         if let Some(control) = state.control {
+            let pending_descriptor_not_loaded = state.control_loaded_vpos >= vpos as i32
+                || (state.control_loaded_vpos == unset_sprite_control_loaded_vpos()
+                    && (vpos as i32) < control.vstart);
             if !state.data_dma_active
                 && !control.data_origin_is_register_stream()
-                && state.control_loaded_vpos == vpos as i32
+                // The descriptor must have loaded earlier in this field before
+                // SPRxPT can retarget its data stream. Equal/later loads or an
+                // unknown save-state value before VSTART restart POS/CTL.
+                && pending_descriptor_not_loaded
             {
                 self.display_dma_sprite_state[sprite] = DisplaySpriteDmaState::default();
                 return;
@@ -7029,7 +7088,27 @@ impl Bus {
         // display area and the channel's descriptor fetch slot for this line
         // has already passed. Frame-start/top-border SPRxPT reloads are normal
         // descriptor setup and must not resurrect stale armed register data.
+        if !display_window_contains_vpos(
+            self.denise.diwstrt,
+            self.denise.diwstop,
+            self.effective_diwhigh(),
+            vpos,
+        ) {
+            return false;
+        }
+
+        let beam_y = vpos as i32;
+        let vstart =
+            sprite_vstart_from_words(self.denise.sprpos[sprite], self.denise.sprctl[sprite]);
+        let raw_vstop = sprite_vstop_from_ctl(self.denise.sprctl[sprite]);
+        let vstop = if raw_vstop < vstart {
+            self.agnus.current_frame_lines() as i32
+        } else {
+            raw_vstop
+        };
         vpos >= self.current_frame_visible_start_vpos
+            && beam_y >= vstart
+            && beam_y < vstop
             && hpos >= SPRITE_DMA_PAIR_CAPTURE_HPOS[sprite / 2]
     }
 
@@ -7464,6 +7543,9 @@ impl Bus {
                 if dmacon & (DMACON_DMAEN | DMACON_SPREN) != (DMACON_DMAEN | DMACON_SPREN) {
                     continue;
                 }
+                if self.sprite_dma_inhibited_by_vertical_blank_at(vpos) {
+                    continue;
+                }
                 for sprite in pair * 2..pair * 2 + 2 {
                     if sprite_dma_disabled_by_bitplane_ddf(
                         sprite,
@@ -7525,12 +7607,19 @@ impl Bus {
         }
     }
 
+    fn sprite_dma_inhibited_by_vertical_blank_at(&self, vpos: u32) -> bool {
+        vpos < sprite_dma_first_active_vpos(self.agnus.video_standard())
+    }
+
     fn capture_sprite_dma_words_if_due(&mut self, vpos: u32, old_hpos: u32, new_hpos: u32) {
         // No sprite DMA pair slot lies in [old_hpos, new_hpos): nothing below
         // can run (the per-pair loop checks the same window), so skip the
         // sprite-state scan on the vast majority of beam advances.
         if old_hpos > SPRITE_DMA_PAIR_CAPTURE_HPOS[3] || new_hpos <= SPRITE_DMA_PAIR_CAPTURE_HPOS[0]
         {
+            return;
+        }
+        if self.sprite_dma_inhibited_by_vertical_blank_at(vpos) {
             return;
         }
         let sprite_dma_enabled =
@@ -8662,6 +8751,16 @@ fn copper_frame_start_vpos(_video_standard: VideoStandard) -> u32 {
     // lines, collapsing the CPU's pre-display work margin. Restarting at line 0
     // restores the margin real hardware gives before early display DMA fetches.
     0
+}
+
+fn sprite_dma_first_active_vpos(video_standard: VideoStandard) -> u32 {
+    // Hard vertical blank inhibits sprite DMA near the top of a standard
+    // field. The first line after that blank is one line earlier than bitplane
+    // DMA: PAL line $19 and NTSC line $14.
+    match video_standard {
+        VideoStandard::Pal => PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS,
+        VideoStandard::Ntsc => NTSC_SPRITE_DMA_FIRST_ACTIVE_VPOS,
+    }
 }
 
 fn next_chip_bus_quantum_at(hpos: u32, line_cck: u32) -> u32 {
@@ -10576,8 +10675,9 @@ mod tests {
         RenderRegisterSnapshot, BLITTER_SLOWDOWN_CPU_MISS_LIMIT, BLTCON1_DOFF, BPLCON0_ECSENA,
         BPLCON3_BRDSPRT, BPLCON3_SPRES_HIRES, COPPER_BUS_LOCKOUT_HPOS, DENISE_HPOS_LAG_CCK,
         DMACON_AUD_MASK, DMACON_BLTEN, DMACON_BLTPRI, DMACON_BPLEN, DMACON_SPREN,
-        RENDER_COPPER_WAIT_HPOS_FB0, RENDER_DIW_HSTART_FB0, RENDER_MIN_OVERSCAN_START_VPOS,
-        RENDER_VISIBLE_LINES, RENDER_VISIBLE_START_VPOS, SPRITE_DMA_PAIR_CAPTURE_HPOS,
+        PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS, RENDER_COPPER_WAIT_HPOS_FB0, RENDER_DIW_HSTART_FB0,
+        RENDER_MIN_OVERSCAN_START_VPOS, RENDER_VISIBLE_LINES, RENDER_VISIBLE_START_VPOS,
+        SPRITE_DMA_PAIR_CAPTURE_HPOS,
     };
     use crate::audio::AudioSink;
     use crate::chipset::agnus::{
@@ -15205,6 +15305,95 @@ mod tests {
     }
 
     #[test]
+    fn vertical_blank_sprite_pointer_write_reloads_descriptor_in_offscreen_replay() {
+        let mut bus = empty_bus();
+        let old_ptr = 0x0100usize;
+        let new_ptr = 0x0200usize;
+        let (old_pos, old_ctl) = sprite_control_words(0x2C, 0x30, 0x0083);
+        let (new_pos, new_ctl) = sprite_control_words(0x2C, 0x30, 0x00A1);
+        write_chip_word(&mut bus, old_ptr, old_pos);
+        write_chip_word(&mut bus, old_ptr + 2, old_ctl);
+        write_chip_word(&mut bus, old_ptr + 4, 0x1111);
+        write_chip_word(&mut bus, old_ptr + 6, 0x2222);
+        write_chip_word(&mut bus, new_ptr, new_pos);
+        write_chip_word(&mut bus, new_ptr + 2, new_ctl);
+        write_chip_word(&mut bus, new_ptr + 4, 0xAAAA);
+        write_chip_word(&mut bus, new_ptr + 6, 0xBBBB);
+
+        bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.sprite_dma_frame_start_ptr[0] = old_ptr as u32;
+        bus.current_frame_render_events.push(BeamRegisterWrite {
+            vpos: PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS - 1,
+            hpos: 0,
+            offset: 0x120,
+            value: (new_ptr >> 16) as u16,
+            source: BeamWriteSource::Copper,
+        });
+        bus.current_frame_render_events.push(BeamRegisterWrite {
+            vpos: PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS - 1,
+            hpos: 0x0A,
+            offset: 0x122,
+            value: new_ptr as u16,
+            source: BeamWriteSource::Copper,
+        });
+
+        bus.agnus.vpos = RENDER_VISIBLE_START_VPOS;
+        bus.capture_current_frame_display_start();
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].hstart, 0x00A1);
+        assert_eq!(lines[0].data, 0xAAAA);
+        assert_eq!(lines[0].datb, 0xBBBB);
+    }
+
+    #[test]
+    fn post_vertical_blank_sprite_pointer_write_retargets_pending_descriptor() {
+        let mut bus = empty_bus();
+        let descriptor_ptr = 0x0100usize;
+        let data_ptr = 0x0200usize;
+        let (pos, ctl) = sprite_control_words(0x2C, 0x30, 0x0083);
+        write_chip_word(&mut bus, descriptor_ptr, pos);
+        write_chip_word(&mut bus, descriptor_ptr + 2, ctl);
+        write_chip_word(&mut bus, descriptor_ptr + 4, 0x1111);
+        write_chip_word(&mut bus, descriptor_ptr + 6, 0x2222);
+        write_chip_word(&mut bus, data_ptr, 0xAAAA);
+        write_chip_word(&mut bus, data_ptr + 2, 0xBBBB);
+
+        bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.sprite_dma_frame_start_ptr[0] = descriptor_ptr as u32;
+        bus.current_frame_render_events.push(BeamRegisterWrite {
+            vpos: PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS + 11,
+            hpos: SPRITE_DMA_PAIR_CAPTURE_HPOS[0],
+            offset: 0x120,
+            value: (data_ptr >> 16) as u16,
+            source: BeamWriteSource::Copper,
+        });
+        bus.current_frame_render_events.push(BeamRegisterWrite {
+            vpos: PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS + 11,
+            hpos: SPRITE_DMA_PAIR_CAPTURE_HPOS[0] + 2,
+            offset: 0x122,
+            value: data_ptr as u16,
+            source: BeamWriteSource::Copper,
+        });
+
+        bus.agnus.vpos = RENDER_VISIBLE_START_VPOS;
+        bus.capture_current_frame_display_start();
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].hstart, 0x0083);
+        assert_eq!(lines[0].data, 0xAAAA);
+        assert_eq!(lines[0].datb, 0xBBBB);
+    }
+
+    #[test]
     fn manual_sprite_control_write_fetches_data_from_sprpt() {
         let mut bus = empty_bus();
         let data_ptr = 0x0200usize;
@@ -15337,10 +15526,58 @@ mod tests {
     }
 
     #[test]
+    fn armed_pointer_reload_before_vstart_fetches_descriptor_words() {
+        let mut bus = empty_bus();
+        let sprite_ptr = 0x0200usize;
+        let (pos, ctl) = sprite_control_words(0x40, 0x42, 0x0101);
+        write_chip_word(&mut bus, sprite_ptr, pos);
+        write_chip_word(&mut bus, sprite_ptr + 2, ctl);
+        write_chip_word(&mut bus, sprite_ptr + 4, 0xAAAA);
+        write_chip_word(&mut bus, sprite_ptr + 6, 0xBBBB);
+
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.denise.diwstrt = (0x2C << 8) | 0x0081;
+        bus.denise.diwstop = (0x80 << 8) | 0x00C1;
+        bus.denise.sprpos[0] = pos;
+        bus.denise.sprctl[0] = ctl;
+        bus.denise.spr_armed[0] = true;
+        bus.display_dma_sprite_state[0] = DisplaySpriteDmaState {
+            control: Some(DisplaySpriteControl {
+                vstart: 0x40,
+                vstop: 0x42,
+                hstart: 0x0101,
+                hsub_70ns: false,
+                data_vstart: 0x40,
+                data_base: 0x0100,
+                next_ptr: 0x0108,
+                attached: false,
+            }),
+            control_loaded_vpos: super::unset_sprite_control_loaded_vpos(),
+            ..DisplaySpriteDmaState::default()
+        };
+
+        bus.agnus.vpos = 0x24;
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0];
+        let _ =
+            bus.write_custom_word_from(0x120, (sprite_ptr >> 16) as u16, BeamWriteSource::Copper);
+        let _ = bus.write_custom_word_from(0x122, sprite_ptr as u16, BeamWriteSource::Copper);
+
+        bus.agnus.vpos = 0x40;
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].hstart, 0x0101);
+        assert_eq!(lines[0].data, 0xAAAA);
+        assert_eq!(lines[0].datb, 0xBBBB);
+    }
+
+    #[test]
     fn after_slot_armed_sprite_pointer_write_seeds_dma_data_stream() {
         let mut bus = empty_bus();
         let data_ptr = 0x0300usize;
-        let (pos, ctl) = sprite_control_words(0x00, 0x00, 0x0101);
+        let (pos, ctl) = sprite_control_words(0x40, 0x44, 0x0101);
         write_chip_word(&mut bus, data_ptr, 0xAAAA);
         write_chip_word(&mut bus, data_ptr + 2, 0xBBBB);
 
@@ -15940,6 +16177,7 @@ mod tests {
         bus.reset_transient_video_after_state_load();
 
         assert!(bus.last_frame_render_base.is_none());
+        assert!(!bus.current_frame_render_blocked);
         assert!(bus.last_frame_render_events.is_empty());
         assert_eq!(bus.current_frame_chip_ram, bus.mem.chip_ram);
         assert!(bus.last_frame_chip_ram.is_empty());
@@ -15956,6 +16194,77 @@ mod tests {
             assert!(!state.data_dma_active);
             assert!(state.last_line.is_none());
         }
+    }
+
+    #[test]
+    fn state_load_after_display_start_suppresses_partial_render_frame() {
+        let mut bus = empty_bus();
+        bus.agnus.vpos = RENDER_VISIBLE_START_VPOS + 20;
+        bus.current_frame_render_base = RenderRegisterSnapshot {
+            bplcon0: 0x1200,
+            ..RenderRegisterSnapshot::default()
+        };
+        bus.current_frame_render_events.push(BeamRegisterWrite {
+            vpos: RENDER_VISIBLE_START_VPOS + 20,
+            hpos: 0x40,
+            offset: 0x180,
+            value: 0x0FFF,
+            source: BeamWriteSource::Copper,
+        });
+        bus.current_frame_bitplane_rows[0] = Some(CapturedBitplaneRow {
+            nplanes: 1,
+            words_per_row: 1,
+            planes: std::array::from_fn(|_| vec![0xFFFF]),
+        });
+        bus.current_frame_sprite_lines.push(CapturedSpriteLine {
+            sprite: 0,
+            hstart: 0x80,
+            hsub_70ns: false,
+            beam_y: RENDER_VISIBLE_START_VPOS as i32 + 20,
+            data: 0x1111,
+            datb: 0x2222,
+            data_ext: [0; 3],
+            datb_ext: [0; 3],
+            width_words: 1,
+            attached: false,
+        });
+
+        bus.reset_transient_video_after_state_load();
+        assert!(bus.current_frame_render_blocked);
+
+        bus.current_frame_render_events.push(BeamRegisterWrite {
+            vpos: RENDER_VISIBLE_START_VPOS + 21,
+            hpos: 0x40,
+            offset: 0x180,
+            value: 0x00F0,
+            source: BeamWriteSource::Copper,
+        });
+        bus.current_frame_bitplane_rows[0] = Some(CapturedBitplaneRow {
+            nplanes: 1,
+            words_per_row: 1,
+            planes: std::array::from_fn(|_| vec![0xAAAA]),
+        });
+        bus.current_frame_sprite_lines.push(CapturedSpriteLine {
+            sprite: 1,
+            hstart: 0x90,
+            hsub_70ns: false,
+            beam_y: RENDER_VISIBLE_START_VPOS as i32 + 21,
+            data: 0x3333,
+            datb: 0x4444,
+            data_ext: [0; 3],
+            datb_ext: [0; 3],
+            width_words: 1,
+            attached: false,
+        });
+
+        bus.begin_new_beam_frame();
+
+        assert!(!bus.frame_render_available());
+        assert!(!bus.current_frame_render_blocked);
+        assert!(bus.last_frame_render_base.is_none());
+        assert!(bus.last_frame_render_events.is_empty());
+        assert!(bus.last_frame_bitplane_rows.iter().all(Option::is_none));
+        assert!(bus.last_frame_sprite_lines.is_empty());
     }
 
     #[test]
