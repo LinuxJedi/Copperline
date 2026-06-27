@@ -7,6 +7,8 @@ use crate::core::cpu::CpuCore;
 use crate::core::ea::{AddressingMode, EaResult};
 use crate::core::types::Size;
 use crate::core::memory::AddressBus;
+use crate::fpu::FloatX80;
+use super::softfloat::{self, ExcFlags, FpCmp, Precision, RoundCtx, RoundMode};
 
 /// Where a resolved FPU operand lives.
 enum FpuEa {
@@ -16,82 +18,6 @@ enum FpuEa {
     Memory(u32),
     /// Immediate data, to be consumed from the instruction stream.
     Immediate,
-}
-
-/// Convert a 68881 96-bit extended value (16-bit sign+exponent word and
-/// 64-bit explicit-integer-bit mantissa) to f64.
-fn extended_to_f64(exp_word: u16, mantissa: u64) -> f64 {
-    let sign = (exp_word >> 15) & 1;
-    let exp = (exp_word & 0x7FFF) as i32;
-
-    if exp == 0 && mantissa == 0 {
-        return if sign != 0 { -0.0 } else { 0.0 };
-    }
-    if exp == 0x7FFF {
-        return if mantissa << 1 == 0 {
-            if sign != 0 {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            }
-        } else {
-            f64::NAN
-        };
-    }
-
-    // Bias for 80-bit extended: 16383; for f64: 1023.
-    let biased_exp = exp - 16383 + 1023;
-    if biased_exp <= 0 || biased_exp >= 2047 {
-        // Out of f64 range: saturate (the emulated FPU computes in f64).
-        return if biased_exp >= 2047 {
-            if sign != 0 {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            }
-        } else if sign != 0 {
-            -0.0
-        } else {
-            0.0
-        };
-    }
-
-    // Extended has an explicit integer bit; f64 does not.
-    let frac = (mantissa << 1) >> 12;
-    let bits = ((sign as u64) << 63) | ((biased_exp as u64) << 52) | frac;
-    f64::from_bits(bits)
-}
-
-/// Convert an f64 to the 68881 96-bit extended representation.
-fn f64_to_extended(value: f64) -> (u16, u64) {
-    let bits = value.to_bits();
-    let sign = ((bits >> 63) as u16) << 15;
-    let exp = ((bits >> 52) & 0x7FF) as i32;
-    let frac = bits & 0x000F_FFFF_FFFF_FFFF;
-
-    if exp == 0x7FF {
-        // Infinity / NaN.
-        let mantissa = if frac == 0 {
-            0
-        } else {
-            0xC000_0000_0000_0000 | (frac << 11)
-        };
-        return (sign | 0x7FFF, mantissa);
-    }
-    if exp == 0 {
-        if frac == 0 {
-            return (sign, 0);
-        }
-        // Subnormal f64: value = frac * 2^-1074. Normalize into the
-        // extended format's much larger exponent range.
-        let lz = frac.leading_zeros();
-        let mantissa = frac << lz;
-        let true_exp = -1074 + (63 - lz as i32);
-        return (sign | ((true_exp + 16383) as u16), mantissa);
-    }
-    let mantissa = 0x8000_0000_0000_0000 | (frac << 11);
-    let ext_exp = (exp - 1023 + 16383) as u16;
-    (sign | ext_exp, mantissa)
 }
 
 /// Round an f64 to an integer using the FPCR rounding mode and saturate
@@ -195,7 +121,7 @@ impl CpuCore {
                 if src_fmt == 7 {
                     // FMOVECR - load constant from ROM. The opmode field is
                     // the ROM index; there is no <ea> source operand.
-                    self.fpr[dst] = fpu_const_rom(opmode as usize);
+                    self.fpr[dst] = FloatX80::from_f64(fpu_const_rom(opmode as usize));
                     self.fpu_set_cc(self.fpr[dst]);
                     return 4;
                 }
@@ -235,7 +161,7 @@ impl CpuCore {
                 if opmode == 0x17 {
                     // FMOVECR - load constant from ROM. In this register-form
                     // encoding the source-register field carries the ROM index.
-                    self.fpr[dst] = fpu_const_rom(src);
+                    self.fpr[dst] = FloatX80::from_f64(fpu_const_rom(src));
                     self.fpu_set_cc(self.fpr[dst]);
                     return 4;
                 }
@@ -297,7 +223,7 @@ impl CpuCore {
                             let exp_word = (self.read_32(bus, addr) >> 16) as u16;
                             let hi = self.read_32(bus, addr.wrapping_add(4)) as u64;
                             let lo = self.read_32(bus, addr.wrapping_add(8)) as u64;
-                            self.fpr[i] = extended_to_f64(exp_word, (hi << 32) | lo);
+                            self.fpr[i] = FloatX80::from_extended(exp_word, (hi << 32) | lo);
                             addr = addr.wrapping_add(12);
                         }
                     }
@@ -310,7 +236,7 @@ impl CpuCore {
                             1 << i
                         };
                         if reg_list & bit != 0 {
-                            let (exp_word, mantissa) = f64_to_extended(self.fpr[i]);
+                            let (exp_word, mantissa) = self.fpr[i].to_extended();
                             self.write_32(bus, addr, (exp_word as u32) << 16);
                             self.write_32(bus, addr.wrapping_add(4), (mantissa >> 32) as u32);
                             self.write_32(bus, addr.wrapping_add(8), mantissa as u32);
@@ -593,12 +519,13 @@ impl CpuCore {
         self.fpcr = 0;
         self.fpsr = 0;
         self.fpiar = 0;
-        self.fpr = [f64::NAN; 8];
+        self.fpr = [FloatX80::default_nan(); 8];
         self.fpu_just_reset = true;
     }
 
-    /// Set FPU condition codes based on a floating point value.
-    fn fpu_set_cc(&mut self, value: f64) {
+    /// Set the FPSR condition-code byte (bits 24-27) from an extended value.
+    /// N reflects the sign bit for every class (so -0 and -NaN set N).
+    fn fpu_set_cc(&mut self, value: FloatX80) {
         const FPCC_N: u32 = 0x0800_0000;
         const FPCC_Z: u32 = 0x0400_0000;
         const FPCC_I: u32 = 0x0200_0000;
@@ -607,19 +534,48 @@ impl CpuCore {
         self.fpsr &= !(FPCC_N | FPCC_Z | FPCC_I | FPCC_NAN);
         if value.is_nan() {
             self.fpsr |= FPCC_NAN;
-        } else if value.is_infinite() {
+        } else if value.is_inf() {
             self.fpsr |= FPCC_I;
-            if value < 0.0 {
-                self.fpsr |= FPCC_N;
-            }
-        } else if value == 0.0 {
+        } else if value.is_zero() {
             self.fpsr |= FPCC_Z;
-            // Check for -0.0 by examining sign bit
-            if value.to_bits() >> 63 != 0 {
-                self.fpsr |= FPCC_N;
-            }
-        } else if value < 0.0 {
+        }
+        if value.sign() {
             self.fpsr |= FPCC_N;
+        }
+    }
+
+    /// Set the FPSR condition codes from an ordered comparison result.
+    fn fpu_set_cc_cmp(&mut self, cmp: FpCmp) {
+        const FPCC_N: u32 = 0x0800_0000;
+        const FPCC_Z: u32 = 0x0400_0000;
+        const FPCC_I: u32 = 0x0200_0000;
+        const FPCC_NAN: u32 = 0x0100_0000;
+
+        self.fpsr &= !(FPCC_N | FPCC_Z | FPCC_I | FPCC_NAN);
+        match cmp {
+            FpCmp::Less => self.fpsr |= FPCC_N,
+            FpCmp::Equal => self.fpsr |= FPCC_Z,
+            FpCmp::Greater => {}
+            FpCmp::Unordered => self.fpsr |= FPCC_NAN,
+        }
+    }
+
+    /// Build the rounding context from FPCR for a base-precision operation.
+    fn fpu_ctx(&self) -> RoundCtx {
+        RoundCtx {
+            mode: RoundMode::from_fpcr(self.fpcr),
+            prec: Precision::Extended,
+        }
+    }
+
+    /// Phase 1 exception commit: map the engine's OPERR/DZ onto the existing
+    /// crude FPSR bits. Phase 2 replaces this with full EXC/AEXC modeling.
+    fn fpu_commit(&mut self, f: ExcFlags) {
+        if f.has(ExcFlags::OPERR) {
+            self.fpsr |= 0x20;
+        }
+        if f.has(ExcFlags::DZ) {
+            self.fpsr |= 0x10;
         }
     }
 
@@ -657,106 +613,107 @@ impl CpuCore {
     }
 
     /// Apply a general FPU ALU operation `opmode` to destination register
-    /// `dst` using the source operand `src` (already widened to f64 from an
-    /// FPm register or an <ea>/immediate operand). This is the single
-    /// dispatch table shared by the register-source (`subop 0x0`) and
-    /// memory/immediate-source (`subop 0x2`) paths so the two cannot drift
-    /// apart. FMOVECR has no f64 source operand and is handled by the callers.
+    /// `dst` using the source operand `src` (an FPm register or an
+    /// <ea>/immediate operand). This is the single dispatch table shared by
+    /// the register-source (`subop 0x0`) and memory/immediate-source (`subop
+    /// 0x2`) paths so the two cannot drift apart. FMOVECR has no source
+    /// operand and is handled by the callers.
     ///
-    /// The 6888x/68040 single- and double-precision rounding-precision
-    /// variants (FSxxx / FDxxx, opmode bit 6 set) force the result width but
-    /// compute the same value; the emulated FPU works in f64 and folds each
-    /// variant onto its base operation. Returns the cycle count, or 0 for an
-    /// unimplemented opmode so the caller raises the Line-F exception.
-    fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: f64) -> i32 {
+    /// Phase 0: arithmetic is still computed via an f64 bridge
+    /// (`src.to_f64()` ... `FloatX80::from_f64(result)`) so results match the
+    /// previous core exactly while the register file is the extended type;
+    /// Phase 1 swaps each arm onto the softfloat engine. The 6888x
+    /// single/double rounding-precision variants (FSxxx/FDxxx) still fold
+    /// onto their base op here.
+    fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: FloatX80) -> i32 {
+        let s = src.to_f64();
         match opmode {
             0x00 | 0x40 | 0x44 => {
-                // FMOVE / FSMOVE / FDMOVE
+                // FMOVE / FSMOVE / FDMOVE (lossless copy)
                 self.fpr[dst] = src;
                 self.fpu_set_cc(src);
                 4
             }
             0x01 => {
-                // FINT - round to integer using FPCR rounding mode
-                let rounding_mode = (self.fpcr >> 4) & 0x3;
-                self.fpr[dst] = match rounding_mode {
-                    0 => src.round(), // RN - Round to Nearest
-                    1 => src.trunc(), // RZ - Round toward Zero
-                    2 => src.floor(), // RM - Round toward Minus Infinity
-                    3 => src.ceil(),  // RP - Round toward Plus Infinity
-                    _ => src.round(),
-                };
+                // FINT - round to integer using the FPCR rounding mode
+                let mode = RoundMode::from_fpcr(self.fpcr);
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::round_to_int(src, mode, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x03 => {
                 // FINTRZ - round to integer toward zero
-                self.fpr[dst] = src.trunc();
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::round_to_int(src, RoundMode::Zero, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x04 | 0x41 | 0x45 => {
                 // FSQRT / FSSQRT / FDSQRT
-                self.fpr[dst] = src.sqrt();
+                let ctx = self.fpu_ctx();
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::sqrt(src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x18 | 0x58 | 0x5C => {
                 // FABS / FSABS / FDABS
-                self.fpr[dst] = src.abs();
+                self.fpr[dst] = softfloat::abs(src);
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x1A | 0x5A | 0x5E => {
                 // FNEG / FSNEG / FDNEG
-                self.fpr[dst] = -src;
+                self.fpr[dst] = softfloat::neg(src);
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x20 | 0x60 | 0x64 => {
                 // FDIV / FSDIV / FDDIV - dst = dst / src
-                if src == 0.0 {
-                    if self.fpr[dst] == 0.0 {
-                        // 0/0 = NaN, set OPERR
-                        self.fpr[dst] = f64::NAN;
-                        self.fpsr |= 0x20; // OPERR
-                    } else {
-                        // x/0 = Inf, set DZ
-                        self.fpr[dst] = if self.fpr[dst] < 0.0 {
-                            f64::NEG_INFINITY
-                        } else {
-                            f64::INFINITY
-                        };
-                        self.fpsr |= 0x10; // DZ
-                    }
-                } else {
-                    self.fpr[dst] /= src;
-                }
+                let ctx = self.fpu_ctx();
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::div(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x22 | 0x62 | 0x66 => {
                 // FADD / FSADD / FDADD
-                self.fpr[dst] += src;
+                let ctx = self.fpu_ctx();
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::add(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x23 | 0x63 | 0x67 => {
                 // FMUL / FSMUL / FDMUL
-                self.fpr[dst] *= src;
+                let ctx = self.fpu_ctx();
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::mul(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x28 | 0x68 | 0x6C => {
                 // FSUB / FSSUB / FDSUB
-                self.fpr[dst] -= src;
+                let ctx = self.fpu_ctx();
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::sub(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x38 => {
-                // FCMP - compare dst with src, set condition codes only
-                let diff = self.fpr[dst] - src;
-                self.fpu_set_cc(diff);
+                // FCMP - ordered compare of dst with src, set condition codes only
+                let mut f = ExcFlags::default();
+                let cmp = softfloat::compare(self.fpr[dst], src, &mut f);
+                self.fpu_set_cc_cmp(cmp);
+                self.fpu_commit(f);
                 4
             }
             0x3A => {
@@ -767,175 +724,161 @@ impl CpuCore {
             // ========== Transcendental Functions ==========
             0x0E => {
                 // FSIN
-                self.fpr[dst] = src.sin();
+                self.fpr[dst] = FloatX80::from_f64(s.sin());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x1D => {
                 // FCOS
-                self.fpr[dst] = src.cos();
+                self.fpr[dst] = FloatX80::from_f64(s.cos());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x0F => {
                 // FTAN
-                self.fpr[dst] = src.tan();
+                self.fpr[dst] = FloatX80::from_f64(s.tan());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x0C => {
                 // FASIN
-                self.fpr[dst] = src.asin();
+                self.fpr[dst] = FloatX80::from_f64(s.asin());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x1C => {
                 // FACOS
-                self.fpr[dst] = src.acos();
+                self.fpr[dst] = FloatX80::from_f64(s.acos());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x0A => {
                 // FATAN
-                self.fpr[dst] = src.atan();
+                self.fpr[dst] = FloatX80::from_f64(s.atan());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x02 => {
                 // FSINH
-                self.fpr[dst] = src.sinh();
+                self.fpr[dst] = FloatX80::from_f64(s.sinh());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x19 => {
                 // FCOSH
-                self.fpr[dst] = src.cosh();
+                self.fpr[dst] = FloatX80::from_f64(s.cosh());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x09 => {
                 // FTANH
-                self.fpr[dst] = src.tanh();
+                self.fpr[dst] = FloatX80::from_f64(s.tanh());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x0D => {
                 // FATANH
-                self.fpr[dst] = src.atanh();
+                self.fpr[dst] = FloatX80::from_f64(s.atanh());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x10 => {
                 // FETOX (e^x)
-                self.fpr[dst] = src.exp();
+                self.fpr[dst] = FloatX80::from_f64(s.exp());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x08 => {
                 // FETOXM1 (e^x - 1)
-                self.fpr[dst] = src.exp_m1();
+                self.fpr[dst] = FloatX80::from_f64(s.exp_m1());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x11 => {
                 // FTWOTOX (2^x)
-                self.fpr[dst] = (2.0_f64).powf(src);
+                self.fpr[dst] = FloatX80::from_f64((2.0_f64).powf(s));
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x12 => {
                 // FTENTOX (10^x)
-                self.fpr[dst] = (10.0_f64).powf(src);
+                self.fpr[dst] = FloatX80::from_f64((10.0_f64).powf(s));
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x14 => {
                 // FLOGN (ln(x))
-                self.fpr[dst] = src.ln();
+                self.fpr[dst] = FloatX80::from_f64(s.ln());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x06 => {
                 // FLOGNP1 (ln(1+x))
-                self.fpr[dst] = src.ln_1p();
+                self.fpr[dst] = FloatX80::from_f64(s.ln_1p());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x15 => {
                 // FLOG10 (log10(x))
-                self.fpr[dst] = src.log10();
+                self.fpr[dst] = FloatX80::from_f64(s.log10());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x16 => {
                 // FLOG2 (log2(x))
-                self.fpr[dst] = src.log2();
+                self.fpr[dst] = FloatX80::from_f64(s.log2());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x1E => {
-                // FGETEXP - extract exponent
-                if src == 0.0 || src.is_nan() || src.is_infinite() {
-                    self.fpr[dst] = if src.is_nan() || src.is_infinite() {
-                        f64::NAN
-                    } else {
-                        0.0
-                    };
-                } else {
-                    // IEEE 754 double: sign (1) | exponent (11) | mantissa (52)
-                    let bits = src.to_bits();
-                    let biased_exp = ((bits >> 52) & 0x7FF) as i32;
-                    let exp = biased_exp - 1023; // Remove bias
-                    self.fpr[dst] = exp as f64;
-                }
+                // FGETEXP - extract the unbiased exponent
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::getexp(src, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x1F => {
-                // FGETMAN - extract mantissa as 1.xxx
-                if src == 0.0 {
-                    self.fpr[dst] = 0.0;
-                } else if src.is_nan() || src.is_infinite() {
-                    self.fpr[dst] = src; // Keep special values
-                } else {
-                    // Construct 1.mantissa with exponent 0 (biased 1023)
-                    let bits = src.to_bits();
-                    let sign = bits & (1 << 63);
-                    let mantissa_bits = bits & 0x000F_FFFF_FFFF_FFFF;
-                    let result_bits = sign | (1023_u64 << 52) | mantissa_bits;
-                    self.fpr[dst] = f64::from_bits(result_bits);
-                }
+                // FGETMAN - extract the mantissa as a value in [1, 2)
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::getman(src, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x21 => {
                 // FMOD
-                self.fpr[dst] %= src;
+                self.fpr[dst] = FloatX80::from_f64(self.fpr[dst].to_f64() % s);
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x25 => {
                 // FREM (IEEE remainder): r = x - y*round(x/y)
-                if src != 0.0 {
-                    let n = (self.fpr[dst] / src).round();
-                    self.fpr[dst] -= src * n;
+                let mut d = self.fpr[dst].to_f64();
+                if s != 0.0 {
+                    let n = (d / s).round();
+                    d -= s * n;
                 }
+                self.fpr[dst] = FloatX80::from_f64(d);
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x26 => {
-                // FSCALE - dst = dst * 2^src
-                let scale = src as i32;
-                self.fpr[dst] *= (2.0_f64).powi(scale);
+                // FSCALE - dst = dst * 2^trunc(src)
+                let ctx = self.fpu_ctx();
+                let mut f = ExcFlags::default();
+                let n = s as i32;
+                self.fpr[dst] = softfloat::scale(self.fpr[dst], n, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x30..=0x37 => {
                 // FSINCOS - compute sin and cos simultaneously.
                 // Bottom 3 bits of opmode = cos destination register.
                 let cos_dst = (opmode & 7) as usize;
-                self.fpr[dst] = src.sin();
-                self.fpr[cos_dst] = src.cos();
+                self.fpr[dst] = FloatX80::from_f64(s.sin());
+                self.fpr[cos_dst] = FloatX80::from_f64(s.cos());
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
@@ -983,14 +926,16 @@ impl CpuCore {
     }
 
     /// Read the ALU/FMOVE source operand in `fmt` (0=long, 1=single,
-    /// 2=extended, 4=word, 6=byte, 5=double) and widen to f64. Packed
+    /// 2=extended, 4=word, 6=byte, 5=double) as an extended value. The
+    /// extended format (2) is read losslessly; the others go through an f64
+    /// bridge for now (Phase 1 replaces these with exact widening). Packed
     /// decimal (3) is unimplemented and reports as unhandled (F-line).
     fn fpu_read_source<B: AddressBus>(
         &mut self,
         bus: &mut B,
         opcode: u16,
         fmt: u16,
-    ) -> Option<f64> {
+    ) -> Option<FloatX80> {
         let ea_mode = ((opcode >> 3) & 7) as u8;
         let ea_reg = (opcode & 7) as usize;
         let bytes: u32 = match fmt {
@@ -1005,46 +950,46 @@ impl CpuCore {
             FpuEa::DataReg(r) => {
                 let v = self.d(r);
                 match fmt {
-                    0 => Some(v as i32 as f64),
-                    1 => Some(f32::from_bits(v) as f64),
-                    4 => Some(v as u16 as i16 as f64),
-                    6 => Some(v as u8 as i8 as f64),
+                    0 => Some(FloatX80::from_f64(v as i32 as f64)),
+                    1 => Some(FloatX80::from_f64(f32::from_bits(v) as f64)),
+                    4 => Some(FloatX80::from_f64(v as u16 as i16 as f64)),
+                    6 => Some(FloatX80::from_f64(v as u8 as i8 as f64)),
                     _ => None, // 8/12-byte operands cannot live in Dn
                 }
             }
             FpuEa::Immediate => match fmt {
-                0 => Some(self.read_imm_32(bus) as i32 as f64),
-                1 => Some(f32::from_bits(self.read_imm_32(bus)) as f64),
-                4 => Some(self.read_imm_16(bus) as i16 as f64),
-                6 => Some((self.read_imm_16(bus) & 0xFF) as u8 as i8 as f64),
+                0 => Some(FloatX80::from_f64(self.read_imm_32(bus) as i32 as f64)),
+                1 => Some(FloatX80::from_f64(f32::from_bits(self.read_imm_32(bus)) as f64)),
+                4 => Some(FloatX80::from_f64(self.read_imm_16(bus) as i16 as f64)),
+                6 => Some(FloatX80::from_f64((self.read_imm_16(bus) & 0xFF) as u8 as i8 as f64)),
                 5 => {
                     let hi = self.read_imm_32(bus) as u64;
                     let lo = self.read_imm_32(bus) as u64;
-                    Some(f64::from_bits((hi << 32) | lo))
+                    Some(FloatX80::from_f64(f64::from_bits((hi << 32) | lo)))
                 }
                 2 => {
                     let exp_word = (self.read_imm_32(bus) >> 16) as u16;
                     let hi = self.read_imm_32(bus) as u64;
                     let lo = self.read_imm_32(bus) as u64;
-                    Some(extended_to_f64(exp_word, (hi << 32) | lo))
+                    Some(FloatX80::from_extended(exp_word, (hi << 32) | lo))
                 }
                 _ => None,
             },
             FpuEa::Memory(addr) => match fmt {
-                0 => Some(self.read_32(bus, addr) as i32 as f64),
-                1 => Some(f32::from_bits(self.read_32(bus, addr)) as f64),
-                4 => Some(self.read_16(bus, addr) as i16 as f64),
-                6 => Some(self.read_8(bus, addr) as i8 as f64),
+                0 => Some(FloatX80::from_f64(self.read_32(bus, addr) as i32 as f64)),
+                1 => Some(FloatX80::from_f64(f32::from_bits(self.read_32(bus, addr)) as f64)),
+                4 => Some(FloatX80::from_f64(self.read_16(bus, addr) as i16 as f64)),
+                6 => Some(FloatX80::from_f64(self.read_8(bus, addr) as i8 as f64)),
                 5 => {
                     let hi = self.read_32(bus, addr) as u64;
                     let lo = self.read_32(bus, addr.wrapping_add(4)) as u64;
-                    Some(f64::from_bits((hi << 32) | lo))
+                    Some(FloatX80::from_f64(f64::from_bits((hi << 32) | lo)))
                 }
                 2 => {
                     let exp_word = self.read_16(bus, addr);
                     let hi = self.read_32(bus, addr.wrapping_add(4)) as u64;
                     let lo = self.read_32(bus, addr.wrapping_add(8)) as u64;
-                    Some(extended_to_f64(exp_word, (hi << 32) | lo))
+                    Some(FloatX80::from_extended(exp_word, (hi << 32) | lo))
                 }
                 _ => None,
             },
@@ -1061,7 +1006,7 @@ impl CpuCore {
         ea_mode: u8,
         ea_reg: usize,
         fmt: u16,
-        value: f64,
+        value: FloatX80,
     ) -> bool {
         let bytes: u32 = match fmt {
             6 => 1,
@@ -1074,24 +1019,28 @@ impl CpuCore {
         let Some(ea) = self.fpu_ea(bus, ea_mode, ea_reg, bytes) else {
             return false;
         };
+        // Bridge: integer/single/double formats round through f64 for now;
+        // the extended format is written losslessly. Phase 1 replaces the
+        // bridge with exact softfloat conversions.
+        let fv = value.to_f64();
         match ea {
             FpuEa::DataReg(r) => match fmt {
                 0 => {
-                    let v = f64_to_int_saturating(value, self.fpcr, i32::MIN as i64, i32::MAX as i64);
+                    let v = f64_to_int_saturating(fv, self.fpcr, i32::MIN as i64, i32::MAX as i64);
                     self.set_d(r, v as u32);
                     true
                 }
                 1 => {
-                    self.set_d(r, (value as f32).to_bits());
+                    self.set_d(r, (fv as f32).to_bits());
                     true
                 }
                 4 => {
-                    let v = f64_to_int_saturating(value, self.fpcr, i16::MIN as i64, i16::MAX as i64);
+                    let v = f64_to_int_saturating(fv, self.fpcr, i16::MIN as i64, i16::MAX as i64);
                     self.set_d(r, (self.d(r) & 0xFFFF_0000) | (v as u16 as u32));
                     true
                 }
                 6 => {
-                    let v = f64_to_int_saturating(value, self.fpcr, i8::MIN as i64, i8::MAX as i64);
+                    let v = f64_to_int_saturating(fv, self.fpcr, i8::MIN as i64, i8::MAX as i64);
                     self.set_d(r, (self.d(r) & 0xFFFF_FF00) | (v as u8 as u32));
                     true
                 }
@@ -1099,32 +1048,32 @@ impl CpuCore {
             },
             FpuEa::Memory(addr) => match fmt {
                 0 => {
-                    let v = f64_to_int_saturating(value, self.fpcr, i32::MIN as i64, i32::MAX as i64);
+                    let v = f64_to_int_saturating(fv, self.fpcr, i32::MIN as i64, i32::MAX as i64);
                     self.write_32(bus, addr, v as u32);
                     true
                 }
                 1 => {
-                    self.write_32(bus, addr, (value as f32).to_bits());
+                    self.write_32(bus, addr, (fv as f32).to_bits());
                     true
                 }
                 4 => {
-                    let v = f64_to_int_saturating(value, self.fpcr, i16::MIN as i64, i16::MAX as i64);
+                    let v = f64_to_int_saturating(fv, self.fpcr, i16::MIN as i64, i16::MAX as i64);
                     self.write_16(bus, addr, v as u16);
                     true
                 }
                 6 => {
-                    let v = f64_to_int_saturating(value, self.fpcr, i8::MIN as i64, i8::MAX as i64);
+                    let v = f64_to_int_saturating(fv, self.fpcr, i8::MIN as i64, i8::MAX as i64);
                     self.write_8(bus, addr, v as u8);
                     true
                 }
                 5 => {
-                    let bits = value.to_bits();
+                    let bits = fv.to_bits();
                     self.write_32(bus, addr, (bits >> 32) as u32);
                     self.write_32(bus, addr.wrapping_add(4), bits as u32);
                     true
                 }
                 2 => {
-                    let (exp_word, mantissa) = f64_to_extended(value);
+                    let (exp_word, mantissa) = value.to_extended();
                     self.write_32(bus, addr, (exp_word as u32) << 16);
                     self.write_32(bus, addr.wrapping_add(4), (mantissa >> 32) as u32);
                     self.write_32(bus, addr.wrapping_add(8), mantissa as u32);
