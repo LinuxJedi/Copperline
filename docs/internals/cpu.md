@@ -27,13 +27,17 @@ the format conversions, FMOVE/FMOVEM in every operand format (including
 packed decimal), the constant ROM, FBcc/FScc/FDBcc/FTRAPcc, control
 registers, the FPCR rounding mode/precision and the FPSR exception/accrued
 bytes, and the FSAVE/FRESTORE state frames (NULL after reset, 68881-style
-IDLE once touched) are all modelled. The transcendentals (FSIN/FCOS/FETOX/
-FLOGN/...) and the FMOD/FREM remainders are the one exception: they are
-still evaluated in f64 and widened to extended, isolated behind
-`vendor/m68k/src/fpu/transcendental.rs` (the real 6888x transcendentals
-are polynomial/CORDIC approximations that are not bit-accurate to libm
-anyway). This covers Kickstart's detection and per-task FPU context
-switching. The
+IDLE once touched) are all modelled. The transcendentals (FSIN/FCOS/FTAN,
+FASIN/FACOS/FATAN, the hyperbolics, FETOX/FETOXM1/FTWOTOX/FTENTOX,
+FLOGN/FLOGNP1/FLOG2/FLOG10) and FSINCOS run in extended precision too: a
+double-`FloatX80` ("double-double", ~128-bit) layer
+(`vendor/m68k/src/fpu/dd.rs`) evaluates Taylor/atanh series over reduced
+ranges and rounds the result to extended under the FPCR mode, setting INEX
+and the domain flags (OPERR/DZ). They are faithful to ~64 bits (not
+chip-bit-exact -- the real 6888x uses its own CORDIC/polynomial microcode,
+and on a bare 68040 these trap to a software FPSP). FMOD/FREM compute the
+exact remainder and the FPSR quotient byte. This covers Kickstart's
+detection and per-task FPU context switching. The
 68000's per-instruction cycle counts in the vendored core have been
 corrected against the SingleStepTests corpus to ~1% aggregate accuracy
 (see `vendor/m68k/CYCLE_TIMING_GAP.md`), which is what makes
