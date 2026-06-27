@@ -44,6 +44,7 @@ range checks as the equivalent TOML fields:
 | `--fast SIZE` | `[memory] fast` | `0`, `1M`, `4M`, `8M`, ... |
 | `--slow SIZE` | `[memory] slow` | `0`, up to `512K` |
 | `--floppy-drives COUNT` | `[floppy] drives` | `1` to `4` wired drives (`DF0:` plus external drives) |
+| `--joystick MODE` | `[input] joystick` | `auto`, `keyboard`, `gamepad` |
 
 For example, to boot a stock A1200 profile but with 8 MB of fast RAM and a
 faster CPU, with no config file at all:
@@ -314,6 +315,30 @@ floppy_sounds_volume = 100  # 0-100, relative to Paula's output
 The drive sounds are generated from scratch: motor hum with spin-up/down,
 head-step clicks for seeks and the empty-drive poll, and faint read/write
 hiss during disk DMA.
+
+## `[input]`
+
+```toml
+[input]
+joystick = "auto"   # "auto" (default), "keyboard", or "gamepad"
+```
+
+Selects the initial host source for the emulated port-2 joystick / CD32 pad:
+
+- `auto` -- a calibrated USB gamepad drives port 2 when one is present;
+  otherwise the keyboard-joystick mapping (cursor keys plus the fire keys)
+  takes over so port 2 stays usable without a controller.
+- `gamepad` -- only a physical pad drives port 2. The keyboard is left to
+  the Amiga, so it passes straight through to a Shell, an editor, or
+  Workbench. With no pad connected there is simply no port-2 input. Handy
+  when running an AmigaOS environment for hands-on, keyboard-driven setup.
+- `keyboard` -- always use the keyboard-joystick mapping, even when a pad is
+  connected.
+
+This only sets the starting mode. `Cmd+J` / `Alt+J` (and the menu's
+**Joystick Input** item, or the launcher's *A/V & Emu* tab) still cycle it
+live without changing the config. `--joystick MODE` overrides this for a
+single run.
 
 ## `[floppy]` and `[floppy.df0]` .. `[floppy.df3]`
 

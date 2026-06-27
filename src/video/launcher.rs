@@ -22,8 +22,8 @@
 use crate::chipset::agnus::{AgnusRevision, VideoStandard};
 use crate::chipset::denise::DeniseRevision;
 use crate::config::{
-    format_size, machine_profile_defaults, Chipset, Config, CpuModel, MachineModel, Overscan,
-    PacingBudget, RawConfig, RawFloppyDrive, RawZorroBoard, WarpSpeed,
+    format_size, machine_profile_defaults, Chipset, Config, CpuModel, JoystickInputMode,
+    MachineModel, Overscan, PacingBudget, RawConfig, RawFloppyDrive, RawZorroBoard, WarpSpeed,
 };
 use crate::zorro::{ConfigOption, ConfigOptionKind, LoadedZorroBoard};
 use anyhow::Result;
@@ -261,6 +261,7 @@ pub enum LauncherField {
     PacingBudget,
     RealtimePriority,
     Warp,
+    Joystick,
 }
 
 /// How a row's value is edited, and therefore which widget the panel draws.
@@ -346,7 +347,7 @@ const CD_ROWS: [Row; 3] = [
     row(F::CdInsertDelay, "Insert delay", Cycle),
     row(F::Cd32Nvram, "CD32 NVRAM", PathRow),
 ];
-const AV_EMULATION_ROWS: [Row; 8] = [
+const AV_EMULATION_ROWS: [Row; 9] = [
     row(F::Overscan, "Overscan", Cycle),
     row(F::Phosphor, "Phosphor", Cycle),
     row(F::FloppySounds, "Floppy sounds", Toggle),
@@ -355,6 +356,7 @@ const AV_EMULATION_ROWS: [Row; 8] = [
     row(F::PacingBudget, "Pacing budget", Cycle),
     row(F::RealtimePriority, "Realtime priority", Toggle),
     row(F::Warp, "Warp speed", Cycle),
+    row(F::Joystick, "Joystick input", Cycle),
 ];
 
 /// The rows shown on a tab, top to bottom. The `Zorro` tab has no rows: it is
@@ -442,6 +444,12 @@ const WARPS: [WarpSpeed; 5] = [
     WarpSpeed::X16,
     WarpSpeed::Max,
 ];
+// Cycle order matches the runtime Cmd+J toggle (auto -> keyboard -> gamepad).
+const JOYSTICK_MODES: [JoystickInputMode; 3] = [
+    JoystickInputMode::Auto,
+    JoystickInputMode::Keyboard,
+    JoystickInputMode::Gamepad,
+];
 
 /// A fully-typed, editable mirror of a configurable machine. See the module
 /// docs for how it round-trips through [`RawConfig`].
@@ -498,6 +506,7 @@ pub struct MachineSetup {
     pacing_budget: PacingBudget,
     realtime_priority: bool,
     warp: WarpSpeed,
+    joystick_input_mode: JoystickInputMode,
     // Extra Zorro boards (metadata path + plugin config schema/overrides)
     zorro_boards: Vec<ZorroBoardSetup>,
 }
@@ -564,6 +573,7 @@ impl MachineSetup {
             pacing_budget: cfg.emulation.pacing_budget,
             realtime_priority: cfg.emulation.realtime_priority,
             warp: cfg.emulation.warp_speed,
+            joystick_input_mode: cfg.joystick_input_mode,
             zorro_boards: raw
                 .zorro
                 .iter()
@@ -717,6 +727,9 @@ impl MachineSetup {
         if self.warp != base.emulation.warp_speed {
             raw.emulation.warp_speed = Some(self.warp.label().to_ascii_lowercase());
         }
+        if self.joystick_input_mode != base.joystick_input_mode {
+            raw.input.joystick = Some(self.joystick_input_mode.label().to_string());
+        }
         // Zorro boards: emit the metadata path plus any per-board overrides
         // (typed per the option schema), only when the user changed something.
         raw.zorro = self
@@ -808,6 +821,7 @@ impl MachineSetup {
         self.pacing_budget = base.emulation.pacing_budget;
         self.realtime_priority = base.emulation.realtime_priority;
         self.warp = base.emulation.warp_speed;
+        self.joystick_input_mode = base.joystick_input_mode;
         if !self.has_gayle() {
             self.ide_master = None;
             self.ide_slave = None;
@@ -952,6 +966,11 @@ impl MachineSetup {
                 PacingBudget::Instructions => "Instructions".to_string(),
             },
             F::Warp => self.warp.label().to_string(),
+            F::Joystick => match self.joystick_input_mode {
+                JoystickInputMode::Auto => "Auto".to_string(),
+                JoystickInputMode::Keyboard => "Keyboard".to_string(),
+                JoystickInputMode::Gamepad => "Gamepad".to_string(),
+            },
             // Path fields: the file name, or a placeholder.
             F::Rom => self.path_label(field, "(bundled AROS)"),
             _ if rows_contains_kind(field, RowKind::Path) => self.path_label(field, "(none)"),
@@ -1019,6 +1038,10 @@ impl MachineSetup {
                 self.pacing_budget = cycle_slice(&PACINGS, self.pacing_budget, forward)
             }
             F::Warp => self.warp = cycle_slice(&WARPS, self.warp, forward),
+            F::Joystick => {
+                self.joystick_input_mode =
+                    cycle_slice(&JOYSTICK_MODES, self.joystick_input_mode, forward)
+            }
             _ => {}
         }
     }
@@ -1588,6 +1611,28 @@ mod tests {
         assert_eq!(raw.chipset.agnus.as_deref(), Some("OCS"));
         let back = MachineSetup::from_raw(&raw).unwrap();
         assert_eq!(back.agnus, Some(AgnusRevision::Ocs));
+    }
+
+    #[test]
+    fn joystick_input_mode_round_trips_through_raw() {
+        let mut s = MachineSetup::default();
+        // Default is Auto, which emits no [input] section.
+        assert_eq!(s.joystick_input_mode, JoystickInputMode::Auto);
+        assert!(s.to_raw().input.joystick.is_none());
+        // Cycle order matches the runtime toggle: auto -> keyboard -> gamepad.
+        s.cycle(LauncherField::Joystick, true);
+        assert_eq!(s.joystick_input_mode, JoystickInputMode::Keyboard);
+        s.cycle(LauncherField::Joystick, true);
+        assert_eq!(s.joystick_input_mode, JoystickInputMode::Gamepad);
+        let raw = s.to_raw();
+        assert_eq!(raw.input.joystick.as_deref(), Some("gamepad"));
+        let back = MachineSetup::from_raw(&raw).unwrap();
+        assert_eq!(back.joystick_input_mode, JoystickInputMode::Gamepad);
+        // Switching machine profile resets it to the Auto default.
+        let mut s = MachineSetup::default();
+        s.cycle(LauncherField::Joystick, true);
+        s.select_model(Some(MachineModel::A1200));
+        assert_eq!(s.joystick_input_mode, JoystickInputMode::Auto);
     }
 
     #[test]

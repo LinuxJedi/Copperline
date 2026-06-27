@@ -162,7 +162,7 @@ The layout is:
   *Hard Disk* (IDE master/slave and the A2091 SCSI ROM and units), *CD* (image,
   insert delay, CD32 NVRAM), *Zorro* (extra autoconfig boards by metadata file),
   and *A/V & Emu* (overscan, phosphor, floppy sounds and volume, power-on,
-  pacing, realtime priority, warp speed).
+  pacing, realtime priority, warp speed, joystick input mode).
 - **Settings rows** (right pane). `[<]`/`[>]` step through a value, On/Off
   buttons flip a toggle, and the **Browse** and **Clear** buttons set or remove
   a file path through a native file dialog. A setting that does not apply to the
@@ -284,10 +284,13 @@ protocol instead, including the red/blue/green/yellow and transport
 buttons. Mouse and gamepad coexist because they use different ports.
 
 If no calibrated gamepad is connected, Copperline can emulate the port-2
-joystick from the host keyboard. The default joystick input mode is
-**auto**: a calibrated USB gamepad is used when present, otherwise the
-keyboard mapping is active. Use the menu's **Joystick Input** item, or
-`Cmd+J` on macOS / `Alt+J` on Linux and Windows, to cycle through:
+joystick from the host keyboard. The joystick input mode starts at **auto**
+(a calibrated USB gamepad is used when present, otherwise the keyboard
+mapping is active); set a different starting mode with `[input] joystick` in
+the config (or `--joystick MODE`, or the launcher's *A/V & Emu* tab) when you
+want the keyboard left to the Amiga for interactive setup. Use the menu's
+**Joystick Input** item, or `Cmd+J` on macOS / `Alt+J` on Linux and Windows,
+to cycle through:
 
 - **auto**: gamepad when available, keyboard fallback otherwise.
 - **keyboard**: always use the keyboard mapping and ignore live gamepad

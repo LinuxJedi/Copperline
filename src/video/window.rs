@@ -64,34 +64,11 @@ impl JoyButtonKind {
     }
 }
 
-/// Host input source for the emulated port-2 joystick/CD32 pad. Auto keeps
-/// a calibrated physical pad in charge when one is present and otherwise
-/// falls back to keyboard joystick emulation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum JoystickInputMode {
-    #[default]
-    Auto,
-    Gamepad,
-    Keyboard,
-}
-
-impl JoystickInputMode {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Auto => Self::Keyboard,
-            Self::Keyboard => Self::Gamepad,
-            Self::Gamepad => Self::Auto,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Gamepad => "gamepad",
-            Self::Keyboard => "keyboard",
-        }
-    }
-}
+// The host input source for the emulated port-2 joystick/CD32 pad is a
+// configurable value, so it lives with the other config enums; re-exported
+// here because the window/menu/ui code refers to it as
+// `crate::video::window::JoystickInputMode`.
+pub use crate::config::JoystickInputMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyboardJoystickKey {
@@ -739,6 +716,7 @@ impl App {
         overscan: Overscan,
         phosphor: f32,
         warp_speed: WarpSpeed,
+        joystick_input_mode: JoystickInputMode,
         about_machine_lines: Vec<String>,
         machine_config: RawConfig,
     ) -> Self {
@@ -809,7 +787,7 @@ impl App {
             hcenter: hcenter_enabled(),
             overscan,
             gamepad: crate::gamepad::GamepadReader::new(),
-            joystick_input_mode: JoystickInputMode::default(),
+            joystick_input_mode,
             warp_speed,
             last_gamepad_active: false,
             keyboard_joy_held: KeyboardJoystickHeld::default(),
@@ -5427,6 +5405,11 @@ impl App {
         self.disk_playlist_index = [0; 4];
         self.overscan = crate::resolve_overscan(cfg.overscan);
         self.warp_speed = cfg.emulation.warp_speed;
+        // Reset the host joystick source to the new machine's configured
+        // start-up mode (a previous live Cmd+J toggle does not carry over).
+        self.joystick_input_mode = cfg.joystick_input_mode;
+        self.last_gamepad_active = false;
+        self.keyboard_joy_held = KeyboardJoystickHeld::default();
         self.about_machine_lines = crate::about_machine_lines(cfg);
         self.deinterlacer = Deinterlacer::with_phosphor(crate::resolve_phosphor(cfg.phosphor));
         self.ui.menu_open = false;
@@ -8795,6 +8778,7 @@ mod tests {
             crate::config::Overscan::Full,
             0.0,
             crate::config::WarpSpeed::Max,
+            crate::config::JoystickInputMode::Auto,
             vec!["Machine: test".to_string()],
             crate::config::RawConfig::default(),
         )
