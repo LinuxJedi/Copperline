@@ -2742,9 +2742,13 @@ fn bitplane_dma_output_start_x(
     if display_control.fetch_start_native_x(display_control.diw_h_start(), pixel_repeat) == 0 {
         return Some(display_start_x);
     }
-    line_fetch_plan_for_word(base_control, control_segments, 0, dma_planes)
-        .iter()
-        .find_map(|(hpos, plane)| (plane == 0).then_some(bitplane_fetch_framebuffer_x(hpos)))
+    let plan = line_fetch_plan_for_word(base_control, control_segments, 0, dma_planes);
+    plan.word_fetch_hpos
+        .or_else(|| {
+            plan.iter()
+                .find_map(|(hpos, plane)| (plane == 0).then_some(hpos))
+        })
+        .map(bitplane_fetch_framebuffer_x)
 }
 
 fn bitplane_carry_words_for_line(
@@ -8064,7 +8068,7 @@ mod tests {
     }
 
     #[test]
-    fn late_ddf_bitplane_output_waits_for_first_bpl1dat_fetch() {
+    fn late_ddf_bitplane_output_starts_at_first_word_fetch() {
         let standard_ddf = ControlState {
             dmacon: DMACON_DMAEN | DMACON_BPLEN,
             bplcon0: 0x1000,
@@ -8094,6 +8098,11 @@ mod tests {
             ..standard_ddf
         };
         let inset_words = inset_ddf.words_per_row(native_frame_width_for_control(inset_ddf));
+        let first_word_x = bitplane_fetch_framebuffer_x(
+            line_fetch_plan_for_word(inset_ddf, &[], 0, inset_ddf.dma_planes())
+                .word_fetch_hpos
+                .unwrap(),
+        );
         let first_bpl1dat_x =
             bitplane_fetch_framebuffer_x(bitplane_fetch_hpos_for_plane(inset_ddf, 0, 0));
 
@@ -8101,6 +8110,7 @@ mod tests {
             inset_ddf.fetch_start_native_x(inset_ddf.diw_h_start(), 2),
             0
         );
+        assert!(first_word_x < first_bpl1dat_x);
         assert_eq!(
             bitplane_output_start_x(
                 inset_ddf,
@@ -8109,7 +8119,7 @@ mod tests {
                 inset_words,
                 inset_ddf.dma_planes(),
             ),
-            first_bpl1dat_x
+            first_word_x
         );
     }
 
