@@ -8,6 +8,7 @@ use crate::core::ea::{AddressingMode, EaResult};
 use crate::core::types::Size;
 use crate::core::memory::AddressBus;
 use crate::fpu::FloatX80;
+use super::packed;
 use super::softfloat::{self, ExcFlags, FpCmp, Precision, RoundCtx, RoundMode};
 
 /// Where a resolved FPU operand lives.
@@ -50,6 +51,21 @@ fn f64_to_int_saturating(value: f64, fpcr: u32, min: i64, max: i64) -> i64 {
     } else {
         rounded as i64
     }
+}
+
+/// Sign-extend a 7-bit FMOVE k-factor to i8.
+fn sign_extend7(v: u16) -> i8 {
+    let raw = (v & 0x7F) as i16;
+    (if raw >= 0x40 { raw - 0x80 } else { raw }) as i8
+}
+
+/// Pack three big-endian longwords into the 12-byte packed-decimal layout.
+fn words_to_bytes(w0: u32, w1: u32, w2: u32) -> [u8; 12] {
+    let mut b = [0u8; 12];
+    b[0..4].copy_from_slice(&w0.to_be_bytes());
+    b[4..8].copy_from_slice(&w1.to_be_bytes());
+    b[8..12].copy_from_slice(&w2.to_be_bytes());
+    b
 }
 
 /// Load a constant from the 6888x on-chip ROM by `offset` (the ROM-index
@@ -136,6 +152,14 @@ impl CpuCore {
                 let dst_fmt = (w2 >> 10) & 0x7;
                 let src = ((w2 >> 7) & 7) as usize;
 
+                // Packed-decimal k-factor: static (fmt 3) in w2 bits 6-0;
+                // dynamic (fmt 7) in bits 6-0 of the Dn named by w2 bits 6-4.
+                let kfactor = match dst_fmt {
+                    3 => sign_extend7(w2),
+                    7 => sign_extend7(self.d(((w2 >> 4) & 7) as usize) as u16),
+                    _ => 0,
+                };
+
                 // Consume w2 now that we're committed.
                 let _w2 = self.read_imm_16(bus);
 
@@ -143,7 +167,7 @@ impl CpuCore {
                 let ea_mode = (ea >> 3) & 7;
                 let ea_reg = (ea & 7) as usize;
 
-                if self.fpu_write_dest(bus, ea_mode, ea_reg, dst_fmt, self.fpr[src]) {
+                if self.fpu_write_dest(bus, ea_mode, ea_reg, dst_fmt, kfactor, self.fpr[src]) {
                     4
                 } else {
                     0
@@ -974,8 +998,8 @@ impl CpuCore {
             4 => 2,
             0 | 1 => 4,
             5 => 8,
-            2 => 12,
-            _ => return None, // packed decimal (3) unimplemented
+            2 | 3 => 12, // extended and packed-decimal are 12 bytes
+            _ => return None,
         };
         match self.fpu_ea(bus, ea_mode, ea_reg, bytes)? {
             FpuEa::DataReg(r) => {
@@ -1004,6 +1028,12 @@ impl CpuCore {
                     let lo = self.read_imm_32(bus) as u64;
                     Some(FloatX80::from_extended(exp_word, (hi << 32) | lo))
                 }
+                3 => {
+                    let w0 = self.read_imm_32(bus);
+                    let w1 = self.read_imm_32(bus);
+                    let w2 = self.read_imm_32(bus);
+                    Some(packed::from_packed(words_to_bytes(w0, w1, w2), &mut ExcFlags::default()))
+                }
                 _ => None,
             },
             FpuEa::Memory(addr) => match fmt {
@@ -1022,6 +1052,12 @@ impl CpuCore {
                     let lo = self.read_32(bus, addr.wrapping_add(8)) as u64;
                     Some(FloatX80::from_extended(exp_word, (hi << 32) | lo))
                 }
+                3 => {
+                    let w0 = self.read_32(bus, addr);
+                    let w1 = self.read_32(bus, addr.wrapping_add(4));
+                    let w2 = self.read_32(bus, addr.wrapping_add(8));
+                    Some(packed::from_packed(words_to_bytes(w0, w1, w2), &mut ExcFlags::default()))
+                }
                 _ => None,
             },
         }
@@ -1037,6 +1073,7 @@ impl CpuCore {
         ea_mode: u8,
         ea_reg: usize,
         fmt: u16,
+        kfactor: i8,
         value: FloatX80,
     ) -> bool {
         let bytes: u32 = match fmt {
@@ -1044,8 +1081,8 @@ impl CpuCore {
             4 => 2,
             0 | 1 => 4,
             5 => 8,
-            2 => 12,
-            _ => return false, // packed decimal unimplemented
+            2 | 3 | 7 => 12, // extended and packed-decimal (static/dynamic k)
+            _ => return false,
         };
         let Some(ea) = self.fpu_ea(bus, ea_mode, ea_reg, bytes) else {
             return false;
@@ -1108,6 +1145,15 @@ impl CpuCore {
                     self.write_32(bus, addr, (exp_word as u32) << 16);
                     self.write_32(bus, addr.wrapping_add(4), (mantissa >> 32) as u32);
                     self.write_32(bus, addr.wrapping_add(8), mantissa as u32);
+                    true
+                }
+                3 | 7 => {
+                    // Packed decimal (static or dynamic k-factor).
+                    let bytes = packed::to_packed(value, kfactor, &mut ExcFlags::default());
+                    for (i, chunk) in bytes.chunks(4).enumerate() {
+                        let w = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        self.write_32(bus, addr.wrapping_add(4 * i as u32), w);
+                    }
                     true
                 }
                 _ => false,

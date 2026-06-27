@@ -491,6 +491,55 @@ pub fn sqrt(a: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     round_pack(false, big_e / 2 + 63, m, ctx, f)
 }
 
+// ============================== int <-> x80 ==============================
+
+/// Build an exact extended value from a u64 magnitude and a sign.
+pub fn from_u64(v: u64, sign: bool) -> FloatX80 {
+    if v == 0 {
+        return FloatX80::zero(sign);
+    }
+    round_pack(
+        sign,
+        63,
+        (v as u128) << 64,
+        RoundCtx::NEAREST_EXT,
+        &mut ExcFlags::default(),
+    )
+}
+
+/// Round `x` to an integer in `[min, max]`, saturating on overflow/NaN/Inf
+/// (raising OPERR) and raising INEX on a fractional discard.
+pub fn to_i64(x: FloatX80, mode: RoundMode, min: i64, max: i64, f: &mut ExcFlags) -> i64 {
+    if x.is_nan() {
+        f.raise(ExcFlags::OPERR);
+        return min;
+    }
+    if x.is_inf() {
+        f.raise(ExcFlags::OPERR);
+        return if x.sign() { min } else { max };
+    }
+    let r = round_to_int(x, mode, f);
+    if r.is_zero() {
+        return 0;
+    }
+    let u = unpack(r);
+    if u.exp > 63 {
+        f.raise(ExcFlags::OPERR);
+        return if u.sign { min } else { max };
+    }
+    let mag = (u.mant >> (63 - u.exp)) as u128;
+    let val = if u.sign { -(mag as i128) } else { mag as i128 };
+    if val < min as i128 {
+        f.raise(ExcFlags::OPERR);
+        min
+    } else if val > max as i128 {
+        f.raise(ExcFlags::OPERR);
+        max
+    } else {
+        val as i64
+    }
+}
+
 // ============================== compare ==================================
 
 /// Compare magnitudes of two finite/inf operands as (biased exp, mantissa).

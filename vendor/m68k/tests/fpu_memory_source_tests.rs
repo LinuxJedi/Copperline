@@ -233,3 +233,26 @@ fn fpu_imm_source_monadic() {
     assert_no_fline(&cpu);
     assert_fpr_eq(cpu.fpr[0], -5.0);
 }
+
+#[test]
+fn fpu_packed_decimal_source() {
+    // fmove.p (a0),fp0 : load a packed-decimal real (format 3). Encodes
+    // +2.5 (D0=2, D1=5, exponent 0) and checks FP0 == 2.5, exercising the
+    // packed-decimal source path end to end.
+    let (mut cpu, mut bus) = new_machine();
+    // F-line opcode (A0) source = mode 2, reg 0; subop 0x2; src format 3.
+    bus.write_word(CODE, 0xF200 | (2 << 3));
+    bus.write_word(CODE.wrapping_add(2), ext(3, 0, 0x00)); // FMOVE.P (A0),FP0
+    bus.write_word(CODE.wrapping_add(4), 0x4E72);
+    bus.write_word(CODE.wrapping_add(6), 0x2700);
+
+    // Packed 2.5: w0 = D0 (2), w1 = D1 (5) in the top nibble, w2 = 0.
+    bus.write_long(DATA, 0x0000_0002);
+    bus.write_long(DATA.wrapping_add(4), 0x5000_0000);
+    bus.write_long(DATA.wrapping_add(8), 0x0000_0000);
+    cpu.dar[8] = DATA;
+    run(&mut cpu, &mut bus);
+
+    assert_no_fline(&cpu);
+    assert_fpr_eq(cpu.fpr[0], 2.5);
+}
