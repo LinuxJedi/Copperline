@@ -1741,7 +1741,12 @@ impl ApplicationHandler for App {
         }
         if let Some((secs, path)) = self.auto_shot.take() {
             if self.emu.bus().emulated_seconds() >= secs as f64 {
+                let emulated_frame = self.emu.bus().emulated_frames();
                 self.finish_render_for_current_frame();
+                if self.last_rendered_emulated_frame != Some(emulated_frame) {
+                    self.auto_shot = Some((secs, path));
+                    return;
+                }
                 self.save_screenshot(&path);
                 self.emu.report_stats();
                 self.emu.bus().poll_stats.dump_top("at screenshot");
@@ -6745,6 +6750,9 @@ impl App {
             return false;
         }
         self.finish_render_for_current_frame();
+        if self.last_rendered_emulated_frame != Some(emulated_frame) {
+            return false;
+        }
 
         let Some(state) = self.frame_dump.as_mut() else {
             return false;
@@ -6968,6 +6976,9 @@ impl App {
         if !self.powered_on {
             return false;
         }
+        if !self.emu.bus().frame_render_available() {
+            return false;
+        }
         let target = self.emu.bus().emulated_frames();
         let mut rendered = self.render_emulated_frame_if_needed();
         while self.render_worker.is_some() && self.last_rendered_emulated_frame != Some(target) {
@@ -6977,6 +6988,9 @@ impl App {
     }
 
     fn render_emulated_frame_if_needed(&mut self) -> bool {
+        if !self.emu.bus().frame_render_available() {
+            return false;
+        }
         if self.render_worker.is_some() {
             return self.render_emulated_frame_threaded();
         }

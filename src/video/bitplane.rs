@@ -1082,6 +1082,7 @@ struct DenisePlannedPlayfieldLine<'a> {
     plane_words: &'a [Vec<u16>],
     fetched_pixels: usize,
     carry_words: [Option<u16>; 8],
+    first_word_plane_start_x: [usize; 8],
 }
 
 impl<'a> DenisePlannedPlayfieldLine<'a> {
@@ -1099,11 +1100,17 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
             plane_words,
             fetched_pixels,
             carry_words: [None; 8],
+            first_word_plane_start_x: [0; 8],
         }
     }
 
     fn with_carry_words(mut self, carry_words: [Option<u16>; 8]) -> Self {
         self.carry_words = carry_words;
+        self
+    }
+
+    fn with_first_word_plane_start_x(mut self, start_x: [usize; 8]) -> Self {
+        self.first_word_plane_start_x = start_x;
         self
     }
 
@@ -1156,6 +1163,17 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
             let fetch_x = native_x - delay;
             if fetch_x < min_fetch_x {
                 active = true;
+                continue;
+            }
+            if fetch_x < 16 && fetch_x < self.first_word_plane_start_x[plane] {
+                active = true;
+                let carry_offset = self.first_word_plane_start_x[plane] - fetch_x;
+                if carry_offset <= 16 {
+                    let bit = carry_offset - 1;
+                    if self.carry_words[plane].is_some_and(|word| word & (1 << bit) != 0) {
+                        idx |= 1 << plane;
+                    }
+                }
                 continue;
             }
             if fetch_x >= self.fetched_pixels {
@@ -2749,6 +2767,51 @@ fn bitplane_dma_output_start_x(
                 .find_map(|(hpos, plane)| (plane == 0).then_some(hpos))
         })
         .map(bitplane_fetch_framebuffer_x)
+}
+
+fn first_word_plane_start_x(
+    base_control: ControlState,
+    control_segments: &[ControlSegment],
+    display_start_x: usize,
+    words_per_row: usize,
+    dma_planes: usize,
+) -> [usize; 8] {
+    if dma_planes == 0 || words_per_row == 0 {
+        return [0; 8];
+    }
+    let mut display_control = base_control;
+    for segment in control_segments {
+        if segment.x <= display_start_x {
+            display_control = segment.control;
+        }
+    }
+    let pixel_repeat = display_control.framebuffer_pixel_repeat();
+    let native_per_pixel = display_control.native_samples_per_framebuffer_pixel();
+    let fetch_start_native_x =
+        display_control.fetch_start_native_x(display_control.diw_h_start(), pixel_repeat);
+    if fetch_start_native_x == 0 {
+        return [0; 8];
+    }
+    let native_x_offset =
+        display_control.native_x_offset(display_control.diw_h_start(), pixel_repeat);
+    let framebuffer_x_to_fetch_x = |x: usize| -> usize {
+        let output_native_x = x
+            .saturating_sub(display_start_x)
+            .saturating_div(pixel_repeat)
+            .saturating_mul(native_per_pixel);
+        output_native_x
+            .saturating_sub(fetch_start_native_x)
+            .saturating_add(native_x_offset)
+    };
+
+    let mut start_x = [0; 8];
+    let plan = line_fetch_plan_for_word(base_control, control_segments, 0, dma_planes);
+    for (hpos, plane) in plan.iter() {
+        if plane < start_x.len() {
+            start_x[plane] = framebuffer_x_to_fetch_x(bitplane_fetch_framebuffer_x(hpos));
+        }
+    }
+    start_x
 }
 
 fn bitplane_carry_words_for_line(
@@ -4793,6 +4856,13 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 dma_output_start_x,
                 previous_playfield_tail_words,
             );
+            let first_word_plane_start_x = first_word_plane_start_x(
+                base_controls[y],
+                row_control_segments,
+                x_start,
+                words_per_row,
+                dma_planes.min(nplanes),
+            );
             let line_plan = DenisePlannedPlayfieldLine::new(
                 y,
                 x_start,
@@ -4800,7 +4870,8 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 &row_words[..nplanes],
                 fetched_pixels,
             )
-            .with_carry_words(carry_words);
+            .with_carry_words(carry_words)
+            .with_first_word_plane_start_x(first_word_plane_start_x);
             let bpl_output_start_x = dma_output_start_x.unwrap_or(0);
             dma_output_start_x_by_line[y] = dma_output_start_x;
             last_playfield_line = Some(y);
@@ -8121,6 +8192,27 @@ mod tests {
             ),
             first_word_x
         );
+    }
+
+    #[test]
+    fn late_ddf_waits_for_each_planes_first_fetch_slot() {
+        let control = ControlState {
+            bplcon0: 0x1000,
+            ..ControlState::default()
+        };
+        let plane_words = [vec![0x0800]];
+        let mut carry_words = [None; 8];
+        carry_words[0] = Some(0x0001);
+        let mut first_word_plane_start_x = [0; 8];
+        first_word_plane_start_x[0] = 4;
+
+        let line = DenisePlannedPlayfieldLine::new(0, 0, 64, &plane_words, 16)
+            .with_carry_words(carry_words)
+            .with_first_word_plane_start_x(first_word_plane_start_x);
+
+        assert_eq!(line.sample(control, 2).idx, 0);
+        assert_eq!(line.sample(control, 3).idx, 1);
+        assert_eq!(line.sample(control, 4).idx, 1);
     }
 
     #[test]
