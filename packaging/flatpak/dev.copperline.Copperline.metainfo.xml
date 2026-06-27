@@ -61,6 +61,11 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.8.0" date="2026-06-27">
+      <description>
+        <p>Machine-configuration launcher, schema-driven Zorro WASM plugin settings, A2065 loopback networking, directory hard-disk filename encoding fixes, startup state-load fixes, and Denise, Agnus, sprite, bitplane, display-window, and save-state render timing improvements.</p>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-06-25">
       <description>
         <p>A1000 and expanded A500 machine profiles, connected floppy-drive controls, debugger step-over/step-out, conditional breakpoints and state pokes, adjustable warp-speed frame skipping, macOS DMG builds, and Copper, Denise, Agnus, blitter, sprite, and floppy timing fixes.</p>
