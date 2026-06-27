@@ -230,6 +230,22 @@ floppy_sounds = true
 floppy_sounds_volume = 100
 
 
+# Host input preferences.
+# [input]
+
+# Initial source for the emulated port-2 joystick / CD32 pad:
+#   "auto"     (default) a calibrated USB gamepad drives port 2 when present,
+#              otherwise the keyboard-joystick mapping (cursor keys + fire keys)
+#              takes over so port 2 stays usable without a controller.
+#   "gamepad"  only a physical pad drives port 2; the keyboard passes straight
+#              through to the Amiga (Shell, editor, Workbench). With no pad
+#              connected there is simply no port-2 input -- ideal for
+#              keyboard-driven setup of an AmigaOS environment.
+#   "keyboard" always use the keyboard-joystick mapping.
+# Cmd+J / Alt+J still cycles this live; --joystick MODE overrides it per run.
+# joystick = "auto"
+
+
 # Optional floppy drives. DF0 is always connected; set [floppy] drives
 # to wire empty external mechanisms as well (1-4 total drives). Missing
 # [floppy.dfN] tables mean no disk in that drive. Supported images:

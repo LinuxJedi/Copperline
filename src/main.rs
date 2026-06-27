@@ -336,6 +336,11 @@ where
                     .ok_or_else(|| anyhow!("--floppy-drives requires COUNT (1-4)"))?;
                 overrides.floppy_drives = Some(parse_floppy_drive_count(&value)?);
             }
+            "--joystick" => {
+                overrides.joystick = Some(args.next().ok_or_else(|| {
+                    anyhow!("--joystick requires a mode (auto/keyboard/gamepad)")
+                })?);
+            }
             "--click-after" => {
                 let secs: f32 = args
                     .next()
@@ -655,6 +660,8 @@ fn print_help() {
          --fast SIZE                    Zorro II fast RAM size, e.g. 0, 1M, 4M, 8M\n  \
          --slow SIZE                    trapdoor slow RAM at $C00000, e.g. 0, 512K\n  \
          --floppy-drives COUNT          wired floppy drives, 1-4 (DF0 plus externals)\n  \
+         --joystick MODE                initial joystick input: auto, keyboard, or gamepad\n  \
+         \x20                            (gamepad lets the keyboard pass through to the Amiga)\n  \
          \x20                            (--model/--cpu/etc. override the config file or defaults)\n  \
          --screenshot-after SECS PATH   save a PNG to PATH after SECS emulated seconds, then exit\n  \
          --save-state-after SECS PATH   write a save state to PATH after SECS emulated seconds,\n  \
@@ -1052,6 +1059,7 @@ fn main() -> Result<()> {
         resolve_overscan(cfg.overscan),
         resolve_phosphor(cfg.phosphor),
         cfg.emulation.warp_speed,
+        cfg.joystick_input_mode,
         about_machine_lines(&cfg),
         raw_cfg,
     );
@@ -1307,6 +1315,7 @@ fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
         resolve_overscan(config::Overscan::Tv),
         resolve_phosphor(0.0),
         config::WarpSpeed::default(),
+        config::JoystickInputMode::default(),
         vec!["Configure a machine, then press Run.".to_string()],
         raw_cfg,
     );

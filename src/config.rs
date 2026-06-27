@@ -138,6 +138,11 @@ pub struct Config {
     /// decay that fuses field-rate dither and interlace flicker on a
     /// real CRT.
     pub phosphor: f32,
+    /// Initial host input source for the emulated port-2 joystick/CD32 pad
+    /// (`[input] joystick` / `--joystick`). Defaults to [`JoystickInputMode::Auto`];
+    /// the runtime `Cmd+J` / `Alt+J` toggle (and the menu's Joystick Input item)
+    /// changes it live without affecting this start-up value.
+    pub joystick_input_mode: JoystickInputMode,
 }
 
 /// How much of the overscan field the window presents. The
@@ -156,6 +161,43 @@ pub enum Overscan {
     /// behind the bezel, and so does this mode. The default.
     #[default]
     Tv,
+}
+
+/// Host input source for the emulated port-2 joystick/CD32 pad. `Auto` keeps a
+/// calibrated physical gamepad in charge when one is present and otherwise
+/// falls back to keyboard joystick emulation. `Gamepad` uses only a physical
+/// pad, so the keyboard passes straight through to the Amiga (and with no pad
+/// connected there is simply no port-2 input). `Keyboard` always uses the
+/// keyboard-joystick mapping. Set the initial mode with `[input] joystick`
+/// (or `--joystick`); `Cmd+J` / `Alt+J` still cycles it at runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JoystickInputMode {
+    #[default]
+    Auto,
+    Gamepad,
+    Keyboard,
+}
+
+impl JoystickInputMode {
+    /// Cycle order for the runtime toggle and the launcher stepper:
+    /// auto -> keyboard -> gamepad -> auto.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Keyboard,
+            Self::Keyboard => Self::Gamepad,
+            Self::Gamepad => Self::Auto,
+        }
+    }
+
+    /// Short label for menus, the on-screen flash, and the config string
+    /// (round-trips through [`parse_joystick_input_mode`]).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gamepad => "gamepad",
+            Self::Keyboard => "keyboard",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -694,6 +736,7 @@ impl Default for Config {
             floppy_playlists: std::array::from_fn(|_| Vec::new()),
             overscan: Overscan::Tv,
             phosphor: 0.0,
+            joystick_input_mode: JoystickInputMode::Auto,
         }
     }
 }
@@ -809,6 +852,9 @@ pub struct ConfigOverrides {
     pub fast: Option<String>,
     pub slow: Option<String>,
     pub floppy_drives: Option<u8>,
+    /// Initial joystick input mode (`--joystick`): "auto", "keyboard", or
+    /// "gamepad". Validated by the same parser as `[input] joystick`.
+    pub joystick: Option<String>,
 }
 
 impl ConfigOverrides {
@@ -823,6 +869,7 @@ impl ConfigOverrides {
             && self.fast.is_none()
             && self.slow.is_none()
             && self.floppy_drives.is_none()
+            && self.joystick.is_none()
     }
 
     /// Inject the set overrides into the raw config, replacing the values
@@ -854,6 +901,9 @@ impl ConfigOverrides {
         }
         if let Some(drives) = self.floppy_drives {
             raw.floppy.drives = Some(drives);
+        }
+        if let Some(joystick) = &self.joystick {
+            raw.input.joystick = Some(joystick.clone());
         }
     }
 }
@@ -905,6 +955,8 @@ pub(crate) struct RawConfig {
     pub(crate) floppy: RawFloppy,
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) display: RawDisplay,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) input: RawInput,
     /// `[[zorro]]` board entries, configured in file order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) zorro: Vec<RawZorroBoard>,
@@ -929,6 +981,17 @@ pub(crate) struct RawDisplay {
     /// CRT phosphor persistence fraction, 0.0 (off, default) to 0.95.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) phosphor: Option<f32>,
+}
+
+/// `[input]` host-input preferences. Currently just the initial joystick input
+/// mode; `Cmd+J` / `Alt+J` still cycles it live.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawInput {
+    /// Initial joystick input source: "auto" (default), "keyboard", or
+    /// "gamepad".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) joystick: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -1282,6 +1345,10 @@ impl TryFrom<RawConfig> for Config {
             Some(p) if (0.0..=0.95).contains(&p) => p,
             Some(p) => bail!("[display] phosphor must be between 0.0 and 0.95, got {p}"),
         };
+        let joystick_input_mode = match raw.input.joystick.as_deref() {
+            None => defaults.joystick_input_mode,
+            Some(s) => parse_joystick_input_mode(s)?,
+        };
 
         let ide = IdeConfig {
             master: raw.ide.master.map(PathBuf::from),
@@ -1426,6 +1493,7 @@ impl TryFrom<RawConfig> for Config {
             floppy_playlists,
             overscan,
             phosphor,
+            joystick_input_mode,
         })
     }
 }
@@ -1435,6 +1503,18 @@ pub(crate) fn parse_overscan(s: &str) -> Result<Overscan> {
         "full" => Ok(Overscan::Full),
         "tv" => Ok(Overscan::Tv),
         other => bail!("[display] overscan must be \"full\" or \"tv\", got \"{other}\""),
+    }
+}
+
+pub(crate) fn parse_joystick_input_mode(s: &str) -> Result<JoystickInputMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(JoystickInputMode::Auto),
+        "keyboard" | "kbd" | "key" => Ok(JoystickInputMode::Keyboard),
+        "gamepad" | "pad" | "joystick" | "joy" => Ok(JoystickInputMode::Gamepad),
+        _ => Err(anyhow!(
+            "unknown [input] joystick {:?}: expected \"auto\", \"keyboard\", or \"gamepad\"",
+            s
+        )),
     }
 }
 
@@ -2072,6 +2152,49 @@ mod tests {
             assert_eq!(cfg.emulation.warp_speed, expected, "for {text:?}");
         }
         assert!(parse_config("[emulation]\nwarp_speed = \"32x\"\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn joystick_input_mode_defaults_to_auto() -> Result<()> {
+        // No [input] section: the port-2 source starts in Auto, regardless of
+        // the machine profile (it is a host-input preference, not hardware).
+        assert_eq!(
+            parse_config("")?.joystick_input_mode,
+            JoystickInputMode::Auto
+        );
+        assert_eq!(
+            parse_config("[machine]\nprofile = \"A1200\"\n")?.joystick_input_mode,
+            JoystickInputMode::Auto
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn joystick_input_mode_parses_and_rejects_garbage() -> Result<()> {
+        for (text, expected) in [
+            ("auto", JoystickInputMode::Auto),
+            ("keyboard", JoystickInputMode::Keyboard),
+            ("gamepad", JoystickInputMode::Gamepad),
+            ("GAMEPAD", JoystickInputMode::Gamepad),
+        ] {
+            let cfg = parse_config(&format!("[input]\njoystick = {text:?}\n"))?;
+            assert_eq!(cfg.joystick_input_mode, expected, "for {text:?}");
+        }
+        assert!(parse_config("[input]\njoystick = \"mouse\"\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn joystick_cli_override_sets_initial_mode() -> Result<()> {
+        let overrides = ConfigOverrides {
+            joystick: Some("gamepad".to_string()),
+            ..ConfigOverrides::default()
+        };
+        assert_eq!(
+            load_overrides(&overrides)?.joystick_input_mode,
+            JoystickInputMode::Gamepad
+        );
         Ok(())
     }
 
