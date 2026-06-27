@@ -269,11 +269,7 @@ fn propagate_nan(a: FloatX80, b: FloatX80, f: &mut ExcFlags) -> FloatX80 {
         f.raise(ExcFlags::SNAN);
         f.raise(ExcFlags::OPERR);
     }
-    if a.is_nan() {
-        a.quiet()
-    } else {
-        b.quiet()
-    }
+    if a.is_nan() { a.quiet() } else { b.quiet() }
 }
 
 // ============================== sign ops ==================================
@@ -480,7 +476,11 @@ pub fn sqrt(a: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     let e = ua.exp - 63; // value = mant * 2^e, mant in [2^63, 2^64)
     // Choose a shift s in {63, 64} so that (e - s) is even and the radicand
     // mant<<s lands in [2^126, 2^128) -> root in [2^63, 2^64).
-    let (s, big_e) = if (e & 1) == 0 { (64u32, e - 64) } else { (63u32, e - 63) };
+    let (s, big_e) = if (e & 1) == 0 {
+        (64u32, e - 64)
+    } else {
+        (63u32, e - 63)
+    };
     let radicand = (ua.mant as u128) << s;
     let (root, remb) = isqrt128(radicand);
     let mut m = root << 64; // integer bit at bit 127
@@ -489,6 +489,53 @@ pub fn sqrt(a: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     }
     // value = root * 2^(big_e/2); round_pack wants exp of bit127 = big_e/2 + 63.
     round_pack(false, big_e / 2 + 63, m, ctx, f)
+}
+
+// ============================== constant ROM =============================
+
+/// 10^n in extended precision (exponentiation by squaring).
+fn pow10_x80(n: u32) -> FloatX80 {
+    let mut result = from_u64(1, false);
+    let mut base = from_u64(10, false);
+    let mut e = n;
+    let mut f = ExcFlags::default();
+    while e != 0 {
+        if e & 1 != 0 {
+            result = mul(result, base, RoundCtx::NEAREST_EXT, &mut f);
+        }
+        e >>= 1;
+        if e != 0 {
+            base = mul(base, base, RoundCtx::NEAREST_EXT, &mut f);
+        }
+    }
+    result
+}
+
+/// FMOVECR on-chip constant ROM. The irrational constants use the exact
+/// 80-bit MC68881 ROM bit patterns; the powers of ten are computed in
+/// extended precision (so 10^512..10^4096 are finite, unlike an f64 ROM).
+pub fn const_rom(offset: usize) -> FloatX80 {
+    let bits = |se: u16, m: u64| FloatX80 {
+        sign_exp: se,
+        mantissa: m,
+    };
+    match offset {
+        0x00 => bits(0x4000, 0xC90F_DAA2_2168_C235), // pi
+        0x0B => bits(0x3FFD, 0x9A20_9A84_FBCF_F799), // log10(2)
+        0x0C => bits(0x4000, 0xADF8_5458_A2BB_4A9A), // e
+        0x0D => bits(0x3FFF, 0xB8AA_3B29_5C17_F0BC), // log2(e)
+        0x0E => bits(0x3FFD, 0xDE5B_D8A9_3728_7195), // log10(e)
+        0x0F => FloatX80::zero(false),               // 0.0
+        0x30 => bits(0x3FFE, 0xB172_17F7_D1CF_79AC), // ln(2)
+        0x31 => bits(0x4000, 0x935D_8DDD_AAA8_AC17), // ln(10)
+        0x32 => bits(0x3FFF, 0x8000_0000_0000_0000), // 1.0 (10^0)
+        // 10^1, 10^2, 10^4, 10^8, ... 10^4096.
+        0x33..=0x3F => {
+            const EXPS: [u32; 13] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+            pow10_x80(EXPS[offset - 0x33])
+        }
+        _ => FloatX80::zero(false),
+    }
 }
 
 // ============================== int <-> x80 ==============================
@@ -638,7 +685,13 @@ pub fn scale(a: FloatX80, n: i32, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
         return a;
     }
     let ua = unpack(a);
-    round_pack(ua.sign, ua.exp.saturating_add(n), (ua.mant as u128) << 64, ctx, f)
+    round_pack(
+        ua.sign,
+        ua.exp.saturating_add(n),
+        (ua.mant as u128) << 64,
+        ctx,
+        f,
+    )
 }
 
 /// FGETEXP: the unbiased exponent as an integer-valued extended number.
@@ -758,7 +811,10 @@ mod tests {
         let mut f = ExcFlags::default();
         let inf = FloatX80::infinity(false);
         assert_eq!(compare(inf, inf, &mut f), FpCmp::Equal); // fixes Inf==Inf
-        assert_eq!(compare(FloatX80::default_nan(), x(1.0), &mut f), FpCmp::Unordered);
+        assert_eq!(
+            compare(FloatX80::default_nan(), x(1.0), &mut f),
+            FpCmp::Unordered
+        );
         assert_eq!(compare(x(-0.0), x(0.0), &mut f), FpCmp::Equal);
         assert_eq!(compare(x(-1.0), x(1.0), &mut f), FpCmp::Less);
         assert_eq!(compare(x(2.0), x(1.0), &mut f), FpCmp::Greater);
@@ -778,7 +834,12 @@ mod tests {
         assert!(f.has(ExcFlags::OPERR));
 
         let mut f = ExcFlags::default();
-        let r = add(FloatX80::infinity(false), FloatX80::infinity(true), rn(), &mut f);
+        let r = add(
+            FloatX80::infinity(false),
+            FloatX80::infinity(true),
+            rn(),
+            &mut f,
+        );
         assert!(r.is_nan());
         assert!(f.has(ExcFlags::OPERR));
     }
@@ -787,14 +848,38 @@ mod tests {
     fn round_to_int_modes() {
         let mut f = ExcFlags::default();
         assert_eq!(round_to_int(x(1.5), RoundMode::Zero, &mut f).to_f64(), 1.0);
-        assert_eq!(round_to_int(x(1.5), RoundMode::NegInf, &mut f).to_f64(), 1.0);
-        assert_eq!(round_to_int(x(1.5), RoundMode::PosInf, &mut f).to_f64(), 2.0);
-        assert_eq!(round_to_int(x(1.5), RoundMode::Nearest, &mut f).to_f64(), 2.0);
-        assert_eq!(round_to_int(x(2.5), RoundMode::Nearest, &mut f).to_f64(), 2.0); // ties to even
-        assert_eq!(round_to_int(x(-1.5), RoundMode::Zero, &mut f).to_f64(), -1.0);
-        assert_eq!(round_to_int(x(0.4), RoundMode::Nearest, &mut f).to_f64(), 0.0);
-        assert_eq!(round_to_int(x(0.5), RoundMode::Nearest, &mut f).to_f64(), 0.0); // ties to even
-        assert_eq!(round_to_int(x(0.6), RoundMode::Nearest, &mut f).to_f64(), 1.0);
+        assert_eq!(
+            round_to_int(x(1.5), RoundMode::NegInf, &mut f).to_f64(),
+            1.0
+        );
+        assert_eq!(
+            round_to_int(x(1.5), RoundMode::PosInf, &mut f).to_f64(),
+            2.0
+        );
+        assert_eq!(
+            round_to_int(x(1.5), RoundMode::Nearest, &mut f).to_f64(),
+            2.0
+        );
+        assert_eq!(
+            round_to_int(x(2.5), RoundMode::Nearest, &mut f).to_f64(),
+            2.0
+        ); // ties to even
+        assert_eq!(
+            round_to_int(x(-1.5), RoundMode::Zero, &mut f).to_f64(),
+            -1.0
+        );
+        assert_eq!(
+            round_to_int(x(0.4), RoundMode::Nearest, &mut f).to_f64(),
+            0.0
+        );
+        assert_eq!(
+            round_to_int(x(0.5), RoundMode::Nearest, &mut f).to_f64(),
+            0.0
+        ); // ties to even
+        assert_eq!(
+            round_to_int(x(0.6), RoundMode::Nearest, &mut f).to_f64(),
+            1.0
+        );
     }
 
     #[test]
@@ -809,11 +894,43 @@ mod tests {
     }
 
     #[test]
+    fn const_rom_values() {
+        // pi is the exact 80-bit ROM pattern.
+        let pi = const_rom(0x00);
+        assert_eq!(pi.sign_exp, 0x4000);
+        assert_eq!(pi.mantissa, 0xC90F_DAA2_2168_C235);
+        // 0x0D is log2(e) (~1.4427), not ln(2) as the old f64 table had it.
+        assert!((const_rom(0x0D).to_f64() - std::f64::consts::LOG2_E).abs() < 1e-15);
+        // Powers of ten.
+        assert_eq!(const_rom(0x32).to_f64(), 1.0);
+        assert_eq!(const_rom(0x34).to_f64(), 100.0);
+        // 10^512 is finite in extended (an f64 ROM returned infinity here).
+        assert!(const_rom(0x3C).to_f64().is_infinite()); // 10^512 > f64 max, finite in x80
+        assert!(!const_rom(0x3C).is_inf()); // ... but the extended value is finite
+    }
+
+    #[test]
     fn rounding_mode_directions() {
         // 1/3 is inexact; check the rounded extended significand differs by mode.
         let mut f = ExcFlags::default();
-        let down = div(x(1.0), x(3.0), RoundCtx { mode: RoundMode::Zero, prec: Precision::Extended }, &mut f);
-        let up = div(x(1.0), x(3.0), RoundCtx { mode: RoundMode::PosInf, prec: Precision::Extended }, &mut f);
+        let down = div(
+            x(1.0),
+            x(3.0),
+            RoundCtx {
+                mode: RoundMode::Zero,
+                prec: Precision::Extended,
+            },
+            &mut f,
+        );
+        let up = div(
+            x(1.0),
+            x(3.0),
+            RoundCtx {
+                mode: RoundMode::PosInf,
+                prec: Precision::Extended,
+            },
+            &mut f,
+        );
         assert!(f.has(ExcFlags::INEX2));
         assert_eq!(up.mantissa, down.mantissa + 1);
     }

@@ -243,7 +243,13 @@ mod tests {
     fn packed_roundtrip_near_exact_for_long_decimals() {
         // The decimal<->binary scaling is correctly-rounded to ~17 significant
         // digits but not bit-exact, so allow a tiny relative error.
-        for v in [123.456_f64, 1e-10, 3.141592653589793, 6.022e23, -2.718281828] {
+        for v in [
+            123.456_f64,
+            1e-10,
+            3.141592653589793,
+            6.022e23,
+            -2.718281828,
+        ] {
             let r = roundtrip_f64(v);
             let rel = ((r - v) / v).abs();
             assert!(rel < 1e-13, "round-trip {v} -> {r} (rel {rel:e})");
