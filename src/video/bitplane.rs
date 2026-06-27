@@ -3227,13 +3227,6 @@ fn manual_sprite_lines_from_events_with_visible_line0(
     include_latched_sprite_state: bool,
 ) -> Vec<Vec<SpriteLine>> {
     let mut regs = BeamSpriteState::from_render_state(initial_state, held);
-    if !include_latched_sprite_state {
-        for sprite in 0..8 {
-            if held[sprite].is_none() {
-                regs.spr_armed[sprite] = false;
-            }
-        }
-    }
     let visible_end = visible_line0 + rows as i32;
     let mut next_beam: [(i32, usize); 8] = std::array::from_fn(|sprite| {
         if include_latched_sprite_state || held[sprite].is_some() {
@@ -3291,10 +3284,15 @@ fn manual_sprite_lines_from_events_with_visible_line0(
             && (off - 0x140) & 0x0006 == 0
             && event.hpos < SPRITE_DMA_PAIR_CAPTURE_HPOS[sprite / 2]
         {
-            regs.spr_armed[sprite] = false;
+            if regs.direct_data_armed[sprite] {
+                regs.spr_armed[sprite] = false;
+            }
             regs.direct_data_armed[sprite] = false;
         }
         regs.apply_write(off, event.value);
+        if (event.vpos as i32) < visible_line0 && matches!((off - 0x140) & 0x0006, 0x4 | 0x6) {
+            regs.direct_data_armed[sprite] = false;
+        }
         next_beam[sprite] = event_beam;
     }
 
@@ -4429,10 +4427,10 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         visible_line0,
     );
     let event_started = Instant::now();
-    // Seed replay from beam-timed SPRx writes, not frame-start data latches.
-    // The SPRxDATA latch can persist across frames, but by itself it does not
-    // tell us whether the sprite vertical comparators are active this field.
-    // DMA-established held sprites seed through `input.held_sprites` instead.
+    // Seed replay spans from beam-timed SPRx writes or DMA-established held
+    // sprites. SPRxDATA latches remain armed across the frame boundary, but
+    // they do not emit by themselves when captured DMA is the primary source;
+    // a later SPRxPOS write can still reuse that latch after the DMA slot.
     let mut manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
         &state,
         render_events,
@@ -9406,28 +9404,69 @@ mod tests {
     }
 
     #[test]
-    fn manual_sprite_position_write_does_not_seed_from_frame_start_data_latch() {
+    fn pre_dma_position_write_preserves_armed_latch_for_later_position_write() {
         let mut initial_state = blank_state();
-        let (old_pos, ctl) = sprite_control_words(
-            PAL_VISIBLE_LINE0 as u16,
-            PAL_VISIBLE_LINE0 as u16 + 1,
-            DIW_HSTART_FB0 as u16,
-        );
-        let (new_pos, _) = sprite_control_words(
-            PAL_VISIBLE_LINE0 as u16,
-            PAL_VISIBLE_LINE0 as u16 + 1,
-            (DIW_HSTART_FB0 + 16) as u16,
-        );
+        let beam_y = PAL_VISIBLE_LINE0;
+        let (old_pos, ctl) =
+            sprite_control_words(beam_y as u16, beam_y as u16 + 1, DIW_HSTART_FB0 as u16);
+        let pre_dma_hstart = (DIW_HSTART_FB0 + 16) as u16;
+        let (pre_dma_pos, _) =
+            sprite_control_words(beam_y as u16, beam_y as u16 + 1, pre_dma_hstart);
+        let post_dma_hstart = (DIW_HSTART_FB0 + 32) as u16;
+        let (post_dma_pos, _) =
+            sprite_control_words(beam_y as u16, beam_y as u16 + 1, post_dma_hstart);
         initial_state.sprpos[0] = old_pos;
         initial_state.sprctl[0] = ctl;
-        initial_state.sprdata[0] = 0xFFFF;
+        initial_state.sprdata[0] = 0x8000;
+        initial_state.spr_armed[0] = true;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[
+                cpu_event(
+                    beam_y as u32,
+                    SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1,
+                    0x140,
+                    pre_dma_pos,
+                ),
+                cpu_event(
+                    beam_y as u32,
+                    SPRITE_DMA_PAIR_CAPTURE_HPOS[0] + 1,
+                    0x140,
+                    post_dma_pos,
+                ),
+            ],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0].iter().any(|line| {
+            line.beam_y == beam_y
+                && line.hstart == i32::from(post_dma_hstart)
+                && line.data == 0x8000
+        }));
+    }
+
+    #[test]
+    fn post_dma_position_write_reuses_armed_frame_start_data_latch() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let (old_pos, ctl) =
+            sprite_control_words(beam_y as u16, beam_y as u16 + 1, DIW_HSTART_FB0 as u16);
+        let reused_hstart = (DIW_HSTART_FB0 + 32) as u16;
+        let (new_pos, _) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, reused_hstart);
+        initial_state.sprpos[0] = old_pos;
+        initial_state.sprctl[0] = ctl;
+        initial_state.sprdata[0] = 0x8000;
         initial_state.spr_armed[0] = true;
 
         let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
             &initial_state,
             &[cpu_event(
-                PAL_VISIBLE_LINE0 as u32,
-                COPPER_WAIT_HPOS_FB0 as u32,
+                beam_y as u32,
+                SPRITE_DMA_PAIR_CAPTURE_HPOS[0] + 1,
                 0x140,
                 new_pos,
             )],
@@ -9437,7 +9476,64 @@ mod tests {
             false,
         );
 
-        assert!(manual_sprite_lines[0].is_empty());
+        assert!(manual_sprite_lines[0].iter().any(|line| {
+            line.beam_y == beam_y && line.hstart == i32::from(reused_hstart) && line.data == 0x8000
+        }));
+    }
+
+    #[test]
+    fn offscreen_pre_dma_position_write_preserves_armed_latch_for_same_line_retime() {
+        let mut initial_state = blank_state();
+        let beam_y = 99;
+        initial_state.sprpos[3] = 0x5020;
+        initial_state.sprctl[3] = 0x0602;
+        initial_state.sprdata[3] = 0xE92D;
+        initial_state.sprdatb[3] = 0x16FF;
+        initial_state.spr_armed[3] = true;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[
+                cpu_event(beam_y as u32, 8, 0x158, 0x5020),
+                cpu_event(beam_y as u32, 64, 0x158, 0x503C),
+            ],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[3].iter().any(|line| {
+            line.beam_y == beam_y
+                && line.hstart == 0x78
+                && line.data == 0xE92D
+                && line.datb == 0x16FF
+        }));
+    }
+
+    #[test]
+    fn pre_visible_data_write_seeds_latch_without_direct_output_guard() {
+        let mut initial_state = blank_state();
+        initial_state.sprpos[3] = 0x5020;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[
+                cpu_event(0, 78, 0x15A, 0x0602),
+                cpu_event(0, 110, 0x15E, 0x16FF),
+                cpu_event(0, 142, 0x15C, 0xE92D),
+                cpu_event(99, 8, 0x158, 0x5020),
+                cpu_event(99, 64, 0x158, 0x503C),
+            ],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[3].iter().any(|line| {
+            line.beam_y == 99 && line.hstart == 0x78 && line.data == 0xE92D && line.datb == 0x16FF
+        }));
     }
 
     #[test]
