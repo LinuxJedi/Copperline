@@ -729,6 +729,19 @@ pub struct Bus {
     last_frame_geometry: FrameGeometry,
     lazy_collision_vpos: u32,
     lazy_collision_hpos: u32,
+    /// Sticky gate for the per-frame collision accumulation. Collision results
+    /// are observable only through a CLXDAT read ($DFF00E); software that never
+    /// reads CLXDAT cannot tell whether the latch was maintained. The full-frame
+    /// collision scan in `begin_new_beam_frame` (`accumulate_live_collisions_to_
+    /// frame_end`) is ~37% of emulation time on a busy demo, so skip it entirely
+    /// until the first CLXDAT read. From that read onward this stays true and the
+    /// per-frame flush runs exactly as before, so any software that actually uses
+    /// collisions is bit-identical. Not serialized: a restored state restarts in
+    /// the skipping state and re-arms on the next CLXDAT read (the latch carries
+    /// the current frame's collisions, which is all real collision code relies
+    /// on; cross-frame historical-OR of an unread latch is not meaningful).
+    #[serde(skip)]
+    collision_tracking_active: bool,
     cpu_bus_arbitration_enabled: bool,
     cpu_granted_chip_slots: u64,
     cpu_missed_chip_slots: u64,
@@ -1810,6 +1823,7 @@ impl Bus {
             last_frame_geometry: FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, false),
             lazy_collision_vpos: RENDER_VISIBLE_START_VPOS,
             lazy_collision_hpos: RENDER_COPPER_WAIT_HPOS_FB0,
+            collision_tracking_active: false,
             cpu_bus_arbitration_enabled: false,
             cpu_clock_carry: 0,
             cpu_clocks_per_cck: 2,
@@ -2120,6 +2134,7 @@ impl Bus {
         self.last_frame_geometry = FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, false);
         self.lazy_collision_vpos = RENDER_VISIBLE_START_VPOS;
         self.lazy_collision_hpos = RENDER_COPPER_WAIT_HPOS_FB0;
+        self.collision_tracking_active = false;
         self.current_frame_bus_trace.clear();
         self.last_frame_bus_trace = None;
         self.cpu_bus_arbitration_enabled = false;
@@ -3739,6 +3754,9 @@ impl Bus {
             0x00A => self.input.joy0dat(), // JOY0DAT (mouse port 1 counters)
             0x00C => self.input.joy1dat(), // JOY1DAT (mouse port 2 counters)
             0x00E => {
+                // Software is observing collisions: arm the per-frame flush from
+                // now on so the latch is maintained exactly as hardware does.
+                self.collision_tracking_active = true;
                 self.accumulate_live_collisions_until_current_beam();
                 self.denise.read_clxdat()
             } // CLXDAT
@@ -6809,7 +6827,12 @@ impl Bus {
                 );
             }
         }
-        self.accumulate_live_collisions_to_frame_end();
+        // Only maintain the collision latch across the frame boundary once
+        // software has shown it reads CLXDAT. Until then the full-frame scan is
+        // unobservable work; see `collision_tracking_active`.
+        if self.collision_tracking_active {
+            self.accumulate_live_collisions_to_frame_end();
+        }
         self.log_bus_accounting_frame();
         self.finish_frame_bus_trace();
         let promote_render_frame = !self.current_frame_render_blocked;
