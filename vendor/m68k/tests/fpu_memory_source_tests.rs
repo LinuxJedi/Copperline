@@ -14,6 +14,7 @@ use m68k::NoOpHleHandler;
 use m68k::core::cpu::CpuCore;
 use m68k::core::memory::AddressBus;
 use m68k::core::types::CpuType;
+use m68k::fpu::FloatX80;
 
 /// Full 32-bit address space backed by a flat 16MB low region (mirrors the
 /// local harness in scc68070_tests.rs; the FPU programs all live below 16MB).
@@ -121,6 +122,16 @@ fn assert_no_fline(cpu: &CpuCore) {
     );
 }
 
+/// Compare an extended FPU register against an exactly-representable f64.
+fn assert_fpr_eq(actual: FloatX80, expected: f64) {
+    assert_eq!(
+        actual.to_f64(),
+        expected,
+        "fpr {actual:?} (= {}) != {expected}",
+        actual.to_f64()
+    );
+}
+
 /// Build the extension word for a memory/immediate-source general FPU op:
 /// R/M = 1, source format `fmt` (bits 12-10), dest FP reg (bits 9-7), opmode.
 fn ext(fmt: u16, dst: u16, opmode: u16) -> u16 {
@@ -151,7 +162,7 @@ fn fpu_mem_source_fneg_double() {
     // fneg.d (a0),fp0 : -3.0 -> 3.0
     let (cpu, _) = run_double_mem_op(0x1A, 0, -3.0);
     assert_no_fline(&cpu);
-    assert_eq!(cpu.fpr[0], 3.0);
+    assert_fpr_eq(cpu.fpr[0], 3.0);
 }
 
 #[test]
@@ -159,7 +170,7 @@ fn fpu_mem_source_fabs_double() {
     // fabs.d (a0),fp0 : -3.0 -> 3.0
     let (cpu, _) = run_double_mem_op(0x18, 0, -3.0);
     assert_no_fline(&cpu);
-    assert_eq!(cpu.fpr[0], 3.0);
+    assert_fpr_eq(cpu.fpr[0], 3.0);
 }
 
 #[test]
@@ -172,11 +183,11 @@ fn fpu_mem_source_ftst_double_sets_zero() {
     bus.write_word(CODE.wrapping_add(6), 0x2700);
     write_f64(&mut bus, DATA, 0.0);
     cpu.dar[8] = DATA;
-    cpu.fpr[0] = 123.0; // FTST must not write the destination.
+    cpu.fpr[0] = FloatX80::from_f64(123.0); // FTST must not write the destination.
     run(&mut cpu, &mut bus);
 
     assert_no_fline(&cpu);
-    assert_eq!(cpu.fpr[0], 123.0, "FTST must not modify FP0");
+    assert_fpr_eq(cpu.fpr[0], 123.0); // FTST must not modify FP0
     assert_ne!(cpu.fpsr & FPCC_Z, 0, "FPSR Z should be set for 0.0");
     assert_eq!(cpu.fpsr & FPCC_N, 0, "FPSR N should be clear for +0.0");
 }
@@ -186,7 +197,7 @@ fn fpu_mem_source_fintrz_double() {
     // fintrz.d (a0),fp0 : 3.7 -> 3.0 (round toward zero)
     let (cpu, _) = run_double_mem_op(0x03, 0, 3.7);
     assert_no_fline(&cpu);
-    assert_eq!(cpu.fpr[0], 3.0);
+    assert_fpr_eq(cpu.fpr[0], 3.0);
 }
 
 #[test]
@@ -194,7 +205,7 @@ fn fpu_mem_source_fsqrt_double() {
     // fsqrt.d (a0),fp0 : 16.0 -> 4.0
     let (cpu, _) = run_double_mem_op(0x04, 0, 16.0);
     assert_no_fline(&cpu);
-    assert_eq!(cpu.fpr[0], 4.0);
+    assert_fpr_eq(cpu.fpr[0], 4.0);
 }
 
 #[test]
@@ -203,7 +214,7 @@ fn fpu_mem_source_fmove_double_still_works() {
     // now that it routes through the shared dispatch helper.
     let (cpu, _) = run_double_mem_op(0x00, 0, 2.5);
     assert_no_fline(&cpu);
-    assert_eq!(cpu.fpr[0], 2.5);
+    assert_fpr_eq(cpu.fpr[0], 2.5);
 }
 
 #[test]
@@ -220,5 +231,28 @@ fn fpu_imm_source_monadic() {
     run(&mut cpu, &mut bus);
 
     assert_no_fline(&cpu);
-    assert_eq!(cpu.fpr[0], -5.0);
+    assert_fpr_eq(cpu.fpr[0], -5.0);
+}
+
+#[test]
+fn fpu_packed_decimal_source() {
+    // fmove.p (a0),fp0 : load a packed-decimal real (format 3). Encodes
+    // +2.5 (D0=2, D1=5, exponent 0) and checks FP0 == 2.5, exercising the
+    // packed-decimal source path end to end.
+    let (mut cpu, mut bus) = new_machine();
+    // F-line opcode (A0) source = mode 2, reg 0; subop 0x2; src format 3.
+    bus.write_word(CODE, 0xF200 | (2 << 3));
+    bus.write_word(CODE.wrapping_add(2), ext(3, 0, 0x00)); // FMOVE.P (A0),FP0
+    bus.write_word(CODE.wrapping_add(4), 0x4E72);
+    bus.write_word(CODE.wrapping_add(6), 0x2700);
+
+    // Packed 2.5: w0 = D0 (2), w1 = D1 (5) in the top nibble, w2 = 0.
+    bus.write_long(DATA, 0x0000_0002);
+    bus.write_long(DATA.wrapping_add(4), 0x5000_0000);
+    bus.write_long(DATA.wrapping_add(8), 0x0000_0000);
+    cpu.dar[8] = DATA;
+    run(&mut cpu, &mut bus);
+
+    assert_no_fline(&cpu);
+    assert_fpr_eq(cpu.fpr[0], 2.5);
 }

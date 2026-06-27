@@ -48,18 +48,19 @@ run_test:
     fbge TEST_FAIL              | e < 3
     
     /* =================================================================== */
-    /* Test 4: Load ln(2) from constant ROM */
-    /* FMOVECR #$0D loads ln(2) = 0.693147... */
+    /* Test 4: Load log2(e) from constant ROM */
+    /* FMOVECR #$0D loads log2(e) = 1.442695... (ln(2) is at $30) */
     /* =================================================================== */
-    fmovecr.x #0x0D, %fp3       | fp3 = ln(2)
-    
-    /* ln(2) should be > 0 and < 1 */
-    ftst.x %fp3
-    fble TEST_FAIL              | ln(2) > 0
-    
+    fmovecr.x #0x0D, %fp3       | fp3 = log2(e)
+
+    /* log2(e) should be > 1 and < 2 */
     fmove.l #1, %fp7
     fcmp.x %fp7, %fp3
-    fbge TEST_FAIL              | ln(2) < 1
+    fble TEST_FAIL              | log2(e) > 1
+
+    fmove.l #2, %fp7
+    fcmp.x %fp7, %fp3
+    fbge TEST_FAIL              | log2(e) < 2
     
     /* =================================================================== */
     /* Test 5: Load 0 from constant ROM */

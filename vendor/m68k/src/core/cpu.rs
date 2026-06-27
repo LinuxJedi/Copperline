@@ -5,6 +5,7 @@
 use super::execute::RUN_MODE_BERR_AERR_RESET;
 use super::memory::{AddressBus, BusFaultKind};
 use super::types::CpuType;
+use crate::fpu::FloatX80;
 
 /// Flag constants for SR bits.
 pub const XFLAG_SET: u32 = 0x100;
@@ -72,8 +73,8 @@ pub struct CpuCore {
     pub ir: u32,
 
     // ========== FPU Registers (68881/68882/68040) ==========
-    /// FPU Data Registers (FP0-FP7) - stored as f64 for simplicity
-    pub fpr: [f64; 8],
+    /// FPU Data Registers (FP0-FP7) - 80-bit extended precision.
+    pub fpr: [FloatX80; 8],
     /// FPU Instruction Address Register
     pub fpiar: u32,
     /// FPU Status Register
@@ -293,7 +294,7 @@ impl CpuCore {
             dtt0: 0,
             dtt1: 0,
             ir: 0,
-            fpr: [0.0; 8],
+            fpr: [FloatX80::default(); 8],
             fpiar: 0,
             fpsr: 0,
             fpcr: 0,
