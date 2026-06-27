@@ -12,7 +12,7 @@
 //! (f64) for now and are replaced in later milestones.
 
 use super::dd::{self, Df};
-use super::softfloat::{self, ExcFlags, RoundCtx, RoundMode};
+use super::softfloat::{self, ExcFlags, FpCmp, RoundCtx, RoundMode};
 use super::types::FloatX80;
 
 // ============================== small helpers ============================
@@ -124,18 +124,9 @@ fn exp10(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     exp_dd(dd::mul_x80(dd::consts().ln10, x)).to_x80(ctx, f)
 }
 
-/// e^x - 1, accurate near 0 (direct series, no 1+ cancellation).
-fn expm1(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
-    if x.is_nan() {
-        return nan_result(x, f);
-    }
-    if x.is_inf() {
-        return if x.sign() { softfloat::neg(one_x80()) } else { x };
-    }
-    if x.is_zero() {
-        return x; // expm1(+-0) = +-0
-    }
-    let d = if x.to_f64().abs() <= 0.5 {
+/// e^x - 1 as Df, accurate near 0 (direct series, no 1+ cancellation).
+fn expm1_df(x: FloatX80) -> Df {
+    if x.to_f64().abs() <= 0.5 {
         // Series sum_{k>=1} x^k/k!.
         let xd = Df::from_x80(x);
         let mut term = xd;
@@ -152,8 +143,20 @@ fn expm1(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
         sum
     } else {
         dd::sub(exp_dd(Df::from_x80(x)), Df::from_i32(1))
-    };
-    d.to_x80(ctx, f)
+    }
+}
+
+fn expm1(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if x.is_nan() {
+        return nan_result(x, f);
+    }
+    if x.is_inf() {
+        return if x.sign() { softfloat::neg(one_x80()) } else { x };
+    }
+    if x.is_zero() {
+        return x; // expm1(+-0) = +-0
+    }
+    expm1_df(x).to_x80(ctx, f)
 }
 
 // ============================== log family ===============================
@@ -232,7 +235,6 @@ fn log1p(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     // x <= -1: domain boundary.
     if x.sign() {
         let cmp = softfloat::compare(x, softfloat::neg(one), &mut noflags());
-        use super::softfloat::FpCmp;
         if cmp == FpCmp::Equal {
             f.raise(ExcFlags::DZ);
             return FloatX80::infinity(true);
@@ -357,11 +359,202 @@ fn tan(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     t.to_x80(ctx, f)
 }
 
-// ============================== still f64-bridged ========================
+// ============================== inverse trig =============================
 
-#[inline]
-fn bridge(x: FloatX80, op: impl FnOnce(f64) -> f64) -> FloatX80 {
-    FloatX80::from_f64(op(x.to_f64()))
+/// sqrt of a Df via one Newton refinement of the 64-bit seed.
+fn sqrt_df(v: Df) -> Df {
+    if v.hi.is_zero() {
+        return v;
+    }
+    let x0 = softfloat::sqrt(v.hi, RoundCtx::NEAREST_EXT, &mut noflags());
+    let q = dd::div(v, Df::from_x80(x0));
+    dd::mul_x80(dd::add_x80(q, x0), fx(0.5))
+}
+
+/// atan as a Df: reduce |a| to <= 0.3 via reciprocal (|a|>1) and the
+/// half-angle identity atan(a) = 2*atan(a/(1+sqrt(1+a^2))), then series.
+fn atan_df(x: Df) -> Df {
+    let neg = x.hi.sign();
+    let ax = if neg { x.neg() } else { x };
+    let (mut a, comp) = if ax.hi.to_f64() > 1.0 {
+        (dd::recip(ax), true)
+    } else {
+        (ax, false)
+    };
+    let mut halvings = 0u32;
+    while a.hi.to_f64() > 0.3 {
+        let s = sqrt_df(dd::add_x80(dd::sqr(a), fx(1.0)));
+        a = dd::div(a, dd::add_x80(s, fx(1.0)));
+        halvings += 1;
+    }
+    let mut r = dd::atan_small(a);
+    for _ in 0..halvings {
+        r = dd::mul_x80(r, fx(2.0));
+    }
+    if comp {
+        r = dd::sub(dd::consts().pi_2, r);
+    }
+    if neg { r.neg() } else { r }
+}
+
+fn atan(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if x.is_nan() {
+        return nan_result(x, f);
+    }
+    if x.is_zero() {
+        return x; // atan(+-0) = +-0
+    }
+    if x.is_inf() {
+        let pi2 = dd::consts().pi_2;
+        return if x.sign() { pi2.neg() } else { pi2 }.to_x80(ctx, f);
+    }
+    atan_df(Df::from_x80(x)).to_x80(ctx, f)
+}
+
+/// True if |x| > 1 (for domain checks).
+fn abs_gt_one(x: FloatX80) -> bool {
+    softfloat::compare(softfloat::abs(x), one_x80(), &mut noflags()) == FpCmp::Greater
+}
+fn abs_eq_one(x: FloatX80) -> bool {
+    softfloat::compare(softfloat::abs(x), one_x80(), &mut noflags()) == FpCmp::Equal
+}
+
+fn asin(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if x.is_nan() {
+        return nan_result(x, f);
+    }
+    if x.is_zero() {
+        return x; // asin(+-0) = +-0
+    }
+    if x.is_inf() || abs_gt_one(x) {
+        f.raise(ExcFlags::OPERR);
+        return FloatX80::default_nan();
+    }
+    if abs_eq_one(x) {
+        let pi2 = dd::consts().pi_2;
+        return if x.sign() { pi2.neg() } else { pi2 }.to_x80(ctx, f);
+    }
+    // asin(x) = atan(x / sqrt(1 - x^2)).
+    let xd = Df::from_x80(x);
+    let denom = sqrt_df(dd::sub(Df::from_i32(1), dd::sqr(xd)));
+    atan_df(dd::div(xd, denom)).to_x80(ctx, f)
+}
+
+fn acos(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if x.is_nan() {
+        return nan_result(x, f);
+    }
+    if x.is_inf() || abs_gt_one(x) {
+        f.raise(ExcFlags::OPERR);
+        return FloatX80::default_nan();
+    }
+    if abs_eq_one(x) {
+        // acos(1) = +0, acos(-1) = pi.
+        return if x.sign() {
+            dd::consts().pi.to_x80(ctx, f)
+        } else {
+            FloatX80::zero(false)
+        };
+    }
+    // acos(x) = pi/2 - asin(x).
+    let xd = Df::from_x80(x);
+    let denom = sqrt_df(dd::sub(Df::from_i32(1), dd::sqr(xd)));
+    let asin_df = atan_df(dd::div(xd, denom));
+    dd::sub(dd::consts().pi_2, asin_df).to_x80(ctx, f)
+}
+
+// ============================== hyperbolic ===============================
+
+fn sinh(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if x.is_nan() {
+        return nan_result(x, f);
+    }
+    if x.is_inf() || x.is_zero() {
+        return x; // sinh(+-inf)=+-inf, sinh(+-0)=+-0
+    }
+    let d = if x.to_f64().abs() <= 0.5 {
+        // Series sum_{k>=0} x^(2k+1)/(2k+1)!.
+        let xd = Df::from_x80(x);
+        let x2 = dd::sqr(xd);
+        let mut term = xd;
+        let mut sum = xd;
+        let mut k = 1i32;
+        loop {
+            term = dd::div(dd::mul(term, x2), Df::from_i32((2 * k) * (2 * k + 1)));
+            sum = dd::add(sum, term);
+            if dd::term_negligible(term, sum) || k > 40 {
+                break;
+            }
+            k += 1;
+        }
+        sum
+    } else {
+        let e = exp_dd(Df::from_x80(x));
+        dd::mul_x80(dd::sub(e, dd::recip(e)), fx(0.5))
+    };
+    d.to_x80(ctx, f)
+}
+
+fn cosh(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if x.is_nan() {
+        return nan_result(x, f);
+    }
+    if x.is_inf() {
+        return FloatX80::infinity(false); // cosh(+-inf) = +inf
+    }
+    if x.is_zero() {
+        return one_x80();
+    }
+    let e = exp_dd(Df::from_x80(x));
+    dd::mul_x80(dd::add(e, dd::recip(e)), fx(0.5)).to_x80(ctx, f)
+}
+
+fn tanh(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if x.is_nan() {
+        return nan_result(x, f);
+    }
+    if x.is_zero() {
+        return x; // tanh(+-0) = +-0
+    }
+    if x.is_inf() || x.to_f64().abs() > 32.0 {
+        // |x| large: tanh -> +-1 (inexact for finite x).
+        let one = if x.sign() { softfloat::neg(one_x80()) } else { one_x80() };
+        if !x.is_inf() {
+            f.raise(ExcFlags::INEX2);
+        }
+        return one;
+    }
+    // tanh(x) = (e^{2x}-1)/(e^{2x}+1) = u/(u+2), u = expm1(2x).
+    let two_x = softfloat::scale(x, 1, RoundCtx::NEAREST_EXT, &mut noflags());
+    let u = expm1_df(two_x);
+    dd::div(u, dd::add_x80(u, fx(2.0))).to_x80(ctx, f)
+}
+
+fn atanh(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if x.is_nan() {
+        return nan_result(x, f);
+    }
+    if x.is_zero() {
+        return x; // atanh(+-0) = +-0
+    }
+    if abs_eq_one(x) {
+        f.raise(ExcFlags::DZ);
+        return FloatX80::infinity(x.sign()); // atanh(+-1) = +-inf
+    }
+    if x.is_inf() || abs_gt_one(x) {
+        f.raise(ExcFlags::OPERR);
+        return FloatX80::default_nan();
+    }
+    let d = if x.to_f64().abs() <= 0.5 {
+        dd::atanh_small(Df::from_x80(x))
+    } else {
+        // atanh(x) = 0.5 * ln((1+x)/(1-x)).
+        let xd = Df::from_x80(x);
+        let arg = dd::div(dd::add_x80(xd, fx(1.0)), dd::sub(Df::from_i32(1), xd));
+        let l = ln_dd(arg.to_x80(RoundCtx::NEAREST_EXT, &mut noflags()));
+        dd::mul_x80(l, fx(0.5))
+    };
+    d.to_x80(ctx, f)
 }
 
 // ============================== dispatch =================================
@@ -384,14 +577,13 @@ pub fn eval_unary(opmode: u16, src: FloatX80) -> Option<FloatX80> {
         0x0E => sin(src, ctx, f),
         0x1D => cos(src, ctx, f),
         0x0F => tan(src, ctx, f),
-        // Still f64-bridged (converted in later milestones).
-        0x0C => bridge(src, f64::asin),
-        0x1C => bridge(src, f64::acos),
-        0x0A => bridge(src, f64::atan),
-        0x02 => bridge(src, f64::sinh),
-        0x19 => bridge(src, f64::cosh),
-        0x09 => bridge(src, f64::tanh),
-        0x0D => bridge(src, f64::atanh),
+        0x0C => asin(src, ctx, f),
+        0x1C => acos(src, ctx, f),
+        0x0A => atan(src, ctx, f),
+        0x02 => sinh(src, ctx, f),
+        0x19 => cosh(src, ctx, f),
+        0x09 => tanh(src, ctx, f),
+        0x0D => atanh(src, ctx, f),
         _ => return None,
     };
     Some(r)
@@ -501,6 +693,48 @@ mod tests {
         let (s, c) = sincos(fx(1.0));
         assert!((s.to_f64() - 1.0_f64.sin()).abs() < 1e-15);
         assert!((c.to_f64() - 1.0_f64.cos()).abs() < 1e-15);
+    }
+
+    #[test]
+    fn inverse_trig() {
+        // atan(1)*4 == pi.
+        assert!(close(ev(0x0A, 1.0) * 4.0, std::f64::consts::PI, 1e-15));
+        assert_eq!(ev(0x0A, 0.0), 0.0);
+        // asin(sin r) == r, acos(cos r) == r over the principal range.
+        for &x in &[-0.9_f64, -0.4, 0.0, 0.25, 0.8, 0.999] {
+            assert!(close(ev(0x0C, x.sin()), x, 1e-13), "asin(sin {x})");
+        }
+        for &x in &[0.1_f64, 0.7, 1.5, 3.0] {
+            assert!(close(ev(0x1C, x.cos()), x, 1e-13), "acos(cos {x})");
+        }
+        // libm agreement.
+        for &x in &[-5.0_f64, -0.3, 0.6, 42.0] {
+            assert!((ev(0x0A, x) - x.atan()).abs() < 1e-14, "atan {x}");
+        }
+        // domain errors.
+        let mut f = ExcFlags::default();
+        assert!(asin(fx(2.0), rn(), &mut f).is_nan());
+        assert!(f.has(ExcFlags::OPERR));
+    }
+
+    #[test]
+    fn hyperbolic() {
+        for &x in &[-3.0_f64, -0.3, 0.0, 0.2, 1.0, 5.0] {
+            assert!((ev(0x02, x) - x.sinh()).abs() < 1e-12 * (1.0 + x.sinh().abs()), "sinh {x}");
+            assert!((ev(0x19, x) - x.cosh()).abs() < 1e-12 * (1.0 + x.cosh().abs()), "cosh {x}");
+            assert!((ev(0x09, x) - x.tanh()).abs() < 1e-14, "tanh {x}");
+            // cosh^2 - sinh^2 == 1.
+            let s = ev(0x02, x);
+            let c = ev(0x19, x);
+            assert!((c * c - s * s - 1.0).abs() < 1e-12, "cosh^2-sinh^2 at {x}");
+        }
+        // atanh near 0 and mid-range.
+        for &x in &[-0.5_f64, -0.1, 0.0, 0.3, 0.9] {
+            assert!((ev(0x0D, x) - x.atanh()).abs() < 1e-14, "atanh {x}");
+        }
+        let mut f = ExcFlags::default();
+        assert!(atanh(fx(1.0), rn(), &mut f).is_inf());
+        assert!(f.has(ExcFlags::DZ));
     }
 
     #[test]
