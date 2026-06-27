@@ -10,6 +10,7 @@ use crate::core::memory::AddressBus;
 use crate::fpu::FloatX80;
 use super::packed;
 use super::softfloat::{self, ExcFlags, FpCmp, Precision, RoundCtx, RoundMode};
+use super::transcendental;
 
 /// Where a resolved FPU operand lives.
 enum FpuEa {
@@ -681,7 +682,6 @@ impl CpuCore {
     /// single/double rounding-precision variants (FSxxx/FDxxx) still fold
     /// onto their base op here.
     fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: FloatX80) -> i32 {
-        let s = src.to_f64();
         match opmode {
             0x00 | 0x40 | 0x44 => {
                 // FMOVE / FSMOVE / FDMOVE (lossless copy)
@@ -776,115 +776,6 @@ impl CpuCore {
                 self.fpu_set_cc(src);
                 4
             }
-            // ========== Transcendental Functions ==========
-            0x0E => {
-                // FSIN
-                self.fpr[dst] = FloatX80::from_f64(s.sin());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x1D => {
-                // FCOS
-                self.fpr[dst] = FloatX80::from_f64(s.cos());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x0F => {
-                // FTAN
-                self.fpr[dst] = FloatX80::from_f64(s.tan());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x0C => {
-                // FASIN
-                self.fpr[dst] = FloatX80::from_f64(s.asin());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x1C => {
-                // FACOS
-                self.fpr[dst] = FloatX80::from_f64(s.acos());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x0A => {
-                // FATAN
-                self.fpr[dst] = FloatX80::from_f64(s.atan());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x02 => {
-                // FSINH
-                self.fpr[dst] = FloatX80::from_f64(s.sinh());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x19 => {
-                // FCOSH
-                self.fpr[dst] = FloatX80::from_f64(s.cosh());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x09 => {
-                // FTANH
-                self.fpr[dst] = FloatX80::from_f64(s.tanh());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x0D => {
-                // FATANH
-                self.fpr[dst] = FloatX80::from_f64(s.atanh());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x10 => {
-                // FETOX (e^x)
-                self.fpr[dst] = FloatX80::from_f64(s.exp());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x08 => {
-                // FETOXM1 (e^x - 1)
-                self.fpr[dst] = FloatX80::from_f64(s.exp_m1());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x11 => {
-                // FTWOTOX (2^x)
-                self.fpr[dst] = FloatX80::from_f64((2.0_f64).powf(s));
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x12 => {
-                // FTENTOX (10^x)
-                self.fpr[dst] = FloatX80::from_f64((10.0_f64).powf(s));
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x14 => {
-                // FLOGN (ln(x))
-                self.fpr[dst] = FloatX80::from_f64(s.ln());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x06 => {
-                // FLOGNP1 (ln(1+x))
-                self.fpr[dst] = FloatX80::from_f64(s.ln_1p());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x15 => {
-                // FLOG10 (log10(x))
-                self.fpr[dst] = FloatX80::from_f64(s.log10());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
-            0x16 => {
-                // FLOG2 (log2(x))
-                self.fpr[dst] = FloatX80::from_f64(s.log2());
-                self.fpu_set_cc(self.fpr[dst]);
-                4
-            }
             0x1E => {
                 // FGETEXP - extract the unbiased exponent
                 let mut f = ExcFlags::default();
@@ -902,19 +793,14 @@ impl CpuCore {
                 4
             }
             0x21 => {
-                // FMOD
-                self.fpr[dst] = FloatX80::from_f64(self.fpr[dst].to_f64() % s);
+                // FMOD (f64-bridged, see transcendental.rs)
+                self.fpr[dst] = transcendental::fmod(self.fpr[dst], src);
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
             0x25 => {
-                // FREM (IEEE remainder): r = x - y*round(x/y)
-                let mut d = self.fpr[dst].to_f64();
-                if s != 0.0 {
-                    let n = (d / s).round();
-                    d -= s * n;
-                }
-                self.fpr[dst] = FloatX80::from_f64(d);
+                // FREM - IEEE remainder (f64-bridged, see transcendental.rs)
+                self.fpr[dst] = transcendental::frem(self.fpr[dst], src);
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
@@ -922,22 +808,37 @@ impl CpuCore {
                 // FSCALE - dst = dst * 2^trunc(src)
                 let ctx = self.fpu_ctx(opmode);
                 let mut f = ExcFlags::default();
-                let n = s as i32;
+                let n = softfloat::to_i64(
+                    src,
+                    RoundMode::Zero,
+                    i32::MIN as i64,
+                    i32::MAX as i64,
+                    &mut f,
+                ) as i32;
                 self.fpr[dst] = softfloat::scale(self.fpr[dst], n, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
                 4
             }
             0x30..=0x37 => {
-                // FSINCOS - compute sin and cos simultaneously.
-                // Bottom 3 bits of opmode = cos destination register.
+                // FSINCOS - sin to FPn, cos to the FPc named by opmode bits 2-0.
                 let cos_dst = (opmode & 7) as usize;
-                self.fpr[dst] = FloatX80::from_f64(s.sin());
-                self.fpr[cos_dst] = FloatX80::from_f64(s.cos());
+                let (sin, cos) = transcendental::sincos(src);
+                self.fpr[dst] = sin;
+                self.fpr[cos_dst] = cos;
                 self.fpu_set_cc(self.fpr[dst]);
                 4
             }
-            _ => 0, // Unimplemented opmode
+            _ => {
+                // The remaining f64-bridged transcendentals (FSIN/FCOS/...).
+                if let Some(r) = transcendental::eval_unary(opmode, src) {
+                    self.fpr[dst] = r;
+                    self.fpu_set_cc(self.fpr[dst]);
+                    4
+                } else {
+                    0 // Unimplemented opmode -> Line-F
+                }
+            }
         }
     }
 
