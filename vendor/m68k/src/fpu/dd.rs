@@ -222,6 +222,12 @@ fn odd_series(x: Df, alternating: bool) -> Df {
     sum
 }
 
+/// True when adding `term` to `sum` would not change `sum` to ~128 bits, i.e.
+/// a series can stop. Also true once `term` underflows to zero.
+pub fn term_negligible(term: Df, sum: Df) -> bool {
+    negligible(term.hi, sum.hi)
+}
+
 pub fn atan_small(x: Df) -> Df {
     odd_series(x, true)
 }
