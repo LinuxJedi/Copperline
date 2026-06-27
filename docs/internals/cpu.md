@@ -20,11 +20,20 @@ colour clocks:
 Selectable models: 68000, 68EC020, 68020, 68030, 68040. `[cpu] fpu`
 fits a 68881/68882 to any 020/030 (and is on by default for the 68040,
 whose FPU is on-die): the vendored core executes the 6888x instruction
-set in f64 precision -- arithmetic, transcendentals, FMOVE/FMOVEM in
-every operand format except packed decimal, FBcc/FScc/FDBcc/FTRAPcc,
-the constant ROM, control registers, and FSAVE/FRESTORE state frames
-(NULL after reset, 68881-style IDLE once touched), which is what
-Kickstart's detection and per-task FPU context switching exercise. The
+set in true 80-bit extended precision via a pure-Rust software floating-
+point engine (`vendor/m68k/src/fpu/softfloat.rs`). Arithmetic (add, sub,
+mul, div, sqrt), ordered compare, round-to-integer, scale, getexp/getman,
+the format conversions, FMOVE/FMOVEM in every operand format (including
+packed decimal), the constant ROM, FBcc/FScc/FDBcc/FTRAPcc, control
+registers, the FPCR rounding mode/precision and the FPSR exception/accrued
+bytes, and the FSAVE/FRESTORE state frames (NULL after reset, 68881-style
+IDLE once touched) are all modelled. The transcendentals (FSIN/FCOS/FETOX/
+FLOGN/...) and the FMOD/FREM remainders are the one exception: they are
+still evaluated in f64 and widened to extended, isolated behind
+`vendor/m68k/src/fpu/transcendental.rs` (the real 6888x transcendentals
+are polynomial/CORDIC approximations that are not bit-accurate to libm
+anyway). This covers Kickstart's detection and per-task FPU context
+switching. The
 68000's per-instruction cycle counts in the vendored core have been
 corrected against the SingleStepTests corpus to ~1% aggregate accuracy
 (see `vendor/m68k/CYCLE_TIMING_GAP.md`), which is what makes

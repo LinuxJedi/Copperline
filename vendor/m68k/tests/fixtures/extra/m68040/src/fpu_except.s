@@ -39,8 +39,8 @@ run_test:
     fdiv.x %fp1, %fp0           | 0/0 = NaN, sets OPERR
     
     fmove.l %fpsr, %d0
-    btst #5, %d0                | OPERR bit
-    beq TEST_FAIL               | OPERR should be set
+    btst #7, %d0                | AEXC IOP bit (accrued invalid-operation: OPERR)
+    beq TEST_FAIL               | IOP should be set
     
     /* =================================================================== */
     /* Test 4: NaN propagation */

@@ -55,7 +55,8 @@ const STATE_MAGIC: &[u8; 8] = b"CLSSTATE";
 //   7: Bus.a2091 Option replaced by Bus.devices Vec<BoardDevice>; the
 //      BoardBacking::A2091 variant became BoardBacking::Device(slot)
 //   8: BoardDevice gained Wasm and A2065 variants (enum layout change)
-pub const STATE_VERSION: u32 = 8;
+//   9: CpuCore.fpr retyped f64 -> FloatX80 (80-bit extended FPU registers)
+pub const STATE_VERSION: u32 = 9;
 
 /// Default state file name, timestamped like the screenshot/recorder names.
 pub fn auto_filename() -> std::path::PathBuf {
