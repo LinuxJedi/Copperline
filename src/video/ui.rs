@@ -48,9 +48,16 @@ const SCRIM_ALPHA: f32 = 0.45;
 pub const MENU_BUTTON_X: usize = FB_WIDTH - 220;
 pub const MENU_BUTTON_W: usize = 22;
 
-const MENU_W: usize = 360;
 const MENU_ITEM_H: usize = 20;
 const MENU_PAD: usize = 3;
+/// Font pixel scale labels are drawn at, and the text inset from each side of
+/// the popup. The widest label is "Joystick Input  [keyboard]" (26 chars);
+/// sizing the popup to it keeps every item's text (and its trailing "...")
+/// inside the menu background instead of spilling past the right edge.
+const MENU_TEXT_PX: usize = 2;
+const MENU_TEXT_INSET: usize = 8;
+const MENU_MAX_LABEL_CHARS: usize = 26;
+const MENU_W: usize = 2 * MENU_TEXT_INSET + MENU_MAX_LABEL_CHARS * font::GLYPH_W * MENU_TEXT_PX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuItem {
@@ -960,7 +967,7 @@ fn draw_menu(
         }
         draw_panel_text(
             frame,
-            item_rect.x + 8,
+            item_rect.x + MENU_TEXT_INSET,
             item_rect.y + (MENU_ITEM_H - 16) / 2,
             &menu_item_label(
                 *item,
@@ -971,7 +978,7 @@ fn draw_menu(
                 joystick_input_mode,
             ),
             fg,
-            2,
+            MENU_TEXT_PX,
             scale,
         );
     }
@@ -3008,6 +3015,47 @@ mod tests {
         );
         // Outside the menu: nothing (the click closes the menu).
         assert_eq!(ui.control_at((0, 0)), None);
+    }
+
+    #[test]
+    fn every_menu_label_fits_inside_the_popup() {
+        // The label is drawn at `item_rect.x + MENU_TEXT_INSET`; its glyphs
+        // must end before the popup's right edge or the trailing "..." clips.
+        let menu = menu_rect();
+        let limit = menu.x + menu.w;
+        let modes = [
+            JoystickInputMode::Auto,
+            JoystickInputMode::Keyboard,
+            JoystickInputMode::Gamepad,
+        ];
+        let speeds = [WarpSpeed::X2, WarpSpeed::X8, WarpSpeed::X16, WarpSpeed::Max];
+        for item in MENU_ITEMS {
+            for warp in [false, true] {
+                for recording in [false, true] {
+                    for input_recording in [false, true] {
+                        for &mode in &modes {
+                            for &speed in &speeds {
+                                let label = menu_item_label(
+                                    item,
+                                    warp,
+                                    speed,
+                                    recording,
+                                    input_recording,
+                                    mode,
+                                );
+                                let text_w = label.chars().count() * font::GLYPH_W * MENU_TEXT_PX;
+                                let right = menu_item_rect(0).x + MENU_TEXT_INSET + text_w;
+                                assert!(
+                                    right <= limit,
+                                    "label {label:?} ({text_w}px) overflows the menu by {}px",
+                                    right.saturating_sub(limit)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
