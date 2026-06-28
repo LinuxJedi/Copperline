@@ -33,10 +33,14 @@ FLOGN/FLOGNP1/FLOG2/FLOG10) and FSINCOS run in extended precision too: a
 double-`FloatX80` ("double-double", ~128-bit) layer
 (`vendor/m68k/src/fpu/dd.rs`) evaluates Taylor/atanh series over reduced
 ranges and rounds the result to extended under the FPCR mode, setting INEX
-and the domain flags (OPERR/DZ). They are faithful to ~64 bits (not
-chip-bit-exact -- the real 6888x uses its own CORDIC/polynomial microcode,
-and on a bare 68040 these trap to a software FPSP). FMOD/FREM compute the
-exact remainder and the FPSR quotient byte. This covers Kickstart's
+and the domain flags (OPERR/DZ). Accuracy is validated against an
+arbitrary-precision oracle (the pure-Rust `astro-float`, a dev-only
+dependency; `vendor/m68k/tests/fpu_accuracy.rs`): every function is within
+1 ULP across a wide sweep and all four rounding modes, and round-to-nearest
+is correctly rounded in practice. They are not chip-bit-exact -- the real
+6888x uses its own CORDIC/polynomial microcode, and on a bare 68040 these
+trap to a software FPSP. FMOD/FREM compute the exact remainder and the FPSR
+quotient byte. This covers Kickstart's
 detection and per-task FPU context switching. The
 68000's per-instruction cycle counts in the vendored core have been
 corrected against the SingleStepTests corpus to ~1% aggregate accuracy
