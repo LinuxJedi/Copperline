@@ -23,7 +23,8 @@ use crate::chipset::agnus::{AgnusRevision, VideoStandard};
 use crate::chipset::denise::DeniseRevision;
 use crate::config::{
     format_size, machine_profile_defaults, Chipset, Config, CpuModel, JoystickInputMode,
-    MachineModel, Overscan, PacingBudget, RawConfig, RawFloppyDrive, RawZorroBoard, WarpSpeed,
+    MachineModel, Overscan, PacingBudget, RawConfig, RawDrive, RawFloppyDrive, RawZorroBoard,
+    WarpSpeed,
 };
 use crate::zorro::{ConfigOption, ConfigOptionKind, LoadedZorroBoard};
 use anyhow::Result;
@@ -273,6 +274,9 @@ pub enum RowKind {
     Toggle,
     /// A file path with Browse/Clear buttons.
     Path,
+    /// A hard-drive image: a path with Browse/Clear, plus an editable
+    /// volume-name field (used when the image is a host directory).
+    Drive,
 }
 
 /// One settings row: a label, the field it edits, and how to edit it.
@@ -288,7 +292,7 @@ const fn row(field: LauncherField, label: &'static str, kind: RowKind) -> Row {
 }
 
 use LauncherField as F;
-use RowKind::{Cycle, Toggle};
+use RowKind::{Cycle, Drive, Toggle};
 // `RowKind::Path` is written out below so it does not collide with the
 // `std::path::Path` import.
 use RowKind::Path as PathRow;
@@ -330,17 +334,17 @@ const FLOPPY_ROWS: [Row; 9] = [
     row(F::Df3WriteProtect, "DF3 write-protect", Toggle),
 ];
 const STORAGE_ROWS: [Row; 11] = [
-    row(F::IdeMaster, "IDE master", PathRow),
-    row(F::IdeSlave, "IDE slave", PathRow),
+    row(F::IdeMaster, "IDE master", Drive),
+    row(F::IdeSlave, "IDE slave", Drive),
     row(F::ScsiRom, "SCSI boot ROM", PathRow),
     row(F::ScsiRomOdd, "SCSI ROM (odd)", PathRow),
-    row(F::ScsiUnit0, "SCSI unit 0", PathRow),
-    row(F::ScsiUnit1, "SCSI unit 1", PathRow),
-    row(F::ScsiUnit2, "SCSI unit 2", PathRow),
-    row(F::ScsiUnit3, "SCSI unit 3", PathRow),
-    row(F::ScsiUnit4, "SCSI unit 4", PathRow),
-    row(F::ScsiUnit5, "SCSI unit 5", PathRow),
-    row(F::ScsiUnit6, "SCSI unit 6", PathRow),
+    row(F::ScsiUnit0, "SCSI unit 0", Drive),
+    row(F::ScsiUnit1, "SCSI unit 1", Drive),
+    row(F::ScsiUnit2, "SCSI unit 2", Drive),
+    row(F::ScsiUnit3, "SCSI unit 3", Drive),
+    row(F::ScsiUnit4, "SCSI unit 4", Drive),
+    row(F::ScsiUnit5, "SCSI unit 5", Drive),
+    row(F::ScsiUnit6, "SCSI unit 6", Drive),
 ];
 const CD_ROWS: [Row; 3] = [
     row(F::CdImage, "CD image", PathRow),
@@ -487,12 +491,16 @@ pub struct MachineSetup {
     /// image is a one-element list.
     df_playlists: [Vec<PathBuf>; 4],
     df_write_protected: [bool; 4],
-    // Hard disk
+    // Hard disk. Each drive's optional volume-name override (directory mounts
+    // only) sits in the matching `*_name` slot, paralleling the path slot.
     ide_master: Option<PathBuf>,
+    ide_master_name: Option<String>,
     ide_slave: Option<PathBuf>,
+    ide_slave_name: Option<String>,
     scsi_rom: Option<PathBuf>,
     scsi_rom_odd: Option<PathBuf>,
     scsi_units: [Option<PathBuf>; 7],
+    scsi_unit_names: [Option<String>; 7],
     // CD
     cd_image: Option<PathBuf>,
     cd_insert_delay: f64,
@@ -555,11 +563,18 @@ impl MachineSetup {
             floppy_drives: raw.floppy.drives.unwrap_or(connected).clamp(1, 4),
             df_playlists: cfg.floppy_playlists.clone(),
             df_write_protected,
-            ide_master: cfg.ide.master.clone(),
-            ide_slave: cfg.ide.slave.clone(),
+            ide_master: cfg.ide.master.as_ref().map(|d| d.path.clone()),
+            ide_master_name: cfg.ide.master.as_ref().and_then(|d| d.volume_name.clone()),
+            ide_slave: cfg.ide.slave.as_ref().map(|d| d.path.clone()),
+            ide_slave_name: cfg.ide.slave.as_ref().and_then(|d| d.volume_name.clone()),
             scsi_rom: cfg.scsi.rom.clone(),
             scsi_rom_odd: cfg.scsi.rom_odd.clone(),
-            scsi_units: cfg.scsi.units.clone(),
+            scsi_units: std::array::from_fn(|i| cfg.scsi.units[i].as_ref().map(|d| d.path.clone())),
+            scsi_unit_names: std::array::from_fn(|i| {
+                cfg.scsi.units[i]
+                    .as_ref()
+                    .and_then(|d| d.volume_name.clone())
+            }),
             cd_image: cfg.cd_image_path.clone(),
             cd_insert_delay: cfg.cd_insert_delay_secs,
             // Use the raw NVRAM path: Config defaults it to "cd32-nvram.bin"
@@ -685,17 +700,38 @@ impl MachineSetup {
         raw.floppy.df2 = self.floppy_drive_raw(2);
         raw.floppy.df3 = self.floppy_drive_raw(3);
         // Hard disk
-        raw.ide.master = self.ide_master.as_deref().map(path_string);
-        raw.ide.slave = self.ide_slave.as_deref().map(path_string);
+        raw.ide.master = drive_raw(self.ide_master.as_deref(), self.ide_master_name.as_deref());
+        raw.ide.slave = drive_raw(self.ide_slave.as_deref(), self.ide_slave_name.as_deref());
         raw.scsi.rom = self.scsi_rom.as_deref().map(path_string);
         raw.scsi.rom_odd = self.scsi_rom_odd.as_deref().map(path_string);
-        raw.scsi.unit0 = self.scsi_units[0].as_deref().map(path_string);
-        raw.scsi.unit1 = self.scsi_units[1].as_deref().map(path_string);
-        raw.scsi.unit2 = self.scsi_units[2].as_deref().map(path_string);
-        raw.scsi.unit3 = self.scsi_units[3].as_deref().map(path_string);
-        raw.scsi.unit4 = self.scsi_units[4].as_deref().map(path_string);
-        raw.scsi.unit5 = self.scsi_units[5].as_deref().map(path_string);
-        raw.scsi.unit6 = self.scsi_units[6].as_deref().map(path_string);
+        raw.scsi.unit0 = drive_raw(
+            self.scsi_units[0].as_deref(),
+            self.scsi_unit_names[0].as_deref(),
+        );
+        raw.scsi.unit1 = drive_raw(
+            self.scsi_units[1].as_deref(),
+            self.scsi_unit_names[1].as_deref(),
+        );
+        raw.scsi.unit2 = drive_raw(
+            self.scsi_units[2].as_deref(),
+            self.scsi_unit_names[2].as_deref(),
+        );
+        raw.scsi.unit3 = drive_raw(
+            self.scsi_units[3].as_deref(),
+            self.scsi_unit_names[3].as_deref(),
+        );
+        raw.scsi.unit4 = drive_raw(
+            self.scsi_units[4].as_deref(),
+            self.scsi_unit_names[4].as_deref(),
+        );
+        raw.scsi.unit5 = drive_raw(
+            self.scsi_units[5].as_deref(),
+            self.scsi_unit_names[5].as_deref(),
+        );
+        raw.scsi.unit6 = drive_raw(
+            self.scsi_units[6].as_deref(),
+            self.scsi_unit_names[6].as_deref(),
+        );
         // CD
         raw.cd.image = self.cd_image.as_deref().map(path_string);
         if self.cd_insert_delay != 0.0 {
@@ -824,7 +860,9 @@ impl MachineSetup {
         self.joystick_input_mode = base.joystick_input_mode;
         if !self.has_gayle() {
             self.ide_master = None;
+            self.ide_master_name = None;
             self.ide_slave = None;
+            self.ide_slave_name = None;
         }
         if !self.has_cd() {
             self.cd_image = None;
@@ -921,6 +959,62 @@ impl MachineSetup {
         }
     }
 
+    /// Whether `field` is a hard-drive image that can carry a volume-name
+    /// override (IDE/SCSI drives, but not the SCSI boot ROM or CD/ROM paths).
+    pub fn is_drive_field(field: LauncherField) -> bool {
+        matches!(
+            field,
+            F::IdeMaster
+                | F::IdeSlave
+                | F::ScsiUnit0
+                | F::ScsiUnit1
+                | F::ScsiUnit2
+                | F::ScsiUnit3
+                | F::ScsiUnit4
+                | F::ScsiUnit5
+                | F::ScsiUnit6
+        )
+    }
+
+    /// The volume-name override for a drive field, if set.
+    pub fn drive_name(&self, field: LauncherField) -> Option<&str> {
+        let name = match field {
+            F::IdeMaster => &self.ide_master_name,
+            F::IdeSlave => &self.ide_slave_name,
+            F::ScsiUnit0 => &self.scsi_unit_names[0],
+            F::ScsiUnit1 => &self.scsi_unit_names[1],
+            F::ScsiUnit2 => &self.scsi_unit_names[2],
+            F::ScsiUnit3 => &self.scsi_unit_names[3],
+            F::ScsiUnit4 => &self.scsi_unit_names[4],
+            F::ScsiUnit5 => &self.scsi_unit_names[5],
+            F::ScsiUnit6 => &self.scsi_unit_names[6],
+            _ => return None,
+        };
+        name.as_deref()
+    }
+
+    /// Set (or, with a blank string, clear) a drive field's volume-name
+    /// override. A name without a configured image is meaningless, so it is
+    /// dropped when the field has no path.
+    pub fn set_drive_name(&mut self, field: LauncherField, name: String) {
+        let trimmed = name.trim();
+        let value =
+            (!trimmed.is_empty() && self.path(field).is_some()).then(|| trimmed.to_string());
+        let slot = match field {
+            F::IdeMaster => &mut self.ide_master_name,
+            F::IdeSlave => &mut self.ide_slave_name,
+            F::ScsiUnit0 => &mut self.scsi_unit_names[0],
+            F::ScsiUnit1 => &mut self.scsi_unit_names[1],
+            F::ScsiUnit2 => &mut self.scsi_unit_names[2],
+            F::ScsiUnit3 => &mut self.scsi_unit_names[3],
+            F::ScsiUnit4 => &mut self.scsi_unit_names[4],
+            F::ScsiUnit5 => &mut self.scsi_unit_names[5],
+            F::ScsiUnit6 => &mut self.scsi_unit_names[6],
+            _ => return,
+        };
+        *slot = value;
+    }
+
     /// The value text shown on a row (the current enum/size/number; the file
     /// name or a placeholder for paths; On/Off for toggles).
     pub fn value_label(&self, field: LauncherField) -> String {
@@ -971,9 +1065,13 @@ impl MachineSetup {
                 JoystickInputMode::Keyboard => "Keyboard".to_string(),
                 JoystickInputMode::Gamepad => "Gamepad".to_string(),
             },
-            // Path fields: the file name, or a placeholder.
+            // Path/drive fields: the file name, or a placeholder.
             F::Rom => self.path_label(field, "(bundled AROS)"),
-            _ if rows_contains_kind(field, RowKind::Path) => self.path_label(field, "(none)"),
+            _ if rows_contains_kind(field, RowKind::Path)
+                || rows_contains_kind(field, RowKind::Drive) =>
+            {
+                self.path_label(field, "(none)")
+            }
             // Toggles
             _ => {
                 if self.toggle_value(field) {
@@ -1122,6 +1220,10 @@ impl MachineSetup {
             F::Cd32Nvram => self.cd32_nvram = None,
             _ => {}
         }
+        // A drive's volume name is meaningless once its image is gone.
+        if Self::is_drive_field(field) {
+            self.set_drive_name(field, String::new());
+        }
     }
 
     pub fn zorro_boards(&self) -> &[ZorroBoardSetup] {
@@ -1190,15 +1292,24 @@ impl StatusMessage {
     }
 }
 
+/// A text field that has keyboard focus in the configuration panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditTarget {
+    /// A Zorro plugin board's string option (board index, option index).
+    BoardOption { board: usize, opt: usize },
+    /// A hard-drive volume-name override.
+    DriveName(LauncherField),
+}
+
 /// The full interactive state of the open configuration panel.
 #[derive(Debug, Clone)]
 pub struct LauncherState {
     pub setup: MachineSetup,
     pub tab: LauncherTab,
     pub status: Option<StatusMessage>,
-    /// The string/int plugin option being typed into (board index, option
-    /// index) and the edit buffer, when a text field has focus.
-    editing: Option<(usize, usize)>,
+    /// The text field being typed into, and the edit buffer, when one has
+    /// focus (a plugin string option or a drive volume name).
+    editing: Option<EditTarget>,
     edit_buffer: String,
 }
 
@@ -1213,8 +1324,8 @@ impl LauncherState {
         }
     }
 
-    /// The (board, option) currently being text-edited, if any.
-    pub fn editing(&self) -> Option<(usize, usize)> {
+    /// The text field currently being edited, if any.
+    pub fn editing(&self) -> Option<EditTarget> {
         self.editing
     }
 
@@ -1224,14 +1335,21 @@ impl LauncherState {
     }
 
     /// Focus a board option for text entry, seeding the buffer with its value.
-    pub fn begin_edit(&mut self, board: usize, opt: usize) {
+    pub fn begin_edit_board(&mut self, board: usize, opt: usize) {
         self.edit_buffer = self
             .setup
             .zorro_boards()
             .get(board)
             .map(|b| b.value(opt))
             .unwrap_or_default();
-        self.editing = Some((board, opt));
+        self.editing = Some(EditTarget::BoardOption { board, opt });
+        self.status = None;
+    }
+
+    /// Focus a drive's volume-name field, seeding the buffer with its value.
+    pub fn begin_edit_drive_name(&mut self, field: LauncherField) {
+        self.edit_buffer = self.setup.drive_name(field).unwrap_or_default().to_string();
+        self.editing = Some(EditTarget::DriveName(field));
         self.status = None;
     }
 
@@ -1247,11 +1365,16 @@ impl LauncherState {
         }
     }
 
-    /// Commit the edit buffer to the focused board option.
+    /// Commit the edit buffer to the focused field.
     pub fn edit_commit(&mut self) {
-        if let Some((board, opt)) = self.editing.take() {
+        if let Some(target) = self.editing.take() {
             let value = std::mem::take(&mut self.edit_buffer);
-            self.setup.zorro_option_set(board, opt, value);
+            match target {
+                EditTarget::BoardOption { board, opt } => {
+                    self.setup.zorro_option_set(board, opt, value);
+                }
+                EditTarget::DriveName(field) => self.setup.set_drive_name(field, value),
+            }
         }
     }
 
@@ -1284,6 +1407,19 @@ fn rows_contains_kind(field: LauncherField, kind: RowKind) -> bool {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// Build a `[ide]`/`[scsi]` drive entry from an editable path + optional
+/// volume-name override. A blank name emits the bare path string so saved
+/// configs stay minimal.
+fn drive_raw(path: Option<&Path>, name: Option<&str>) -> Option<RawDrive> {
+    path.map(|p| RawDrive {
+        path: path_string(p),
+        name: name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
 }
 
 fn cycle_slice<T: Copy + PartialEq>(items: &[T], current: T, forward: bool) -> T {
@@ -1656,6 +1792,57 @@ mod tests {
         assert_eq!(
             raw.floppy.df1.as_ref().and_then(|d| d.path.as_deref()),
             Some("/disks/b.adf")
+        );
+    }
+
+    #[test]
+    fn drive_volume_name_round_trips_through_raw() {
+        let mut s = MachineSetup::default();
+        s.select_model(Some(MachineModel::A1200)); // Gayle, so IDE applies.
+        s.set_path(LauncherField::IdeMaster, PathBuf::from("/host/games"));
+        s.set_drive_name(LauncherField::IdeMaster, "Games".to_string());
+        assert_eq!(s.drive_name(LauncherField::IdeMaster), Some("Games"));
+
+        let raw = s.to_raw();
+        let master = raw.ide.master.as_ref().expect("master emitted");
+        assert_eq!(master.path, "/host/games");
+        assert_eq!(master.name.as_deref(), Some("Games"));
+
+        let back = MachineSetup::from_raw(&raw).unwrap();
+        assert_eq!(back.drive_name(LauncherField::IdeMaster), Some("Games"));
+    }
+
+    #[test]
+    fn drive_volume_name_without_an_image_is_dropped() {
+        let mut s = MachineSetup::default();
+        s.select_model(Some(MachineModel::A1200));
+        // No image set: a name has nothing to label.
+        s.set_drive_name(LauncherField::IdeMaster, "Orphan".to_string());
+        assert_eq!(s.drive_name(LauncherField::IdeMaster), None);
+
+        // With an image the name sticks, then clearing the image drops it too.
+        s.set_path(LauncherField::IdeMaster, PathBuf::from("/host/games"));
+        s.set_drive_name(LauncherField::IdeMaster, "Games".to_string());
+        assert_eq!(s.drive_name(LauncherField::IdeMaster), Some("Games"));
+        s.clear_path(LauncherField::IdeMaster);
+        assert_eq!(s.drive_name(LauncherField::IdeMaster), None);
+    }
+
+    #[test]
+    fn editing_a_drive_name_commits_to_the_setup() {
+        let mut setup = MachineSetup::default();
+        setup.select_model(Some(MachineModel::A1200));
+        setup.set_path(LauncherField::ScsiUnit0, PathBuf::from("/host/work"));
+        let mut state = LauncherState::new(setup);
+        state.begin_edit_drive_name(LauncherField::ScsiUnit0);
+        for ch in "WORK".chars() {
+            state.edit_push(ch);
+        }
+        state.edit_commit();
+        assert_eq!(state.editing(), None);
+        assert_eq!(
+            state.setup.drive_name(LauncherField::ScsiUnit0),
+            Some("WORK")
         );
     }
 }

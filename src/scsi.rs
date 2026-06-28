@@ -155,10 +155,16 @@ pub struct ScsiDisk {
 impl ScsiDisk {
     /// Open a SCSI unit. `unit` is the SCSI ID, which picks the DHn device
     /// name a synthesized RDB advertises (so a bare hardfile on unit 0
-    /// boots as DH0 exactly as it would on the IDE bus).
-    pub fn open(path: &Path, unit: usize) -> anyhow::Result<Self> {
-        let disk =
-            HardDriveImage::open(path, &format!("DH{unit}"), "scsi", "COPPERLINE SCSI DISK")?;
+    /// boots as DH0 exactly as it would on the IDE bus). `volume_name`
+    /// labels a directory mounted as an in-memory FFS volume.
+    pub fn open(path: &Path, unit: usize, volume_name: Option<&str>) -> anyhow::Result<Self> {
+        let disk = HardDriveImage::open(
+            path,
+            &format!("DH{unit}"),
+            "scsi",
+            "COPPERLINE SCSI DISK",
+            volume_name,
+        )?;
         Ok(Self {
             disk,
             sense: [0u8; SENSE_LEN],
@@ -1230,7 +1236,7 @@ mod tests {
     fn chip_with_disk(sectors: u64) -> (Wd33c93, PathBuf) {
         let path = temp_image(sectors);
         let mut wd = Wd33c93::new();
-        wd.attach_target(0, ScsiDisk::open(&path, 0).unwrap());
+        wd.attach_target(0, ScsiDisk::open(&path, 0, None).unwrap());
         (wd, path)
     }
 

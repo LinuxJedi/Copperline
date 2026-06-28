@@ -200,10 +200,21 @@ impl JoystickInputMode {
     }
 }
 
+/// A configured hard-drive image: the host path plus an optional volume-name
+/// override. The override only changes a host *directory* mounted as an
+/// in-memory FFS volume -- it sets the FFS volume label instead of deriving it
+/// from the directory name. A raw HDF carries its own label inside the image
+/// and ignores the override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveImage {
+    pub path: PathBuf,
+    pub volume_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IdeConfig {
-    pub master: Option<PathBuf>,
-    pub slave: Option<PathBuf>,
+    pub master: Option<DriveImage>,
+    pub slave: Option<DriveImage>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -214,7 +225,7 @@ pub struct ScsiConfig {
     /// Odd-byte EPROM half for split dumps.
     pub rom_odd: Option<PathBuf>,
     /// Drive images by SCSI ID (0-6; ID 7 is the controller).
-    pub units: [Option<PathBuf>; 7],
+    pub units: [Option<DriveImage>; 7],
 }
 
 impl ScsiConfig {
@@ -994,13 +1005,105 @@ pub(crate) struct RawInput {
     pub(crate) joystick: Option<String>,
 }
 
+/// A drive image entry in `[ide]`/`[scsi]`. Accepts either a bare path string
+/// (`master = "disk.hdf"`) or a table carrying an explicit volume-name override
+/// (`master = { path = "games/", name = "Games" }`). It serializes back to the
+/// bare string when no name is set, so existing minimal configs round-trip
+/// unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RawDrive {
+    pub(crate) path: String,
+    pub(crate) name: Option<String>,
+}
+
+impl RawDrive {
+    pub(crate) fn from_path(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            name: None,
+        }
+    }
+}
+
+impl Serialize for RawDrive {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.name {
+            // No override: a plain string keeps saved configs minimal.
+            None => serializer.serialize_str(&self.path),
+            Some(name) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("path", &self.path)?;
+                map.serialize_entry("name", name)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RawDrive {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DriveVisitor;
+        impl<'de> serde::de::Visitor<'de> for DriveVisitor {
+            type Value = RawDrive;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a drive image path, or a table with `path` and optional `name`")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<RawDrive, E> {
+                Ok(RawDrive::from_path(v))
+            }
+            fn visit_string<E: serde::de::Error>(
+                self,
+                v: String,
+            ) -> std::result::Result<RawDrive, E> {
+                Ok(RawDrive::from_path(v))
+            }
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<RawDrive, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut path: Option<String> = None;
+                let mut name: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "path" => {
+                            if path.is_some() {
+                                return Err(serde::de::Error::duplicate_field("path"));
+                            }
+                            path = Some(map.next_value()?);
+                        }
+                        "name" => {
+                            if name.is_some() {
+                                return Err(serde::de::Error::duplicate_field("name"));
+                            }
+                            name = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(serde::de::Error::unknown_field(other, &["path", "name"]));
+                        }
+                    }
+                }
+                let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
+                Ok(RawDrive { path, name })
+            }
+        }
+        deserializer.deserialize_any(DriveVisitor)
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawIde {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) master: Option<String>,
+    pub(crate) master: Option<RawDrive>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) slave: Option<String>,
+    pub(crate) slave: Option<RawDrive>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -1013,19 +1116,19 @@ pub(crate) struct RawScsi {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rom_odd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unit0: Option<String>,
+    pub(crate) unit0: Option<RawDrive>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unit1: Option<String>,
+    pub(crate) unit1: Option<RawDrive>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unit2: Option<String>,
+    pub(crate) unit2: Option<RawDrive>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unit3: Option<String>,
+    pub(crate) unit3: Option<RawDrive>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unit4: Option<String>,
+    pub(crate) unit4: Option<RawDrive>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unit5: Option<String>,
+    pub(crate) unit5: Option<RawDrive>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unit6: Option<String>,
+    pub(crate) unit6: Option<RawDrive>,
 }
 
 /// `[a2065]` Ethernet board. Fitting the board enables host networking, which
@@ -1199,6 +1302,32 @@ pub(crate) struct RawFloppyDrive {
     pub(crate) write_protected: Option<bool>,
 }
 
+/// Convert a parsed `[ide]`/`[scsi]` drive entry into a `DriveImage`,
+/// validating any volume-name override. An empty/whitespace name is treated as
+/// no override; AmigaDOS volume names cannot contain ':' or '/' and the FFS
+/// root block stores at most 30 characters.
+fn drive_image(raw: RawDrive) -> Result<DriveImage> {
+    let volume_name = match raw.name {
+        None => None,
+        Some(name) => {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.contains([':', '/']) {
+                bail!("drive name {name:?} must not contain ':' or '/'");
+            } else if trimmed.chars().count() > 30 {
+                bail!("drive name {name:?} is too long (AmigaDOS volume names hold 30 characters)");
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+    };
+    Ok(DriveImage {
+        path: PathBuf::from(raw.path),
+        volume_name,
+    })
+}
+
 impl TryFrom<RawConfig> for Config {
     type Error = anyhow::Error;
 
@@ -1351,8 +1480,8 @@ impl TryFrom<RawConfig> for Config {
         };
 
         let ide = IdeConfig {
-            master: raw.ide.master.map(PathBuf::from),
-            slave: raw.ide.slave.map(PathBuf::from),
+            master: raw.ide.master.map(drive_image).transpose()?,
+            slave: raw.ide.slave.map(drive_image).transpose()?,
         };
         if (ide.master.is_some() || ide.slave.is_some()) && defaults.gate_array == GateArray::None {
             bail!("[ide] images need a Gayle machine: set [machine] profile = \"A600\" (or A1200)");
@@ -1362,13 +1491,13 @@ impl TryFrom<RawConfig> for Config {
             rom: raw.scsi.rom.map(PathBuf::from),
             rom_odd: raw.scsi.rom_odd.map(PathBuf::from),
             units: [
-                raw.scsi.unit0.map(PathBuf::from),
-                raw.scsi.unit1.map(PathBuf::from),
-                raw.scsi.unit2.map(PathBuf::from),
-                raw.scsi.unit3.map(PathBuf::from),
-                raw.scsi.unit4.map(PathBuf::from),
-                raw.scsi.unit5.map(PathBuf::from),
-                raw.scsi.unit6.map(PathBuf::from),
+                raw.scsi.unit0.map(drive_image).transpose()?,
+                raw.scsi.unit1.map(drive_image).transpose()?,
+                raw.scsi.unit2.map(drive_image).transpose()?,
+                raw.scsi.unit3.map(drive_image).transpose()?,
+                raw.scsi.unit4.map(drive_image).transpose()?,
+                raw.scsi.unit5.map(drive_image).transpose()?,
+                raw.scsi.unit6.map(drive_image).transpose()?,
             ],
         };
         if scsi.enabled() && scsi.rom.is_none() {
@@ -2051,7 +2180,7 @@ mod tests {
                 denise: None,
             },
             ide: RawIde {
-                master: Some("hd0.hdf".to_string()),
+                master: Some(RawDrive::from_path("hd0.hdf")),
                 slave: None,
             },
             floppy: RawFloppy {
@@ -2549,7 +2678,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.ide.master.as_deref(), Some(Path::new("disk.hdf")));
+        assert_eq!(
+            cfg.ide.master.as_ref().map(|d| d.path.as_path()),
+            Some(Path::new("disk.hdf"))
+        );
         assert_eq!(cfg.ide.slave, None);
     }
 
@@ -2832,11 +2964,14 @@ mod tests {
         assert!(cfg.scsi.enabled());
         assert_eq!(cfg.scsi.rom.as_deref(), Some(Path::new("a2091.rom")));
         assert_eq!(
-            cfg.scsi.units[0].as_deref(),
+            cfg.scsi.units[0].as_ref().map(|d| d.path.as_path()),
             Some(Path::new("workbench.hdf"))
         );
         assert!(cfg.scsi.units[1].is_none());
-        assert_eq!(cfg.scsi.units[3].as_deref(), Some(Path::new("data.hdf")));
+        assert_eq!(
+            cfg.scsi.units[3].as_ref().map(|d| d.path.as_path()),
+            Some(Path::new("data.hdf"))
+        );
 
         // Drives without the boot ROM cannot work: the ROM carries the
         // scsi.device driver.
@@ -2862,6 +2997,131 @@ mod tests {
         )?;
         assert!(cfg.scsi.enabled());
         Ok(())
+    }
+
+    #[test]
+    fn drive_entries_accept_a_volume_name_override() -> Result<()> {
+        // IDE and SCSI drives take either a bare path or a table carrying an
+        // explicit volume name; the bare form leaves the name unset.
+        let cfg = parse_config(
+            r#"
+            [machine]
+            profile = "A1200"
+            [ide]
+            master = { path = "games/", name = "Games" }
+            slave = "data.hdf"
+            "#,
+        )?;
+        let master = cfg.ide.master.as_ref().expect("master configured");
+        assert_eq!(master.path, Path::new("games/"));
+        assert_eq!(master.volume_name.as_deref(), Some("Games"));
+        let slave = cfg.ide.slave.as_ref().expect("slave configured");
+        assert_eq!(slave.path, Path::new("data.hdf"));
+        assert_eq!(slave.volume_name, None);
+
+        let cfg = parse_config(
+            r#"
+            [scsi]
+            rom = "a2091.rom"
+            unit0 = { path = "work/", name = "Work Disk" }
+            "#,
+        )?;
+        let unit0 = cfg.scsi.units[0].as_ref().expect("unit0 configured");
+        assert_eq!(unit0.volume_name.as_deref(), Some("Work Disk"));
+        Ok(())
+    }
+
+    #[test]
+    fn drive_name_override_is_validated() {
+        // A ':' or '/' is illegal in an AmigaDOS volume name.
+        let err = parse_config(
+            r#"
+            [scsi]
+            rom = "a2091.rom"
+            unit0 = { path = "work/", name = "Bad:Name" }
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must not contain"), "{err:#}");
+
+        // Over the 30-character FFS volume-label limit.
+        let err = parse_config(&format!(
+            r#"
+            [scsi]
+            rom = "a2091.rom"
+            unit0 = {{ path = "work/", name = "{}" }}
+            "#,
+            "X".repeat(31)
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("too long"), "{err:#}");
+
+        // A blank name is treated as no override (not an error).
+        let cfg = parse_config(
+            r#"
+            [scsi]
+            rom = "a2091.rom"
+            unit0 = { path = "work/", name = "  " }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.scsi.units[0].as_ref().unwrap().volume_name, None);
+
+        // An unknown key in the table form is rejected.
+        let err = parse_config(
+            r#"
+            [scsi]
+            rom = "a2091.rom"
+            unit0 = { path = "work/", label = "Work" }
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("label"), "{err:#}");
+    }
+
+    #[test]
+    fn mixed_named_and_bare_drives_round_trip_through_saved_toml() {
+        // A named drive serializes as a sub-table; a bare sibling must not be
+        // swallowed by it (TOML requires scalar keys before sub-tables). Save
+        // the whole config the way the panel does and parse it back.
+        let raw = RawConfig {
+            scsi: RawScsi {
+                rom: Some("a2091.rom".to_string()),
+                unit0: Some(RawDrive {
+                    path: "work/".to_string(),
+                    name: Some("Work".to_string()),
+                }),
+                unit1: Some(RawDrive::from_path("data.hdf")),
+                ..RawScsi::default()
+            },
+            ..RawConfig::default()
+        };
+        let text = raw.to_toml_string().unwrap();
+        let back: RawConfig = toml::from_str(&text).unwrap();
+        assert_eq!(raw, back, "round-trip mismatch; TOML was:\n{text}");
+    }
+
+    #[test]
+    fn drive_entry_round_trips_through_toml() {
+        // No name: serializes back to the bare string form.
+        let bare = RawIde {
+            master: Some(RawDrive::from_path("disk.hdf")),
+            slave: None,
+        };
+        let text = toml::to_string(&bare).unwrap();
+        assert!(text.contains(r#"master = "disk.hdf""#), "{text}");
+
+        // With a name: serializes to the inline table and parses back.
+        let named = RawIde {
+            master: Some(RawDrive {
+                path: "games/".to_string(),
+                name: Some("Games".to_string()),
+            }),
+            slave: None,
+        };
+        let text = toml::to_string(&named).unwrap();
+        let parsed: RawIde = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, named);
     }
 
     #[test]

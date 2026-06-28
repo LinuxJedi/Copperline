@@ -165,10 +165,13 @@ The layout is:
   pacing, realtime priority, warp speed, joystick input mode).
 - **Settings rows** (right pane). `[<]`/`[>]` step through a value, On/Off
   buttons flip a toggle, and the **Browse** and **Clear** buttons set or remove
-  a file path through a native file dialog. A setting that does not apply to the
-  chosen machine is greyed and shows why in place of its control -- "needs
-  32-bit CPU" for Zorro III RAM, "needs 68020+" for the FPU, "needs A600/A1200"
-  for IDE.
+  a file path through a native file dialog. On the *Hard Disk* tab, once an IDE
+  or SCSI drive has an image a small editable box appears next to **Browse**:
+  click it and type to set the volume name for a directory mount (left blank, a
+  directory mount inherits the host directory's name; the box has no effect on a
+  raw HDF). A setting that does not apply to the chosen machine is greyed and
+  shows why in place of its control -- "needs 32-bit CPU" for Zorro III RAM,
+  "needs 68020+" for the FPU, "needs A600/A1200" for IDE.
 - **Action bar** (bottom). **Load...** and **Save...** read and write a `.toml`
   config
   through a file dialog (Save writes a minimal file, only the settings that

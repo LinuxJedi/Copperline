@@ -402,6 +402,19 @@ exit. Note that the stock A1200/A600 Kickstart `scsi.device` only probes
 the IDE master; a slave drive needs a guest OS or driver that supports
 two units (e.g. Kickstart 3.1.4).
 
+To override the volume name (instead of inheriting the directory name),
+give the drive as a table with `path` and `name`:
+
+```toml
+[ide]
+master = { path = "/host/Games", name = "Games" }
+# slave = "scratch.hdf"        # the bare-string form still works
+```
+
+The name sets the FFS volume label of a directory mount; AmigaDOS volume
+names hold up to 30 characters and cannot contain `:` or `/`. It has no
+effect on a raw HDF, which carries its own label inside the image.
+
 The drive responds to ATA IDENTIFY with the Gayle byte order real hardware
 uses, so both Kickstart 3.1 variants boot from it. An HDD activity LED
 appears in the status bar on IDE machines.
@@ -437,7 +450,9 @@ vector at `$2000`).
 Each `unitN` accepts everything `[ide]` paths do: RDB images, bare
 partition hardfiles (a synthesized RDB advertises a bootable `DHn`
 partition, named after the SCSI ID), and host directories built into
-in-memory FFS volumes. The HDD activity LED covers SCSI traffic too.
+in-memory FFS volumes -- including the `{ path = "...", name = "..." }`
+table form that overrides a directory mount's volume name. The HDD
+activity LED covers SCSI traffic too.
 
 ## `[cd]` -- CDTV and CD32
 

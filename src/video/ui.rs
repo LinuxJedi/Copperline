@@ -8,7 +8,7 @@
 //! `window.rs` routes events to it and builds the per-frame view data
 //! (register snapshots, disassembly text) the panels render.
 
-use super::launcher::{self, LauncherField, LauncherState, LauncherTab, RowKind};
+use super::launcher::{self, EditTarget, LauncherField, LauncherState, LauncherTab, RowKind};
 use super::window::{
     draw_rect_bevel, fill_rect, fill_rect_blend, rgba, scale_rect, JoystickInputMode, Rect,
     BUTTON_EDGE_DARK, BUTTON_EDGE_LIGHT, BUTTON_FACE, BUTTON_FACE_HOVER,
@@ -436,6 +436,8 @@ pub enum UiControl {
     LauncherBrowse(LauncherField),
     /// Configuration screen: clear a path field.
     LauncherClear(LauncherField),
+    /// Configuration screen: focus a drive's volume-name field for text entry.
+    LauncherDriveNameEdit(LauncherField),
     /// Configuration screen: add a Zorro metadata board file.
     LauncherZorroAdd,
     /// Configuration screen: remove the Zorro board at this index.
@@ -1944,6 +1946,8 @@ const LAUNCH_ACTION_W: usize = 84;
 const LAUNCH_ACTION_H: usize = 22;
 const LAUNCH_BROWSE_W: usize = 66;
 const LAUNCH_CLEAR_W: usize = 54;
+/// Width of the editable volume-name box on a drive row.
+const LAUNCH_NAME_W: usize = 96;
 const LAUNCH_REMOVE_W: usize = 70;
 const LAUNCH_CONTROL_H: usize = 20;
 
@@ -2065,6 +2069,18 @@ fn launcher_path_rects(rect: Rect, row_y: usize) -> (Rect, Rect) {
         h: LAUNCH_CONTROL_H,
     };
     (browse, clear)
+}
+
+/// The editable volume-name box on a drive row: it sits just left of the
+/// Browse button, with the path text filling the space before it.
+fn launcher_drive_name_rect(rect: Rect, row_y: usize) -> Rect {
+    let (browse, _clear) = launcher_path_rects(rect, row_y);
+    Rect {
+        x: browse.x.saturating_sub(6 + LAUNCH_NAME_W),
+        y: browse.y,
+        w: LAUNCH_NAME_W,
+        h: LAUNCH_CONTROL_H,
+    }
 }
 
 fn launcher_action_rects(rect: Rect) -> [(UiControl, Rect); 4] {
@@ -2271,6 +2287,21 @@ fn launcher_control_at(rect: Rect, state: &LauncherState, pos: (i32, i32)) -> Op
                         return Some(UiControl::LauncherClear(r.field));
                     }
                 }
+                RowKind::Drive => {
+                    let (browse, clear) = launcher_path_rects(rect, row_y);
+                    if browse.contains(pos) {
+                        return Some(UiControl::LauncherBrowse(r.field));
+                    }
+                    if clear.contains(pos) {
+                        return Some(UiControl::LauncherClear(r.field));
+                    }
+                    // The volume name only matters once an image is chosen.
+                    if state.setup.path(r.field).is_some()
+                        && launcher_drive_name_rect(rect, row_y).contains(pos)
+                    {
+                        return Some(UiControl::LauncherDriveNameEdit(r.field));
+                    }
+                }
             }
         }
     }
@@ -2336,12 +2367,13 @@ fn draw_launcher_chip(
 fn draw_launcher_row(
     frame: &mut [u8],
     rect: Rect,
-    setup: &launcher::MachineSetup,
+    state: &LauncherState,
     r: &launcher::Row,
     i: usize,
     hover: Option<UiControl>,
     scale: usize,
 ) {
+    let setup = &state.setup;
     let row_y = launcher_row_y(rect, i);
     let reason = setup.disabled_reason(r.field);
     let label_color = if reason.is_none() {
@@ -2425,6 +2457,62 @@ fn draw_launcher_row(
             let avail = browse.x.saturating_sub(value_x + 8);
             let text = truncate_to_width(&setup.value_label(r.field), avail);
             draw_panel_text(frame, value_x, browse.y + 6, &text, PANEL_TEXT, 1, scale);
+            draw_text_button(
+                frame,
+                browse,
+                "Browse",
+                true,
+                hover == Some(UiControl::LauncherBrowse(r.field)),
+                scale,
+            );
+            draw_text_button(
+                frame,
+                clear,
+                "Clear",
+                true,
+                hover == Some(UiControl::LauncherClear(r.field)),
+                scale,
+            );
+        }
+        RowKind::Drive => {
+            let (browse, clear) = launcher_path_rects(rect, row_y);
+            let value_x = launcher_control_x(rect);
+            // The volume-name box only appears once an image is chosen (a name
+            // has nothing to label otherwise); until then the row reads like a
+            // plain path row and the path text fills the full width.
+            let has_image = setup.path(r.field).is_some();
+            let name_box = launcher_drive_name_rect(rect, row_y);
+            let text_right = if has_image { name_box.x } else { browse.x };
+            let avail = text_right.saturating_sub(value_x + 8);
+            let text = truncate_to_width(&setup.value_label(r.field), avail);
+            draw_panel_text(frame, value_x, browse.y + 6, &text, PANEL_TEXT, 1, scale);
+            if has_image {
+                draw_rect_bevel(
+                    frame,
+                    scale_rect(name_box, scale),
+                    BUTTON_EDGE_DARK,
+                    BUTTON_EDGE_LIGHT,
+                    scale,
+                );
+                let editing = state.editing() == Some(EditTarget::DriveName(r.field));
+                let (label, color) = if editing {
+                    (format!("{}_", state.edit_buffer()), PANEL_TEXT_HILIGHT)
+                } else if let Some(name) = setup.drive_name(r.field) {
+                    (name.to_string(), PANEL_TEXT)
+                } else {
+                    ("(volume)".to_string(), PANEL_TEXT_DIM)
+                };
+                let shown = truncate_to_width(&label, name_box.w.saturating_sub(8));
+                draw_panel_text(
+                    frame,
+                    name_box.x + 4,
+                    name_box.y + 6,
+                    &shown,
+                    color,
+                    1,
+                    scale,
+                );
+            }
             draw_text_button(
                 frame,
                 browse,
@@ -2613,7 +2701,7 @@ fn draw_launcher_board_option(
             );
         }
         K::String => {
-            let editing = state.editing() == Some((board, opt));
+            let editing = state.editing() == Some(EditTarget::BoardOption { board, opt });
             let vbox = launcher_board_value_rect(rect, row_y);
             draw_rect_bevel(
                 frame,
@@ -2705,7 +2793,7 @@ fn draw_launcher(
         draw_launcher_zorro(frame, rect, state, hover, scale);
     } else {
         for (i, r) in launcher::rows(state.tab).iter().enumerate() {
-            draw_launcher_row(frame, rect, setup, r, i, hover, scale);
+            draw_launcher_row(frame, rect, state, r, i, hover, scale);
         }
     }
     // Status / error line.
@@ -3667,5 +3755,38 @@ mod tests {
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "launcher-zorro");
         let _ = std::fs::remove_file(&manifest_path);
+
+        // Configuration screen: the Storage tab on an A1200, with an IDE
+        // master mounted from a host directory and given a volume-name
+        // override (the editable box beside Browse).
+        let mut frame = vec![0u8; w * h * 4];
+        let mut state = LauncherState::new(launcher::MachineSetup::default());
+        state.setup.select_model(Some(MachineModel::A1200));
+        state.setup.set_path(
+            LauncherField::IdeMaster,
+            std::path::PathBuf::from("/host/games"),
+        );
+        state
+            .setup
+            .set_drive_name(LauncherField::IdeMaster, "Games".to_string());
+        state.tab = LauncherTab::Storage;
+        let ui = UiState {
+            menu_open: false,
+            panel: Some(Panel::Launcher(Box::new(state))),
+        };
+        draw(
+            &mut frame,
+            scale,
+            &ui,
+            None,
+            None,
+            false,
+            WarpSpeed::Max,
+            false,
+            false,
+            JoystickInputMode::Auto,
+        );
+        assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
+        save(&frame, "launcher-storage");
     }
 }

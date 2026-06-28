@@ -213,27 +213,38 @@ impl HardDriveImage {
     /// "DH0") a synthesized RDB advertises; `bus_name` ("ide"/"scsi") tags
     /// log messages; `disk_label` fills the RDSK vendor/product identity.
     /// The path may be a raw HDF image file, or a host directory, which is
-    /// built into an in-memory FFS volume at open time.
+    /// built into an in-memory FFS volume at open time. `volume_override`
+    /// names that FFS volume; when `None` the directory name is used. It has
+    /// no effect on a raw HDF, which carries its own label inside the image.
     pub fn open(
         path: &Path,
         device_name: &str,
         bus_name: &'static str,
         disk_label: &str,
+        volume_override: Option<&str>,
     ) -> anyhow::Result<Self> {
         let mut backing = if path.is_dir() {
-            let volume = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let volume = volume_override.map(str::to_string).unwrap_or_else(|| {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
             let image = crate::dirfs::build_ffs_image(path, &volume)?;
             log::warn!(
-                "{bus_name}: {} mounted as an in-memory volume built from the directory; \
-                 guest writes to it are NOT written back to the host and are lost \
+                "{bus_name}: {} mounted as an in-memory volume \"{volume}\" built from the \
+                 directory; guest writes to it are NOT written back to the host and are lost \
                  at exit",
                 path.display()
             );
             Backing::Memory(image)
         } else {
+            if volume_override.is_some() {
+                log::warn!(
+                    "{bus_name}: {} is a raw HDF image; the configured drive name is ignored \
+                     (the volume label lives inside the image)",
+                    path.display()
+                );
+            }
             Backing::File(
                 OpenOptions::new()
                     .read(true)
@@ -426,7 +437,7 @@ mod tests {
         let mut bytes = vec![0u8; 64 * SECTOR_SIZE];
         bytes[5 * SECTOR_SIZE..5 * SECTOR_SIZE + 4].copy_from_slice(b"MARK");
         let path = temp_image("serde.hdf", &bytes);
-        let mut original = HardDriveImage::open(&path, "DH0", "ide", "TEST DISK").unwrap();
+        let mut original = HardDriveImage::open(&path, "DH0", "ide", "TEST DISK", None).unwrap();
 
         let encoded = bincode::serialize(&original).unwrap();
         let mut restored: HardDriveImage = bincode::deserialize(&encoded).unwrap();
@@ -450,10 +461,62 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Read every sector of an image and return the FFS volume label found in
+    /// its root block (block type 2 / secondary type 1). The directory mount
+    /// prepends a synthesized RDB, so the root block is not at a fixed LBA;
+    /// scan for it instead.
+    fn volume_label(disk: &mut HardDriveImage) -> String {
+        let mut sector = vec![0u8; SECTOR_SIZE];
+        for lba in 0..disk.total_sectors() {
+            disk.read_sector(lba, &mut sector).unwrap();
+            let be32 = |off: usize| u32::from_be_bytes(sector[off..off + 4].try_into().unwrap());
+            if be32(0) == 2 && be32(SECTOR_SIZE - 4) == 1 {
+                let name_base = SECTOR_SIZE - 80;
+                let len = sector[name_base] as usize;
+                return String::from_utf8_lossy(&sector[name_base + 1..name_base + 1 + len])
+                    .into_owned();
+            }
+        }
+        panic!("no FFS root block found");
+    }
+
+    /// A uniquely-named parent temp dir holding a short-named child directory
+    /// (returned) with one file. The child's name is short enough that the
+    /// 30-character FFS volume-label limit does not truncate it.
+    fn temp_mount_dir(child: &str) -> (PathBuf, PathBuf) {
+        static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let parent = std::env::temp_dir().join(format!(
+            "copperline-harddrive-dir-{}-{unique}",
+            std::process::id()
+        ));
+        let mount = parent.join(child);
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::write(mount.join("hello.txt"), b"hi\n").unwrap();
+        (parent, mount)
+    }
+
+    #[test]
+    fn directory_mount_uses_the_directory_name_as_the_volume_label() {
+        let (parent, mount) = temp_mount_dir("Games");
+        let mut disk = HardDriveImage::open(&mount, "DH0", "ide", "TEST DISK", None).unwrap();
+        assert_eq!(volume_label(&mut disk), "Games");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn directory_mount_volume_override_sets_the_label() {
+        let (parent, mount) = temp_mount_dir("Games");
+        let mut disk =
+            HardDriveImage::open(&mount, "DH0", "ide", "TEST DISK", Some("Workbench")).unwrap();
+        assert_eq!(volume_label(&mut disk), "Workbench");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     #[test]
     fn serde_errors_when_backing_file_is_missing() {
         let path = temp_image("gone.hdf", &vec![0u8; 8 * SECTOR_SIZE]);
-        let original = HardDriveImage::open(&path, "DH0", "ide", "TEST DISK").unwrap();
+        let original = HardDriveImage::open(&path, "DH0", "ide", "TEST DISK", None).unwrap();
         let encoded = bincode::serialize(&original).unwrap();
         let _ = std::fs::remove_file(&path);
         let Err(err) = bincode::deserialize::<HardDriveImage>(&encoded) else {

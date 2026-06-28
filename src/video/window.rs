@@ -4710,8 +4710,14 @@ impl App {
             }
             UiControl::LauncherClear(field) => {
                 if let Some(state) = self.launcher_state_mut() {
+                    state.edit_cancel();
                     state.setup.clear_path(field);
                     state.status = None;
+                }
+            }
+            UiControl::LauncherDriveNameEdit(field) => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.begin_edit_drive_name(field);
                 }
             }
             UiControl::LauncherZorroRemove(idx) => {
@@ -4748,7 +4754,7 @@ impl App {
             }
             UiControl::LauncherBoardEdit { board, opt } => {
                 if let Some(state) = self.launcher_state_mut() {
-                    state.begin_edit(board, opt);
+                    state.begin_edit_board(board, opt);
                 }
             }
             UiControl::LauncherBoardBrowse { board, opt } => self.launcher_board_browse(board, opt),
@@ -5245,6 +5251,9 @@ impl App {
         let picked = dialog.pick_file();
         if let Some(path) = picked {
             if let Some(state) = self.launcher_state_mut() {
+                // A pending volume-name edit (on this or another drive row)
+                // would otherwise be left visually focused after the dialog.
+                state.edit_cancel();
                 state.setup.set_path(field, path);
                 state.status = None;
             }
@@ -5315,6 +5324,10 @@ impl App {
     }
 
     fn launcher_save(&mut self) {
+        // Capture a name/option typed but not yet committed with Enter.
+        if let Some(state) = self.launcher_state_mut() {
+            state.edit_commit();
+        }
         let toml = match self.launcher_state().map(|s| s.setup.to_toml()) {
             Some(Ok(text)) => text,
             Some(Err(e)) => {
@@ -5351,6 +5364,10 @@ impl App {
     /// AROS resolution, audio-device and machine-construction errors all stay
     /// in the panel as a status line; only success swaps the live machine.
     fn launcher_run(&mut self) {
+        // Capture a name/option typed but not yet committed with Enter.
+        if let Some(state) = self.launcher_state_mut() {
+            state.edit_commit();
+        }
         let mut cfg = match self.launcher_state().map(|s| s.setup.build_config()) {
             Some(Ok(cfg)) => cfg,
             Some(Err(e)) => {

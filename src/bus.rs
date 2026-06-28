@@ -19757,7 +19757,7 @@ mod tests {
 
         let mut bus = empty_bus();
         let mut gayle = Gayle::new(0xD0);
-        gayle.attach_drive(0, IdeDrive::open(&image, 0).unwrap());
+        gayle.attach_drive(0, IdeDrive::open(&image, 0, None).unwrap());
         bus.attach_gayle(gayle);
 
         // Enable the IDE interrupt at $DAA000 and issue a READ SECTORS via

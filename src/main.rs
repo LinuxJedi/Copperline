@@ -1098,10 +1098,13 @@ pub(crate) fn build_machine(
         let rom_path = cfg.scsi.rom.as_ref().expect("config validated [scsi] rom");
         let rom = crate::a2091::A2091::load_rom(rom_path, cfg.scsi.rom_odd.as_deref())?;
         let mut board = crate::a2091::A2091::new(rom)?;
-        for (unit, path) in cfg.scsi.units.iter().enumerate() {
-            let Some(path) = path else { continue };
-            board.attach_drive(unit, crate::scsi::ScsiDisk::open(path, unit)?);
-            info!("scsi: unit {unit} {}", path.display());
+        for (unit, drive) in cfg.scsi.units.iter().enumerate() {
+            let Some(drive) = drive else { continue };
+            board.attach_drive(
+                unit,
+                crate::scsi::ScsiDisk::open(&drive.path, unit, drive.volume_name.as_deref())?,
+            );
+            info!("scsi: unit {unit} {}", drive.path.display());
         }
         let slot = devices.len();
         zorro.add_board(crate::zorro::BoardSpec::a2091(slot))?;
@@ -1180,13 +1183,19 @@ pub(crate) fn build_machine(
     bus.set_rtc_present(cfg.rtc_present);
     if let Some(id) = cfg.gate_array.gayle_id() {
         let mut gayle = crate::gayle::Gayle::new(id);
-        if let Some(path) = &cfg.ide.master {
-            gayle.attach_drive(0, crate::gayle::IdeDrive::open(path, 0)?);
-            info!("ide: master {}", path.display());
+        if let Some(drive) = &cfg.ide.master {
+            gayle.attach_drive(
+                0,
+                crate::gayle::IdeDrive::open(&drive.path, 0, drive.volume_name.as_deref())?,
+            );
+            info!("ide: master {}", drive.path.display());
         }
-        if let Some(path) = &cfg.ide.slave {
-            gayle.attach_drive(1, crate::gayle::IdeDrive::open(path, 1)?);
-            info!("ide: slave {}", path.display());
+        if let Some(drive) = &cfg.ide.slave {
+            gayle.attach_drive(
+                1,
+                crate::gayle::IdeDrive::open(&drive.path, 1, drive.volume_name.as_deref())?,
+            );
+            info!("ide: slave {}", drive.path.display());
         }
         bus.attach_gayle(gayle);
     }

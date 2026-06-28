@@ -70,7 +70,9 @@ cycles are not yet arbitrated against the CPU (TODO in `a2091.rs`).
 Both IDE and SCSI drives share the `harddrive.rs` sector backend: raw
 HDF images, bare partition hardfiles wrapped in a synthesized RDB
 (bootable `DHn` named after the unit), and host directories built into
-in-memory FFS volumes by `dirfs.rs`. The SCSI-2 target layer in
+in-memory FFS volumes by `dirfs.rs` (whose volume label defaults to the
+directory name, or a `name` override configured on the drive). The
+SCSI-2 target layer in
 `scsi.rs` answers INQUIRY, MODE SENSE pages 3/4, READ CAPACITY,
 READ/WRITE(6)/(10), REQUEST SENSE, and the no-op housekeeping commands,
 with sense state kept per target.

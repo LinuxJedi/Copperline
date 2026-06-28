@@ -92,9 +92,16 @@ impl IdeDrive {
     /// Open an IDE unit (0 = master, 1 = slave; this picks the DHn device
     /// name a synthesized RDB advertises). The path may be a raw HDF image
     /// file, or a host directory, which is built into an in-memory FFS
-    /// volume at open time.
-    pub fn open(path: &Path, unit: usize) -> anyhow::Result<Self> {
-        let disk = HardDriveImage::open(path, &format!("DH{unit}"), "ide", "COPPERLINE IDE DISK")?;
+    /// volume at open time; `volume_name` labels that volume (directory
+    /// mounts only).
+    pub fn open(path: &Path, unit: usize, volume_name: Option<&str>) -> anyhow::Result<Self> {
+        let disk = HardDriveImage::open(
+            path,
+            &format!("DH{unit}"),
+            "ide",
+            "COPPERLINE IDE DISK",
+            volume_name,
+        )?;
         // The classic Amiga HDF geometry: 16 surfaces, 32 sectors per track
         // (what HDToolBox/RDB tooling defaults to), so the CHS the host
         // computes from an RDB's physical-drive block agrees with what the
@@ -906,7 +913,7 @@ mod tests {
     fn gayle_with_drive(sectors: u64) -> (Gayle, PathBuf) {
         let path = temp_image(sectors);
         let mut gayle = Gayle::new(0xD0);
-        gayle.attach_drive(0, IdeDrive::open(&path, 0).unwrap());
+        gayle.attach_drive(0, IdeDrive::open(&path, 0, None).unwrap());
         (gayle, path)
     }
 
@@ -955,7 +962,7 @@ mod tests {
         data[SECTOR_SIZE] = 0xA5; // marker in partition sector 1
         std::fs::write(&path, &data).unwrap();
 
-        let mut drive = IdeDrive::open(&path, 0).unwrap();
+        let mut drive = IdeDrive::open(&path, 0, None).unwrap();
         // One synthesized RDB cylinder plus the partition cylinder.
         assert_eq!(drive.disk.total_sectors(), 2 * u64::from(CYL_SECTORS));
 
@@ -1011,7 +1018,7 @@ mod tests {
         let mut data = std::fs::read(&path).unwrap();
         data[..4].copy_from_slice(b"RDSK");
         std::fs::write(&path, &data).unwrap();
-        let mut drive = IdeDrive::open(&path, 0).unwrap();
+        let mut drive = IdeDrive::open(&path, 0, None).unwrap();
         assert_eq!(drive.disk.total_sectors(), u64::from(CYL_SECTORS));
         let mut sector = [0u8; SECTOR_SIZE];
         drive.disk.read_sector(0, &mut sector).unwrap();
@@ -1026,7 +1033,7 @@ mod tests {
         let mut data = std::fs::read(&path).unwrap();
         data[..4].copy_from_slice(b"DOS\x00");
         std::fs::write(&path, &data).unwrap();
-        let err = match IdeDrive::open(&path, 0) {
+        let err = match IdeDrive::open(&path, 0, None) {
             Ok(_) => panic!("expected open to fail"),
             Err(e) => e.to_string(),
         };
