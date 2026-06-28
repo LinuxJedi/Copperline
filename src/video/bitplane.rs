@@ -908,6 +908,26 @@ impl ControlState {
                 origin_shift -= 1;
             }
         }
+        // A hi-res/SHRES FMODE=0 screen that starts DDFSTRT earlier than the
+        // standard $3C slot pre-fetches whole word(s) before the display window
+        // opens. On real hardware those words are shifted into the left border
+        // ahead of DIWSTRT and never appear inside the window; the negative
+        // `ddf_native_shift` is exactly that early pre-fetch width in pixels.
+        // Snap the picture origin up to the first fully-fetched word so the
+        // pre-fetch word is clipped on the left AND the real right edge (the
+        // last visible word) stays inside the window instead of being cropped.
+        //
+        // Confirmed against vAmiga for XSysInfo's hardware panel (hi-res,
+        // DDFSTRT=$38, DIWSTRT=$81, BPL1MOD/BPL2MOD=-4): a clean left edge with
+        // the >OVERVIEW box keeping its right border. With the negative modulo
+        // that pre-fetch word equals the previous row's right-edge word, so
+        // without this the right edge both bled into the left column one
+        // scanline down and was cropped off the right. Late DDFSTRT (e.g. the
+        // Kickstart insert-disk screen's $40, `ddf_native_shift >= 0`), lo-res,
+        // and wide-FMODE fetches are untouched.
+        if (self.hires() || self.shres()) && self.fetch_quantum() == 1 && ddf_native_shift < 0 {
+            origin_shift = origin_shift.max(-ddf_native_shift);
+        }
         origin_shift
     }
 }
@@ -7211,6 +7231,52 @@ mod tests {
             hires.bitplane_content_window_h(),
             Some((STANDARD_DIW_HSTART, STANDARD_DIW_HSTOP))
         );
+    }
+
+    #[test]
+    fn early_ddf_hires_origin_snaps_to_word_boundary() {
+        // XSysInfo's hardware-information panel: hi-res, FMODE=0, DDFSTRT=$38
+        // (the lo-res "Normal" slot) - one 4-cck fetch word earlier than the
+        // hi-res standard $3C - with DIWSTRT=$81 and BPL1MOD/BPL2MOD=-4. The
+        // early pre-fetch word is clocked into the left border before the
+        // window opens, so the picture origin must snap up to the first
+        // fully-fetched word: native x-offset 16 (one 16-pixel word) instead of
+        // the unsnapped 12. That clips the pre-fetch word on the left AND keeps
+        // the real right edge inside the window. Without it the negative modulo
+        // made that word both bleed into the left column one scanline down and
+        // crop off the right edge. Confirmed against vAmiga (clean left edge,
+        // the >OVERVIEW box keeps its right border).
+        let xsysinfo = ControlState {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: 0x8200,
+            diwstrt: 0x2C81,
+            diwstop: 0x2CC1,
+            ddfstrt: 0x0038,
+            ddfstop: 0x00D8,
+            ..ControlState::default()
+        };
+        let repeat = xsysinfo.framebuffer_pixel_repeat();
+        assert_eq!(xsysinfo.native_x_offset(xsysinfo.diw_h_start(), repeat), 16);
+
+        // The hi-res standard slot pre-fetches nothing; origin stays clamped at
+        // 0 (no snap).
+        let standard = ControlState {
+            ddfstrt: 0x003C,
+            ..xsysinfo
+        };
+        assert_eq!(standard.native_x_offset(standard.diw_h_start(), repeat), 0);
+
+        // Kickstart 2.05 insert-disk screen: hi-res but DDFSTRT=$40 (late), so
+        // there is no pre-fetch word - the origin is unsnapped and the
+        // calibrated boot art is untouched.
+        let ks_boot = ControlState {
+            diwstrt: 0x2C95,
+            diwstop: 0x2CAD,
+            ddfstrt: 0x0040,
+            ddfstop: 0x00D0,
+            ..xsysinfo
+        };
+        assert_eq!(ks_boot.native_x_offset(ks_boot.diw_h_start(), repeat), 20);
     }
 
     fn ocs_snapshot(
