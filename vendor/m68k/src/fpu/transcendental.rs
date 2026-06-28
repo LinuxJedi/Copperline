@@ -185,19 +185,34 @@ fn log_special(x: FloatX80, f: &mut ExcFlags) -> Option<FloatX80> {
     }
 }
 
-/// ln(x) for finite x > 0, in Df: x = m*2^e with m in [sqrt(1/2), sqrt(2)),
-/// ln(x) = e*ln2 + 2*atanh((m-1)/(m+1)).
-fn ln_dd(x: FloatX80) -> Df {
-    let mut e = unbiased_exp(x);
-    let mut m = softfloat::getman(x, &mut noflags());
-    if m.to_f64() > std::f64::consts::SQRT_2 {
-        m = softfloat::scale(m, -1, RoundCtx::NEAREST_EXT, &mut noflags());
+/// Multiply a Df by 2^n exactly (power-of-two scaling of both limbs).
+fn scale_df(d: Df, n: i32) -> Df {
+    Df {
+        hi: softfloat::scale(d.hi, n, RoundCtx::NEAREST_EXT, &mut noflags()),
+        lo: softfloat::scale(d.lo, n, RoundCtx::NEAREST_EXT, &mut noflags()),
+    }
+}
+
+/// ln of a positive Df value, full double-double precision: x = f*2^e with
+/// f in [sqrt(1/2), sqrt(2)), ln(x) = e*ln2 + 2*atanh((f-1)/(f+1)). Taking a
+/// Df argument (not a rounded x80) is what keeps log1p/atanh faithful.
+fn ln_df(x: Df) -> Df {
+    let mut e = unbiased_exp(x.hi);
+    let mut f = scale_df(x, -e);
+    if f.hi.to_f64() > std::f64::consts::SQRT_2 {
+        f = scale_df(f, -1);
         e += 1;
     }
-    let md = Df::from_x80(m);
-    let s = dd::div(dd::sub(md, Df::from_i32(1)), dd::add(md, Df::from_i32(1)));
-    let ln_f = dd::mul_x80(dd::atanh_small(s), fx(2.0));
-    dd::add(dd::mul_x80(dd::consts().ln2, fx(e as f64)), ln_f)
+    let one = Df::from_i32(1);
+    let s = dd::div(dd::sub(f, one), dd::add(f, one));
+    dd::add(
+        dd::mul_x80(dd::consts().ln2, fx(e as f64)),
+        dd::mul_x80(dd::atanh_small(s), fx(2.0)),
+    )
+}
+
+fn ln_dd(x: FloatX80) -> Df {
+    ln_df(Df::from_x80(x))
 }
 
 fn ln(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
@@ -256,12 +271,7 @@ fn log1p(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
         let s = dd::div(xd, dd::add_x80(xd, fx(2.0)));
         dd::mul_x80(dd::atanh_small(s), fx(2.0))
     } else {
-        ln_dd(softfloat::add(
-            x,
-            one,
-            RoundCtx::NEAREST_EXT,
-            &mut noflags(),
-        ))
+        ln_df(dd::add_x80(Df::from_x80(x), one))
     };
     d.to_x80(ctx, f)
 }
@@ -563,11 +573,11 @@ fn atanh(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     let d = if x.to_f64().abs() <= 0.5 {
         dd::atanh_small(Df::from_x80(x))
     } else {
-        // atanh(x) = 0.5 * ln((1+x)/(1-x)).
+        // atanh(x) = 0.5 * ln((1+x)/(1-x)); ln of the Df ratio (not a rounded
+        // x80) keeps the result faithful.
         let xd = Df::from_x80(x);
         let arg = dd::div(dd::add_x80(xd, fx(1.0)), dd::sub(Df::from_i32(1), xd));
-        let l = ln_dd(arg.to_x80(RoundCtx::NEAREST_EXT, &mut noflags()));
-        dd::mul_x80(l, fx(0.5))
+        dd::mul_x80(ln_df(arg), fx(0.5))
     };
     d.to_x80(ctx, f)
 }
