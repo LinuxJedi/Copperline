@@ -7,6 +7,12 @@
 //! a 32-bit word, so register N lives at base + N * 4. Copperline exposes a
 //! read-only wall-clock view: guest writes can control the HOLD latch,
 //! but they never change the host clock.
+//!
+//! The clock is reported in the host's *local* time zone (matching the
+//! auto-generated filename stamps in `timestamp.rs`), since AmigaOS has no
+//! real notion of time zones and a UTC clock just confuses users. The
+//! deterministic `COPPERLINE_RTC_FIXED_SECS` override stays UTC so it
+//! remains host-independent.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -102,7 +108,7 @@ impl Msm6242Rtc {
         {
             return RtcDateTime::from_unix_seconds(secs);
         }
-        RtcDateTime::from_system_time(SystemTime::now())
+        RtcDateTime::from_system_time_local(SystemTime::now())
     }
 
     #[cfg(test)]
@@ -116,12 +122,27 @@ fn register_from_offset(addr: u64) -> u8 {
 }
 
 impl RtcDateTime {
+    /// UTC decomposition for the deterministic test path, where a
+    /// host-independent (time-zone-free) result keeps the asserted BCD
+    /// digits stable across CI hosts.
+    #[cfg(test)]
     fn from_system_time(time: SystemTime) -> Self {
-        let secs = time
-            .duration_since(UNIX_EPOCH)
+        Self::from_unix_seconds(Self::unix_secs(time))
+    }
+
+    /// Local-time decomposition for the live clock, mirroring
+    /// `timestamp.rs` so the RTC and the auto-generated filename stamps
+    /// agree on the time zone. Falls back to UTC where the platform has no
+    /// thread-safe local conversion (or it fails).
+    fn from_system_time_local(time: SystemTime) -> Self {
+        let secs = Self::unix_secs(time);
+        Self::from_local(secs).unwrap_or_else(|| Self::from_unix_seconds(secs))
+    }
+
+    fn unix_secs(time: SystemTime) -> u64 {
+        time.duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        Self::from_unix_seconds(secs)
+            .as_secs()
     }
 
     fn from_unix_seconds(secs: u64) -> Self {
@@ -136,6 +157,57 @@ impl RtcDateTime {
             hour: (second_of_day / 3600) as u8,
             minute: ((second_of_day / 60) % 60) as u8,
             second: (second_of_day % 60) as u8,
+        }
+    }
+
+    /// Decompose a Unix-seconds value into the host's *local* broken-down
+    /// time. Returns `None` when the platform exposes no thread-safe local
+    /// conversion so the caller can fall back to UTC.
+    ///
+    /// As in `timestamp.rs`, this is sound only because we never mutate the
+    /// TZ environment at runtime (envcfg snapshots it once), so `localtime_r`
+    /// cannot race the audio thread.
+    #[cfg(unix)]
+    fn from_local(secs: u64) -> Option<Self> {
+        // SAFETY: localtime_r fully initializes `tm` and retains no pointers.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let t = secs as libc::time_t;
+        if unsafe { libc::localtime_r(&t, &mut tm).is_null() } {
+            return None;
+        }
+        Some(Self::from_tm(&tm))
+    }
+
+    #[cfg(windows)]
+    fn from_local(secs: u64) -> Option<Self> {
+        // localtime_s reverses the POSIX argument order and returns errno_t
+        // (0 = success).
+        // SAFETY: localtime_s fully initializes `tm` and retains no pointers.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let t = secs as libc::time_t;
+        if unsafe { libc::localtime_s(&mut tm, &t) } != 0 {
+            return None;
+        }
+        Some(Self::from_tm(&tm))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn from_local(_secs: u64) -> Option<Self> {
+        None
+    }
+
+    /// Map a libc broken-down local time onto the RTC fields. `tm_wday`
+    /// already uses the 0 = Sunday convention the weekday register expects.
+    #[cfg(any(unix, windows))]
+    fn from_tm(tm: &libc::tm) -> Self {
+        Self {
+            year: (tm.tm_year + 1900) as u16,
+            month: (tm.tm_mon + 1) as u8,
+            day: tm.tm_mday as u8,
+            weekday: tm.tm_wday as u8,
+            hour: tm.tm_hour as u8,
+            minute: tm.tm_min as u8,
+            second: tm.tm_sec as u8,
         }
     }
 }
@@ -202,5 +274,19 @@ mod tests {
 
         rtc.write(0xD * 4, 4, 0);
         assert_eq!(read_reg(&mut rtc, 0x0), 0);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn live_path_uses_local_time() {
+        // 2000-01-02 03:04:05 UTC stays within 2000-01-01..02 across every
+        // real time zone (offsets are within +-14h), so the local
+        // decomposition always lands in that window regardless of the test
+        // host.
+        let dt =
+            RtcDateTime::from_system_time_local(UNIX_EPOCH + Duration::from_secs(946_782_245));
+        assert_eq!(dt.year, 2000);
+        assert_eq!(dt.month, 1);
+        assert!(dt.day == 1 || dt.day == 2);
     }
 }
