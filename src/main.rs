@@ -949,7 +949,14 @@ fn main() -> Result<()> {
     }
 
     let mut cfg = cfg.with_rom_override(cli.rom_path.clone());
-    if cli.load_state.is_none() {
+    if cli.load_state.is_some() {
+        // A save state restores the full ROM image, so a Kickstart file is not
+        // required to load one. Still resolve the bundled-AROS sentinel when
+        // AROS is installed (best effort, so the banner and any post-load reuse
+        // see real paths); build_machine substitutes a placeholder for whatever
+        // ROM is still unavailable.
+        let _ = resolve_bundled_rom(&mut cfg);
+    } else {
         resolve_bundled_rom(&mut cfg)?;
     }
     let disk_insert_after = resolve_disk_insert_after(&mut cfg, cli.disk_insert_after)?;
@@ -1008,7 +1015,7 @@ fn main() -> Result<()> {
         || cli.gdb.is_some();
     let paced = !headless_capture;
     info!("emulation timing: deterministic core, paced={paced}");
-    let mut emu = build_machine(&cfg, audio, paced)?;
+    let mut emu = build_machine(&cfg, audio, paced, cli.load_state.is_some())?;
     if let Some(path) = &cli.load_state {
         let outcome = emu.load_state(path)?;
         info!(
@@ -1089,6 +1096,7 @@ pub(crate) fn build_machine(
     cfg: &Config,
     audio: Box<dyn AudioSink>,
     paced: bool,
+    rom_optional: bool,
 ) -> Result<Emulator> {
     let mut zorro = cfg.build_zorro_chain()?;
     // Functional Zorro-chain boards. Each board's autoconfig identity goes on
@@ -1147,18 +1155,38 @@ pub(crate) fn build_machine(
     // the Kickstart disk in DF0.
     let mut mem = if cfg.machine == Some(crate::config::MachineModel::A1000) {
         Memory::load_a1000(&cfg.rom_path, cfg.chip_ram_bytes, cfg.slow_ram_bytes, zorro)?
+    } else if rom_optional && !cfg.rom_path.is_file() {
+        // A save state restores the full ROM image, so a missing or sentinel
+        // ROM path (the bundled-AROS placeholder, or a Kickstart the user no
+        // longer keeps) is fine: build with a placeholder the state replaces.
+        info!(
+            "--load-state: ROM {} is unavailable; building with a placeholder \
+             ROM that the save state will replace",
+            cfg.rom_path.display()
+        );
+        Memory::placeholder(cfg.chip_ram_bytes, cfg.slow_ram_bytes, zorro)
     } else {
         Memory::load(&cfg.rom_path, cfg.chip_ram_bytes, cfg.slow_ram_bytes, zorro)?
     };
     if let Some(path) = &cfg.extended_rom_path {
-        let image = std::fs::read(path)
-            .map_err(|e| anyhow!("reading extended ROM {}: {e}", path.display()))?;
-        mem.attach_extended_rom(image)?;
-        info!(
-            "extended ROM: {} at {:#08X}",
-            path.display(),
-            mem.extended_rom_base
-        );
+        if rom_optional && !path.is_file() {
+            // As with the main ROM above, the save state carries the extended
+            // ROM image, so a missing file here is not fatal.
+            info!(
+                "--load-state: extended ROM {} is unavailable; the save state \
+                 will supply it",
+                path.display()
+            );
+        } else {
+            let image = std::fs::read(path)
+                .map_err(|e| anyhow!("reading extended ROM {}: {e}", path.display()))?;
+            mem.attach_extended_rom(image)?;
+            info!(
+                "extended ROM: {} at {:#08X}",
+                path.display(),
+                mem.extended_rom_base
+            );
+        }
     }
     let mut cd_image = match &cfg.cd_image_path {
         Some(path) => {

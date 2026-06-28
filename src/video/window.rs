@@ -5490,7 +5490,9 @@ impl App {
                 return;
             }
         };
-        let emu = match crate::build_machine(&cfg, audio, true) {
+        // The launcher boots a fresh machine, never a save state, so a real
+        // ROM is required here.
+        let emu = match crate::build_machine(&cfg, audio, true, false) {
             Ok(emu) => emu,
             Err(e) => {
                 self.set_launcher_status(StatusMessage::err(short_status_error(&e)));

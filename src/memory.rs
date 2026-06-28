@@ -140,6 +140,21 @@ impl Memory {
         ))
     }
 
+    /// Build a machine with a minimal placeholder ROM for the `--load-state`
+    /// path. A save state carries the full ROM image and replaces it on load,
+    /// so the machine only has to be constructible first; this avoids requiring
+    /// the original Kickstart (or the bundled AROS) just to restore a state.
+    /// The stub vectors the reset PC into a `bra.s` self-loop, so a machine that
+    /// is somehow run before the state is applied stays inert rather than
+    /// executing unmapped memory.
+    pub fn placeholder(chip_ram_bytes: usize, slow_ram_bytes: usize, zorro: ZorroChain) -> Self {
+        let mut rom = vec![0u8; ROM_SIZE];
+        rom[0..4].copy_from_slice(&0x0000_4000u32.to_be_bytes()); // initial SP
+        rom[4..8].copy_from_slice(&0x00F8_0010u32.to_be_bytes()); // initial PC
+        rom[0x10..0x12].copy_from_slice(&0x60FEu16.to_be_bytes()); // bra.s self
+        Self::with_rom(rom, chip_ram_bytes, slow_ram_bytes, zorro, Vec::new())
+    }
+
     fn with_rom(
         rom: Vec<u8>,
         chip_ram_bytes: usize,
@@ -230,6 +245,20 @@ mod tests {
         assert!(normalize_boot_rom(vec![0u8; 1024]).is_err());
         assert!(normalize_boot_rom(vec![0u8; ROM_SIZE + 1]).is_err());
         assert!(normalize_boot_rom(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn placeholder_rom_is_full_size_and_self_loops() {
+        // The --load-state placeholder must be a valid full-size ROM with sane
+        // reset vectors and an inert self-loop, so a machine built from it is
+        // constructible and harmless until the save state replaces the image.
+        let mem = Memory::placeholder(512 * 1024, 256 * 1024, ZorroChain::default());
+        assert_eq!(mem.rom.len(), ROM_SIZE);
+        assert_eq!(mem.chip_ram.len(), 512 * 1024);
+        assert_eq!(mem.slow_ram.len(), 256 * 1024);
+        assert_eq!(&mem.rom[0..4], &0x0000_4000u32.to_be_bytes()); // initial SP
+        assert_eq!(&mem.rom[4..8], &0x00F8_0010u32.to_be_bytes()); // initial PC
+        assert_eq!(&mem.rom[0x10..0x12], &0x60FEu16.to_be_bytes()); // bra.s self
     }
 
     #[test]
