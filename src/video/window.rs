@@ -183,12 +183,11 @@ fn keyboard_joystick_key_for(code: KeyCode) -> Option<KeyboardJoystickKey> {
     })
 }
 
-fn joystick_mode_uses_keyboard(mode: JoystickInputMode, gamepad_active: bool) -> bool {
-    match mode {
-        JoystickInputMode::Keyboard => true,
-        JoystickInputMode::Auto => !gamepad_active,
-        JoystickInputMode::Gamepad => false,
-    }
+/// Whether the active mode routes the keyboard joystick mapping to port 2. With
+/// only the two explicit modes this is a direct read of the mode -- `Keyboard`
+/// captures the arrow/fire keys, `Gamepad` lets every key reach the Amiga.
+fn joystick_mode_uses_keyboard(mode: JoystickInputMode) -> bool {
+    matches!(mode, JoystickInputMode::Keyboard)
 }
 
 /// The port-2 controls currently held by `--joy-after` scripting.
@@ -275,6 +274,13 @@ const VOLUME_SLIDER_H: usize = 8;
 const VOLUME_KNOB_W: usize = 8;
 const VOLUME_KNOB_H: usize = 16;
 const VOLUME_GLYPH_X: usize = VOLUME_SLIDER_X - 16;
+// Joystick input-source toggle: a compact icon button just left of the volume
+// glyph, in the otherwise-free slot before the right-hand control cluster. The
+// widest media layout (four floppies plus a CD) ends at x=372, so a 22px button
+// here clears both the media controls and the speaker glyph; this is verified by
+// `joystick_toggle_clears_worst_case_media`.
+const JOY_TOGGLE_W: usize = 22;
+const JOY_TOGGLE_X: usize = VOLUME_GLYPH_X - 2 - JOY_TOGGLE_W;
 const STANDARD_PAL_VISIBLE_WIDTH: usize = 320 * 2;
 const STANDARD_PAL_VISIBLE_LINES: usize = 256;
 const STANDARD_PAL_VISIBLE_START_VPOS: u32 = 0x2C;
@@ -519,10 +525,6 @@ pub struct App {
     /// vsync-gated, so this is what decouples warp speed from the host monitor
     /// refresh rate. Adjustable from the Emulator menu and the keyboard.
     warp_speed: WarpSpeed,
-    /// Whether the last normal input poll resolved a calibrated physical
-    /// gamepad. Auto mode uses this to decide whether mapped keyboard keys
-    /// should be consumed as joystick controls.
-    last_gamepad_active: bool,
     /// Mapped host keys currently held for keyboard joystick emulation.
     keyboard_joy_held: KeyboardJoystickHeld,
     /// Pop-up menu and main-window overlay state. Debugger and frame
@@ -789,7 +791,6 @@ impl App {
             gamepad: crate::gamepad::GamepadReader::new(),
             joystick_input_mode,
             warp_speed,
-            last_gamepad_active: false,
             keyboard_joy_held: KeyboardJoystickHeld::default(),
             ui: UiState::default(),
             about_machine_lines,
@@ -803,15 +804,14 @@ impl App {
     }
 
     /// Poll the active host joystick source and drive the emulated port-2
-    /// joystick. Called once per scheduler quantum. In Auto mode, a
-    /// calibrated gamepad wins; otherwise the keyboard mapping supplies a
-    /// joystick so port 2 remains usable without a physical controller.
+    /// joystick. Called once per scheduler quantum. In Gamepad mode a calibrated
+    /// physical pad drives the port; in Keyboard mode the keyboard mapping does,
+    /// so port 2 stays usable without a physical controller.
     fn pump_joystick_input(&mut self) {
         let gamepad_state = match self.joystick_input_mode {
             JoystickInputMode::Keyboard => None,
-            JoystickInputMode::Auto | JoystickInputMode::Gamepad => self.gamepad.poll(),
+            JoystickInputMode::Gamepad => self.gamepad.poll(),
         };
-        self.last_gamepad_active = gamepad_state.is_some();
 
         match gamepad_state {
             Some(state) => self.apply_joystick_state(state),
@@ -830,7 +830,7 @@ impl App {
     }
 
     fn keyboard_joystick_enabled(&self) -> bool {
-        joystick_mode_uses_keyboard(self.joystick_input_mode, self.last_gamepad_active)
+        joystick_mode_uses_keyboard(self.joystick_input_mode)
     }
 
     fn apply_joystick_state(&mut self, state: crate::gamepad::JoystickState) {
@@ -865,9 +865,6 @@ impl App {
             return;
         }
         self.joystick_input_mode = mode;
-        if mode == JoystickInputMode::Keyboard {
-            self.last_gamepad_active = false;
-        }
         if !matches!(self.ui.panel, Some(Panel::Calibration(_))) {
             self.pump_joystick_input();
         }
@@ -1432,6 +1429,7 @@ impl ApplicationHandler for App {
                     powered_on: self.powered_on,
                     paused: self.paused,
                     media,
+                    joystick_input_mode: self.joystick_input_mode,
                     hover,
                 };
                 let osd = self.active_osd_text();
@@ -2476,6 +2474,13 @@ fn draw_status_bar(frame: &mut [u8], view: &StatusBarView, texture_scale: usize)
             texture_scale,
         );
     }
+    draw_joystick_button(
+        frame,
+        scale_rect(joystick_toggle_rect(), texture_scale),
+        view.joystick_input_mode,
+        hover == Some(BarControl::Joystick),
+        texture_scale,
+    );
     draw_volume_control(frame, status.output_volume_percent, texture_scale);
     draw_menu_button(
         frame,
@@ -2536,6 +2541,8 @@ struct StatusBarView {
     powered_on: bool,
     paused: bool,
     media: MediaBar,
+    /// Active host joystick source, shown by the status-bar toggle icon.
+    joystick_input_mode: JoystickInputMode,
     hover: Option<BarControl>,
 }
 
@@ -2547,6 +2554,7 @@ enum BarControl {
     Reboot,
     Screenshot,
     Menu,
+    Joystick,
     Volume,
     DriveLoad(usize),
     DriveSwap(usize),
@@ -2667,6 +2675,9 @@ fn control_at(pos: (i32, i32), layout: &BarLayout) -> Option<BarControl> {
     }
     if reboot_button_rect().contains(pos) {
         return Some(BarControl::Reboot);
+    }
+    if joystick_toggle_rect().contains(pos) {
+        return Some(BarControl::Joystick);
     }
     if volume_control_hit_rect().contains(pos) {
         return Some(BarControl::Volume);
@@ -2799,6 +2810,15 @@ fn volume_control_hit_rect() -> Rect {
         x: VOLUME_SLIDER_X - 8,
         y: PRESENT_HEIGHT + STATUS_CONTROL_Y,
         w: VOLUME_SLIDER_W + 16,
+        h: STATUS_CONTROL_H,
+    }
+}
+
+fn joystick_toggle_rect() -> Rect {
+    Rect {
+        x: JOY_TOGGLE_X,
+        y: PRESENT_HEIGHT + STATUS_CONTROL_Y,
+        w: JOY_TOGGLE_W,
         h: STATUS_CONTROL_H,
     }
 }
@@ -3634,6 +3654,81 @@ fn draw_pause_button(
     } else {
         draw_pause_glyph(frame, cx, cy, BUTTON_GLYPH, texture_scale);
     }
+}
+
+/// Joystick input-source toggle: shows the device currently driving the
+/// emulated port-2 joystick (a gamepad in `Gamepad` mode, a keyboard in
+/// `Keyboard` mode). Clicking it flips between the two, so the active source is
+/// always visible rather than hidden behind a key combination.
+fn draw_joystick_button(
+    frame: &mut [u8],
+    rect: Rect,
+    mode: JoystickInputMode,
+    hover: bool,
+    texture_scale: usize,
+) {
+    draw_button_base(frame, rect, hover, texture_scale);
+    match mode {
+        JoystickInputMode::Gamepad => draw_gamepad_glyph(frame, rect, texture_scale),
+        JoystickInputMode::Keyboard => draw_keyboard_glyph(frame, rect, texture_scale),
+    }
+}
+
+/// A small gamepad: a rounded green body with a recessed d-pad on the left and
+/// two action buttons on the right.
+fn draw_gamepad_glyph(frame: &mut [u8], rect: Rect, texture_scale: usize) {
+    let s = texture_scale;
+    let mut cell = |x: usize, y: usize, w: usize, h: usize, color: u32| {
+        fill_rect(
+            frame,
+            Rect {
+                x: rect.x + x * s,
+                y: rect.y + y * s,
+                w: w * s,
+                h: h * s,
+            },
+            color,
+            texture_scale,
+        );
+    };
+    // Body and the two grip bumps.
+    cell(4, 8, 14, 8, BUTTON_GLYPH);
+    cell(3, 13, 3, 3, BUTTON_GLYPH);
+    cell(16, 13, 3, 3, BUTTON_GLYPH);
+    // D-pad cross, cut into the body on the left.
+    cell(7, 9, 2, 5, BUTTON_EDGE_DARK);
+    cell(5, 11, 6, 2, BUTTON_EDGE_DARK);
+    // Two action buttons on the right.
+    cell(13, 10, 2, 2, BUTTON_EDGE_DARK);
+    cell(15, 12, 2, 2, BUTTON_EDGE_DARK);
+}
+
+/// A small keyboard: a recessed dark case holding two rows of green keys and a
+/// space bar.
+fn draw_keyboard_glyph(frame: &mut [u8], rect: Rect, texture_scale: usize) {
+    let s = texture_scale;
+    let mut cell = |x: usize, y: usize, w: usize, h: usize, color: u32| {
+        fill_rect(
+            frame,
+            Rect {
+                x: rect.x + x * s,
+                y: rect.y + y * s,
+                w: w * s,
+                h: h * s,
+            },
+            color,
+            texture_scale,
+        );
+    };
+    // Case.
+    cell(3, 6, 16, 11, BUTTON_EDGE_DARK);
+    // Two rows of keys.
+    for &kx in &[5, 8, 11, 14] {
+        cell(kx, 8, 2, 2, BUTTON_GLYPH);
+        cell(kx, 11, 2, 2, BUTTON_GLYPH);
+    }
+    // Space bar.
+    cell(7, 14, 8, 2, BUTTON_GLYPH);
 }
 
 /// The pause symbol: two short vertical bars flanking the centre.
@@ -4586,6 +4681,10 @@ impl App {
             BarControl::DriveEject(idx) => self.eject_drive_disk(idx),
             BarControl::CdLoad => self.load_cd_from_dialog(),
             BarControl::CdEject => self.eject_cd(),
+            BarControl::Joystick => {
+                self.cycle_joystick_input_mode();
+                self.request_redraw();
+            }
             BarControl::Volume => {}
         }
     }
@@ -5425,7 +5524,6 @@ impl App {
         // Reset the host joystick source to the new machine's configured
         // start-up mode (a previous live Cmd+J toggle does not carry over).
         self.joystick_input_mode = cfg.joystick_input_mode;
-        self.last_gamepad_active = false;
         self.keyboard_joy_held = KeyboardJoystickHeld::default();
         self.about_machine_lines = crate::about_machine_lines(cfg);
         self.deinterlacer = Deinterlacer::with_phosphor(crate::resolve_phosphor(cfg.phosphor));
@@ -7579,18 +7677,18 @@ mod tests {
         control_at, copperline_icon_image, copperline_logo_image, copy_present_frame,
         draw_status_bar, fdd_track_counter_rect, fdd_track_digit_rect,
         host_shortcut_modifier_pressed, host_to_amiga_rawkey, joystick_mode_uses_keyboard,
-        keyboard_joystick_key_for, led_row_rect, mask_present_frame_to_tv, paint_test_screen,
-        parse_amiga_key, pause_button_rect, power_button_rect, present_row_sample,
-        presentation_source_y_offset, reboot_button_rect, rgba, shot_button_rect,
-        should_render_emulated_frame, standard_window_top_row, status_with_latched_fdd_track,
-        take_integral_mouse_delta, texture_height, texture_width, tv_source_h_bounds,
-        tv_standard_h_shift, volume_percent_from_pos, volume_slider_track_rect, BarControl,
-        DriveBar, JoystickInputMode, KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar,
-        StatusBarView, ToolPanelKind, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF,
-        CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF,
-        HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
-        STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
-        TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
+        joystick_toggle_rect, keyboard_joystick_key_for, led_row_rect, mask_present_frame_to_tv,
+        paint_test_screen, parse_amiga_key, pause_button_rect, power_button_rect,
+        present_row_sample, presentation_source_y_offset, reboot_button_rect, rgba,
+        shot_button_rect, should_render_emulated_frame, standard_window_top_row,
+        status_with_latched_fdd_track, take_integral_mouse_delta, texture_height, texture_width,
+        tv_source_h_bounds, tv_standard_h_shift, volume_percent_from_pos, volume_slider_track_rect,
+        BarControl, DriveBar, JoystickInputMode, KeyboardJoystickHeld, KeyboardJoystickKey,
+        MediaBar, StatusBarView, ToolPanelKind, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY,
+        CD_LED_OFF, CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON,
+        HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON,
+        PRESENT_HEIGHT, STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG,
+        TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::FrontPanelStatus;
@@ -7630,6 +7728,7 @@ mod tests {
             powered_on,
             paused,
             media: single_drive_media(),
+            joystick_input_mode: JoystickInputMode::Gamepad,
             hover: None,
         }
     }
@@ -7716,24 +7815,69 @@ mod tests {
     }
 
     #[test]
-    fn joystick_input_mode_policy_uses_keyboard_as_auto_fallback() {
-        assert_eq!(JoystickInputMode::Auto.next(), JoystickInputMode::Keyboard);
+    fn joystick_input_mode_toggles_between_two_explicit_modes() {
+        // The toggle flips directly between the two modes; there is no hidden
+        // auto-detect state, so the keyboard mapping is engaged exactly when
+        // (and only when) the mode is Keyboard.
+        assert_eq!(
+            JoystickInputMode::Gamepad.next(),
+            JoystickInputMode::Keyboard
+        );
         assert_eq!(
             JoystickInputMode::Keyboard.next(),
             JoystickInputMode::Gamepad
         );
-        assert_eq!(JoystickInputMode::Gamepad.next(), JoystickInputMode::Auto);
 
-        assert!(joystick_mode_uses_keyboard(JoystickInputMode::Auto, false));
-        assert!(!joystick_mode_uses_keyboard(JoystickInputMode::Auto, true));
-        assert!(joystick_mode_uses_keyboard(
-            JoystickInputMode::Keyboard,
-            true
-        ));
-        assert!(!joystick_mode_uses_keyboard(
-            JoystickInputMode::Gamepad,
-            false
-        ));
+        assert!(joystick_mode_uses_keyboard(JoystickInputMode::Keyboard));
+        assert!(!joystick_mode_uses_keyboard(JoystickInputMode::Gamepad));
+    }
+
+    #[test]
+    fn joystick_toggle_clears_worst_case_media() {
+        // The toggle sits at a fixed x just left of the volume glyph. The
+        // widest media layout (four floppies plus a CD) must not reach it, and
+        // it must stay left of the volume control's hit area.
+        let toggle = joystick_toggle_rect();
+        let layout = bar_layout(&media(4, Some(true)));
+        let media_right = layout
+            .cd_eject
+            .into_iter()
+            .chain(layout.drive_eject.into_iter().flatten())
+            .map(|r| r.x + r.w)
+            .max()
+            .unwrap();
+        assert!(
+            media_right <= toggle.x,
+            "media right edge {media_right} overlaps joystick toggle at {}",
+            toggle.x
+        );
+        assert!(toggle.x + toggle.w <= VOLUME_GLYPH_X);
+    }
+
+    #[test]
+    fn joystick_toggle_is_hit_tested_and_draws_each_mode() {
+        let layout = bar_layout(&single_drive_media());
+        let toggle = joystick_toggle_rect();
+        let center = (
+            (toggle.x + toggle.w / 2) as i32,
+            (toggle.y + toggle.h / 2) as i32,
+        );
+        assert_eq!(control_at(center, &layout), Some(BarControl::Joystick));
+
+        // Each mode lights the green glyph somewhere in the button (gamepad
+        // body vs. keyboard keys), so the two states are visually distinct.
+        let scale = 1;
+        for mode in [JoystickInputMode::Gamepad, JoystickInputMode::Keyboard] {
+            let mut frame = vec![0u8; texture_width(scale) * texture_height(scale) * 4];
+            let mut v = view(FrontPanelStatus::default(), true, false);
+            v.joystick_input_mode = mode;
+            draw_status_bar(&mut frame, &v, scale);
+            let lit = (toggle.y..toggle.y + toggle.h).any(|y| {
+                (toggle.x..toggle.x + toggle.w)
+                    .any(|x| pixel(&frame, x, y, scale) == BUTTON_GLYPH.to_le_bytes())
+            });
+            assert!(lit, "joystick toggle drew no glyph for {mode:?}");
+        }
     }
 
     #[test]
@@ -8240,6 +8384,7 @@ mod tests {
             powered_on: true,
             paused: false,
             media: bar,
+            joystick_input_mode: JoystickInputMode::Gamepad,
             hover: None,
         };
         draw_status_bar(&mut frame, &v, scale);
@@ -8795,7 +8940,7 @@ mod tests {
             crate::config::Overscan::Full,
             0.0,
             crate::config::WarpSpeed::Max,
-            crate::config::JoystickInputMode::Auto,
+            crate::config::JoystickInputMode::Gamepad,
             vec!["Machine: test".to_string()],
             crate::config::RawConfig::default(),
         )

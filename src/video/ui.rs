@@ -3111,11 +3111,7 @@ mod tests {
         // must end before the popup's right edge or the trailing "..." clips.
         let menu = menu_rect();
         let limit = menu.x + menu.w;
-        let modes = [
-            JoystickInputMode::Auto,
-            JoystickInputMode::Keyboard,
-            JoystickInputMode::Gamepad,
-        ];
+        let modes = [JoystickInputMode::Gamepad, JoystickInputMode::Keyboard];
         let speeds = [WarpSpeed::X2, WarpSpeed::X8, WarpSpeed::X16, WarpSpeed::Max];
         for item in MENU_ITEMS {
             for warp in [false, true] {
@@ -3482,7 +3478,7 @@ mod tests {
             WarpSpeed::Max,
             false,
             false,
-            JoystickInputMode::Auto,
+            JoystickInputMode::Gamepad,
         );
         let menu = menu_rect();
         let probe = ((menu.y + MENU_PAD + 2) * w + menu.x + 4) * 4;
@@ -3514,7 +3510,7 @@ mod tests {
             WarpSpeed::Max,
             false,
             false,
-            JoystickInputMode::Auto,
+            JoystickInputMode::Gamepad,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "about");
@@ -3534,7 +3530,7 @@ mod tests {
             WarpSpeed::Max,
             false,
             false,
-            JoystickInputMode::Auto,
+            JoystickInputMode::Gamepad,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "shortcuts");
@@ -3571,7 +3567,7 @@ mod tests {
             WarpSpeed::Max,
             false,
             false,
-            JoystickInputMode::Auto,
+            JoystickInputMode::Gamepad,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "calibration");
@@ -3615,7 +3611,7 @@ mod tests {
             WarpSpeed::Max,
             false,
             false,
-            JoystickInputMode::Auto,
+            JoystickInputMode::Gamepad,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "debugger");
@@ -3656,7 +3652,7 @@ mod tests {
             WarpSpeed::Max,
             false,
             false,
-            JoystickInputMode::Auto,
+            JoystickInputMode::Gamepad,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "debugger-break");
@@ -3683,7 +3679,7 @@ mod tests {
             WarpSpeed::Max,
             false,
             false,
-            JoystickInputMode::Auto,
+            JoystickInputMode::Gamepad,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "launcher");
@@ -3750,7 +3746,7 @@ mod tests {
             WarpSpeed::Max,
             false,
             false,
-            JoystickInputMode::Auto,
+            JoystickInputMode::Gamepad,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "launcher-zorro");
@@ -3784,7 +3780,7 @@ mod tests {
             WarpSpeed::Max,
             false,
             false,
-            JoystickInputMode::Auto,
+            JoystickInputMode::Gamepad,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "launcher-storage");

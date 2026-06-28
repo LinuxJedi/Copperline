@@ -19,7 +19,7 @@ The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
 | `Cmd+D` | `Alt+D` | Swap to the next disk in a drive's configured playlist |
 | `Cmd+G` | `Alt+G` | Capture / release the host mouse (clicking the display also captures) |
 | `Cmd+B` | `Alt+B` | Open the [debugger window](../debugger/window) |
-| `Cmd+J` | `Alt+J` | Cycle joystick input mode: auto, keyboard, gamepad |
+| `Cmd+J` | `Alt+J` | Toggle joystick input mode: gamepad / keyboard (also the status-bar icon) |
 | `Cmd+W` | `Alt+W` | Toggle Warp Speed (turbo) on / off |
 | `Cmd+Shift+W` | `Alt+Shift+W` | Cycle the Warp Speed limit: 2x, 4x, 8x, 16x, Max |
 | `Esc` | `Esc` | Close an open menu, tool window, or overlay panel; otherwise passed through to the Amiga |
@@ -58,6 +58,10 @@ The status bar (44 pixels below the display) holds, left to right:
 - **Camera button**: saves a screenshot (same as `Cmd+S` on macOS or
   `Alt+S` on Linux/Windows).
 - **Hamburger menu button**: opens the pop-up menu (below).
+- **Joystick toggle** (just left of the volume control): a gamepad or
+  keyboard icon showing which source drives the port-2 joystick. Click it to
+  flip between gamepad-only and keyboard joystick emulation; see
+  [](#mouse-and-joystick).
 - **Volume slider**: drag, or scroll the mouse wheel over it for 5% steps.
 - **Pause / power / reboot buttons.** Pause freezes emulation while staying
   powered; power cold-boots (clears RAM) or powers off back to the test
@@ -90,8 +94,8 @@ tool window or overlay.
   pauses the machine and opens the five-tab debugger in a tool window; see
   [](../debugger/window).
 - **Calibrate Gamepad...**: the guided calibration flow, described below.
-- **Joystick Input** (also `Cmd+J` / `Alt+J`): cycles between automatic
-  selection, keyboard joystick emulation, and gamepad-only mode.
+- **Joystick Input** (also `Cmd+J` / `Alt+J`, or the status-bar icon):
+  toggles between gamepad-only and keyboard joystick emulation.
 - **Warp Speed** (also `Cmd+W` / `Alt+W`): runs the emulator unpaced for
   fast-forward. Toggling back re-anchors real-time pacing cleanly.
 - **Warp Limit** (also `Cmd+Shift+W` / `Alt+Shift+W`): cycles how fast warp
@@ -286,20 +290,21 @@ POT1Y/POTGOR. On a CD32 machine the pad speaks the CD32 serial button
 protocol instead, including the red/blue/green/yellow and transport
 buttons. Mouse and gamepad coexist because they use different ports.
 
-If no calibrated gamepad is connected, Copperline can emulate the port-2
-joystick from the host keyboard. The joystick input mode starts at **auto**
-(a calibrated USB gamepad is used when present, otherwise the keyboard
-mapping is active); set a different starting mode with `[input] joystick` in
-the config (or `--joystick MODE`, or the launcher's *A/V & Emu* tab) when you
-want the keyboard left to the Amiga for interactive setup. Use the menu's
-**Joystick Input** item, or `Cmd+J` on macOS / `Alt+J` on Linux and Windows,
-to cycle through:
+Copperline can also emulate the port-2 joystick from the host keyboard.
+There are two explicit input modes, and the active one is always shown by the
+gamepad / keyboard icon in the status bar (next to the volume control), so a
+"my keys aren't working" surprise can be spotted and fixed at a glance:
 
-- **auto**: gamepad when available, keyboard fallback otherwise.
-- **keyboard**: always use the keyboard mapping and ignore live gamepad
-  polling.
-- **gamepad**: use only a calibrated gamepad; keyboard keys pass through
-  to the Amiga keyboard.
+- **gamepad** (the default): use only a calibrated gamepad; every keyboard
+  key passes through to the Amiga. With no pad connected there is no port-2
+  input. This is the no-surprise mode for interactive AmigaOS setup.
+- **keyboard**: use the keyboard-joystick mapping so port 2 works without a
+  controller.
+
+Click the status-bar icon to flip between them; the menu's **Joystick Input**
+item and `Cmd+J` on macOS / `Alt+J` on Linux and Windows do the same. Set the
+starting mode with `[input] joystick` in the config (or `--joystick MODE`, or
+the launcher's *A/V & Emu* tab).
 
 Keyboard joystick mode uses the FS-UAE-compatible mapping: cursor keys for
 directions, and Right Ctrl or Right Alt for fire. For CD32 pad buttons,

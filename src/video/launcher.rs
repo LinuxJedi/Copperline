@@ -448,12 +448,9 @@ const WARPS: [WarpSpeed; 5] = [
     WarpSpeed::X16,
     WarpSpeed::Max,
 ];
-// Cycle order matches the runtime Cmd+J toggle (auto -> keyboard -> gamepad).
-const JOYSTICK_MODES: [JoystickInputMode; 3] = [
-    JoystickInputMode::Auto,
-    JoystickInputMode::Keyboard,
-    JoystickInputMode::Gamepad,
-];
+// The stepper flips the two explicit modes, matching the runtime toggle.
+const JOYSTICK_MODES: [JoystickInputMode; 2] =
+    [JoystickInputMode::Gamepad, JoystickInputMode::Keyboard];
 
 /// A fully-typed, editable mirror of a configurable machine. See the module
 /// docs for how it round-trips through [`RawConfig`].
@@ -1061,7 +1058,6 @@ impl MachineSetup {
             },
             F::Warp => self.warp.label().to_string(),
             F::Joystick => match self.joystick_input_mode {
-                JoystickInputMode::Auto => "Auto".to_string(),
                 JoystickInputMode::Keyboard => "Keyboard".to_string(),
                 JoystickInputMode::Gamepad => "Gamepad".to_string(),
             },
@@ -1752,23 +1748,23 @@ mod tests {
     #[test]
     fn joystick_input_mode_round_trips_through_raw() {
         let mut s = MachineSetup::default();
-        // Default is Auto, which emits no [input] section.
-        assert_eq!(s.joystick_input_mode, JoystickInputMode::Auto);
+        // Default is Gamepad, which emits no [input] section.
+        assert_eq!(s.joystick_input_mode, JoystickInputMode::Gamepad);
         assert!(s.to_raw().input.joystick.is_none());
-        // Cycle order matches the runtime toggle: auto -> keyboard -> gamepad.
+        // The stepper flips between the two explicit modes.
         s.cycle(LauncherField::Joystick, true);
         assert_eq!(s.joystick_input_mode, JoystickInputMode::Keyboard);
+        let raw = s.to_raw();
+        assert_eq!(raw.input.joystick.as_deref(), Some("keyboard"));
+        let back = MachineSetup::from_raw(&raw).unwrap();
+        assert_eq!(back.joystick_input_mode, JoystickInputMode::Keyboard);
         s.cycle(LauncherField::Joystick, true);
         assert_eq!(s.joystick_input_mode, JoystickInputMode::Gamepad);
-        let raw = s.to_raw();
-        assert_eq!(raw.input.joystick.as_deref(), Some("gamepad"));
-        let back = MachineSetup::from_raw(&raw).unwrap();
-        assert_eq!(back.joystick_input_mode, JoystickInputMode::Gamepad);
-        // Switching machine profile resets it to the Auto default.
+        // Switching machine profile resets it to the Gamepad default.
         let mut s = MachineSetup::default();
         s.cycle(LauncherField::Joystick, true);
         s.select_model(Some(MachineModel::A1200));
-        assert_eq!(s.joystick_input_mode, JoystickInputMode::Auto);
+        assert_eq!(s.joystick_input_mode, JoystickInputMode::Gamepad);
     }
 
     #[test]

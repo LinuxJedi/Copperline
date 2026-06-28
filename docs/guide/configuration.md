@@ -44,7 +44,7 @@ range checks as the equivalent TOML fields:
 | `--fast SIZE` | `[memory] fast` | `0`, `1M`, `4M`, `8M`, ... |
 | `--slow SIZE` | `[memory] slow` | `0`, up to `512K` |
 | `--floppy-drives COUNT` | `[floppy] drives` | `1` to `4` wired drives (`DF0:` plus external drives) |
-| `--joystick MODE` | `[input] joystick` | `auto`, `keyboard`, `gamepad` |
+| `--joystick MODE` | `[input] joystick` | `gamepad` (default), `keyboard` |
 
 For example, to boot a stock A1200 profile but with 8 MB of fast RAM and a
 faster CPU, with no config file at all:
@@ -320,25 +320,26 @@ hiss during disk DMA.
 
 ```toml
 [input]
-joystick = "auto"   # "auto" (default), "keyboard", or "gamepad"
+joystick = "gamepad"   # "gamepad" (default) or "keyboard"
 ```
 
-Selects the initial host source for the emulated port-2 joystick / CD32 pad:
+Selects the initial host source for the emulated port-2 joystick / CD32 pad.
+There are two explicit modes, so the active source is always visible rather
+than depending on whether a pad happens to be connected:
 
-- `auto` -- a calibrated USB gamepad drives port 2 when one is present;
-  otherwise the keyboard-joystick mapping (cursor keys plus the fire keys)
-  takes over so port 2 stays usable without a controller.
-- `gamepad` -- only a physical pad drives port 2. The keyboard is left to
-  the Amiga, so it passes straight through to a Shell, an editor, or
-  Workbench. With no pad connected there is simply no port-2 input. Handy
-  when running an AmigaOS environment for hands-on, keyboard-driven setup.
-- `keyboard` -- always use the keyboard-joystick mapping, even when a pad is
-  connected.
+- `gamepad` (the default) -- only a physical pad drives port 2. The keyboard
+  is left to the Amiga, so it passes straight through to a Shell, an editor,
+  or Workbench, and no keys are unexpectedly captured as joystick input. With
+  no pad connected there is simply no port-2 input.
+- `keyboard` -- use the keyboard-joystick mapping (cursor keys plus the fire
+  keys), so port 2 stays usable without a controller.
 
-This only sets the starting mode. `Cmd+J` / `Alt+J` (and the menu's
-**Joystick Input** item, or the launcher's *A/V & Emu* tab) still cycle it
-live without changing the config. `--joystick MODE` overrides this for a
-single run.
+This only sets the starting mode. The status-bar toggle (the gamepad /
+keyboard icon next to the volume control), `Cmd+J` / `Alt+J`, the menu's
+**Joystick Input** item, and the launcher's *A/V & Emu* tab all flip it live
+without changing the config. `--joystick MODE` overrides this for a single
+run. (`auto` is still accepted here as a backward-compatibility alias for
+`gamepad`; the old auto-detect mode has been removed.)
 
 ## `[floppy]` and `[floppy.df0]` .. `[floppy.df3]`
 

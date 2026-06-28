@@ -139,9 +139,10 @@ pub struct Config {
     /// real CRT.
     pub phosphor: f32,
     /// Initial host input source for the emulated port-2 joystick/CD32 pad
-    /// (`[input] joystick` / `--joystick`). Defaults to [`JoystickInputMode::Auto`];
-    /// the runtime `Cmd+J` / `Alt+J` toggle (and the menu's Joystick Input item)
-    /// changes it live without affecting this start-up value.
+    /// (`[input] joystick` / `--joystick`). Defaults to
+    /// [`JoystickInputMode::Gamepad`]; the runtime status-bar toggle, `Cmd+J` /
+    /// `Alt+J`, and the menu's Joystick Input item flip it live without
+    /// affecting this start-up value.
     pub joystick_input_mode: JoystickInputMode,
 }
 
@@ -163,29 +164,27 @@ pub enum Overscan {
     Tv,
 }
 
-/// Host input source for the emulated port-2 joystick/CD32 pad. `Auto` keeps a
-/// calibrated physical gamepad in charge when one is present and otherwise
-/// falls back to keyboard joystick emulation. `Gamepad` uses only a physical
-/// pad, so the keyboard passes straight through to the Amiga (and with no pad
-/// connected there is simply no port-2 input). `Keyboard` always uses the
-/// keyboard-joystick mapping. Set the initial mode with `[input] joystick`
-/// (or `--joystick`); `Cmd+J` / `Alt+J` still cycles it at runtime.
+/// Host input source for the emulated port-2 joystick/CD32 pad. `Gamepad` (the
+/// default) uses only a physical pad, so the keyboard passes straight through to
+/// the Amiga (and with no pad connected there is simply no port-2 input).
+/// `Keyboard` always uses the keyboard-joystick mapping, capturing the arrow
+/// keys and fire keys. There are deliberately only these two explicit modes: the
+/// status-bar toggle and `Cmd+J` / `Alt+J` flip between them, so the active mode
+/// is always visible rather than depending on hidden gamepad-presence state. Set
+/// the start-up mode with `[input] joystick` (or `--joystick`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum JoystickInputMode {
     #[default]
-    Auto,
     Gamepad,
     Keyboard,
 }
 
 impl JoystickInputMode {
-    /// Cycle order for the runtime toggle and the launcher stepper:
-    /// auto -> keyboard -> gamepad -> auto.
+    /// Flip the two-state toggle (status bar, `Cmd+J`/`Alt+J`, launcher stepper).
     pub fn next(self) -> Self {
         match self {
-            Self::Auto => Self::Keyboard,
+            Self::Gamepad => Self::Keyboard,
             Self::Keyboard => Self::Gamepad,
-            Self::Gamepad => Self::Auto,
         }
     }
 
@@ -193,7 +192,6 @@ impl JoystickInputMode {
     /// (round-trips through [`parse_joystick_input_mode`]).
     pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "auto",
             Self::Gamepad => "gamepad",
             Self::Keyboard => "keyboard",
         }
@@ -747,7 +745,7 @@ impl Default for Config {
             floppy_playlists: std::array::from_fn(|_| Vec::new()),
             overscan: Overscan::Tv,
             phosphor: 0.0,
-            joystick_input_mode: JoystickInputMode::Auto,
+            joystick_input_mode: JoystickInputMode::Gamepad,
         }
     }
 }
@@ -863,8 +861,9 @@ pub struct ConfigOverrides {
     pub fast: Option<String>,
     pub slow: Option<String>,
     pub floppy_drives: Option<u8>,
-    /// Initial joystick input mode (`--joystick`): "auto", "keyboard", or
-    /// "gamepad". Validated by the same parser as `[input] joystick`.
+    /// Initial joystick input mode (`--joystick`): "gamepad" or "keyboard"
+    /// ("auto" still accepted as a compatibility alias). Validated by the same
+    /// parser as `[input] joystick`.
     pub joystick: Option<String>,
 }
 
@@ -995,12 +994,13 @@ pub(crate) struct RawDisplay {
 }
 
 /// `[input]` host-input preferences. Currently just the initial joystick input
-/// mode; `Cmd+J` / `Alt+J` still cycles it live.
+/// mode; the status-bar toggle and `Cmd+J` / `Alt+J` flip it live.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawInput {
-    /// Initial joystick input source: "auto" (default), "keyboard", or
-    /// "gamepad".
+    /// Initial joystick input source: "gamepad" (default) or "keyboard".
+    /// ("auto" is still accepted for backward compatibility and maps to
+    /// "gamepad".)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) joystick: Option<String>,
 }
@@ -1637,11 +1637,13 @@ pub(crate) fn parse_overscan(s: &str) -> Result<Overscan> {
 
 pub(crate) fn parse_joystick_input_mode(s: &str) -> Result<JoystickInputMode> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "auto" => Ok(JoystickInputMode::Auto),
+        // "auto" is retained as a backward-compatibility alias for older configs
+        // and `--joystick auto`; the auto-detect mode was removed in favour of
+        // the two explicit, always-visible modes, so it now maps to the default.
+        "auto" | "gamepad" | "pad" | "joystick" | "joy" => Ok(JoystickInputMode::Gamepad),
         "keyboard" | "kbd" | "key" => Ok(JoystickInputMode::Keyboard),
-        "gamepad" | "pad" | "joystick" | "joy" => Ok(JoystickInputMode::Gamepad),
         _ => Err(anyhow!(
-            "unknown [input] joystick {:?}: expected \"auto\", \"keyboard\", or \"gamepad\"",
+            "unknown [input] joystick {:?}: expected \"gamepad\" or \"keyboard\"",
             s
         )),
     }
@@ -2285,16 +2287,18 @@ mod tests {
     }
 
     #[test]
-    fn joystick_input_mode_defaults_to_auto() -> Result<()> {
-        // No [input] section: the port-2 source starts in Auto, regardless of
-        // the machine profile (it is a host-input preference, not hardware).
+    fn joystick_input_mode_defaults_to_gamepad() -> Result<()> {
+        // No [input] section: the port-2 source starts in Gamepad, regardless
+        // of the machine profile (it is a host-input preference, not hardware).
+        // Gamepad is the no-surprise default: with no pad the keyboard reaches
+        // the Amiga normally instead of being captured as joystick input.
         assert_eq!(
             parse_config("")?.joystick_input_mode,
-            JoystickInputMode::Auto
+            JoystickInputMode::Gamepad
         );
         assert_eq!(
             parse_config("[machine]\nprofile = \"A1200\"\n")?.joystick_input_mode,
-            JoystickInputMode::Auto
+            JoystickInputMode::Gamepad
         );
         Ok(())
     }
@@ -2302,7 +2306,8 @@ mod tests {
     #[test]
     fn joystick_input_mode_parses_and_rejects_garbage() -> Result<()> {
         for (text, expected) in [
-            ("auto", JoystickInputMode::Auto),
+            // "auto" is a backward-compatibility alias mapping to the default.
+            ("auto", JoystickInputMode::Gamepad),
             ("keyboard", JoystickInputMode::Keyboard),
             ("gamepad", JoystickInputMode::Gamepad),
             ("GAMEPAD", JoystickInputMode::Gamepad),

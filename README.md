@@ -139,8 +139,8 @@ config file:
 Essential shortcuts use `Cmd` on macOS and `Alt` on Linux/Windows:
 `Cmd+Q` / `Alt+Q` closes the window, `Esc` passes through to the Amiga (or
 closes an open menu/window), `Cmd+S` / `Alt+S` saves a screenshot, and
-`Cmd+B` / `Alt+B` opens the debugger. `Cmd+J` / `Alt+J` cycles joystick
-input between automatic selection, keyboard emulation, and gamepad-only.
+`Cmd+B` / `Alt+B` opens the debugger. `Cmd+J` / `Alt+J` (or the status-bar
+icon) toggles joystick input between gamepad-only and keyboard emulation.
 The status bar, pop-up menu, tool windows (debugger and frame analyzer),
 overlay panels, save/load state, input recording, and the full shortcut list
 are documented in the
