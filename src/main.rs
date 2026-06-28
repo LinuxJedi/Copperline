@@ -948,7 +948,9 @@ fn main() -> Result<()> {
     }
 
     let mut cfg = cfg.with_rom_override(cli.rom_path.clone());
-    resolve_bundled_rom(&mut cfg)?;
+    if cli.load_state.is_none() {
+        resolve_bundled_rom(&mut cfg)?;
+    }
     let disk_insert_after = resolve_disk_insert_after(&mut cfg, cli.disk_insert_after)?;
 
     info!(
