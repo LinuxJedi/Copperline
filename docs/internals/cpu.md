@@ -155,7 +155,34 @@ throughput still runs below the reference, and the cycle model does not reflect
 instruction-cache hit/miss *latency* (only its bus-traffic effect), so software
 that toggles CACR cache-on/off and depends on the exact transition timing can
 diverge.
-MMU-dependent 030/040 accelerator setups are a non-goal.
+
+## MMU
+
+The 68030 and 68040 model the on-chip MMU (`has_pmmu`), so software that sets up
+and enables address translation runs rather than having its MMU writes ignored.
+The two parts differ enough to need separate walkers: the 68030 uses its
+programmable table walk (CRP/SRP selection, the TC index fields, 4-/8-byte
+descriptor modes, early-termination descriptors), while the 68040 has a
+fixed-format three-level walk (root -> pointer -> page, 4 KB or 8 KB pages,
+URP/SRP split by supervisor) keyed off its own TC layout. Both share the
+transparent translation registers (TTRs: the 030's TT0/1, the 040's ITT0/1 +
+DTT0/1), which short-circuit the walk for a matching address range.
+
+One register set (`mmu_*` in `CpuCore`) is canonical for both paths, so the 030
+`PMOVE` writes, the 040 `MOVEC` writes, and the walker can never desync (the 040
+root pointers overload the CRP/SRP address slots, dispatched by `cpu_type`). The
+enable bit differs by part -- TC[31] on the 030, TC[15] on the 040 -- via
+`tc_enable()`. `PMOVE`/`MOVEC` load the registers and `PTEST`/`PLOAD`/`PFLUSH`
+are accepted as no-ops rather than trapping.
+
+A table walk that misses a valid descriptor currently falls back to identity
+translation rather than raising an access fault: the resumable 68040 access-error
+and 68030 long-bus-fault stack frames are not built yet, so faulting mid-access
+would crash the guest -- identity is the safe direction (the same stance the
+caches take). Remaining work, tracked as later phases: an address-translation
+cache (ATC) so a translated access does not pay a per-access table walk, and real
+access faults with write-protect/supervisor permission checks and MMUSR
+reporting (so Enforcer-class tools work).
 
 ## Interrupts and STOP
 

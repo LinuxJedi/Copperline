@@ -58,7 +58,10 @@ const STATE_MAGIC: &[u8; 8] = b"CLSSTATE";
 //   9: CpuCore.fpr retyped f64 -> FloatX80 (80-bit extended FPU registers)
 //  10: CpuCache backing arrays became Vec (variable line count for the
 //      68040's 4 KB caches vs the 020/030's 256 bytes)
-pub const STATE_VERSION: u32 = 10;
+//  11: CpuCore MMU registers collapsed (removed tc/urp/srp/mmusr duplicates;
+//      mmu_sr retyped u16->u32) so the 040 MOVEC path and the page-table
+//      walker share one register set
+pub const STATE_VERSION: u32 = 11;
 
 /// Default state file name, timestamped like the screenshot/recorder names.
 pub fn auto_filename() -> std::path::PathBuf {

@@ -190,20 +190,23 @@ pub struct CpuCore {
     pub nmi_pending: u32,
 
     // ========== MMU Registers ==========
-    pub mmu_crp_aptr: u32,
-    pub mmu_crp_limit: u32,
-    pub mmu_srp_aptr: u32,
-    pub mmu_srp_limit: u32,
-    pub mmu_tc: u32,
-    pub mmu_sr: u16,
+    // One canonical register set is shared by the 68030 and 68040 paths so the
+    // page-table walker and the register writes can never desync. The 68040
+    // root pointers (URP/SRP) overload the CRP/SRP address slots: `mmu_crp_aptr`
+    // is the CRP on the 030 and the URP on the 040, `mmu_srp_aptr` is the SRP on
+    // both. The two formats never coexist (the walker dispatches on `cpu_type`),
+    // and the 040 root pointers carry no limit longword, so the 040 ignores the
+    // `*_limit` fields.
+    pub mmu_crp_aptr: u32, // CRP (030) / URP (040) address pointer
+    pub mmu_crp_limit: u32, // CRP limit/mode (030 only)
+    pub mmu_srp_aptr: u32, // SRP address pointer (030 + 040)
+    pub mmu_srp_limit: u32, // SRP limit/mode (030 only)
+    pub mmu_tc: u32,       // Translation Control (030 PMOVE / 040 MOVEC 0x003)
+    pub mmu_sr: u32,       // MMU Status Register (030 + 040; layout per cpu_type)
     // 68030 Transparent Translation Registers
     pub mmu_tt0: u32,
     pub mmu_tt1: u32,
     // 68040-specific MMU registers
-    pub urp: u32,   // User Root Pointer (0x806)
-    pub srp: u32,   // Supervisor Root Pointer (0x807)
-    pub tc: u32,    // Translation Control (0x003)
-    pub mmusr: u32, // MMU Status Register (0x805)
     pub dacr0: u32, // Data Access Control 0 (0x008)
     pub dacr1: u32, // Data Access Control 1 (0x009)
     pub iacr0: u32, // Instruction Access Control 0 (0x00A)
@@ -356,10 +359,6 @@ impl CpuCore {
             mmu_sr: 0,
             mmu_tt0: 0,
             mmu_tt1: 0,
-            urp: 0,
-            srp: 0,
-            tc: 0,
-            mmusr: 0,
             dacr0: 0,
             dacr1: 0,
             iacr0: 0,
@@ -806,7 +805,7 @@ impl CpuCore {
             0x000 => self.sfc,   // Source Function Code
             0x001 => self.dfc,   // Destination Function Code
             0x002 => self.cacr,  // Cache Control Register
-            0x003 => self.tc,    // Translation Control (68040)
+            0x003 => self.mmu_tc, // Translation Control (68040)
             0x004 => self.itt0,  // Instruction TTR 0 (68040)
             0x005 => self.itt1,  // Instruction TTR 1 (68040)
             0x006 => self.dtt0,  // Data TTR 0 (68040)
@@ -841,10 +840,10 @@ impl CpuCore {
                     self.sp[4]
                 }
             }
-            0x805 => self.mmusr, // MMU Status Register (68040)
-            0x806 => self.urp,   // User Root Pointer (68040)
-            0x807 => self.srp,   // Supervisor Root Pointer (68040)
-            _ => 0,              // Unknown register
+            0x805 => self.mmu_sr,        // MMU Status Register (68040)
+            0x806 => self.mmu_crp_aptr,  // User Root Pointer (68040; URP)
+            0x807 => self.mmu_srp_aptr,  // Supervisor Root Pointer (68040)
+            _ => 0,                      // Unknown register
         }
     }
 
@@ -874,7 +873,12 @@ impl CpuCore {
                 self.cacr = value & persist;
                 self.cacr_pending_ops |= value & strobes;
             }
-            0x003 => self.tc = value,      // Translation Control (68040)
+            0x003 => {
+                // Translation Control (68040). MOVEC must update pmmu_enabled
+                // (the 040 enable bit is TC[15], unlike the 030's TC[31]).
+                self.mmu_tc = value;
+                self.pmmu_enabled = self.tc_enable();
+            }
             0x004 => self.itt0 = value,    // Instruction TTR 0 (68040)
             0x005 => self.itt1 = value,    // Instruction TTR 1 (68040)
             0x006 => self.dtt0 = value,    // Data TTR 0 (68040)
@@ -909,10 +913,31 @@ impl CpuCore {
                     self.sp[4] = value;
                 }
             }
-            0x805 => self.mmusr = value, // MMU Status Register (68040)
-            0x806 => self.urp = value,   // User Root Pointer (68040)
-            0x807 => self.srp = value,   // Supervisor Root Pointer (68040)
-            _ => {}                      // Unknown register - ignore
+            0x805 => self.mmu_sr = value,        // MMU Status Register (68040)
+            0x806 => self.mmu_crp_aptr = value,  // User Root Pointer (68040; URP)
+            0x807 => self.mmu_srp_aptr = value,  // Supervisor Root Pointer (68040)
+            _ => {}                              // Unknown register - ignore
+        }
+    }
+
+    /// True for any 68040-family part (full / LC / EC). The 040 MMU differs
+    /// from the 030 in register layout, TC enable bit, and table format.
+    #[inline]
+    pub fn is_040(&self) -> bool {
+        matches!(
+            self.cpu_type,
+            CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040
+        )
+    }
+
+    /// Whether TC's translation-enable bit is set. The bit position differs by
+    /// part: the 68040 uses TC[15], the 68030 uses TC[31].
+    #[inline]
+    pub fn tc_enable(&self) -> bool {
+        if self.is_040() {
+            self.mmu_tc & 0x0000_8000 != 0
+        } else {
+            self.mmu_tc & 0x8000_0000 != 0
         }
     }
 
@@ -1327,14 +1352,23 @@ impl CpuCore {
             // PTEST on 68040 - treat as NOP
             return 4;
         }
-        if (modes & 0xFDE0) == 0x2000
+        // PLOAD / PFLUSH / PFLUSHA / PTEST (68030 forms): recognized but not yet
+        // fully modelled. Treat them as NOPs rather than returning 0, which the
+        // decoder would turn into a LINE-1111 trap -- AROS and the 68040.library
+        // issue these during MMU setup, so trapping crashes the boot. PTEST
+        // reports "no fault" via a benign MMUSR; an ATC to flush (PFLUSH/PLOAD)
+        // and precise MMUSR bits (PTEST) come with later phases.
+        if (modes & 0xFDE0) == 0x2000   // PLOAD
             || (modes & 0xE200) == 0x2000
-            || modes == 0xA000
+            || modes == 0xA000          // PFLUSHA
             || modes == 0x2800
-            || (modes & 0xFFF8) == 0x2C00
+            || (modes & 0xFFF8) == 0x2C00 // PFLUSH
             || is_ptest
         {
-            return 0;
+            if is_ptest {
+                self.mmu_sr = 0;
+            }
+            return 8;
         }
 
         // Decode effective address from opcode.
@@ -1404,8 +1438,8 @@ impl CpuCore {
                     // TC (32)
                     let v = self.read_resolved_ea(bus, ea, Size::Long);
                     self.mmu_tc = v;
-                    // Enable PMMU based on TC high bit (common convention).
-                    self.pmmu_enabled = (self.mmu_tc & 0x8000_0000) != 0;
+                    // PMOVE is 68030-only, so tc_enable() reads TC[31] here.
+                    self.pmmu_enabled = self.tc_enable();
                     4
                 }
                 0x12 => {
