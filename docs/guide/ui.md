@@ -27,8 +27,10 @@ The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
 
 Host modifiers that are passed through to the emulated keyboard map onto
 the Amiga keyboard: Alt becomes Amiga Alt, Cmd/Super becomes the left/right
-Amiga keys, and Ctrl becomes Amiga Ctrl, so `Ctrl+Amiga+Amiga` is typed
-naturally.
+Amiga keys, and left Ctrl becomes Amiga Ctrl, so `Ctrl+Amiga+Amiga` is
+typed naturally. The Amiga keyboard has no right Ctrl, so host right Ctrl
+also acts as the right Amiga key -- handy on PC/laptop keyboards that lack
+a right Super/Win key.
 
 All other keys are sent to the emulated machine through the real path: a
 bit-timed keyboard-MCU model clocks each transition into CIA-A's serial

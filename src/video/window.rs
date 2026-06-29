@@ -7540,11 +7540,16 @@ fn host_to_amiga_rawkey(code: KeyCode) -> Option<u8> {
         ShiftLeft => 0x60,
         ShiftRight => 0x61,
         CapsLock => 0x62,
-        ControlLeft | ControlRight => 0x63,
+        // The Amiga keyboard has a single Ctrl key (left side); there is no
+        // right Ctrl. Map host ControlLeft to it. Host ControlRight has no
+        // Amiga counterpart, so alias it to Right Amiga ($67) alongside
+        // SuperRight -- many PC/laptop keyboards lack a right Super/Win key,
+        // leaving Right Amiga otherwise unreachable.
+        ControlLeft => 0x63,
         AltLeft => 0x64,
         AltRight => 0x65,
         SuperLeft => 0x66,
-        SuperRight => 0x67,
+        SuperRight | ControlRight => 0x67,
         // Arrows
         ArrowUp => 0x4C,
         ArrowDown => 0x4D,
@@ -7738,11 +7743,13 @@ mod tests {
     #[test]
     fn host_mapping_includes_amiga_modifiers() {
         assert_eq!(host_to_amiga_rawkey(KeyCode::ControlLeft), Some(0x63));
-        assert_eq!(host_to_amiga_rawkey(KeyCode::ControlRight), Some(0x63));
         assert_eq!(host_to_amiga_rawkey(KeyCode::AltLeft), Some(0x64));
         assert_eq!(host_to_amiga_rawkey(KeyCode::AltRight), Some(0x65));
         assert_eq!(host_to_amiga_rawkey(KeyCode::SuperLeft), Some(0x66));
         assert_eq!(host_to_amiga_rawkey(KeyCode::SuperRight), Some(0x67));
+        // The Amiga has no right Ctrl, so host ControlRight doubles as a
+        // Right Amiga ($67) alias for keyboards without a right Super key.
+        assert_eq!(host_to_amiga_rawkey(KeyCode::ControlRight), Some(0x67));
     }
 
     #[test]
