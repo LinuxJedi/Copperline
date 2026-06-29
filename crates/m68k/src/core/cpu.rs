@@ -211,6 +211,10 @@ pub struct CpuCore {
     pub dacr1: u32, // Data Access Control 1 (0x009)
     pub iacr0: u32, // Instruction Access Control 0 (0x00A)
     pub iacr1: u32, // Instruction Access Control 1 (0x00B)
+    /// Address Translation Cache: a pure cache of recent page-table walks, so it
+    /// is not serialized (restored empty) and is flushed on any mapping change.
+    #[serde(skip)]
+    pub atc: crate::mmu::Atc,
 
     // ========== Execution State ==========
     /// Remaining cycles in current timeslice
@@ -363,6 +367,7 @@ impl CpuCore {
             dacr1: 0,
             iacr0: 0,
             iacr1: 0,
+            atc: crate::mmu::Atc::default(),
             cycles_remaining: 0,
             initial_cycles: 0,
             sst_m68000_compat: false,
@@ -917,6 +922,11 @@ impl CpuCore {
             0x806 => self.mmu_crp_aptr = value,  // User Root Pointer (68040; URP)
             0x807 => self.mmu_srp_aptr = value,  // Supervisor Root Pointer (68040)
             _ => {}                              // Unknown register - ignore
+        }
+        // A write to TC, a root pointer, or a TTR can change every translation,
+        // so drop the cached ones (the 040 walker consults the ATC).
+        if matches!(reg, 0x003 | 0x004 | 0x005 | 0x006 | 0x007 | 0x806 | 0x807) {
+            self.atc.flush_all();
         }
     }
 

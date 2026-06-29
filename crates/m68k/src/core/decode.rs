@@ -188,16 +188,20 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         return 4;
     }
 
-    // 68030/68040 PFLUSH instructions (F-line, privileged): 0xF5xx
+    // 68040 PFLUSH instructions (F-line, privileged): 0xF5xx
     // PFLUSHA: 1111 0101 0001 1000 (0xF518)
     // PFLUSHN: 1111 0101 0000 0xxx (0xF500-0xF507)
     // PFLUSH: 1111 0101 0010 0xxx (0xF520-0xF527)
-    // We treat these as NOPs since there's no TLB to flush.
     if is_cache_cpu && (opcode >> 8) & 0xF == 5 {
         if !cpu.is_supervisor() {
             return cpu.take_exception(bus, 8); // Privilege violation
         }
-        // All PFLUSH variants are NOPs for us
+        // Flush the ATC. We do not track entries finely enough to honour the
+        // per-page / opcode (An) scope, so every variant flushes all; this is
+        // always coherent (over-flushing only costs re-walks). The 68030 PFLUSH
+        // forms come through exec_mmu_op0 (0xF0xx) and the 030 walker does not
+        // consult the ATC, so nothing to flush there.
+        cpu.atc.flush_all();
         return 4;
     }
 

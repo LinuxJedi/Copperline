@@ -243,6 +243,12 @@ fn translate_040<B: AddressBus>(
     let page_bits = if cpu.mmu_tc & 0x0000_4000 != 0 { 13 } else { 12 };
     let page_mask = (1u32 << page_bits) - 1;
 
+    // ATC fast path: a recent walk for this page avoids the descriptor fetches.
+    let page_frame = logical >> page_bits;
+    if let Some(phys_page) = cpu.atc.lookup(page_frame, supervisor) {
+        return Ok(phys_page | (logical & page_mask));
+    }
+
     // Root pointer: SRP in supervisor mode, URP (stored in mmu_crp_aptr) in user
     // mode. The 128-entry root table is 512-byte aligned.
     let root = if supervisor {
@@ -287,5 +293,9 @@ fn translate_040<B: AddressBus>(
     }
 
     let phys_page = page_desc & !page_mask;
+    // Cache only real resident translations -- never the identity fallbacks
+    // above, so a page that is later given a valid mapping (after PFLUSH) is not
+    // masked by a stale identity entry.
+    cpu.atc.insert(page_frame, supervisor, phys_page);
     Ok(phys_page | (logical & page_mask))
 }

@@ -175,14 +175,21 @@ enable bit differs by part -- TC[31] on the 030, TC[15] on the 040 -- via
 `tc_enable()`. `PMOVE`/`MOVEC` load the registers and `PTEST`/`PLOAD`/`PFLUSH`
 are accepted as no-ops rather than trapping.
 
+A 68040 table walk costs three descriptor fetches, far too much to pay on every
+access, so the 040 walker is fronted by an address-translation cache
+(`crate::mmu::atc`, mirrored on the real 64-entry ATC): a direct-mapped cache of
+(logical page -> physical page) keyed by page frame and supervisor flag. It is a
+pure cache -- never serialized (restored empty) -- and is flushed when the
+mapping could change: a write to TC / a root pointer / a TTR, or a PFLUSH. Like
+real hardware a plain write to a descriptor does not auto-flush; software must
+PFLUSH, which is where the ATC is cleared.
+
 A table walk that misses a valid descriptor currently falls back to identity
 translation rather than raising an access fault: the resumable 68040 access-error
 and 68030 long-bus-fault stack frames are not built yet, so faulting mid-access
 would crash the guest -- identity is the safe direction (the same stance the
-caches take). Remaining work, tracked as later phases: an address-translation
-cache (ATC) so a translated access does not pay a per-access table walk, and real
-access faults with write-protect/supervisor permission checks and MMUSR
-reporting (so Enforcer-class tools work).
+caches take). Remaining work: real access faults with write-protect/supervisor
+permission checks and MMUSR reporting (so Enforcer-class tools work).
 
 ## Interrupts and STOP
 

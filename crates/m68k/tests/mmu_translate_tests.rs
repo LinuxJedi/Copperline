@@ -129,6 +129,42 @@ fn translate_040_remap_redirects_to_physical_page() {
 }
 
 #[test]
+fn translate_040_atc_caches_walk_and_honours_flush() {
+    // The ATC must serve a second access to the same page from cache, hold that
+    // mapping until a flush (real 68040 coherency: a descriptor edit needs a
+    // PFLUSH), and pick up the new mapping after a TC write flushes it.
+    let mut bus = TestBus::new(0x10000);
+    let logical = 0x0000_1000;
+    let page_table = 0x4000; // matches build_040_table's layout
+    let page_idx = (logical >> 12) & 0x3F;
+    let desc_addr = page_table + page_idx * 4;
+    let root = build_040_table(&mut bus, logical, logical); // identity
+    bus.poke_long(logical, 0xAAAA_0001); // value at the identity page
+    bus.poke_long(0x9000, 0xBBBB_0002); // value at the would-be remap target
+
+    let mut cpu = enabled_040_cpu();
+    cpu.write_control_register(0x807, root);
+    cpu.write_control_register(0x003, 0x0000_8000);
+
+    // First access walks and caches; second is an ATC hit -- both identity.
+    assert_eq!(cpu.read_32(&mut bus, logical), 0xAAAA_0001);
+    assert_eq!(cpu.read_32(&mut bus, logical), 0xAAAA_0001);
+
+    // Edit the descriptor to remap the page to 0x9000 WITHOUT flushing: the ATC
+    // still serves the old (identity) mapping, as on real hardware.
+    bus.poke_long(desc_addr, 0x9000 | 1);
+    assert_eq!(
+        cpu.read_32(&mut bus, logical),
+        0xAAAA_0001,
+        "stale ATC entry must persist until a flush"
+    );
+
+    // A TC write flushes the ATC; the next access re-walks and sees the remap.
+    cpu.write_control_register(0x003, 0x0000_8000);
+    assert_eq!(cpu.read_32(&mut bus, logical), 0xBBBB_0002);
+}
+
+#[test]
 fn translate_040_unconfigured_walk_falls_back_to_identity() {
     // PHASE1: with no valid tables, the walk falls back to identity rather than
     // faulting (a later phase delivers a resumable access fault instead).
