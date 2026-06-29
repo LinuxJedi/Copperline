@@ -1319,8 +1319,16 @@ impl CpuCore {
                 self.run_mode = RUN_MODE_BERR_AERR_RESET;
             }
             MmuFaultKind::AccessLevelViolation => {
-                let _ = self.take_exception(bus, vector::MMU_ACCESS_LEVEL_VIOLATION_ERROR);
-                self.run_mode = RUN_MODE_BERR_AERR_RESET;
+                if self.is_040() {
+                    // On the 68040 an MMU access fault vectors to BUS_ERROR
+                    // (vector 2) with a format-7 frame. Route through
+                    // trigger_bus_error so the instruction is rolled back and
+                    // RTE restarts it once the handler fixes the mapping.
+                    self.trigger_bus_error(bus, fault.address, write, instruction);
+                } else {
+                    let _ = self.take_exception(bus, vector::MMU_ACCESS_LEVEL_VIOLATION_ERROR);
+                    self.run_mode = RUN_MODE_BERR_AERR_RESET;
+                }
             }
         }
     }

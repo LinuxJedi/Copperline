@@ -15,23 +15,17 @@
 
 const ATC_ENTRIES: usize = 64;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct AtcEntry {
     valid: bool,
     /// `(page_frame << 1) | supervisor`, disambiguating user vs supervisor maps.
     tag: u32,
     /// Physical page base (aligned to the page size in force at fill time).
     phys_page: u32,
-}
-
-impl Default for AtcEntry {
-    fn default() -> Self {
-        Self {
-            valid: false,
-            tag: 0,
-            phys_page: 0,
-        }
-    }
+    /// Write-protected page (W): a write must fault, not hit.
+    write_protected: bool,
+    /// Supervisor-only page (S): a user access must fault, not hit.
+    supervisor_only: bool,
 }
 
 /// A direct-mapped address translation cache.
@@ -60,24 +54,38 @@ impl Atc {
     }
 
     /// Look up the physical page base for `page_frame` (logical address >> page
-    /// bits), or `None` on a miss.
+    /// bits) for this access, or `None` on a miss. A cached entry whose
+    /// permissions the access would violate (a write to a write-protected page,
+    /// or a user access to a supervisor page) returns `None` so the caller
+    /// re-walks and raises the fault -- the permission check is never bypassed.
     #[inline]
-    pub fn lookup(&self, page_frame: u32, supervisor: bool) -> Option<u32> {
+    pub fn lookup(&self, page_frame: u32, supervisor: bool, write: bool) -> Option<u32> {
         let e = &self.entries[Self::index(page_frame)];
-        if e.valid && e.tag == Self::tag(page_frame, supervisor) {
-            Some(e.phys_page)
-        } else {
-            None
+        if !e.valid || e.tag != Self::tag(page_frame, supervisor) {
+            return None;
         }
+        if (write && e.write_protected) || (!supervisor && e.supervisor_only) {
+            return None;
+        }
+        Some(e.phys_page)
     }
 
-    /// Record a freshly-walked translation.
+    /// Record a freshly-walked translation and its protection bits.
     #[inline]
-    pub fn insert(&mut self, page_frame: u32, supervisor: bool, phys_page: u32) {
+    pub fn insert(
+        &mut self,
+        page_frame: u32,
+        supervisor: bool,
+        phys_page: u32,
+        write_protected: bool,
+        supervisor_only: bool,
+    ) {
         self.entries[Self::index(page_frame)] = AtcEntry {
             valid: true,
             tag: Self::tag(page_frame, supervisor),
             phys_page,
+            write_protected,
+            supervisor_only,
         };
     }
 
@@ -105,22 +113,33 @@ mod tests {
     #[test]
     fn hit_after_insert_miss_after_flush() {
         let mut atc = Atc::default();
-        assert_eq!(atc.lookup(0x10, false), None);
-        atc.insert(0x10, false, 0x8000);
-        assert_eq!(atc.lookup(0x10, false), Some(0x8000));
+        assert_eq!(atc.lookup(0x10, false, false), None);
+        atc.insert(0x10, false, 0x8000, false, false);
+        assert_eq!(atc.lookup(0x10, false, false), Some(0x8000));
         // Supervisor map of the same page frame is a distinct entry.
-        assert_eq!(atc.lookup(0x10, true), None);
+        assert_eq!(atc.lookup(0x10, true, false), None);
         atc.flush_all();
-        assert_eq!(atc.lookup(0x10, false), None);
+        assert_eq!(atc.lookup(0x10, false, false), None);
     }
 
     #[test]
     fn flush_page_drops_only_that_frame() {
         let mut atc = Atc::default();
-        atc.insert(0x10, false, 0x1000);
+        atc.insert(0x10, false, 0x1000, false, false);
         atc.flush_page(0x11); // different frame, same is unlikely-index: no-op for 0x10
-        assert_eq!(atc.lookup(0x10, false), Some(0x1000));
+        assert_eq!(atc.lookup(0x10, false, false), Some(0x1000));
         atc.flush_page(0x10);
-        assert_eq!(atc.lookup(0x10, false), None);
+        assert_eq!(atc.lookup(0x10, false, false), None);
+    }
+
+    #[test]
+    fn permission_violation_does_not_hit() {
+        let mut atc = Atc::default();
+        // Write-protected, supervisor-only page.
+        atc.insert(0x10, true, 0x5000, true, true);
+        // A supervisor read hits; a write misses (write-protected) so the caller
+        // re-walks and faults.
+        assert_eq!(atc.lookup(0x10, true, false), Some(0x5000));
+        assert_eq!(atc.lookup(0x10, true, true), None);
     }
 }

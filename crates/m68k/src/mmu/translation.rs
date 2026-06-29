@@ -235,7 +235,7 @@ fn translate_040<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
     logical: u32,
-    _write: bool,
+    write: bool,
     supervisor: bool,
     _instruction: bool,
 ) -> MmuResult<u32> {
@@ -244,8 +244,10 @@ fn translate_040<B: AddressBus>(
     let page_mask = (1u32 << page_bits) - 1;
 
     // ATC fast path: a recent walk for this page avoids the descriptor fetches.
+    // A cached entry the access would violate (write to a write-protected page,
+    // user access to a supervisor page) misses here, so we re-walk and fault.
     let page_frame = logical >> page_bits;
-    if let Some(phys_page) = cpu.atc.lookup(page_frame, supervisor) {
+    if let Some(phys_page) = cpu.atc.lookup(page_frame, supervisor, write) {
         return Ok(phys_page | (logical & page_mask));
     }
 
@@ -292,10 +294,21 @@ fn translate_040<B: AddressBus>(
         return Ok(logical); // PHASE3: PDT invalid -> access fault
     }
 
+    // Protection bits: W (write-protect, bit 2) accumulates across the table and
+    // page descriptors; S (supervisor-only, bit 7) lives on the page descriptor.
+    // A violating access faults (resumable on the 040, vector 2 / format 7).
+    let write_protected = (root_desc | ptr_desc | page_desc) & 0x0000_0004 != 0;
+    let supervisor_only = page_desc & 0x0000_0080 != 0;
+    if (write && write_protected) || (!supervisor && supervisor_only) {
+        return Err(access_fault(logical));
+    }
+
     let phys_page = page_desc & !page_mask;
     // Cache only real resident translations -- never the identity fallbacks
     // above, so a page that is later given a valid mapping (after PFLUSH) is not
-    // masked by a stale identity entry.
-    cpu.atc.insert(page_frame, supervisor, phys_page);
+    // masked by a stale identity entry. The protection bits ride along so a
+    // later violating access to the same page is caught on the ATC path too.
+    cpu.atc
+        .insert(page_frame, supervisor, phys_page, write_protected, supervisor_only);
     Ok(phys_page | (logical & page_mask))
 }

@@ -184,12 +184,22 @@ mapping could change: a write to TC / a root pointer / a TTR, or a PFLUSH. Like
 real hardware a plain write to a descriptor does not auto-flush; software must
 PFLUSH, which is where the ATC is cleared.
 
-A table walk that misses a valid descriptor currently falls back to identity
-translation rather than raising an access fault: the resumable 68040 access-error
-and 68030 long-bus-fault stack frames are not built yet, so faulting mid-access
-would crash the guest -- identity is the safe direction (the same stance the
-caches take). Remaining work: real access faults with write-protect/supervisor
-permission checks and MMUSR reporting (so Enforcer-class tools work).
+The 68040 enforces page protection: a write to a write-protected page (the W
+bit, accumulated across the table and page descriptors) or a user access to a
+supervisor-only page (the S bit) raises an access fault, delivered as a 68040
+format-7 access-error stack frame at the bus-error vector. The faulting
+instruction is rolled back and its PC stacked, so after the handler fixes the
+mapping an `RTE` restarts it (the demand-paging / memory-protection model). The
+ATC carries the protection bits, so a cached translation cannot bypass the
+check. The frame's writeback/continuation fields are left clear (full-restart
+model); mid-instruction continuation is not modelled.
+
+A table walk that misses a *valid* descriptor still falls back to identity
+translation rather than faulting -- flipping that on (so an access to an invalid
+page faults, which is how Enforcer/MuForce catch low-memory hits) is the next
+step, gated on confirming it does not destabilise the bundled AROS boot.
+Remaining: MMUSR result bits for `PTEST`, and the 68030 long bus-fault frame and
+030 permission checks (the 030 walker is unchanged so far).
 
 ## Interrupts and STOP
 

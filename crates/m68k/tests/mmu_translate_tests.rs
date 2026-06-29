@@ -5,6 +5,7 @@
 use m68k::core::cpu::CpuCore;
 use m68k::core::memory::AddressBus;
 use m68k::core::types::CpuType;
+use m68k::mmu::{translate_address, MmuFaultKind};
 
 /// Flat byte-addressed test memory.
 struct TestBus {
@@ -61,6 +62,23 @@ fn build_040_table(bus: &mut TestBus, logical: u32, phys_page: u32) -> u32 {
     bus.poke_long(PTR + ptr_idx * 4, PAGE | 2); // UDT resident -> page table
     bus.poke_long(PAGE + page_idx * 4, (phys_page & 0xFFFF_F000) | 1); // PDT resident
     ROOT
+}
+
+/// Like `build_040_table` but sets the page descriptor's protection bits:
+/// `w` = write-protected (bit 2), `s` = supervisor-only (bit 7).
+fn build_040_table_prot(bus: &mut TestBus, logical: u32, phys_page: u32, w: bool, s: bool) -> u32 {
+    let root = build_040_table(bus, logical, phys_page);
+    let page = 0x4000; // PAGE base in build_040_table
+    let page_idx = (logical >> 12) & 0x3F;
+    let mut pd = (phys_page & 0xFFFF_F000) | 1;
+    if w {
+        pd |= 0x0000_0004;
+    }
+    if s {
+        pd |= 0x0000_0080;
+    }
+    bus.poke_long(page + page_idx * 4, pd);
+    root
 }
 
 fn enabled_040_cpu() -> CpuCore {
@@ -162,6 +180,67 @@ fn translate_040_atc_caches_walk_and_honours_flush() {
     // A TC write flushes the ATC; the next access re-walks and sees the remap.
     cpu.write_control_register(0x003, 0x0000_8000);
     assert_eq!(cpu.read_32(&mut bus, logical), 0xBBBB_0002);
+}
+
+#[test]
+fn translate_040_enforces_write_protect_and_supervisor() {
+    // Write-protected page: a read translates, a write faults.
+    let mut bus = TestBus::new(0x10000);
+    let logical = 0x0000_1000;
+    let root = build_040_table_prot(&mut bus, logical, logical, true, false);
+    let mut cpu = enabled_040_cpu();
+    cpu.write_control_register(0x807, root);
+    cpu.write_control_register(0x003, 0x0000_8000);
+
+    assert!(translate_address(&mut cpu, &mut bus, logical, false, true, false).is_ok());
+    let err = translate_address(&mut cpu, &mut bus, logical, true, true, false).unwrap_err();
+    assert_eq!(err.kind, MmuFaultKind::AccessLevelViolation);
+
+    // Supervisor-only page: a supervisor access translates, a user access faults.
+    let mut bus = TestBus::new(0x10000);
+    let root = build_040_table_prot(&mut bus, logical, logical, false, true);
+    let mut cpu = enabled_040_cpu();
+    cpu.write_control_register(0x806, root); // URP (user root)
+    cpu.write_control_register(0x807, root); // SRP (supervisor root)
+    cpu.write_control_register(0x003, 0x0000_8000);
+
+    assert!(translate_address(&mut cpu, &mut bus, logical, false, true, false).is_ok());
+    let err = translate_address(&mut cpu, &mut bus, logical, false, false, false).unwrap_err();
+    assert_eq!(err.kind, MmuFaultKind::AccessLevelViolation);
+}
+
+#[test]
+fn translate_040_write_protect_delivers_resumable_format7_frame() {
+    // A write to a write-protected page must vector to BUS_ERROR (vector 2)
+    // with a 68040 format-7 access-error frame, leaving the access undone and
+    // RTE able to restart the faulting instruction.
+    let mut bus = TestBus::new(0x8_0000);
+    let target = 0x0001_0000; // write-protected resident page
+    let root = build_040_table_prot(&mut bus, target, target, true, false);
+    bus.poke_long(0x8, 0x0002_0000); // vector 2 handler (VBR=0, unmapped page -> identity)
+
+    let mut cpu = enabled_040_cpu();
+    cpu.write_control_register(0x807, root);
+    cpu.write_control_register(0x003, 0x0000_8000);
+    let ssp = 0x0000_3000u32;
+    cpu.dar[15] = ssp;
+    cpu.ppc = 0x0000_1234; // pretend faulting-instruction PC (restart target)
+    // No real instruction ran, so make the bus-error rollback a no-op.
+    cpu.sr_save = cpu.get_sr();
+    cpu.dar_save = cpu.dar;
+
+    cpu.write_32(&mut bus, target, 0xDEAD_BEEF);
+
+    assert_eq!(cpu.pc, 0x0002_0000, "vectored to the access-fault handler");
+    let sp = cpu.dar[15];
+    assert_eq!(bus.read_long(sp + 2), 0x0000_1234, "stacked restart PC = PPC");
+    assert_eq!(bus.read_word(sp + 6), 0x7008, "format 7, vector offset 0x08");
+    assert_eq!(bus.read_long(sp + 0x14), target, "fault address");
+    assert_eq!(
+        bus.read_long(target),
+        0,
+        "the write-protected store must not have landed"
+    );
 }
 
 #[test]

@@ -321,9 +321,41 @@ impl CpuCore {
                 self.push_16_raw(bus, old_sr);
                 let _ = (status_word, address); // currently unused in this placeholder
             }
+            _ if self.is_040() => {
+                // 68040 access-error stack frame (format 7, 30 words). The
+                // caller (trigger_bus_error) has already rolled the instruction
+                // back, so we stack PPC and leave the writeback/continuation
+                // fields clear: RTE then restarts the faulting instruction
+                // (demand-paging / Enforcer fix-and-retry model). The SSW
+                // reports R/W and the function code; the size field is left at
+                // its long default since the restart re-runs the real access.
+                // Layout (Musashi m68ki_stack_frame_0111), pushed high->low.
+                let rw = if write { 0 } else { 0x0100 }; // SSW bit 8: 1 = read
+                let ssw = rw | (fc as u16 & 0x7); // TM = function code
+                let fmt_vec = 0x7000 | ((vector::BUS_ERROR as u16) << 2);
+                // PD2/PD1/PD0 and the three writeback entries are all unused.
+                for _ in 0..3 {
+                    self.push_32_raw(bus, 0); // PD2, PD1, PD0
+                }
+                self.push_32_raw(bus, 0); // WB1D
+                self.push_32_raw(bus, 0); // WB1A
+                self.push_32_raw(bus, 0); // WB2D
+                self.push_32_raw(bus, 0); // WB2A
+                self.push_32_raw(bus, 0); // WB3D
+                self.push_32_raw(bus, 0); // WB3A
+                self.push_32_raw(bus, address); // fault address
+                self.push_16_raw(bus, 0); // WB1S (status: invalid -> no writeback)
+                self.push_16_raw(bus, 0); // WB2S
+                self.push_16_raw(bus, 0); // WB3S
+                self.push_16_raw(bus, ssw); // special status word
+                self.push_32_raw(bus, address); // effective address
+                self.push_16_raw(bus, fmt_vec); // format 7 / vector offset
+                self.push_32_raw(bus, self.ppc); // restart PC
+                self.push_16_raw(bus, old_sr);
+            }
             _ => {
-                // TODO: 68020+ bus error stack frames (format A/B/7 variants) are not yet
-                // implemented. Minimal fallback.
+                // TODO: 68020/68030 bus-error stack frames (format A / long
+                // format B) are not yet implemented. Minimal fallback.
                 self.push_16_raw(bus, (vector::BUS_ERROR as u16) << 2);
                 self.push_32_raw(bus, self.ppc);
                 self.push_16_raw(bus, old_sr);
