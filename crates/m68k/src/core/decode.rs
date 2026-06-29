@@ -188,19 +188,34 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         return 4;
     }
 
-    // 68040 PFLUSH instructions (F-line, privileged): 0xF5xx
-    // PFLUSHA: 1111 0101 0001 1000 (0xF518)
-    // PFLUSHN: 1111 0101 0000 0xxx (0xF500-0xF507)
-    // PFLUSH: 1111 0101 0010 0xxx (0xF520-0xF527)
+    // 68040 PFLUSH/PTEST instructions (F-line, privileged): 0xF5xx.
+    //   PFLUSH/PFLUSHA/PFLUSHN: bit 6 clear.
+    //   PTESTR (An): 1111 0101 0110 1rrr; PTESTW (An): 1111 0101 0100 1rrr
+    //   (bit 6 set; bit 5 = read).
     if is_cache_cpu && (opcode >> 8) & 0xF == 5 {
         if !cpu.is_supervisor() {
             return cpu.take_exception(bus, 8); // Privilege violation
         }
-        // Flush the ATC. We do not track entries finely enough to honour the
-        // per-page / opcode (An) scope, so every variant flushes all; this is
-        // always coherent (over-flushing only costs re-walks). The 68030 PFLUSH
-        // forms come through exec_mmu_op0 (0xF0xx) and the 030 walker does not
-        // consult the ATC, so nothing to flush there.
+        if cpu.is_040() && (opcode & 0x0040) != 0 {
+            // PTEST: walk the page for An and report it in MMUSR. We model the
+            // physical-address and resident (R) bits, enough for an OS to tell a
+            // mapped page from an invalid one; the cache-mode / used / modified
+            // attribute bits are not yet filled in.
+            let read = (opcode & 0x0020) != 0;
+            let addr = cpu.dar[8 + (opcode & 7) as usize];
+            let supervisor = cpu.is_supervisor();
+            cpu.mmu_sr =
+                match crate::mmu::translate_address(cpu, bus, addr, !read, supervisor, false) {
+                    Ok(phys) => (phys & 0xFFFF_F000) | 0x0000_0001, // R = resident
+                    Err(_) => 0,                                    // not resident
+                };
+            return 4;
+        }
+        // PFLUSH variants flush the ATC. We do not track entries finely enough
+        // to honour the per-page / (An) scope, so every variant flushes all;
+        // this is always coherent (over-flushing only costs re-walks). The
+        // 68030 PFLUSH forms come through exec_mmu_op0 (0xF0xx) and the 030
+        // walker does not consult the ATC, so nothing to flush there.
         cpu.atc.flush_all();
         return 4;
     }

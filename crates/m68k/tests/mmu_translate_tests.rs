@@ -210,6 +210,59 @@ fn translate_040_enforces_write_protect_and_supervisor() {
 }
 
 #[test]
+fn translate_030_enforces_write_protect() {
+    // A 68030 single-level table whose page descriptor sets WP (bit 2): a read
+    // translates (identity), a write faults.
+    let mut bus = TestBus::new(0x10000);
+    let table = 0x2000;
+    // Early-termination page descriptor: mode 1, base 0, WP set (bit 2).
+    bus.poke_long(table, 0x0000_0005);
+
+    let mut cpu = CpuCore::new();
+    cpu.set_cpu_type(CpuType::M68030);
+    cpu.set_sr(0x2700);
+    cpu.mmu_crp_aptr = table;
+    cpu.mmu_crp_limit = 2; // mode 2: 4-byte descriptors
+    cpu.mmu_tc = 0x8000_4000; // E (bit 31), IS=0, TIA=4 entries
+    cpu.pmmu_enabled = true;
+
+    let logical = 0x0000_1000;
+    assert!(translate_address(&mut cpu, &mut bus, logical, false, true, false).is_ok());
+    let err = translate_address(&mut cpu, &mut bus, logical, true, true, false).unwrap_err();
+    assert_eq!(err.kind, MmuFaultKind::AccessLevelViolation);
+}
+
+#[test]
+fn ptest_040_reports_resident_and_physical_in_mmusr() {
+    // PTESTR (A0) probes the page that A0 points at and reports the physical
+    // page + resident (R) bit in MMUSR; an invalid page reports not-resident.
+    let mut bus = TestBus::new(0x2_0000);
+    let resident = 0x0001_0000;
+    let root = build_040_table(&mut bus, resident, resident); // identity resident
+    bus.write_word(0x1000, 0xF568); // PTESTR (A0) -- fetched via identity fallback
+    bus.write_word(0x1002, 0x4E71); // NOP
+
+    let mut cpu = CpuCore::new();
+    cpu.set_cpu_type(CpuType::M68040);
+    cpu.reset(&mut bus);
+    cpu.set_sr(0x2700);
+    cpu.write_control_register(0x807, root);
+    cpu.write_control_register(0x003, 0x0000_8000);
+
+    let mut hle = m68k::NoOpHleHandler;
+
+    cpu.dar[8] = resident; // A0 -> a mapped page
+    cpu.pc = 0x1000;
+    cpu.step_with_hle_handler(&mut bus, &mut hle);
+    assert_eq!(cpu.mmu_sr, resident | 1, "resident page: R set, physical addr");
+
+    cpu.dar[8] = 0x0005_0000; // A0 -> an unmapped page
+    cpu.pc = 0x1000;
+    cpu.step_with_hle_handler(&mut bus, &mut hle);
+    assert_eq!(cpu.mmu_sr, 0, "invalid page: not resident");
+}
+
+#[test]
 fn translate_040_write_protect_delivers_resumable_format7_frame() {
     // A write to a write-protected page must vector to BUS_ERROR (vector 2)
     // with a 68040 format-7 access-error frame, leaving the access undone and
@@ -244,15 +297,19 @@ fn translate_040_write_protect_delivers_resumable_format7_frame() {
 }
 
 #[test]
-fn translate_040_unconfigured_walk_falls_back_to_identity() {
-    // PHASE1: with no valid tables, the walk falls back to identity rather than
-    // faulting (a later phase delivers a resumable access fault instead).
+fn translate_040_invalid_page_faults_data_but_falls_back_for_fetch() {
+    // With no valid tables, a DATA access through the invalid descriptor faults
+    // (this is Enforcer's low-memory catch), while an INSTRUCTION fetch falls
+    // back to identity so a 68040 enabling TC before its code is mapped does
+    // not derail.
     let mut bus = TestBus::new(0x10000);
-    bus.poke_long(0x0000_1000, 0xDEAD_BEEF);
-
     let mut cpu = enabled_040_cpu();
     cpu.write_control_register(0x807, 0x00FF_0000); // garbage root (unmapped)
     cpu.write_control_register(0x003, 0x0000_8000);
 
-    assert_eq!(cpu.read_32(&mut bus, 0x0000_1000), 0xDEAD_BEEF);
+    let data = translate_address(&mut cpu, &mut bus, 0x0000_1000, false, true, false);
+    assert_eq!(data.unwrap_err().kind, MmuFaultKind::AccessLevelViolation);
+
+    let fetch = translate_address(&mut cpu, &mut bus, 0x0000_1000, false, true, true);
+    assert_eq!(fetch, Ok(0x0000_1000), "an instruction fetch falls back");
 }

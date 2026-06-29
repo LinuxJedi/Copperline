@@ -194,12 +194,21 @@ ATC carries the protection bits, so a cached translation cannot bypass the
 check. The frame's writeback/continuation fields are left clear (full-restart
 model); mid-instruction continuation is not modelled.
 
-A table walk that misses a *valid* descriptor still falls back to identity
-translation rather than faulting -- flipping that on (so an access to an invalid
-page faults, which is how Enforcer/MuForce catch low-memory hits) is the next
-step, gated on confirming it does not destabilise the bundled AROS boot.
-Remaining: MMUSR result bits for `PTEST`, and the 68030 long bus-fault frame and
-030 permission checks (the 030 walker is unchanged so far).
+A *data* access through an invalid/unconfigured descriptor raises an access
+fault -- this is how Enforcer/MuForce catch low-memory and freed-memory hits. An
+*instruction fetch* through an invalid descriptor instead falls back to identity:
+a 68040 enables TC before all of its code is mapped during boot, so faulting the
+fetch stream there would derail it. The bus-error delivery sets the
+exception-processing flag, so the frame writes and vector fetch do not
+re-translate (and a fault while delivering a fault is a clean double-fault halt).
+
+`PTEST` (68040) walks the addressed page and reports the physical address and
+resident bit in MMUSR (the cache-mode/used/modified attribute bits are not yet
+filled in). The 68030 also enforces the descriptor write-protect (WP) bit, and
+its faults are routed to the bus-error vector like the 040's, though the 68030
+long bus-fault stack frame (format A/B) is still the minimal fallback rather than
+a fully resumable frame. Remaining: the 040 SSW access size, the indirect/used/
+modified MMUSR bits, and the resumable 030 frame.
 
 ## Interrupts and STOP
 

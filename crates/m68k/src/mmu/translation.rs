@@ -154,6 +154,9 @@ pub fn translate<B: AddressBus>(
         0 => return Err(access_fault(logical)),
         1 => {
             // Early termination descriptor (Musashi uses &0xffffff00).
+            if write && tbl_entry & 0x4 != 0 {
+                return Err(access_fault(logical)); // WP: write-protected page
+            }
             let base = tbl_entry & 0xFFFF_FF00;
             let shift = is + abits;
             let addr_out = low_bits(addr_in, shift).wrapping_add(base);
@@ -182,6 +185,9 @@ pub fn translate<B: AddressBus>(
     match tbmode {
         0 => return Err(access_fault(logical)),
         1 => {
+            if write && tbl_entry & 0x4 != 0 {
+                return Err(access_fault(logical)); // WP: write-protected page
+            }
             let base = tbl_entry & 0xFFFF_FF00;
             let shift = is + abits + bbits;
             let addr_out = low_bits(addr_in, shift).wrapping_add(base);
@@ -205,6 +211,9 @@ pub fn translate<B: AddressBus>(
     // Final termination at table C.
     match tcmode {
         1 => {
+            if write && tbl_entry & 0x4 != 0 {
+                return Err(access_fault(logical)); // WP: write-protected page
+            }
             let base = tbl_entry & 0xFFFF_FF00;
             let shift = is + abits + bbits + cbits;
             Ok(low_bits(addr_in, shift).wrapping_add(base))
@@ -223,22 +232,29 @@ pub fn translate<B: AddressBus>(
 /// page descriptors use PDT (bits [1:0]): 0 = invalid, 2 = indirect, 1/3 =
 /// resident.
 ///
-/// Phase 1 honours only the resident descriptor type to translate through valid
-/// tables (so 1:1 tables identity-map and remapped tables relocate). A walk that
-/// hits an invalid/unconfigured descriptor falls back to identity translation
-/// rather than faulting: the resumable 68040 access-fault stack frame does not
-/// exist yet, so faulting here would crash software that enables TC before its
-/// tables cover an access (the codebase's "safe direction"). A later phase
-/// replaces the `// PHASE3` fallbacks with real access faults + MMUSR reporting,
-/// and adds write-protect / supervisor permission enforcement.
+/// A *data* access through an invalid/unconfigured descriptor raises an access
+/// fault (this is how Enforcer/MuForce catch low-memory and freed-memory hits).
+/// An *instruction fetch* through an invalid descriptor instead falls back to
+/// identity translation: a 68040 enables TC before all of its code is mapped
+/// during boot, and faulting the fetch stream there would derail it (the
+/// codebase's "safe direction"). Resident pages additionally enforce the W
+/// (write-protect) and S (supervisor-only) descriptor bits.
 fn translate_040<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
     logical: u32,
     write: bool,
     supervisor: bool,
-    _instruction: bool,
+    instruction: bool,
 ) -> MmuResult<u32> {
+    // Invalid-descriptor outcome: fault on data, identity-fallback on a fetch.
+    let invalid = |logical: u32| -> MmuResult<u32> {
+        if instruction {
+            Ok(logical)
+        } else {
+            Err(access_fault(logical))
+        }
+    };
     // Page size: TC bit 14 (P) selects 8 KB, else 4 KB.
     let page_bits = if cpu.mmu_tc & 0x0000_4000 != 0 { 13 } else { 12 };
     let page_mask = (1u32 << page_bits) - 1;
@@ -263,7 +279,7 @@ fn translate_040<B: AddressBus>(
     let root_idx = (logical >> 25) & 0x7F;
     let root_desc = read_u32_phys(bus, (root & 0xFFFF_FE00).wrapping_add(root_idx * 4))?;
     if root_desc & 3 < 2 {
-        return Ok(logical); // PHASE3: UDT invalid -> access fault
+        return invalid(logical); // UDT invalid: data faults, fetch falls back
     }
 
     // Level 2: pointer table (512-byte aligned), indexed by logical[24:18].
@@ -271,7 +287,7 @@ fn translate_040<B: AddressBus>(
     let ptr_idx = (logical >> 18) & 0x7F;
     let ptr_desc = read_u32_phys(bus, ptr_table.wrapping_add(ptr_idx * 4))?;
     if ptr_desc & 3 < 2 {
-        return Ok(logical); // PHASE3: UDT invalid -> access fault
+        return invalid(logical); // UDT invalid: data faults, fetch falls back
     }
 
     // Level 3: page table. With 4 KB pages it has 64 entries (256-byte aligned,
@@ -291,7 +307,7 @@ fn translate_040<B: AddressBus>(
         page_desc = read_u32_phys(bus, page_desc & 0xFFFF_FFFC)?;
     }
     if page_desc & 3 == 0 {
-        return Ok(logical); // PHASE3: PDT invalid -> access fault
+        return invalid(logical); // PDT invalid: data faults, fetch falls back
     }
 
     // Protection bits: W (write-protect, bit 2) accumulates across the table and

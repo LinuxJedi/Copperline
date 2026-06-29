@@ -1024,11 +1024,21 @@ impl CpuCore {
         if self.faulted() {
             return;
         }
+        // A fault while already delivering a fault is a double fault: halt
+        // rather than recurse. (translate() also bypasses while this flag is
+        // set, so the frame writes and vector fetch below do not re-translate.)
+        if self.exception_processing {
+            self.stopped = 1;
+            self.run_mode = RUN_MODE_BERR_AERR_RESET;
+            return;
+        }
 
         // Roll back any partially-applied register side effects from the faulting instruction.
         self.set_sr_noint_nosp(self.sr_save);
         self.dar = self.dar_save;
+        self.exception_processing = true;
         let _ = self.exception_bus_error(bus, address, write, instruction);
+        self.exception_processing = false;
         self.run_mode = RUN_MODE_BERR_AERR_RESET;
     }
 
@@ -1319,16 +1329,13 @@ impl CpuCore {
                 self.run_mode = RUN_MODE_BERR_AERR_RESET;
             }
             MmuFaultKind::AccessLevelViolation => {
-                if self.is_040() {
-                    // On the 68040 an MMU access fault vectors to BUS_ERROR
-                    // (vector 2) with a format-7 frame. Route through
-                    // trigger_bus_error so the instruction is rolled back and
-                    // RTE restarts it once the handler fixes the mapping.
-                    self.trigger_bus_error(bus, fault.address, write, instruction);
-                } else {
-                    let _ = self.take_exception(bus, vector::MMU_ACCESS_LEVEL_VIOLATION_ERROR);
-                    self.run_mode = RUN_MODE_BERR_AERR_RESET;
-                }
+                // Integrated 68030/68040 MMU faults vector to BUS_ERROR
+                // (vector 2), not the 68851 access-level vector. Route through
+                // trigger_bus_error so the instruction is rolled back and RTE
+                // can restart it once the handler fixes the mapping (the 040
+                // gets a resumable format-7 frame; the 030 long bus-fault
+                // format-A/B frame is still the minimal fallback).
+                self.trigger_bus_error(bus, fault.address, write, instruction);
             }
         }
     }
