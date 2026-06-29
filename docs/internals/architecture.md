@@ -16,7 +16,7 @@ src/
   debugger.rs       # env-driven headless debugger
   disasm.rs         # 68000 + Copper-list disassemblers
   cpu.rs            # m68k core wrapper and CPU-visible bus adapter
-  cache.rs          # 68020/030 on-chip instruction/data cache model
+  cache.rs          # 68020/030/040 on-chip instruction/data cache model
   bus.rs            # shared RAM, ROM, chipset, CIA, RTC, and I/O state
   memory.rs         # chip/slow RAM, ROM, extended ROM containers
   romsearch.rs      # locate the bundled AROS default boot ROM

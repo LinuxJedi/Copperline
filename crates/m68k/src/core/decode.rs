@@ -148,10 +148,17 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         return cpu.exec_move16(bus, opcode);
     }
 
-    // 68030/68040 Cache Instructions: CINV and CPUSH (F-line, privileged)
-    // CINVA/CPUSHA: 1111 0100 x1x1 1000 (0xF418, 0xF438, 0xF458, 0xF478, etc.)
-    // CINV/CPUSH line/page: 1111 010x xxxx xaaa
-    // We treat these as NOPs since there's no cache to invalidate/push.
+    // 68040 Cache Instructions: CINV and CPUSH (F-line, privileged).
+    //   1111 0100 cc o ss aaa   cc = caches (01 data, 10 instr, 11 both),
+    //                           o = 0 CINV / 1 CPUSH, ss = scope, aaa = An.
+    // The host cache model is functional + write-through, so a push has no
+    // dirty data to write back and CPUSH collapses to CINV; we also do not
+    // track lines finely enough to honour the line/page scope, so every
+    // variant clears the whole indicated cache(s). Over-clearing only costs a
+    // few refills and is always coherent (the safe direction). The clears are
+    // surfaced to the host via cacr_pending_ops, the same channel the 68030
+    // CACR clear strobes use. The 68030 has no CINV/CPUSH (it invalidates
+    // through CACR), so these stay NOPs there.
     let is_cache_cpu = matches!(
         cpu.cpu_type,
         CpuType::M68EC030
@@ -165,7 +172,19 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         if !cpu.is_supervisor() {
             return cpu.take_exception(bus, 8); // Privilege violation
         }
-        // All CINV/CPUSH variants are NOPs for us
+        let is_68040 = matches!(
+            cpu.cpu_type,
+            CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040
+        );
+        if is_68040 {
+            let caches = (opcode >> 6) & 0b11;
+            if caches & 0b01 != 0 {
+                cpu.cacr_pending_ops |= super::cpu::CACR_CD; // clear data cache
+            }
+            if caches & 0b10 != 0 {
+                cpu.cacr_pending_ops |= super::cpu::CACR_CI; // clear instruction cache
+            }
+        }
         return 4;
     }
 

@@ -67,26 +67,42 @@ fall-through) and
 ## Caches
 
 The on-chip caches are silicon, so they are modelled by default on the parts
-that have them: the instruction cache on the 68020/68EC020/68030 and the data
-cache on the 68030 (`CpuModel::has_instruction_cache`/`has_data_cache`).
-CACR/CAAR are always stored; software (AmigaOS at boot) enables and clears the
-cache through CACR exactly as on hardware. A cache hit costs no bus cycle, so
-a cached instruction fetch does not contend with chip-bus DMA -- which is the
-point: 020/030 code looping out of chip RAM otherwise pays a bitplane-DMA
-arbitration stall on every fetch and runs at roughly half speed, drifting an
-AGA demo's interrupt-driven music or animation to half its intended rate. The
-data cache only covers expansion RAM/ROM because chip and slow RAM are
-DMA-visible and cache-inhibited, as on real machines. A 68000/68010 models no
-cache. `[cpu] icache = false`/`dcache = false` opt a 020/030 back out; with no
-cache modelled, the cache-control instructions are no-ops and self-modifying
-code always executes fresh bytes (the safe direction).
+that have them: the instruction cache on the 68020/68EC020/68030/68040 and the
+data cache on the 68030/68040 (`CpuModel::has_instruction_cache`/
+`has_data_cache`). CACR (and CAAR on the 020/030) are always stored; software
+(AmigaOS at boot) enables and clears the cache exactly as on hardware. A cache
+hit costs no bus cycle, so a cached instruction fetch does not contend with
+chip-bus DMA -- which is the point: 020/030/040 code looping out of chip RAM
+otherwise pays a bitplane-DMA arbitration stall on every fetch and runs at
+roughly half speed, drifting an AGA demo's interrupt-driven music or animation
+to half its intended rate. The data cache only covers expansion RAM/ROM
+because chip and slow RAM are DMA-visible and cache-inhibited, as on real
+machines. A 68000/68010 models no cache. `[cpu] icache = false`/`dcache =
+false` opt a cached CPU back out; with no cache modelled, the cache-control
+instructions are no-ops and self-modifying code always executes fresh bytes
+(the safe direction).
+
+Each cache is a power-of-two array of direct-mapped longword entries
+(`src/cache.rs`): 64 entries (256 bytes) on the 020/030 -- the exact 68020
+instruction-cache geometry -- and 1024 (4 KB) on the 68040. The larger 040
+capacity is the part that matters here: a chip-RAM loop bigger than 256 bytes
+stays resident on a 040 where it would thrash a 020. The 040's 4-way
+set-associative, 16-byte-line, copyback organisation is deliberately not
+modelled, and need not be -- copyback is unobservable because the data cache
+only covers expansion RAM, which is not DMA-visible, so write-back versus
+write-through cannot be told apart. The 040 also redefines CACR (only the IE/DE
+enable bits, no freeze or clear strobes) and moves invalidation to the
+CINV/CPUSH instructions; the model maps a CINV/CPUSH to a whole-cache clear of
+the indicated cache(s) -- over-clearing line/page scopes, which is always
+coherent (a push has no dirty data to write back in a write-through model).
 
 The instruction cache does not snoop writes (authentic 68020 behaviour), so a
 line stays valid until DMA or the CPU rewrites its backing memory, or software
-clears it via CACR. Restoring a save state that predates cache modelling (or
-was captured with the cache disabled) re-establishes the model's cache cold
-and re-derives its enable bits from the restored CACR, so the machine keeps
-the cache its CPU has rather than silently running cacheless after a load.
+clears it (via CACR on the 020/030, via CINV/CPUSH on the 040). Restoring a
+save state that predates cache modelling (or was captured with the cache
+disabled) re-establishes the model's cache cold and re-derives its enable bits
+from the restored CACR, so the machine keeps the cache its CPU has rather than
+silently running cacheless after a load.
 
 ## 68020+ timing
 
