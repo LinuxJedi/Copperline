@@ -486,6 +486,10 @@ pub struct App {
     held_rawkeys: [bool; 128],
     cursor_pos: Option<(i32, i32)>,
     last_display_cursor_pos: Option<(i32, i32)>,
+    /// Most recent raw host cursor position (physical pixels) from the last
+    /// CursorMoved. Kept only for the COPPERLINE_DIAG_CURSOR click trace, which
+    /// needs the un-mapped coordinate alongside the mapped pixel.
+    last_cursor_phys: Option<winit::dpi::PhysicalPosition<f64>>,
     volume_dragging: bool,
     /// True while the frame analyzer selector is following a held left
     /// mouse button.
@@ -774,6 +778,7 @@ impl App {
             held_rawkeys: [false; 128],
             cursor_pos: None,
             last_display_cursor_pos: None,
+            last_cursor_phys: None,
             volume_dragging: false,
             analyzer_dragging: false,
             mouse_captured: false,
@@ -1271,6 +1276,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let previous_cursor_pos = self.cursor_pos;
+                self.last_cursor_phys = Some(position);
                 let pos = self
                     .render
                     .as_ref()
@@ -1319,6 +1325,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
+                if pressed {
+                    self.log_cursor_diag(button);
+                }
                 if button == MouseButton::Left {
                     if pressed {
                         self.analyzer_dragging = false;
@@ -1400,6 +1409,22 @@ impl ApplicationHandler for App {
                         self.adjust_output_volume(steps * VOLUME_STEP_PERCENT);
                     }
                 }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // The host DPI changed -- the GNOME/Wayland scale setting was
+                // altered while running, or (the common case) the window was
+                // dragged onto a monitor with a different scale factor. winit
+                // resizes the surface via the Resized event that follows, but
+                // the backing texture is sized FB_WIDTH x WINDOW_PRESENT_HEIGHT
+                // times an integer supersample factor captured at window
+                // creation. Left stale, cursor_texture_position maps clicks
+                // against a texture extent that no longer matches the surface,
+                // so a status-bar click is mis-classified as a display click
+                // and grabs the mouse. Rebuild the texture for the new scale.
+                if let Some(r) = self.render.as_mut() {
+                    resync_render_scale(&mut r.pixels, &mut r.texture_scale, scale_factor);
+                }
+                self.request_redraw();
             }
             WindowEvent::Resized(size) => {
                 if let Some(r) = self.render.as_mut() {
@@ -2132,7 +2157,39 @@ fn decode_embedded_png(bytes: &[u8]) -> Result<EmbeddedRgbaImage> {
 }
 
 fn texture_scale_for_window(window: &Window) -> usize {
-    (window.scale_factor().round() as usize).clamp(1, MAX_TEXTURE_SCALE)
+    texture_scale_for_factor(window.scale_factor())
+}
+
+/// Integer supersample factor for the backing texture at a given host DPI
+/// scale factor. The texture is rendered at this multiple of the logical
+/// FB_WIDTH x WINDOW_PRESENT_HEIGHT size so a 2x display stays crisp.
+fn texture_scale_for_factor(scale_factor: f64) -> usize {
+    (scale_factor.round() as usize).clamp(1, MAX_TEXTURE_SCALE)
+}
+
+/// React to a host DPI scale-factor change for one window's pixel surface.
+///
+/// pixels' `window_pos_to_pixel` maps a host click into texture space using
+/// both the surface size (which the following Resized event updates) and the
+/// texture extent (which nothing updated before this). When the supersample
+/// factor changes -- e.g. dragging between a 1x and a 2x monitor -- the texture
+/// must be rebuilt to the new size, otherwise the two halves of the mapping
+/// disagree and clicks land in the wrong region. The rebuild reallocates a GPU
+/// texture, so it is skipped when the rounded factor is unchanged (a slow drag
+/// across a fractional-scale monitor seam can emit many events); the surface
+/// itself is re-synced by the Resized event that always follows.
+fn resync_render_scale(pixels: &mut Pixels<'static>, texture_scale: &mut usize, scale_factor: f64) {
+    let new_scale = texture_scale_for_factor(scale_factor);
+    if new_scale == *texture_scale {
+        return;
+    }
+    match pixels.resize_buffer(
+        texture_width(new_scale) as u32,
+        texture_height(new_scale) as u32,
+    ) {
+        Ok(()) => *texture_scale = new_scale,
+        Err(e) => warn!("resize texture buffer for scale {scale_factor} failed: {e}"),
+    }
 }
 
 fn build_pixels_for_window(
@@ -4322,6 +4379,39 @@ impl App {
         self.set_mouse_captured(!self.mouse_captured);
     }
 
+    /// COPPERLINE_DIAG_CURSOR: trace how the most recent click maps from host
+    /// physical coordinates through pixels' window_pos_to_pixel into a
+    /// texture/region hit. The tool for diagnosing mouse capture on DPI scale
+    /// changes and mixed-scale monitors (see the ScaleFactorChanged handler):
+    /// if a status-bar click logs region=display(->capture), the surface and
+    /// texture extents have drifted out of agreement.
+    fn log_cursor_diag(&self, button: MouseButton) {
+        if !crate::envcfg::flag("COPPERLINE_DIAG_CURSOR") {
+            return;
+        }
+        let Some(r) = self.render.as_ref() else {
+            return;
+        };
+        let scale_factor = r.window.scale_factor();
+        let inner = r.window.inner_size();
+        let phys = self.last_cursor_phys;
+        let mapped = phys.map(|p| r.pixels.window_pos_to_pixel((p.x as f32, p.y as f32)));
+        let pos = phys.and_then(|p| cursor_texture_position(&r.pixels, p, r.texture_scale));
+        let region = match pos {
+            Some(p) if cursor_in_status_bar(p) => "status_bar",
+            Some(p) if cursor_in_display(p) => "display(->capture)",
+            Some(_) => "other",
+            None => "none",
+        };
+        info!(
+            "[DIAG_CURSOR] button={button:?} phys={phys:?} scale_factor={scale_factor:.4} \
+             inner={}x{} texture_scale={} window_pos_to_pixel={mapped:?} mapped_pos={pos:?} \
+             region={region} (present_h={PRESENT_HEIGHT} window_present_h={WINDOW_PRESENT_HEIGHT} \
+             fb_w={FB_WIDTH})",
+            inner.width, inner.height, r.texture_scale,
+        );
+    }
+
     fn set_mouse_captured(&mut self, captured: bool) {
         if self.mouse_captured == captured {
             return;
@@ -4630,6 +4720,16 @@ impl App {
                     self.activate_tool_control(kind, control);
                     self.ensure_tool_windows_for_open_panels(event_loop);
                 }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Same stale-texture hazard as the main window (see the main
+                // window's ScaleFactorChanged handler): rebuild the tool
+                // window's texture for the new scale so its own hit-testing
+                // stays aligned after a DPI change or monitor move.
+                if let Some(tool) = self.tool_window_mut(kind) {
+                    resync_render_scale(&mut tool.pixels, &mut tool.texture_scale, scale_factor);
+                }
+                self.request_redraw();
             }
             WindowEvent::Resized(size) => {
                 if let Some(tool) = self.tool_window_mut(kind) {
