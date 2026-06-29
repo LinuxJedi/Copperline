@@ -61,6 +61,11 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.9.0" date="2026-06-29">
+      <description>
+        <p>Explicit joystick input mode controls, hard-disk volume-name overrides, no-ROM save-state loading, CIA timer one-shot and floppy motor timing fixes, Amiga input-line fixes, early display-fetch origin alignment, local-time RTC reporting, relocated m68k fork packaging, and 68881/68882 FPU accuracy improvements.</p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-06-27">
       <description>
         <p>Machine-configuration launcher, schema-driven Zorro WASM plugin settings, A2065 loopback networking, directory hard-disk filename encoding fixes, startup state-load fixes, and Denise, Agnus, sprite, bitplane, display-window, and save-state render timing improvements.</p>
