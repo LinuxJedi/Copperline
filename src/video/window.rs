@@ -462,6 +462,10 @@ fn raw_device_qualifier_rawkey(code: KeyCode) -> Option<u8> {
     }
 }
 
+fn raw_device_qualifier_family_held(held_rawkeys: &[bool; 128], left: u8, right: u8) -> bool {
+    rawkey_is_held(held_rawkeys, left) || rawkey_is_held(held_rawkeys, right)
+}
+
 pub struct App {
     emu: Emulator,
     fb: Vec<u32>,
@@ -527,6 +531,7 @@ pub struct App {
     record_input_path: Option<PathBuf>,
     modifiers: ModifiersState,
     held_rawkeys: [bool; 128],
+    raw_device_held_rawkeys: [bool; 128],
     main_window_focused: bool,
     cursor_pos: Option<(i32, i32)>,
     last_display_cursor_pos: Option<(i32, i32)>,
@@ -820,6 +825,7 @@ impl App {
             record_input_path: record_input,
             modifiers: ModifiersState::empty(),
             held_rawkeys: [false; 128],
+            raw_device_held_rawkeys: [false; 128],
             main_window_focused: false,
             cursor_pos: None,
             last_display_cursor_pos: None,
@@ -4698,6 +4704,7 @@ impl App {
         };
 
         let pressed = event.state == ElementState::Pressed;
+        self.raw_device_held_rawkeys[rawkey_index(rawkey)] = pressed;
         if pressed && (!self.main_window_focused || self.modal_ui_active()) {
             return;
         }
@@ -6966,11 +6973,23 @@ impl App {
 
     fn update_host_modifiers(&mut self, modifiers: ModifiersState) {
         self.modifiers = modifiers;
-        if !modifiers.shift_key() {
+        if !modifiers.shift_key()
+            && !raw_device_qualifier_family_held(
+                &self.raw_device_held_rawkeys,
+                AMIGA_RAWKEY_LEFT_SHIFT,
+                AMIGA_RAWKEY_RIGHT_SHIFT,
+            )
+        {
             self.release_amiga_rawkey_if_held(AMIGA_RAWKEY_LEFT_SHIFT);
             self.release_amiga_rawkey_if_held(AMIGA_RAWKEY_RIGHT_SHIFT);
         }
-        if !modifiers.alt_key() {
+        if !modifiers.alt_key()
+            && !raw_device_qualifier_family_held(
+                &self.raw_device_held_rawkeys,
+                AMIGA_RAWKEY_LEFT_ALT,
+                AMIGA_RAWKEY_RIGHT_ALT,
+            )
+        {
             self.release_amiga_rawkey_if_held(AMIGA_RAWKEY_LEFT_ALT);
             self.release_amiga_rawkey_if_held(AMIGA_RAWKEY_RIGHT_ALT);
         }
@@ -7892,19 +7911,19 @@ mod tests {
         host_shortcut_modifier_pressed, host_to_amiga_rawkey, joystick_mode_uses_keyboard,
         joystick_toggle_rect, keyboard_joystick_key_for, led_row_rect, mask_present_frame_to_tv,
         paint_test_screen, parse_amiga_key, pause_button_rect, power_button_rect,
-        present_row_sample, presentation_source_y_offset, raw_device_qualifier_rawkey,
-        rawkey_is_held, rawkey_transition_is_duplicate, reboot_button_rect,
-        repeated_main_key_should_drop, rgba, shot_button_rect, should_render_emulated_frame,
-        standard_window_top_row, status_with_latched_fdd_track, take_integral_mouse_delta,
-        texture_height, texture_width, tv_source_h_bounds, tv_standard_h_shift,
-        volume_percent_from_pos, volume_slider_track_rect, BarControl, DriveBar, JoystickInputMode,
-        KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar, StatusBarView, ToolPanelKind,
-        AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT, AMIGA_RAWKEY_RIGHT_ALT,
-        AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF,
-        CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF,
-        HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
-        STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
-        TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
+        present_row_sample, presentation_source_y_offset, raw_device_qualifier_family_held,
+        raw_device_qualifier_rawkey, rawkey_is_held, rawkey_transition_is_duplicate,
+        reboot_button_rect, repeated_main_key_should_drop, rgba, shot_button_rect,
+        should_render_emulated_frame, standard_window_top_row, status_with_latched_fdd_track,
+        take_integral_mouse_delta, texture_height, texture_width, tv_source_h_bounds,
+        tv_standard_h_shift, volume_percent_from_pos, volume_slider_track_rect, BarControl,
+        DriveBar, JoystickInputMode, KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar,
+        StatusBarView, ToolPanelKind, AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT,
+        AMIGA_RAWKEY_RIGHT_ALT, AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED,
+        CD_BODY, CD_LED_OFF, CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF,
+        FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF,
+        POWER_LED_ON, PRESENT_HEIGHT, STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS,
+        STATUS_BG, TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::FrontPanelStatus;
@@ -8029,6 +8048,31 @@ mod tests {
     }
 
     #[test]
+    fn raw_device_qualifier_family_reports_physical_side_state() {
+        let mut held = [false; 128];
+        assert!(!raw_device_qualifier_family_held(
+            &held,
+            AMIGA_RAWKEY_LEFT_ALT,
+            AMIGA_RAWKEY_RIGHT_ALT
+        ));
+
+        held[AMIGA_RAWKEY_LEFT_ALT as usize] = true;
+        assert!(raw_device_qualifier_family_held(
+            &held,
+            AMIGA_RAWKEY_LEFT_ALT,
+            AMIGA_RAWKEY_RIGHT_ALT
+        ));
+
+        held[AMIGA_RAWKEY_LEFT_ALT as usize] = false;
+        held[AMIGA_RAWKEY_RIGHT_ALT as usize] = true;
+        assert!(raw_device_qualifier_family_held(
+            &held,
+            AMIGA_RAWKEY_LEFT_ALT,
+            AMIGA_RAWKEY_RIGHT_ALT
+        ));
+    }
+
+    #[test]
     fn amiga_qualifier_transitions_ignore_duplicate_host_events() {
         let mut held = [false; 128];
 
@@ -8078,6 +8122,36 @@ mod tests {
         app.update_host_modifiers(ModifiersState::empty());
         assert!(!rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_LEFT_SHIFT));
         assert!(!rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_RIGHT_SHIFT));
+    }
+
+    #[test]
+    fn raw_device_alt_hold_blocks_altgr_aggregate_cleanup() {
+        let mut app = test_app();
+        app.main_window_focused = true;
+
+        app.handle_raw_device_key_event(RawKeyEvent {
+            physical_key: PhysicalKey::Code(KeyCode::AltLeft),
+            state: ElementState::Pressed,
+        });
+        app.update_host_modifiers(ModifiersState::ALT);
+        assert!(rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_LEFT_ALT));
+
+        app.update_host_modifiers(ModifiersState::empty());
+        assert!(rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_LEFT_ALT));
+
+        app.handle_raw_device_key_event(RawKeyEvent {
+            physical_key: PhysicalKey::Code(KeyCode::AltRight),
+            state: ElementState::Pressed,
+        });
+        assert!(rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_LEFT_ALT));
+        assert!(rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_RIGHT_ALT));
+
+        app.handle_raw_device_key_event(RawKeyEvent {
+            physical_key: PhysicalKey::Code(KeyCode::AltLeft),
+            state: ElementState::Released,
+        });
+        assert!(!rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_LEFT_ALT));
+        assert!(rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_RIGHT_ALT));
     }
 
     #[test]
