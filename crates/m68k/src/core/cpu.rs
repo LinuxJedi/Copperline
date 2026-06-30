@@ -221,8 +221,8 @@ pub struct CpuCore {
 }
 
 // CACR bit assignments (68020/68030). The 68040 redefines CACR (IE/DE
-// enables only, with CINV/CPUSH instructions doing invalidation) and is
-// not cache-modeled here.
+// enables only, with CINV/CPUSH instructions doing invalidation); its bits
+// are below (CACR_040_*).
 /// Enable instruction cache.
 pub const CACR_EI: u32 = 1 << 0;
 /// Freeze instruction cache (hits served, misses do not allocate).
@@ -245,6 +245,15 @@ pub const CACR_CD: u32 = 1 << 11;
 pub const CACR_DBE: u32 = 1 << 12;
 /// Write allocate (68030; stored, the host model is write-through).
 pub const CACR_WA: u32 = 1 << 13;
+
+// CACR bit assignments (68040). The 68040 CACR has only two defined bits -
+// the cache enables - and no freeze/clear strobes: invalidation is done with
+// the CINV/CPUSH instructions instead (see decode.rs). All other bits are
+// reserved and read back as zero.
+/// Enable instruction cache (68040).
+pub const CACR_040_IE: u32 = 1 << 15;
+/// Enable data cache (68040).
+pub const CACR_040_DE: u32 = 1 << 31;
 
 impl Default for CpuCore {
     fn default() -> Self {
@@ -856,9 +865,11 @@ impl CpuCore {
                         CACR_EI | CACR_FI | CACR_IBE | CACR_ED | CACR_FD | CACR_DBE | CACR_WA,
                         CACR_CEI | CACR_CI | CACR_CED | CACR_CD,
                     ),
-                    // 68040 CACR has a different layout (IE/DE) and uses
-                    // CINV/CPUSH for invalidation; store it untouched.
-                    _ => (0xFFFF_FFFF, 0),
+                    // 68040 CACR defines only the two cache-enable bits and
+                    // has no clear strobes - invalidation is done with the
+                    // CINV/CPUSH instructions (see decode.rs). Reserved bits
+                    // read back as zero.
+                    _ => (CACR_040_IE | CACR_040_DE, 0),
                 };
                 self.cacr = value & persist;
                 self.cacr_pending_ops |= value & strobes;

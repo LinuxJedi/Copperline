@@ -11,6 +11,9 @@ pub mod mmu;
 
 // Re-export commonly used types from core
 pub use core::cpu::CpuCore;
-pub use core::cpu::{CACR_CD, CACR_CED, CACR_CEI, CACR_CI, CACR_ED, CACR_EI, CACR_FD, CACR_FI};
+pub use core::cpu::{
+    CACR_040_DE, CACR_040_IE, CACR_CD, CACR_CED, CACR_CEI, CACR_CI, CACR_ED, CACR_EI, CACR_FD,
+    CACR_FI,
+};
 pub use core::memory::AddressBus;
 pub use core::types::{CpuType, HleHandler, NoOpHleHandler, Size, StepResult};

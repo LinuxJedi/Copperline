@@ -197,8 +197,8 @@ carried no information.)
 [cpu]
 model = "68000"     # 68000, 68EC020, 68020, 68030, 68040
 clock_mhz = 14.0    # optional; defaults to the model's stock speed
-# icache = false    # 020/030 instruction-cache model (on by default for them)
-# dcache = false    # 030 data-cache model (on by default for the 030)
+# icache = false    # instruction-cache model (on by default: 020/030/040)
+# dcache = false    # data-cache model (on by default: 030/040)
 # fpu = true        # fit a 68881/68882 (68020/68030; needs the coprocessor
 #                   # interface, so not valid on a 68000). The full 68040's
 #                   # on-die FPU is enabled by default.
@@ -212,14 +212,15 @@ clock_mhz = 14.0    # optional; defaults to the model's stock speed
   stay chip-bus bound, so overclocking speeds up only what a real
   accelerator would speed up.
 - `icache`/`dcache` model the on-chip caches and default **on** for the
-  silicon that has them (instruction cache on the 020/68EC020/030, data cache
-  on the 030 only), matching real hardware where AmigaOS enables them via
-  CACR. Set either to `false` to opt out. This is not cosmetic: 020/030 code
-  that loops out of chip RAM otherwise contends with bitplane DMA on every
-  instruction fetch and can run at roughly half speed, which is why an AGA
-  demo's music or animation may pace correctly only with the cache modelled.
-  The data cache caches expansion RAM/ROM only, since chip and slow RAM are
-  DMA-visible and cache-inhibited as on real Amigas.
+  silicon that has them (instruction cache on the 020/68EC020/030/040, data
+  cache on the 030/040), matching real hardware where AmigaOS enables them via
+  CACR. The cache is sized to the CPU: 256 bytes on the 020/030, 4 KB on the
+  040. Set either to `false` to opt out. This is not cosmetic: code that loops
+  out of chip RAM otherwise contends with bitplane DMA on every instruction
+  fetch and can run at roughly half speed, which is why an AGA demo's music or
+  animation may pace correctly only with the cache modelled. The data cache
+  caches expansion RAM/ROM only, since chip and slow RAM are DMA-visible and
+  cache-inhibited as on real Amigas.
 
 ## `[memory]`
 

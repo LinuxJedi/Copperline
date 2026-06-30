@@ -428,22 +428,22 @@ impl CpuModel {
     }
 
     /// Whether this model has the on-chip instruction cache Copperline models.
-    /// The 68020/68EC020/68030 all ship a 256-byte direct-mapped instruction
-    /// cache; AmigaOS enables it (CACR.EI) at boot. Real A1200/A4000 software
-    /// (demos especially) leans on it: code looping out of chip RAM otherwise
-    /// contends with bitplane DMA on every fetch and runs roughly half-speed.
-    /// The 68040 caches exist but are not modelled here, so it reports false.
+    /// The 68020/68EC020/68030 ship a 256-byte direct-mapped instruction cache
+    /// and the 68040 a 4 KB one; AmigaOS enables it (CACR) at boot. Real
+    /// A1200/A4000 software (demos especially) leans on it: code looping out of
+    /// chip RAM otherwise contends with bitplane DMA on every fetch and runs
+    /// roughly half-speed.
     pub fn has_instruction_cache(self) -> bool {
         matches!(
             self,
-            CpuModel::M68EC020 | CpuModel::M68020 | CpuModel::M68030
+            CpuModel::M68EC020 | CpuModel::M68020 | CpuModel::M68030 | CpuModel::M68040
         )
     }
 
-    /// Whether this model has the on-chip data cache Copperline models. Only
-    /// the 68030 has one (the 020 has none; the 040's is not modelled).
+    /// Whether this model has the on-chip data cache Copperline models. The
+    /// 68030 (256 bytes) and 68040 (4 KB) have one; the 020 has none.
     pub fn has_data_cache(self) -> bool {
-        self == CpuModel::M68030
+        matches!(self, CpuModel::M68030 | CpuModel::M68040)
     }
 }
 
@@ -1362,19 +1362,17 @@ impl TryFrom<RawConfig> for Config {
             .icache
             .unwrap_or_else(|| cpu.has_instruction_cache());
         let cpu_dcache = raw.cpu.dcache.unwrap_or_else(|| cpu.has_data_cache());
-        if cpu_icache
-            && !matches!(
-                cpu,
-                CpuModel::M68EC020 | CpuModel::M68020 | CpuModel::M68030
-            )
-        {
+        if cpu_icache && !cpu.has_instruction_cache() {
             bail!(
-                "[cpu] icache = true needs a 68020/68EC020/68030 (the 68000 has \
-                 no cache; the 68040 cache is not modelled)"
+                "[cpu] icache = true needs a 68020/68EC020/68030/68040 \
+                 (the 68000 has no instruction cache)"
             );
         }
-        if cpu_dcache && cpu != CpuModel::M68030 {
-            bail!("[cpu] dcache = true needs a 68030 (the 68020 has no data cache)");
+        if cpu_dcache && !cpu.has_data_cache() {
+            bail!(
+                "[cpu] dcache = true needs a 68030 or 68040 \
+                 (the 68000/68020 have no data cache)"
+            );
         }
         if let Some(speed) = raw.emulation.speed.as_deref() {
             log::warn!(
@@ -2880,6 +2878,9 @@ mod tests {
         let cfg = parse_config("[cpu]\nmodel = \"68020\"")?;
         assert!(cfg.cpu_icache && !cfg.cpu_dcache);
         let cfg = parse_config("[cpu]\nmodel = \"68030\"")?;
+        assert!(cfg.cpu_icache && cfg.cpu_dcache);
+        // A 68040 gets both its (4 KB) caches by default.
+        let cfg = parse_config("[cpu]\nmodel = \"68040\"")?;
         assert!(cfg.cpu_icache && cfg.cpu_dcache);
 
         // A plain 68000 has neither.

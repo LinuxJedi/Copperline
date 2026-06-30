@@ -1360,14 +1360,16 @@ impl M68kMachine {
         cck
     }
 
-    /// Install the 68020/030 cache models. These default on for CPUs that have
-    /// them (see `CpuModel::has_instruction_cache`/`has_data_cache`), matching
-    /// real silicon where AmigaOS enables the cache via CACR; `[cpu] icache =
-    /// false`/`dcache = false` opt out. With both false, CACR writes are
-    /// tracked but have no effect.
+    /// Install the 68020/030/040 cache models. These default on for CPUs that
+    /// have them (see `CpuModel::has_instruction_cache`/`has_data_cache`),
+    /// matching real silicon where AmigaOS enables the cache via CACR; `[cpu]
+    /// icache = false`/`dcache = false` opt out. With both false, CACR writes
+    /// are tracked but have no effect. The cache is sized for the CPU: 256
+    /// bytes (64 longwords) on the 020/030, 4 KB (1024) on the 040.
     pub fn set_cache_emulation(&mut self, icache: bool, dcache: bool) {
-        self.bus.icache = icache.then(Box::default);
-        self.bus.dcache = dcache.then(Box::default);
+        let lines = cache_lines_for_cpu_type(self.cpu.cpu_type);
+        self.bus.icache = icache.then(|| Box::new(crate::cache::CpuCache::new(lines)));
+        self.bus.dcache = dcache.then(|| Box::new(crate::cache::CpuCache::new(lines)));
         self.last_cacr = 0;
         self.apply_cacr_updates();
         if icache || dcache {
@@ -1383,7 +1385,10 @@ impl M68kMachine {
     /// strobes. Called after every instruction; a single compare when
     /// nothing changed.
     fn apply_cacr_updates(&mut self) {
-        use m68k::{CACR_CD, CACR_CED, CACR_CEI, CACR_CI, CACR_ED, CACR_EI, CACR_FD, CACR_FI};
+        use m68k::{
+            CACR_040_DE, CACR_040_IE, CACR_CD, CACR_CED, CACR_CEI, CACR_CI, CACR_ED, CACR_EI,
+            CACR_FD, CACR_FI,
+        };
         let ops = std::mem::take(&mut self.cpu.cacr_pending_ops);
         let cacr = self.cpu.cacr;
         if ops == 0 && cacr == self.last_cacr {
@@ -1391,6 +1396,29 @@ impl M68kMachine {
         }
         self.last_cacr = cacr;
         let caar = self.cpu.caar;
+        // The 68040 CACR uses different enable bits (IE/DE) and has no freeze
+        // or CACR clear strobes - invalidation arrives through CINV/CPUSH,
+        // which decode.rs surfaces as the CACR_CI/CACR_CD pending ops below.
+        if matches!(
+            self.cpu.cpu_type,
+            CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040
+        ) {
+            if let Some(icache) = self.bus.icache.as_deref_mut() {
+                icache.enabled = cacr & CACR_040_IE != 0;
+                icache.frozen = false;
+                if ops & CACR_CI != 0 {
+                    icache.clear_all();
+                }
+            }
+            if let Some(dcache) = self.bus.dcache.as_deref_mut() {
+                dcache.enabled = cacr & CACR_040_DE != 0;
+                dcache.frozen = false;
+                if ops & CACR_CD != 0 {
+                    dcache.clear_all();
+                }
+            }
+            return;
+        }
         if let Some(icache) = self.bus.icache.as_deref_mut() {
             icache.enabled = cacr & CACR_EI != 0;
             icache.frozen = cacr & CACR_FI != 0;
@@ -2164,6 +2192,15 @@ fn cpu_type_for_model(model: CpuModel) -> CpuType {
     }
 }
 
+/// Longword entries in each on-chip cache for this CPU: the 040's caches are
+/// 4 KB (1024 longwords), the 020/030's 256 bytes (64). See `crate::cache`.
+fn cache_lines_for_cpu_type(cpu_type: CpuType) -> usize {
+    match cpu_type {
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 => crate::cache::LINES_040,
+        _ => crate::cache::LINES_020,
+    }
+}
+
 fn address_mask_for_model(model: CpuModel) -> u32 {
     match model {
         CpuModel::M68000 | CpuModel::M68EC020 => ADDRESS_MASK_24BIT,
@@ -2676,6 +2713,68 @@ mod tests {
         assert_eq!(slice.instructions, 8);
         assert_eq!(machine.d(2), 1, "CACR CI must flush the stale entry");
         Ok(())
+    }
+
+    #[test]
+    fn icache_68040_enabled_by_ie_and_flushed_by_cinv() -> Result<()> {
+        // The 68040 CACR enables the instruction cache through IE (bit 15),
+        // and CINV/CPUSH - not a CACR strobe - invalidates it. Self-modifying
+        // code therefore runs the stale cached opcode until a CINV.
+        //
+        //   $100: 203C 0000 8000  move.l #$8000,d0        (CACR.IE)
+        //   $106: 4E7B 0002        movec d0,cacr           (icache on)
+        //   $10A: 4E71             nop                     (cached on first run)
+        //   $10C: 31FC 5282 010A   move.w #$5282,($10A).w  (patch -> addq.l #1,d2)
+        //   $112: F498             cinva (instruction)     (clear icache)  [B only]
+        //   ...:  4EF8 010A        jmp ($10A).w
+        let prologue: [u16; 9] = [
+            0x203C, 0x0000, 0x8000, 0x4E7B, 0x0002, 0x4E71, 0x31FC, 0x5282, 0x010A,
+        ];
+
+        // A: no CINV. The patched write does not snoop the icache, so the
+        // revisit hits the stale NOP and d2 stays 0.
+        let mut program_a = prologue.to_vec();
+        program_a.extend_from_slice(&[0x4EF8, 0x010A]); // jmp ($10A).w
+        let mut machine = M68kMachine::new(
+            test_bus(reset_rom(0x0007_FFFE, 0x0000_0100)),
+            CpuModel::M68040,
+            false,
+        )?;
+        machine.set_cache_emulation(true, false);
+        write_program(machine.bus_mut(), 0x100, &program_a);
+        let slice = machine.step_slice(6)?;
+        assert_eq!(slice.instructions, 6);
+        assert_eq!(machine.d(2), 0, "stale cached NOP must run without a CINV");
+
+        // B: CINVA before the jump flushes the icache, so the revisit misses
+        // and refetches the patched ADDQ.
+        let mut program_b = prologue.to_vec();
+        program_b.extend_from_slice(&[0xF498, 0x4EF8, 0x010A]); // cinva (instr); jmp
+        let mut machine = M68kMachine::new(
+            test_bus(reset_rom(0x0007_FFFE, 0x0000_0100)),
+            CpuModel::M68040,
+            false,
+        )?;
+        machine.set_cache_emulation(true, false);
+        write_program(machine.bus_mut(), 0x100, &program_b);
+        let slice = machine.step_slice(7)?;
+        assert_eq!(slice.instructions, 7);
+        assert_eq!(machine.d(2), 1, "CINVA must flush the stale icache entry");
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_040_caches_are_4kb() {
+        // The 040 installs the larger 4 KB (1024-longword) caches; the 020/030
+        // get the 256-byte (64) ones.
+        assert_eq!(
+            cache_lines_for_cpu_type(CpuType::M68LC040),
+            crate::cache::LINES_040
+        );
+        assert_eq!(
+            cache_lines_for_cpu_type(CpuType::M68020),
+            crate::cache::LINES_020
+        );
     }
 
     #[test]

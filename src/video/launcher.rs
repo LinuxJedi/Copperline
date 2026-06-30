@@ -891,14 +891,11 @@ impl MachineSetup {
         let reason = |applicable: bool, why: &'static str| (!applicable).then_some(why);
         match field {
             F::Fpu => reason(self.cpu != CpuModel::M68000, "needs 68020+"),
-            F::Icache => reason(
-                matches!(
-                    self.cpu,
-                    CpuModel::M68EC020 | CpuModel::M68020 | CpuModel::M68030
-                ),
-                "needs 68020/030",
-            ),
-            F::Dcache => reason(self.cpu == CpuModel::M68030, "needs 68030"),
+            // Gate on the model's actual cache capability so the launcher tracks
+            // CpuModel rather than a second hand-maintained list (the 040 has
+            // both caches; only the 68000 has neither).
+            F::Icache => reason(self.cpu.has_instruction_cache(), "needs 68020+"),
+            F::Dcache => reason(self.cpu.has_data_cache(), "needs 68030/040"),
             F::Z3Ram => reason(cpu_is_32bit(self.cpu), "needs 32-bit CPU"),
             F::IdeMaster | F::IdeSlave => reason(self.has_gayle(), "needs A600/A1200"),
             F::CdImage | F::CdInsertDelay => reason(self.has_cd(), "needs CDTV/CD32"),
@@ -1699,6 +1696,33 @@ mod tests {
         let toml = s.to_toml().unwrap();
         assert!(toml.trim().is_empty(), "expected empty TOML, got:\n{toml}");
         assert!(s.build_config().is_ok());
+    }
+
+    #[test]
+    fn launcher_exposes_both_cache_toggles_for_the_68040() {
+        let mut s = MachineSetup::default();
+        // Step the CPU selector along to the 68040.
+        for _ in 0..CPUS.len() {
+            if s.cpu == CpuModel::M68040 {
+                break;
+            }
+            s.cycle(LauncherField::Cpu, true);
+        }
+        assert_eq!(s.cpu, CpuModel::M68040, "cycled to the 68040");
+        // The 040 has both caches, so neither toggle is greyed and both default
+        // on (like the 030) when the part is selected.
+        assert_eq!(s.disabled_reason(LauncherField::Icache), None);
+        assert_eq!(s.disabled_reason(LauncherField::Dcache), None);
+        assert!(s.toggle_value(LauncherField::Icache));
+        assert!(s.toggle_value(LauncherField::Dcache));
+
+        // The 68000 has neither; the 68EC020 has only the instruction cache.
+        s.cpu = CpuModel::M68000;
+        assert!(s.disabled_reason(LauncherField::Icache).is_some());
+        assert!(s.disabled_reason(LauncherField::Dcache).is_some());
+        s.cpu = CpuModel::M68EC020;
+        assert_eq!(s.disabled_reason(LauncherField::Icache), None);
+        assert!(s.disabled_reason(LauncherField::Dcache).is_some());
     }
 
     #[test]

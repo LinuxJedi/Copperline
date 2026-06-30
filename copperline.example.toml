@@ -72,14 +72,16 @@ model = "68000"
 # RAM stay chip-bus bound.
 # clock_mhz = 14.0
 
-# Model the on-chip caches (CACR-controlled, cleared through MOVEC like
-# real silicon). Off by default: the calibrated 020 timing assumes no
-# cache model, so enabling them makes chip-RAM-resident code faster.
-# icache needs a 68020/68EC020/68030; dcache needs a 68030 (and only
-# caches expansion RAM/ROM -- chip and slow RAM are cache-inhibited
-# because DMA writes them, as on real Amigas).
-# icache = true
-# dcache = true
+# Model the on-chip caches (a hit serves with no chip-bus cycle, as on
+# real silicon, so cached code stops contending with DMA). On by default
+# for the CPUs that have them, since AmigaOS enables them at boot: the
+# instruction cache on the 68020/68EC020/68030/68040 (256 bytes on the
+# 020/030, 4 KB on the 040) and the data cache on the 68030/68040. The
+# data cache only covers expansion RAM/ROM -- chip and slow RAM are
+# cache-inhibited because DMA writes them, as on real Amigas. Set false
+# to force a CPU to run cacheless (e.g. for the uncalibrated baseline).
+# icache = false
+# dcache = false
 
 
 # Optional machine profile: a validated bundle of chipset revisions, CPU,
