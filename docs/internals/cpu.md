@@ -155,7 +155,60 @@ throughput still runs below the reference, and the cycle model does not reflect
 instruction-cache hit/miss *latency* (only its bus-traffic effect), so software
 that toggles CACR cache-on/off and depends on the exact transition timing can
 diverge.
-MMU-dependent 030/040 accelerator setups are a non-goal.
+
+## MMU
+
+The 68030 and 68040 model the on-chip MMU (`has_pmmu`), so software that sets up
+and enables address translation runs rather than having its MMU writes ignored.
+The two parts differ enough to need separate walkers: the 68030 uses its
+programmable table walk (CRP/SRP selection, the TC index fields, 4-/8-byte
+descriptor modes, early-termination descriptors), while the 68040 has a
+fixed-format three-level walk (root -> pointer -> page, 4 KB or 8 KB pages,
+URP/SRP split by supervisor) keyed off its own TC layout. Both share the
+transparent translation registers (TTRs: the 030's TT0/1, the 040's ITT0/1 +
+DTT0/1), which short-circuit the walk for a matching address range.
+
+One register set (`mmu_*` in `CpuCore`) is canonical for both paths, so the 030
+`PMOVE` writes, the 040 `MOVEC` writes, and the walker can never desync (the 040
+root pointers overload the CRP/SRP address slots, dispatched by `cpu_type`). The
+enable bit differs by part -- TC[31] on the 030, TC[15] on the 040 -- via
+`tc_enable()`. `PMOVE`/`MOVEC` load the registers and `PTEST`/`PLOAD`/`PFLUSH`
+are accepted as no-ops rather than trapping.
+
+A 68040 table walk costs three descriptor fetches, far too much to pay on every
+access, so the 040 walker is fronted by an address-translation cache
+(`crate::mmu::atc`, mirrored on the real 64-entry ATC): a direct-mapped cache of
+(logical page -> physical page) keyed by page frame and supervisor flag. It is a
+pure cache -- never serialized (restored empty) -- and is flushed when the
+mapping could change: a write to TC / a root pointer / a TTR, or a PFLUSH. Like
+real hardware a plain write to a descriptor does not auto-flush; software must
+PFLUSH, which is where the ATC is cleared.
+
+The 68040 enforces page protection: a write to a write-protected page (the W
+bit, accumulated across the table and page descriptors) or a user access to a
+supervisor-only page (the S bit) raises an access fault, delivered as a 68040
+format-7 access-error stack frame at the bus-error vector. The faulting
+instruction is rolled back and its PC stacked, so after the handler fixes the
+mapping an `RTE` restarts it (the demand-paging / memory-protection model). The
+ATC carries the protection bits, so a cached translation cannot bypass the
+check. The frame's writeback/continuation fields are left clear (full-restart
+model); mid-instruction continuation is not modelled.
+
+A *data* access through an invalid/unconfigured descriptor raises an access
+fault -- this is how Enforcer/MuForce catch low-memory and freed-memory hits. An
+*instruction fetch* through an invalid descriptor instead falls back to identity:
+a 68040 enables TC before all of its code is mapped during boot, so faulting the
+fetch stream there would derail it. The bus-error delivery sets the
+exception-processing flag, so the frame writes and vector fetch do not
+re-translate (and a fault while delivering a fault is a clean double-fault halt).
+
+`PTEST` (68040) walks the addressed page and reports the physical address and
+resident bit in MMUSR (the cache-mode/used/modified attribute bits are not yet
+filled in). The 68030 also enforces the descriptor write-protect (WP) bit, and
+its faults are routed to the bus-error vector like the 040's, though the 68030
+long bus-fault stack frame (format A/B) is still the minimal fallback rather than
+a fully resumable frame. Remaining: the 040 SSW access size, the indirect/used/
+modified MMUSR bits, and the resumable 030 frame.
 
 ## Interrupts and STOP
 

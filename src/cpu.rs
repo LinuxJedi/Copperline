@@ -2188,7 +2188,9 @@ fn cpu_type_for_model(model: CpuModel) -> CpuType {
         CpuModel::M68EC020 => CpuType::M68EC020,
         CpuModel::M68020 => CpuType::M68020,
         CpuModel::M68030 => CpuType::M68030,
-        CpuModel::M68040 => CpuType::M68LC040,
+        // Full 68040: FPU on-die (default_fpu) and the MMU enabled (has_pmmu).
+        // The FPU-less LC/EC variants are not modelled (see CpuModel docs).
+        CpuModel::M68040 => CpuType::M68040,
     }
 }
 

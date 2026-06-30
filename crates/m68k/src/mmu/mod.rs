@@ -1,11 +1,13 @@
 //! MMU emulation (68030/68040 PMMU)
 
+pub mod atc;
 mod translation;
 pub mod ttr;
 
 use crate::core::cpu::CpuCore;
 use crate::core::memory::AddressBus;
 
+pub use atc::Atc;
 pub use translation::translate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
