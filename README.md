@@ -48,7 +48,8 @@ against real hardware.
   with an optional 68881/68882 FPU (default-on for the 68040).
 - **Peripherals**: a bit-timed keyboard (6500/1 MCU), mouse, USB gamepad
   (via the pure-Rust `gilrs`, no SDL2), 4-channel Paula audio, floppy
-  (ADF / ADZ / DMS, read-only SCP), Gayle IDE, A2091 SCSI, and CDTV/CD32 CD.
+  (ADF / ADZ / ZIP / DMS, read-only SCP), Gayle IDE, A2091 SCSI, and CDTV/CD32
+  CD.
 - **Tooling**: an in-window debugger, an interactive chip-bus frame
   analyzer, remote GDB support, deterministic save states, input
   recording/replay, and headless screenshot/frame-dump capture -- the

@@ -361,10 +361,10 @@ also connects that drive automatically, so existing configs that name
 `[floppy.df1]` .. `[floppy.df3]` keep working.
 
 Supported image formats: standard 901120-byte DD ADF, gzip-compressed
-images (ADZ), DMS archives, UAE extended ADF, and read-only SCP flux
-images. DMS, gzip, and SCP images are decoded at load time and always
-treated as write-protected; set `write_protected = false` on a plain ADF to
-allow write-through updates to the image file.
+images (ADZ), single file ZIP archives, DMS archives, UAE extended ADF, and
+read-only SCP flux images. DMS, gzip, and SCP images are decoded at load time
+and always treated as write-protected; set `write_protected = false` on a plain
+ADF to allow write-through updates to the image file.
 
 A `paths` playlist lets multi-disk software that only drives DF0: run
 without a second drive: the first entry is the boot disk and the disk-swap
