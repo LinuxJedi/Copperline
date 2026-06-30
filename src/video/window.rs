@@ -417,7 +417,8 @@ use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{
-    DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+    DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, RawKeyEvent,
+    WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -448,6 +449,16 @@ fn repeated_main_key_should_drop(
     match host_to_amiga_rawkey(code) {
         Some(rawkey) => rawkey_is_held(held_rawkeys, rawkey),
         None => true,
+    }
+}
+
+fn raw_device_qualifier_rawkey(code: KeyCode) -> Option<u8> {
+    match code {
+        KeyCode::ShiftLeft => Some(AMIGA_RAWKEY_LEFT_SHIFT),
+        KeyCode::ShiftRight => Some(AMIGA_RAWKEY_RIGHT_SHIFT),
+        KeyCode::AltLeft => Some(AMIGA_RAWKEY_LEFT_ALT),
+        KeyCode::AltRight => Some(AMIGA_RAWKEY_RIGHT_ALT),
+        _ => None,
     }
 }
 
@@ -516,6 +527,7 @@ pub struct App {
     record_input_path: Option<PathBuf>,
     modifiers: ModifiersState,
     held_rawkeys: [bool; 128],
+    main_window_focused: bool,
     cursor_pos: Option<(i32, i32)>,
     last_display_cursor_pos: Option<(i32, i32)>,
     /// Most recent raw host cursor position (physical pixels) from the last
@@ -808,6 +820,7 @@ impl App {
             record_input_path: record_input,
             modifiers: ModifiersState::empty(),
             held_rawkeys: [false; 128],
+            main_window_focused: false,
             cursor_pos: None,
             last_display_cursor_pos: None,
             last_cursor_phys: None,
@@ -1350,10 +1363,13 @@ impl ApplicationHandler for App {
                     self.request_redraw();
                 }
             }
-            WindowEvent::Focused(false) => {
-                self.volume_dragging = false;
-                self.analyzer_dragging = false;
-                self.set_mouse_captured(false);
+            WindowEvent::Focused(focused) => {
+                self.main_window_focused = focused;
+                if !focused {
+                    self.volume_dragging = false;
+                    self.analyzer_dragging = false;
+                    self.set_mouse_captured(false);
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
@@ -1535,10 +1551,14 @@ impl ApplicationHandler for App {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        if let DeviceEvent::MouseMotion { delta } = event {
-            if self.mouse_captured {
-                self.add_host_mouse_delta(delta.0, delta.1);
+        match event {
+            DeviceEvent::MouseMotion { delta } => {
+                if self.mouse_captured {
+                    self.add_host_mouse_delta(delta.0, delta.1);
+                }
             }
+            DeviceEvent::Key(event) => self.handle_raw_device_key_event(event),
+            _ => {}
         }
     }
 
@@ -4667,6 +4687,24 @@ impl App {
             repeat,
             self.ui_key_accepts_repeat(None, code),
         )
+    }
+
+    fn handle_raw_device_key_event(&mut self, event: RawKeyEvent) {
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        let Some(rawkey) = raw_device_qualifier_rawkey(code) else {
+            return;
+        };
+
+        let pressed = event.state == ElementState::Pressed;
+        if pressed && (!self.main_window_focused || self.modal_ui_active()) {
+            return;
+        }
+        if self.handle_keyboard_joystick_key(code, pressed) {
+            return;
+        }
+        self.handle_amiga_key_event(rawkey, pressed);
     }
 
     fn activate_analyzer_pick_at(&mut self, kind: ToolPanelKind, pos: (i32, i32)) -> bool {
@@ -7854,18 +7892,19 @@ mod tests {
         host_shortcut_modifier_pressed, host_to_amiga_rawkey, joystick_mode_uses_keyboard,
         joystick_toggle_rect, keyboard_joystick_key_for, led_row_rect, mask_present_frame_to_tv,
         paint_test_screen, parse_amiga_key, pause_button_rect, power_button_rect,
-        present_row_sample, presentation_source_y_offset, rawkey_is_held,
-        rawkey_transition_is_duplicate, reboot_button_rect, repeated_main_key_should_drop, rgba,
-        shot_button_rect, should_render_emulated_frame, standard_window_top_row,
-        status_with_latched_fdd_track, take_integral_mouse_delta, texture_height, texture_width,
-        tv_source_h_bounds, tv_standard_h_shift, volume_percent_from_pos, volume_slider_track_rect,
-        BarControl, DriveBar, JoystickInputMode, KeyboardJoystickHeld, KeyboardJoystickKey,
-        MediaBar, StatusBarView, ToolPanelKind, AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT,
-        AMIGA_RAWKEY_RIGHT_ALT, AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED,
-        CD_BODY, CD_LED_OFF, CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF,
-        FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF,
-        POWER_LED_ON, PRESENT_HEIGHT, STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS,
-        STATUS_BG, TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
+        present_row_sample, presentation_source_y_offset, raw_device_qualifier_rawkey,
+        rawkey_is_held, rawkey_transition_is_duplicate, reboot_button_rect,
+        repeated_main_key_should_drop, rgba, shot_button_rect, should_render_emulated_frame,
+        standard_window_top_row, status_with_latched_fdd_track, take_integral_mouse_delta,
+        texture_height, texture_width, tv_source_h_bounds, tv_standard_h_shift,
+        volume_percent_from_pos, volume_slider_track_rect, BarControl, DriveBar, JoystickInputMode,
+        KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar, StatusBarView, ToolPanelKind,
+        AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT, AMIGA_RAWKEY_RIGHT_ALT,
+        AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF,
+        CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF,
+        HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
+        STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
+        TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::FrontPanelStatus;
@@ -7874,8 +7913,8 @@ mod tests {
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::rc::Rc;
-    use winit::event::ElementState;
-    use winit::keyboard::{KeyCode, ModifiersState};
+    use winit::event::{ElementState, RawKeyEvent};
+    use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
     /// A typical session: DF0 connected with a disk in, no CD drive.
     fn single_drive_media() -> MediaBar {
@@ -7968,6 +8007,28 @@ mod tests {
     }
 
     #[test]
+    fn raw_device_qualifier_filter_is_limited_to_amiga_modifier_lines() {
+        assert_eq!(
+            raw_device_qualifier_rawkey(KeyCode::ShiftLeft),
+            Some(AMIGA_RAWKEY_LEFT_SHIFT)
+        );
+        assert_eq!(
+            raw_device_qualifier_rawkey(KeyCode::ShiftRight),
+            Some(AMIGA_RAWKEY_RIGHT_SHIFT)
+        );
+        assert_eq!(
+            raw_device_qualifier_rawkey(KeyCode::AltLeft),
+            Some(AMIGA_RAWKEY_LEFT_ALT)
+        );
+        assert_eq!(
+            raw_device_qualifier_rawkey(KeyCode::AltRight),
+            Some(AMIGA_RAWKEY_RIGHT_ALT)
+        );
+        assert_eq!(raw_device_qualifier_rawkey(KeyCode::KeyS), None);
+        assert_eq!(raw_device_qualifier_rawkey(KeyCode::ArrowRight), None);
+    }
+
+    #[test]
     fn amiga_qualifier_transitions_ignore_duplicate_host_events() {
         let mut held = [false; 128];
 
@@ -8017,6 +8078,58 @@ mod tests {
         app.update_host_modifiers(ModifiersState::empty());
         assert!(!rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_LEFT_SHIFT));
         assert!(!rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_RIGHT_SHIFT));
+    }
+
+    #[test]
+    fn raw_device_release_clears_one_side_while_aggregate_modifier_remains() {
+        let mut app = test_app();
+        app.main_window_focused = true;
+
+        app.handle_raw_device_key_event(RawKeyEvent {
+            physical_key: PhysicalKey::Code(KeyCode::ShiftLeft),
+            state: ElementState::Pressed,
+        });
+        app.handle_raw_device_key_event(RawKeyEvent {
+            physical_key: PhysicalKey::Code(KeyCode::ShiftRight),
+            state: ElementState::Pressed,
+        });
+        assert!(rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_LEFT_SHIFT));
+        assert!(rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_RIGHT_SHIFT));
+
+        app.handle_raw_device_key_event(RawKeyEvent {
+            physical_key: PhysicalKey::Code(KeyCode::ShiftLeft),
+            state: ElementState::Released,
+        });
+        app.update_host_modifiers(ModifiersState::SHIFT);
+        assert!(!rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_LEFT_SHIFT));
+        assert!(rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_RIGHT_SHIFT));
+
+        app.handle_raw_device_key_event(RawKeyEvent {
+            physical_key: PhysicalKey::Code(KeyCode::ShiftRight),
+            state: ElementState::Released,
+        });
+        assert!(!rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_RIGHT_SHIFT));
+    }
+
+    #[test]
+    fn raw_device_alt_right_respects_keyboard_joystick_ownership() {
+        let mut app = test_app();
+        app.main_window_focused = true;
+        app.set_joystick_input_mode(JoystickInputMode::Keyboard);
+
+        app.handle_raw_device_key_event(RawKeyEvent {
+            physical_key: PhysicalKey::Code(KeyCode::AltRight),
+            state: ElementState::Pressed,
+        });
+        assert!(app.keyboard_joy_held.fire_right_alt);
+        assert!(!rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_RIGHT_ALT));
+
+        app.handle_raw_device_key_event(RawKeyEvent {
+            physical_key: PhysicalKey::Code(KeyCode::AltRight),
+            state: ElementState::Released,
+        });
+        assert!(!app.keyboard_joy_held.fire_right_alt);
+        assert!(!rawkey_is_held(&app.held_rawkeys, AMIGA_RAWKEY_RIGHT_ALT));
     }
 
     #[test]
