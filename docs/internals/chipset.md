@@ -195,8 +195,8 @@ DSKDAT, and DMA into chip RAM behave as Paula documents. Non-WORDSYNC read
 DMA drains Paula's recovered 16-bit disk word phase even when DSKLEN is
 armed between disk-word boundaries; WORDSYNC is the explicit mode that
 realigns framing to a matched sync word before transfer. Supported image
-formats: ADF (read/write), gzip ADZ, DMS (decompressed by `dms.rs`), UAE
-extended ADF, and read-only SCP flux images.
+formats: ADF (read/write), gzip ADZ, single file ZIP, DMS (decompressed by
+ `dms.rs`), UAE extended ADF, and read-only SCP flux images.
 
 Standard ADF and AmigaDOS tracks are synthesized as one PAL-sized
 revolution: 11 sectors occupy 5984 MFM words, and the generated revolution

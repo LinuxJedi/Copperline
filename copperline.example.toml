@@ -251,8 +251,9 @@ floppy_sounds_volume = 100
 # Optional floppy drives. DF0 is always connected; set [floppy] drives
 # to wire empty external mechanisms as well (1-4 total drives). Missing
 # [floppy.dfN] tables mean no disk in that drive. Supported images:
-# DD ADF (901120 bytes), ADZ/gzip, DMS, UAE extended ADF, and read-only
-# SCP flux captures. DMS/gzip/SCP are always treated as write-protected.
+# DD ADF (901120 bytes), ADZ/gzip, single file ZIP archives, DMS, UAE extended
+# ADF, and read-only SCP flux captures. DMS/gzip/SCP are always treated as
+# write-protected.
 #
 # [floppy]
 # drives = 2

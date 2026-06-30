@@ -169,8 +169,8 @@ rom = "KICK13.ROM"
 path = "MyGame.adf"
 ```
 
-Copperline accepts plain ADF images, gzip-compressed images, DMS archives,
-UAE extended ADFs, and read-only SCP flux images.
+Copperline accepts plain ADF images, gzip-compressed images, single file ZIP
+archives, DMS archives, UAE extended ADFs, and read-only SCP flux images.
 
 ## Example configuration
 

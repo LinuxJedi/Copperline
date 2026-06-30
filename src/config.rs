@@ -2093,6 +2093,7 @@ fn validate_floppy_image_path(idx: usize, path: &Path) -> Result<()> {
         )
     })?;
     if sig[..2] == [0x1F, 0x8B]
+        || sig[..4] == [0x50, 0x4b, 0x03, 0x04]
         || &sig[..3] == b"SCP"
         || &sig[..4] == b"DMS!"
         || &sig == b"UAE-1ADF"
@@ -2102,7 +2103,8 @@ fn validate_floppy_image_path(idx: usize, path: &Path) -> Result<()> {
     }
 
     bail!(
-        "floppy.df{} image {} is {} bytes, expected {} bytes (standard DD ADF), gzip-compressed supported image, UAE extended ADF, SCP, or DMS",
+        "floppy.df{} image {} is {} bytes, expected {} bytes (standard DD ADF),
+        gzip-compressed supported image, UAE extended ADF, SCP, DMS or single file ZIP",
         idx,
         path.display(),
         meta.len(),

@@ -5437,9 +5437,10 @@ impl App {
             LauncherField::Df0Image
             | LauncherField::Df1Image
             | LauncherField::Df2Image
-            | LauncherField::Df3Image => {
-                dialog.add_filter("Floppy images", &["adf", "adz", "dms", "scp", "gz", "ipf"])
-            }
+            | LauncherField::Df3Image => dialog.add_filter(
+                "Floppy images",
+                &["adf", "adz", "dms", "scp", "gz", "ipf", "zip"],
+            ),
             LauncherField::CdImage => dialog.add_filter("CD images", &["cue", "iso", "bin"]),
             LauncherField::Cd32Nvram => dialog.add_filter("NVRAM images", &["bin", "nv", "sav"]),
             _ => dialog.add_filter("Hard disk images", &["hdf", "img", "bin"]),
@@ -6663,7 +6664,10 @@ impl App {
         self.suspend_live_audio_for_host_io();
         let picked = rfd::FileDialog::new()
             .set_title(format!("Load DF{drive_idx} disk image(s)"))
-            .add_filter("Amiga disk images", &["adf", "adz", "dms", "scp", "gz"])
+            .add_filter(
+                "Amiga disk images",
+                &["adf", "adz", "dms", "scp", "gz", "zip"],
+            )
             .pick_files();
 
         // The modal file dialog blocks this (the main/emulation) thread, so

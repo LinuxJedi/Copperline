@@ -11,9 +11,10 @@ use crate::chipset::paula::PAULA_CLOCK_HZ;
 use crate::config::{FloppyConfig, FloppyDriveConfig};
 use crate::dms;
 use anyhow::{bail, ensure, Context, Result};
-use flate2::read::GzDecoder;
+use flate2::read::{DeflateDecoder, GzDecoder};
+use flate2::CrcReader;
 use log::{debug, warn};
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 pub const CYLINDERS: usize = 80;
@@ -93,6 +94,7 @@ const UAE_EXT2_SIGNATURE: &[u8; 8] = b"UAE-1ADF";
 const IPF_SIGNATURE: &[u8; 4] = b"CAPS";
 const SCP_SIGNATURE: &[u8; 3] = b"SCP";
 const GZIP_SIGNATURE: &[u8; 2] = &[0x1F, 0x8B];
+const ZIP_SIGNATURE: &[u8; 4] = &[0x50, 0x4b, 0x03, 0x04];
 const STANDARD_EXTERNAL_DRIVE_ID: u32 = 0xFFFF_FFFF;
 const SCP_TRACK_TABLE_OFFSET: usize = 0x10;
 const SCP_EXTENDED_TRACK_TABLE_OFFSET: usize = 0x80;
@@ -1775,6 +1777,9 @@ impl FloppyImage {
         let (data, write_protected, legacy_extended_adf) = if packed.starts_with(GZIP_SIGNATURE) {
             let unpacked = decode_gzip_floppy_image(&packed)?;
             decode_floppy_payload(unpacked, true, &config.path)?
+        } else if packed.starts_with(ZIP_SIGNATURE) {
+            let unpacked = decode_zip_floppy_image(&packed)?;
+            decode_floppy_payload(unpacked, true, &config.path)?
         } else {
             decode_floppy_payload(packed, config.write_protected, &config.path)?
         };
@@ -1910,6 +1915,72 @@ fn decode_gzip_floppy_image(data: &[u8]) -> Result<Vec<u8>> {
         .read_to_end(&mut unpacked)
         .context("decompressing gzip-compressed floppy image")?;
     Ok(unpacked)
+}
+
+fn decode_zip_floppy_image(data: &[u8]) -> Result<Vec<u8>> {
+    ensure!(data.starts_with(ZIP_SIGNATURE), "missing zip signature");
+    let mut cursor = Cursor::new(data);
+    let mut u16buf = [0u8; 2];
+    let mut u32buf = [0u8; 4];
+
+    // Skip to compression method (at offset 8 in local file header)
+    cursor.set_position(8);
+    cursor.read_exact(&mut u16buf)?;
+    let compression = u16::from_le_bytes(u16buf);
+
+    // Skip to CRC-32 (at offset 14 in local file header)
+    cursor.set_position(14);
+    cursor.read_exact(&mut u32buf)?;
+    let expected_crc = u32::from_le_bytes(u32buf);
+
+    // Skip to uncompressed size (at offset 22 in local file header)
+    cursor.set_position(22);
+    cursor.read_exact(&mut u32buf)?;
+    let uncomp_size = u32::from_le_bytes(u32buf);
+    ensure!(
+        uncomp_size as usize == ADF_SIZE,
+        "invalid ADF file size in ZIP archive"
+    );
+
+    // Skip to file name length and extra field length
+    cursor.set_position(26);
+    cursor.read_exact(&mut u16buf)?;
+    let file_name_length = u16::from_le_bytes(u16buf);
+    cursor.read_exact(&mut u16buf)?;
+    let extra_field_length = u16::from_le_bytes(u16buf);
+
+    // Skip the file name and extra field to reach the compressed data
+    cursor.set_position((30 + file_name_length + extra_field_length) as u64);
+
+    let mut decompressed = vec![0; ADF_SIZE];
+
+    let calculated_crc = match compression {
+        8 => {
+            // Deflate compression
+            let mut decode_reader = CrcReader::new(DeflateDecoder::new(cursor));
+            decode_reader
+                .read_exact(&mut decompressed)
+                .context("deflating zipped floppy image")?;
+            decode_reader.crc().sum()
+        }
+        0 => {
+            // No compression
+            let mut reader = CrcReader::new(cursor);
+            reader
+                .read_exact(&mut decompressed)
+                .context("unarchiving zipped floppy image")?;
+            reader.crc().sum()
+        }
+        n => {
+            bail!("Unsupported compression method in zip archive: {n}");
+        }
+    };
+    // Verify CRC32
+    if calculated_crc != expected_crc {
+        bail!("checksum error in zip archive: expected: {expected_crc} != calculated: {calculated_crc}");
+    }
+
+    Ok(decompressed)
 }
 
 fn decode_uae_extended_adf(data: &[u8]) -> Result<FloppyImageData> {
