@@ -5038,6 +5038,9 @@ impl App {
             UiControl::DebugBreaksClear => {
                 self.activate_tool_control(ToolPanelKind::Debugger, control)
             }
+            UiControl::DebugAudioMute(_) => {
+                self.activate_tool_control(ToolPanelKind::Debugger, control)
+            }
             UiControl::AnalyzerRun => {
                 self.activate_tool_control(ToolPanelKind::FrameAnalyzer, control)
             }
@@ -5182,6 +5185,20 @@ impl App {
                 self.emu.machine.ui_breaks_clear();
                 self.last_debug_stop = None;
                 self.show_osd("Cleared all breakpoints and watchpoints");
+            }
+            (ToolPanelKind::Debugger, UiControl::DebugAudioMute(idx)) => {
+                let paula = &mut self.emu.bus_mut().paula;
+                let (label, muted) = if idx < 4 {
+                    paula.toggle_channel_muted(idx);
+                    (format!("AUD{idx}"), paula.channel_muted(idx))
+                } else {
+                    paula.toggle_cd_muted();
+                    ("CD audio".to_string(), paula.cd_muted())
+                };
+                self.show_osd(format!(
+                    "{label} {}",
+                    if muted { "muted" } else { "unmuted" }
+                ));
             }
             (ToolPanelKind::FrameAnalyzer, UiControl::AnalyzerRun) => {
                 self.frame_analyzer_toggle_run()
@@ -6584,6 +6601,7 @@ impl App {
         }
         let read = |addr: u32| bus.peek_word_any(addr);
         let mut lines: Vec<ui::DbgLine> = Vec::new();
+        let mut audio: Option<ui::AudioScopeView> = None;
         match panel.tab {
             ui::DebugTab::Cpu => {
                 let pc = machine.pc();
@@ -6725,6 +6743,117 @@ impl App {
                     });
                 }
             }
+            ui::DebugTab::Audio => {
+                let dmacon = bus.agnus.dmacon;
+                let master = dmacon & 0x0200 != 0; // DMACON DMAEN
+                let adkcon = bus.paula.adkcon;
+                // Audio interrupt-pending latches live in INTREQ bits 7..10
+                // (AUD0..AUD3); use the CPU-visible copy like the Chipset tab.
+                let intreq = bus.cpu_visible_intreq();
+                // Per-channel AUDxEN bit (AUD0..AUD3 = bits 0..3).
+                let auden: Vec<&str> = (0..4)
+                    .map(|ch| if dmacon & (1 << ch) != 0 { "1" } else { "." })
+                    .collect();
+                let header = format!(
+                    "DMACON {:04X}  DMAEN {}  AUDEN {}   ADKCON {:04X}  {}",
+                    dmacon,
+                    if master { "on" } else { "off" },
+                    auden.join(" "),
+                    adkcon,
+                    ui::adkcon_audio_flags(adkcon),
+                );
+                let mut channels: Vec<ui::AudioRowView> = Vec::with_capacity(4);
+                for ch in 0..4 {
+                    let Some(a) = bus.paula.audio_channel_debug(ch) else {
+                        continue;
+                    };
+                    let dma_on = master && (dmacon & (1 << ch)) != 0;
+                    let mut text: Vec<ui::DbgLine> = Vec::new();
+                    let head = format!(
+                        "AUD{} [{}]  DMA {}  IRQ {}",
+                        ch,
+                        a.state,
+                        if dma_on { "on" } else { "off" },
+                        if intreq & (1 << (7 + ch)) != 0 {
+                            "pend"
+                        } else {
+                            "-"
+                        },
+                    );
+                    // Highlight a channel that is actively streaming samples.
+                    text.push(if a.state == "Running" {
+                        ui::DbgLine::hilit(head)
+                    } else {
+                        ui::DbgLine::plain(head)
+                    });
+                    text.push(ui::DbgLine::plain(format!(
+                        "  LC {:06X}  LEN {:04X}  PER {:04X}  VOL {:02X}",
+                        a.lc, a.len, a.per, a.vol
+                    )));
+                    text.push(ui::DbgLine::plain(format!(
+                        "  PTR {:06X}  words {:04X}  acc {:04X}  ph{}  out {}",
+                        a.ptr, a.words_left, a.period_acc, a.phase, a.current
+                    )));
+                    let mut pending: Vec<&str> = Vec::new();
+                    if a.dma_disable_pending {
+                        pending.push("dma-disable");
+                    }
+                    if a.restart_pending {
+                        pending.push("restart");
+                    }
+                    if a.manual_pending {
+                        pending.push("manual");
+                    }
+                    if a.dma_request {
+                        pending.push("dma-req");
+                    }
+                    if a.next_word_ready {
+                        pending.push("next-word");
+                    }
+                    if !pending.is_empty() {
+                        text.push(ui::DbgLine::plain(format!(
+                            "  pending: {}",
+                            pending.join(" ")
+                        )));
+                    }
+                    channels.push(ui::AudioRowView {
+                        text,
+                        muted: bus.paula.channel_muted(ch),
+                        scope: bus.paula.audio_scope_samples(ch),
+                    });
+                }
+                let cd_scope = bus.paula.cd_scope_samples();
+                let cd_active = cd_scope.iter().any(|&s| s != 0);
+                let cd_peak = cd_scope
+                    .iter()
+                    .map(|&s| (s as i16).abs())
+                    .max()
+                    .unwrap_or(0);
+                let cd = ui::AudioRowView {
+                    text: vec![
+                        ui::DbgLine::hilit(format!(
+                            "CD-DA  {}",
+                            if cd_active { "playing" } else { "idle" }
+                        )),
+                        ui::DbgLine::plain(format!("  peak {cd_peak:>3}")),
+                    ],
+                    muted: bus.paula.cd_muted(),
+                    scope: cd_scope,
+                };
+                // Mirror the text into `lines` for the headless/text fallback
+                // and the non-empty-view invariant; the tab itself is drawn
+                // graphically from the structured view.
+                lines.push(ui::DbgLine::hilit(header.clone()));
+                for row in channels.iter().chain(std::iter::once(&cd)) {
+                    lines.push(ui::DbgLine::plain(""));
+                    lines.extend(row.text.iter().cloned());
+                }
+                audio = Some(ui::AudioScopeView {
+                    header,
+                    channels,
+                    cd,
+                });
+            }
             ui::DebugTab::Memory => {
                 lines.push(ui::DbgLine::plain(
                     "Click the $ box, type a hex address, Enter to jump; </> to page",
@@ -6817,6 +6946,7 @@ impl App {
             reverse_available: self.emu.time_travel_enabled(),
             status,
             lines,
+            audio,
         }
     }
 
@@ -10016,6 +10146,20 @@ mod tests {
                 super::ui::DebugTab::Copper => {
                     assert!(view.lines[0].text.contains("COP1LC"));
                 }
+                super::ui::DebugTab::Audio => {
+                    // Text is mirrored into `lines` for the fallback/invariant.
+                    assert!(view.lines[0].text.starts_with("DMACON"));
+                    assert!(view.lines[0].text.contains("ADKCON"));
+                    assert!(view.lines.iter().any(|l| l.text.starts_with("AUD0")));
+                    assert!(view.lines.iter().any(|l| l.text.starts_with("AUD3")));
+                    // The structured view drives the graphical layout: four
+                    // Paula channels plus a CD row.
+                    let audio = view.audio.as_ref().expect("audio scope view");
+                    assert!(audio.header.starts_with("DMACON"));
+                    assert_eq!(audio.channels.len(), 4);
+                    assert!(audio.channels[0].text[0].text.starts_with("AUD0"));
+                    assert!(audio.cd.text[0].text.contains("CD-DA"));
+                }
                 super::ui::DebugTab::Memory => {
                     // The hex dump shows the NOP sled at the PC's ROM page.
                     assert!(view.lines.iter().any(|l| l.text.contains("4E 71")));
@@ -10026,6 +10170,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn audio_tab_mute_buttons_toggle_paula_mutes() {
+        let mut app = test_app();
+        app.open_debugger();
+        if let Some(panel) = app.debugger_panel.as_mut() {
+            panel.tab = super::ui::DebugTab::Audio;
+        }
+        // Clicking a channel's mute button toggles that Paula channel's mute
+        // through the full dispatch path.
+        assert!(!app.emu.bus().paula.channel_muted(1));
+        app.activate_ui_control(super::ui::UiControl::DebugAudioMute(1));
+        assert!(app.emu.bus().paula.channel_muted(1));
+        app.activate_ui_control(super::ui::UiControl::DebugAudioMute(1));
+        assert!(!app.emu.bus().paula.channel_muted(1));
+        // Index 4 is the CD-DA mute.
+        assert!(!app.emu.bus().paula.cd_muted());
+        app.activate_ui_control(super::ui::UiControl::DebugAudioMute(4));
+        assert!(app.emu.bus().paula.cd_muted());
     }
 
     #[test]
