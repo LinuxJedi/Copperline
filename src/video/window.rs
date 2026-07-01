@@ -558,8 +558,9 @@ pub struct App {
     disk_write_protected: [bool; 4],
     /// Index of the currently inserted disk within each drive's playlist.
     disk_playlist_index: [usize; 4],
-    /// Whether to horizontally recentre a standard (non-overscan) display
-    /// for presentation. On by default; set COPPERLINE_HCENTER=0 to disable.
+    /// Whether to horizontally recentre a standard (non-overscan) display for
+    /// full-overscan presentation. On by default; set COPPERLINE_HCENTER=0 to
+    /// disable. TV presentation keeps the framebuffer's fixed source origin.
     hcenter: bool,
     /// Presentation-level overscan handling ([display] overscan): Tv masks
     /// the deep-overscan margins with black like a CRT bezel.
@@ -1898,9 +1899,9 @@ fn post_process_rendered_field(
     overscan: Overscan,
 ) -> usize {
     let field_rows = geometry.visible_lines.min(fb.len() / FB_WIDTH);
-    // Vertical/horizontal recentring and the TV bezel mask are 15 kHz
-    // CRT concepts anchored to the standard PAL/NTSC window; a
-    // programmable scan defines its own window and presents in full,
+    // Vertical centring, optional full-overscan horizontal recentring, and the
+    // TV bezel mask are 15 kHz CRT concepts anchored to the standard PAL/NTSC
+    // window; a programmable scan defines its own window and presents in full,
     // like a multisync monitor.
     if !geometry.programmable {
         center_present_frame_for_visible_start(fb, visible_start_vpos);
@@ -7428,15 +7429,15 @@ impl App {
 /// it and so does this mask. The emulated framebuffer itself always carries
 /// the full field; this runs on the presentation copy only.
 ///
-/// The window is a realistic PAL TV visible area rather than the bare
-/// standard window: real sets show a margin of overscan, which intentional
-/// overscan displays rely on, while the deep-overscan junk the mask exists
-/// to hide sits further out. Default TV presentation keeps 24 lo-res pixels
-/// of horizontal overscan beside the standard PAL window; full overscan
-/// remains available through `Overscan::Full`. The mask is horizontal only:
-/// vertical border colour changes are part of the Denise output and can be
-/// intentional effects, so rows above or below the standard display remain as
-/// rendered. `h_shift` is the horizontal centring shift already applied to the
+/// The window is a realistic PAL TV visible area rather than the bare standard
+/// window: real sets show a margin of overscan, which intentional overscan
+/// displays rely on, while the deep-overscan junk the mask exists to hide sits
+/// further out. Default TV presentation keeps 24 lo-res pixels of horizontal
+/// overscan beside the standard PAL window; full overscan remains available
+/// through `Overscan::Full`. The mask is horizontal only: vertical border
+/// colour changes are part of the Denise output and can be intentional
+/// effects, so rows above or below the standard display remain as rendered.
+/// `h_shift` is any horizontal presentation shift already applied to the
 /// frame, so the bezel tracks the shifted picture instead of clipping its left
 /// edge.
 fn mask_present_frame_to_tv(fb: &mut [u32], h_shift: usize, _standard_top_row: usize) {
@@ -7463,8 +7464,8 @@ fn standard_window_top_row(visible_start_vpos: u32) -> usize {
 }
 
 /// Whether horizontal recentring is enabled. On unless COPPERLINE_HCENTER is
-/// set to a falsey value (0/false/off/no), so the standard display can be
-/// presented exactly as rendered when debugging alignment.
+/// set to a falsey value (0/false/off/no), so full-overscan presentation can
+/// show the standard display exactly as rendered when debugging alignment.
 fn hcenter_enabled() -> bool {
     match crate::envcfg::var("COPPERLINE_HCENTER") {
         Some(v) => !matches!(
@@ -7527,19 +7528,13 @@ fn presentation_source_y_offset(visible_start_vpos: u32) -> usize {
 
 fn presentation_h_shift_for(snapshot: &RenderRegisterSnapshot, overscan: Overscan) -> usize {
     match overscan {
-        // TV mode masks to a consumer-visible aperture, so center that aperture
-        // in the presentation texture even if the raw frame fetches into deeper
-        // horizontal overscan.
-        Overscan::Tv => tv_standard_h_shift(),
+        // TV mode is an aperture over the emulated framebuffer, matching the
+        // fixed source cutout used by reference emulators. Do not copy pixels
+        // sideways here: a standard hi-res screen already occupies the right
+        // edge of Copperline's 716-pixel cutout.
+        Overscan::Tv => 0,
         Overscan::Full => bitplane::present_h_shift_for(snapshot),
     }
-}
-
-fn tv_standard_h_shift() -> usize {
-    let (source_left, source_right) = tv_source_h_bounds();
-    let source_width = source_right.saturating_sub(source_left);
-    let centered_left = FB_WIDTH.saturating_sub(source_width) / 2;
-    source_left.saturating_sub(centered_left)
 }
 
 fn tv_source_h_bounds() -> (usize, usize) {
@@ -7896,23 +7891,23 @@ mod tests {
         host_shortcut_modifier_pressed, host_to_amiga_rawkey, joystick_mode_uses_keyboard,
         joystick_toggle_rect, keyboard_joystick_key_for, led_row_rect, mask_present_frame_to_tv,
         paint_test_screen, parse_amiga_key, pause_button_rect, power_button_rect,
-        presentation_source_y_offset, raw_device_qualifier_family_held,
+        presentation_h_shift_for, presentation_source_y_offset, raw_device_qualifier_family_held,
         raw_device_qualifier_rawkey, rawkey_is_held, rawkey_transition_is_duplicate,
         reboot_button_rect, repeated_main_key_should_drop, rgba, shot_button_rect,
         should_render_emulated_frame, standard_window_top_row, status_with_latched_fdd_track,
         take_integral_mouse_delta, texture_height, texture_width, tv_source_h_bounds,
-        tv_standard_h_shift, volume_percent_from_pos, volume_slider_track_rect, BarControl,
-        DriveBar, JoystickInputMode, KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar,
-        StatusBarView, ToolPanelKind, AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT,
-        AMIGA_RAWKEY_RIGHT_ALT, AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED,
-        CD_BODY, CD_LED_OFF, CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF,
-        FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF,
-        POWER_LED_ON, PRESENT_HEIGHT, STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS,
-        STATUS_BG, TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
+        volume_percent_from_pos, volume_slider_track_rect, BarControl, DriveBar, JoystickInputMode,
+        KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar, StatusBarView, ToolPanelKind,
+        AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT, AMIGA_RAWKEY_RIGHT_ALT,
+        AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF,
+        CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF,
+        HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
+        STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
+        TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
-    use crate::bus::FrontPanelStatus;
-    use crate::config::WarpSpeed;
+    use crate::bus::{FrontPanelStatus, RenderRegisterSnapshot};
+    use crate::config::{Overscan, WarpSpeed};
     use crate::video::{FB_HEIGHT, FB_PIXELS, FB_WIDTH};
     use std::cell::RefCell;
     use std::path::PathBuf;
@@ -9177,15 +9172,17 @@ mod tests {
     }
 
     #[test]
-    fn tv_horizontal_centering_centers_the_tv_aperture() {
-        let shift = tv_standard_h_shift();
-        let (source_left, source_right) = tv_source_h_bounds();
-        let source_width = source_right - source_left;
-        let centered_left = (FB_WIDTH - source_width) / 2;
-        let centered_right = centered_left + source_width;
+    fn tv_presentation_keeps_standard_hires_framebuffer_origin() {
+        let snapshot = RenderRegisterSnapshot {
+            bplcon0: 0x0200,
+            diwstrt: 0x0581,
+            diwstop: 0x40C1,
+            ddfstrt: 0x003C,
+            ddfstop: 0x00D0,
+            ..RenderRegisterSnapshot::default()
+        };
 
-        assert_eq!(source_left - shift, centered_left);
-        assert_eq!(source_right - shift, centered_right);
+        assert_eq!(presentation_h_shift_for(&snapshot, Overscan::Tv), 0);
     }
 
     #[test]
@@ -9207,22 +9204,22 @@ mod tests {
         let marker = rgba(0x12, 0x34, 0x56);
         let mut fb = vec![marker; FB_PIXELS];
 
-        // A standard screen centred by the presentation: window top at
+        // A standard screen after vertical presentation: window top at
         // framebuffer row 14 (the standard centring offset), with the TV
-        // aperture centred horizontally.
+        // aperture anchored to the emulated framebuffer.
         let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
-        let shift = tv_standard_h_shift();
+        let shift = 0;
         mask_present_frame_to_tv(&mut fb, shift, std_top);
 
         let (source_left, source_right) = tv_source_h_bounds();
         let left = source_left - shift;
         let right = source_right - shift;
         let mid_row = std_top + 100;
+        assert_eq!(right, FB_WIDTH);
         assert_eq!(fb[mid_row * FB_WIDTH + left - 1], rgba(0, 0, 0));
         assert_eq!(fb[mid_row * FB_WIDTH + left], marker);
         assert_eq!(fb[mid_row * FB_WIDTH + right - 1], marker);
-        assert_eq!(fb[mid_row * FB_WIDTH + right], rgba(0, 0, 0));
-        assert_eq!(fb[mid_row * FB_WIDTH + FB_WIDTH - 1], rgba(0, 0, 0));
+        assert_eq!(fb[mid_row * FB_WIDTH + FB_WIDTH - 1], marker);
         // The deep left overscan margin stays hidden.
         assert_eq!(fb[mid_row * FB_WIDTH], rgba(0, 0, 0));
         // Vertical border rows remain visible; the TV mask only hides the
@@ -9235,11 +9232,10 @@ mod tests {
     }
 
     #[test]
-    fn tv_horizontal_centering_preserves_visible_left_overscan_margin() {
+    fn tv_mask_preserves_visible_left_overscan_margin_without_shifting() {
         let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
         let mid_row = std_top + 100;
         let (source_left, _) = tv_source_h_bounds();
-        let shift = tv_standard_h_shift();
         let marker = rgba(0x12, 0x34, 0x56);
         let hidden_marker = rgba(0x98, 0x76, 0x54);
         let mut fb = vec![rgba(0, 0, 0); FB_PIXELS];
@@ -9247,14 +9243,10 @@ mod tests {
         fb[mid_row * FB_WIDTH + source_left - 1] = hidden_marker;
         fb[mid_row * FB_WIDTH + source_left] = marker;
 
-        center_present_frame_horizontally(&mut fb, shift);
-        mask_present_frame_to_tv(&mut fb, shift, std_top);
+        mask_present_frame_to_tv(&mut fb, 0, std_top);
 
-        assert_eq!(
-            fb[mid_row * FB_WIDTH + source_left - shift - 1],
-            rgba(0, 0, 0)
-        );
-        assert_eq!(fb[mid_row * FB_WIDTH + source_left - shift], marker);
+        assert_eq!(fb[mid_row * FB_WIDTH + source_left - 1], rgba(0, 0, 0));
+        assert_eq!(fb[mid_row * FB_WIDTH + source_left], marker);
     }
 
     #[test]
@@ -9283,7 +9275,7 @@ mod tests {
         let marker = rgba(0x12, 0x34, 0x56);
         let mut fb = vec![marker; FB_PIXELS];
         let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
-        let shift = tv_standard_h_shift();
+        let shift = 0;
         let (source_left, source_right) = tv_source_h_bounds();
         let left = source_left - shift;
         let right = source_right - shift;
@@ -9291,10 +9283,10 @@ mod tests {
 
         mask_present_frame_to_tv(&mut fb, shift, std_top);
 
+        assert_eq!(right, FB_WIDTH);
         assert_eq!(fb[bottom * FB_WIDTH + left - 1], rgba(0, 0, 0));
         assert_eq!(fb[bottom * FB_WIDTH + left], marker);
         assert_eq!(fb[bottom * FB_WIDTH + right - 1], marker);
-        assert_eq!(fb[bottom * FB_WIDTH + right], rgba(0, 0, 0));
     }
 
     #[test]

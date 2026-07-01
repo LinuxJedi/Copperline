@@ -250,17 +250,19 @@ framebuffer):
   margins in black like a CRT bezel; `"full"` shows the entire field. The
   default TV mask is presentation-only: horizontally it keeps 24 lo-res
   pixels of consumer-visible overscan beside the standard display and blacks
-  only the deeper horizontal margins. Vertical border colour changes remain
-  visible because they are part of the Denise output and are often deliberate
-  border effects.
-- **Horizontal recentring**: a standard (non-overscan) display is recentred
-  for presentation, since the framebuffer captures a deep slab of left
-  overscan that would otherwise push the picture right of centre compared
-  with vAmiga/FS-UAE. The decision keys off the bitplane data the display
-  actually fetches (DDF), not just the DIW window: a demo that opens DIW wide
-  open around a standard-width picture (Virtual Dreams' "Absolute Inebriation")
-  is still recentred, while a display that genuinely fetches bitplane data into
-  the overscan border is left exactly as rendered.
+  only the deeper horizontal margins. TV mode keeps the framebuffer's fixed
+  horizontal source origin, matching the way vAmiga and FS-UAE crop from their
+  rendered source texture instead of copying the picture sideways. Vertical
+  border colour changes remain visible because they are part of the Denise
+  output and are often deliberate border effects.
+- **Full-overscan horizontal recentring**: in `"full"` presentation, a standard
+  (non-overscan) display is recentred because the framebuffer captures a deep
+  slab of left overscan that would otherwise push the picture right of centre.
+  The decision keys off the bitplane data the display actually fetches (DDF),
+  not just the DIW window: a demo that opens DIW wide around a standard-width
+  picture (Virtual Dreams' "Absolute Inebriation") is still recentred, while a
+  display that genuinely fetches bitplane data into the overscan border is left
+  exactly as rendered.
 
 `ui.rs` implements the status bar widgets, the pop-up menu, the smaller
 overlay panels (About, Shortcuts, Calibration), and the shared debugger/tool
