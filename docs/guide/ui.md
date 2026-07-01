@@ -98,6 +98,13 @@ tool window or overlay.
 - **Calibrate Gamepad...**: the guided calibration flow, described below.
 - **Joystick Input** (also `Cmd+J` / `Alt+J`, or the status-bar icon):
   toggles between gamepad-only and keyboard joystick emulation.
+- **Pixel Aspect**: flips the presentation between the 4:3 CRT pixel
+  aspect (the default; PAL lo-res pixels slightly wider than tall, as a
+  real TV shows them) and square pixels (a 320x256 screen is an exact
+  640x512, handy for pixel-exact comparison with square-pixel emulators).
+  The window and its backing texture resize with the mode. The start-up
+  mode comes from `[display] pixel_aspect`
+  (see [Configuration](configuration.md)).
 - **Warp Speed** (also `Cmd+W` / `Alt+W`): runs the emulator unpaced for
   fast-forward. Toggling back re-anchors real-time pacing cleanly.
 - **Warp Limit** (also `Cmd+Shift+W` / `Alt+Shift+W`): cycles how fast warp
@@ -167,8 +174,9 @@ The layout is:
   extended ROM), *Floppy* (drive count and per-drive image and write-protect),
   *Hard Disk* (IDE master/slave and the A2091 SCSI ROM and units), *CD* (image,
   insert delay, CD32 NVRAM), *Zorro* (extra autoconfig boards by metadata file),
-  and *A/V & Emu* (overscan, phosphor, floppy sounds and volume, power-on,
-  pacing, realtime priority, warp speed, joystick input mode).
+  and *A/V & Emu* (overscan, pixel aspect, phosphor, floppy sounds and
+  volume, power-on, pacing, realtime priority, warp speed, joystick input
+  mode).
 - **Settings rows** (right pane). `[<]`/`[>]` step through a value, On/Off
   buttons flip a toggle, and the **Browse** and **Clear** buttons set or remove
   a file path through a native file dialog. On the *Hard Disk* tab, once an IDE

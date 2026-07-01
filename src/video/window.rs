@@ -9,14 +9,14 @@ use super::deinterlace::{Deinterlacer, OUT_HEIGHT};
 use super::launcher::{LauncherField, LauncherState, MachineSetup, StatusMessage};
 use super::ui::{self, Panel, UiControl, UiState};
 use super::{
-    bitplane, font, FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL,
-    MAX_FB_PIXELS, PRESENT_HEIGHT,
+    bitplane, font, present_height, FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH,
+    HOST_SHORTCUT_MODIFIER_LABEL, MAX_FB_PIXELS,
 };
 use crate::audio::{AudioSink, CpalSink};
 use crate::bus::{
     BeamWriteSource, FrontPanelStatus, RenderRegisterSnapshot, VideoRenderFrameTiming,
 };
-use crate::config::{Config, Overscan, RawConfig, WarpSpeed};
+use crate::config::{Config, Overscan, PixelAspect, RawConfig, WarpSpeed};
 use crate::emulator::Emulator;
 use crate::screenshot;
 
@@ -231,7 +231,11 @@ pub const DEFAULT_KEY_HOLD_MS: u32 = 100;
 const DEBUGGER_REVERSE_INTERVAL_FRAMES: u64 = 10;
 const MAX_TEXTURE_SCALE: usize = 2;
 const STATUS_BAR_HEIGHT: usize = 44;
-const WINDOW_PRESENT_HEIGHT: usize = PRESENT_HEIGHT + STATUS_BAR_HEIGHT;
+/// Logical window height: the presentation canvas for the active pixel
+/// aspect plus the status bar below it.
+fn window_present_height() -> usize {
+    present_height() + STATUS_BAR_HEIGHT
+}
 const STATUS_LABEL_X: usize = 18;
 const STATUS_LED_X: usize = 58;
 const STATUS_LED_Y_OFFSET: usize = 1;
@@ -1039,9 +1043,10 @@ impl ApplicationHandler for App {
         if self.render.is_some() {
             return;
         }
-        // Keep the internal overscan field buffer, but present it as a
-        // standard 4:3 Amiga display.
-        let size = LogicalSize::new(FB_WIDTH as f64, WINDOW_PRESENT_HEIGHT as f64);
+        // Keep the internal overscan field buffer, but present it with
+        // the configured pixel aspect: a standard 4:3 Amiga display by
+        // default, or square pixels ([display] pixel_aspect = "square").
+        let size = LogicalSize::new(FB_WIDTH as f64, window_present_height() as f64);
         // Headless capture (screenshot / frame dump) renders into the
         // framebuffer for the saved PNG but has no interactive viewer, so
         // create the window hidden: it avoids flashing an empty window on
@@ -1056,7 +1061,7 @@ impl ApplicationHandler for App {
             .with_inner_size(size)
             .with_min_inner_size(LogicalSize::new(
                 FB_WIDTH as f64 / 2.0,
-                WINDOW_PRESENT_HEIGHT as f64 / 2.0,
+                window_present_height() as f64 / 2.0,
             ));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -1499,7 +1504,7 @@ impl ApplicationHandler for App {
                 // altered while running, or (the common case) the window was
                 // dragged onto a monitor with a different scale factor. winit
                 // resizes the surface via the Resized event that follows, but
-                // the backing texture is sized FB_WIDTH x WINDOW_PRESENT_HEIGHT
+                // the backing texture is sized FB_WIDTH x window height
                 // times an integer supersample factor captured at window
                 // creation. Left stale, cursor_texture_position maps clicks
                 // against a texture extent that no longer matches the surface,
@@ -1587,6 +1592,7 @@ impl ApplicationHandler for App {
                         recording,
                         input_recording,
                         self.joystick_input_mode,
+                        super::pixel_aspect(),
                     );
                     if let Err(e) = r.pixels.render() {
                         error!("pixels.render: {e}");
@@ -2268,7 +2274,7 @@ fn texture_scale_for_window(window: &Window) -> usize {
 
 /// Integer supersample factor for the backing texture at a given host DPI
 /// scale factor. The texture is rendered at this multiple of the logical
-/// FB_WIDTH x WINDOW_PRESENT_HEIGHT size so a 2x display stays crisp.
+/// FB_WIDTH x window-height size so a 2x display stays crisp.
 fn texture_scale_for_factor(scale_factor: f64) -> usize {
     (scale_factor.round() as usize).clamp(1, MAX_TEXTURE_SCALE)
 }
@@ -2328,7 +2334,7 @@ pub(super) fn texture_width(scale: usize) -> usize {
 }
 
 pub(super) fn texture_height(scale: usize) -> usize {
-    WINDOW_PRESENT_HEIGHT * scale
+    window_present_height() * scale
 }
 
 pub(super) fn scale_rect(rect: Rect, scale: usize) -> Rect {
@@ -2352,11 +2358,11 @@ fn cursor_texture_position(
 }
 
 fn cursor_in_status_bar(pos: (i32, i32)) -> bool {
-    pos.1 >= PRESENT_HEIGHT as i32 && pos.1 < WINDOW_PRESENT_HEIGHT as i32
+    pos.1 >= present_height() as i32 && pos.1 < window_present_height() as i32
 }
 
 fn cursor_in_display(pos: (i32, i32)) -> bool {
-    pos.0 >= 0 && pos.0 < FB_WIDTH as i32 && pos.1 >= 0 && pos.1 < PRESENT_HEIGHT as i32
+    pos.0 >= 0 && pos.0 < FB_WIDTH as i32 && pos.1 >= 0 && pos.1 < present_height() as i32
 }
 
 fn volume_percent_from_pos(pos: (i32, i32)) -> u8 {
@@ -2401,7 +2407,7 @@ fn copy_present_frame(src_fb: &[u32], src_rows: usize, frame: &mut [u8], texture
         texture_width(texture_scale) * texture_height(texture_scale) * 4
     );
     let dst_stride = texture_width(texture_scale) * 4;
-    let out_rows = PRESENT_HEIGHT * texture_scale;
+    let out_rows = present_height() * texture_scale;
     // The 570 woven scanlines map onto the 537-row 4:3 presentation (times
     // the HiDPI texture scale). Select whole source rows instead of blending
     // adjacent Amiga scanlines; normal presentation should not synthesize
@@ -2464,9 +2470,17 @@ fn copy_tv_aperture_to_window(
         texture_width(texture_scale) * texture_height(texture_scale) * 4
     );
     let dst_stride = texture_width(texture_scale) * 4;
-    let out_rows = PRESENT_HEIGHT * texture_scale;
+    let present_rows = present_height();
+    let out_rows = present_rows * texture_scale;
+    let black = rgba(0, 0, 0).to_le_bytes();
     for y in 0..out_rows {
-        let crop_y = screenshot::scaled_source_row(y, TV_PAL_PRESENT_HEIGHT, out_rows);
+        let Some(crop_y) = tv_aperture_source_row(y, present_rows, texture_scale) else {
+            let dst = &mut frame[y * dst_stride..(y + 1) * dst_stride];
+            for px in dst.chunks_exact_mut(4) {
+                px.copy_from_slice(&black);
+            }
+            continue;
+        };
         let src_y = (TV_PAL_PRESENT_SOURCE_Y + crop_y).min(src_rows - 1);
         let row = &src_fb[src_y * FB_WIDTH..(src_y + 1) * FB_WIDTH];
         let dst_off = y * dst_stride;
@@ -2507,6 +2521,27 @@ fn copy_tv_aperture_to_window(
             }
         }
     }
+}
+
+/// Map an output texture row to a row of the 540-line TV aperture crop,
+/// or None for rows that fall on the black bezel of the square-pixel
+/// presentation. The square canvas (570 rows) is taller than the
+/// aperture, so the crop is centred between black bands -- the vertical
+/// counterpart of the TV_PAL_LIVE_PAD_X side bands -- and its rows map
+/// 1:1. The default 4:3 canvas (537 rows) is shorter than the aperture
+/// and keeps mapping all 540 rows onto the output, as before.
+fn tv_aperture_source_row(y: usize, present_rows: usize, texture_scale: usize) -> Option<usize> {
+    let out_rows = present_rows * texture_scale;
+    let pad_rows = present_rows.saturating_sub(TV_PAL_PRESENT_HEIGHT) / 2 * texture_scale;
+    let content_rows = out_rows - 2 * pad_rows;
+    if y < pad_rows || y >= pad_rows + content_rows {
+        return None;
+    }
+    Some(screenshot::scaled_source_row(
+        y - pad_rows,
+        TV_PAL_PRESENT_HEIGHT,
+        content_rows,
+    ))
 }
 
 /// Paint a TV-style test pattern into the presentation framebuffer,
@@ -2609,13 +2644,13 @@ fn draw_status_bar(frame: &mut [u8], view: &StatusBarView, texture_scale: usize)
     );
     draw_hline(
         frame,
-        PRESENT_HEIGHT * texture_scale,
+        present_height() * texture_scale,
         STATUS_TOP,
         texture_scale,
     );
     draw_hline(
         frame,
-        WINDOW_PRESENT_HEIGHT * texture_scale - 1,
+        window_present_height() * texture_scale - 1,
         STATUS_BOTTOM,
         texture_scale,
     );
@@ -2624,7 +2659,7 @@ fn draw_status_bar(frame: &mut [u8], view: &StatusBarView, texture_scale: usize)
         draw_text(
             frame,
             STATUS_LABEL_X * texture_scale,
-            (PRESENT_HEIGHT + led_row_label_y(row, rows.len())) * texture_scale,
+            (present_height() + led_row_label_y(row, rows.len())) * texture_scale,
             spec.label,
             STATUS_TEXT,
             texture_scale,
@@ -2830,13 +2865,13 @@ fn bar_layout(media: &MediaBar) -> BarLayout {
             let row = pos / 2;
             (
                 MEDIA_CLUSTER_X + col * (MEDIA_CLUSTER_W + MEDIA_CLUSTER_GAP),
-                PRESENT_HEIGHT + MEDIA_STACKED_ROW0_Y + row * MEDIA_STACKED_PITCH,
+                present_height() + MEDIA_STACKED_ROW0_Y + row * MEDIA_STACKED_PITCH,
                 MEDIA_STACKED_H,
             )
         } else {
             (
                 MEDIA_CLUSTER_X + pos * (MEDIA_CLUSTER_W + MEDIA_CLUSTER_GAP),
-                PRESENT_HEIGHT + STATUS_CONTROL_Y,
+                present_height() + STATUS_CONTROL_Y,
                 STATUS_CONTROL_H,
             )
         };
@@ -2856,7 +2891,7 @@ fn bar_layout(media: &MediaBar) -> BarLayout {
         };
         // The CD cluster is load plus eject only; eject takes the slot a
         // drive cluster gives to swap.
-        let (load, eject, _) = cluster(x, PRESENT_HEIGHT + STATUS_CONTROL_Y, STATUS_CONTROL_H);
+        let (load, eject, _) = cluster(x, present_height() + STATUS_CONTROL_Y, STATUS_CONTROL_H);
         layout.cd_load = Some(load);
         layout.cd_eject = Some(eject);
     }
@@ -2909,7 +2944,7 @@ fn control_at(pos: (i32, i32), layout: &BarLayout) -> Option<BarControl> {
 fn status_bar_rect() -> Rect {
     Rect {
         x: 0,
-        y: PRESENT_HEIGHT,
+        y: present_height(),
         w: FB_WIDTH,
         h: STATUS_BAR_HEIGHT,
     }
@@ -2983,7 +3018,7 @@ fn led_row_label_y(row: usize, count: usize) -> usize {
 fn led_row_rect(row: usize, count: usize) -> Rect {
     Rect {
         x: STATUS_LED_X,
-        y: PRESENT_HEIGHT + led_row_label_y(row, count) + STATUS_LED_Y_OFFSET,
+        y: present_height() + led_row_label_y(row, count) + STATUS_LED_Y_OFFSET,
         w: STATUS_LED_W,
         h: STATUS_LED_H,
     }
@@ -2992,7 +3027,7 @@ fn led_row_rect(row: usize, count: usize) -> Rect {
 fn fdd_track_counter_rect() -> Rect {
     Rect {
         x: 132,
-        y: PRESENT_HEIGHT + STATUS_CONTROL_Y,
+        y: present_height() + STATUS_CONTROL_Y,
         w: 58,
         h: STATUS_CONTROL_H,
     }
@@ -3011,7 +3046,7 @@ fn fdd_track_digit_rect(index: usize) -> Rect {
 fn shot_button_rect() -> Rect {
     Rect {
         x: SHOT_BUTTON_X,
-        y: PRESENT_HEIGHT + STATUS_CONTROL_Y,
+        y: present_height() + STATUS_CONTROL_Y,
         w: SHOT_BUTTON_W,
         h: STATUS_CONTROL_H,
     }
@@ -3020,7 +3055,7 @@ fn shot_button_rect() -> Rect {
 fn menu_button_rect() -> Rect {
     Rect {
         x: ui::MENU_BUTTON_X,
-        y: PRESENT_HEIGHT + STATUS_CONTROL_Y,
+        y: present_height() + STATUS_CONTROL_Y,
         w: ui::MENU_BUTTON_W,
         h: STATUS_CONTROL_H,
     }
@@ -3029,7 +3064,7 @@ fn menu_button_rect() -> Rect {
 fn volume_control_hit_rect() -> Rect {
     Rect {
         x: VOLUME_SLIDER_X - 8,
-        y: PRESENT_HEIGHT + STATUS_CONTROL_Y,
+        y: present_height() + STATUS_CONTROL_Y,
         w: VOLUME_SLIDER_W + 16,
         h: STATUS_CONTROL_H,
     }
@@ -3038,7 +3073,7 @@ fn volume_control_hit_rect() -> Rect {
 fn joystick_toggle_rect() -> Rect {
     Rect {
         x: JOY_TOGGLE_X,
-        y: PRESENT_HEIGHT + STATUS_CONTROL_Y,
+        y: present_height() + STATUS_CONTROL_Y,
         w: JOY_TOGGLE_W,
         h: STATUS_CONTROL_H,
     }
@@ -3047,7 +3082,7 @@ fn joystick_toggle_rect() -> Rect {
 fn volume_slider_track_rect() -> Rect {
     Rect {
         x: VOLUME_SLIDER_X,
-        y: PRESENT_HEIGHT + VOLUME_SLIDER_Y,
+        y: present_height() + VOLUME_SLIDER_Y,
         w: VOLUME_SLIDER_W,
         h: VOLUME_SLIDER_H,
     }
@@ -3059,7 +3094,7 @@ fn volume_slider_knob_rect(percent: u8) -> Rect {
     let center = track.x + range * usize::from(percent.min(100)) / 100;
     Rect {
         x: center.saturating_sub(VOLUME_KNOB_W / 2),
-        y: PRESENT_HEIGHT + STATUS_CONTROL_Y + (STATUS_CONTROL_H - VOLUME_KNOB_H) / 2,
+        y: present_height() + STATUS_CONTROL_Y + (STATUS_CONTROL_H - VOLUME_KNOB_H) / 2,
         w: VOLUME_KNOB_W,
         h: VOLUME_KNOB_H,
     }
@@ -3068,7 +3103,7 @@ fn volume_slider_knob_rect(percent: u8) -> Rect {
 fn reboot_button_rect() -> Rect {
     Rect {
         x: FB_WIDTH - 58,
-        y: PRESENT_HEIGHT + STATUS_CONTROL_Y,
+        y: present_height() + STATUS_CONTROL_Y,
         w: 42,
         h: STATUS_CONTROL_H,
     }
@@ -3077,7 +3112,7 @@ fn reboot_button_rect() -> Rect {
 fn power_button_rect() -> Rect {
     Rect {
         x: FB_WIDTH - 108,
-        y: PRESENT_HEIGHT + STATUS_CONTROL_Y,
+        y: present_height() + STATUS_CONTROL_Y,
         w: 42,
         h: STATUS_CONTROL_H,
     }
@@ -3086,7 +3121,7 @@ fn power_button_rect() -> Rect {
 fn pause_button_rect() -> Rect {
     Rect {
         x: FB_WIDTH - 158,
-        y: PRESENT_HEIGHT + STATUS_CONTROL_Y,
+        y: present_height() + STATUS_CONTROL_Y,
         w: 42,
         h: STATUS_CONTROL_H,
     }
@@ -3429,7 +3464,7 @@ fn draw_shot_button(frame: &mut [u8], rect: Rect, hover: bool, texture_scale: us
 fn draw_speaker_glyph(frame: &mut [u8], texture_scale: usize) {
     let s = texture_scale;
     let x = VOLUME_GLYPH_X * s;
-    let y = (PRESENT_HEIGHT + STATUS_CONTROL_Y) * s;
+    let y = (present_height() + STATUS_CONTROL_Y) * s;
     let fs = s as f32;
     fill_rect(
         frame,
@@ -4293,7 +4328,7 @@ fn draw_osd(frame: &mut [u8], text: &str, texture_scale: usize) {
     let pad = 4 * s;
     let margin = 8 * s;
     let fw = texture_width(s);
-    let display_h = PRESENT_HEIGHT * s;
+    let display_h = present_height() * s;
 
     let text_w = font::text_width(text, px).min(fw.saturating_sub(2 * (margin + pad)));
     let text_h = font::text_height(px);
@@ -4570,9 +4605,12 @@ impl App {
         info!(
             "[DIAG_CURSOR] button={button:?} phys={phys:?} scale_factor={scale_factor:.4} \
              inner={}x{} texture_scale={} window_pos_to_pixel={mapped:?} mapped_pos={pos:?} \
-             region={region} (present_h={PRESENT_HEIGHT} window_present_h={WINDOW_PRESENT_HEIGHT} \
-             fb_w={FB_WIDTH})",
-            inner.width, inner.height, r.texture_scale,
+             region={region} (present_h={} window_present_h={} fb_w={FB_WIDTH})",
+            inner.width,
+            inner.height,
+            r.texture_scale,
+            present_height(),
+            window_present_height(),
         );
     }
 
@@ -5018,6 +5056,7 @@ impl App {
                     }
                     ui::MenuItem::Debugger => self.open_debugger(),
                     ui::MenuItem::JoystickInput => self.cycle_joystick_input_mode(),
+                    ui::MenuItem::PixelAspect => self.toggle_pixel_aspect(),
                     ui::MenuItem::Warp => self.toggle_warp(),
                     ui::MenuItem::WarpLimit => self.cycle_warp_speed(),
                     ui::MenuItem::Record => self.toggle_recording(),
@@ -5517,14 +5556,14 @@ impl App {
             return;
         }
 
-        let size = LogicalSize::new(FB_WIDTH as f64, WINDOW_PRESENT_HEIGHT as f64);
+        let size = LogicalSize::new(FB_WIDTH as f64, window_present_height() as f64);
         let attrs = WindowAttributes::default()
             .with_title(title)
             .with_window_icon(copperline_window_icon())
             .with_inner_size(size)
             .with_min_inner_size(LogicalSize::new(
                 FB_WIDTH as f64 / 2.0,
-                WINDOW_PRESENT_HEIGHT as f64 / 2.0,
+                window_present_height() as f64 / 2.0,
             ));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -5869,6 +5908,7 @@ impl App {
         });
         self.disk_playlist_index = [0; 4];
         self.overscan = crate::resolve_overscan(cfg.overscan);
+        self.apply_pixel_aspect(crate::resolve_pixel_aspect(cfg.pixel_aspect));
         self.warp_speed = cfg.emulation.warp_speed;
         // Reset the host joystick source to the new machine's configured
         // start-up mode (a previous live Cmd+J toggle does not carry over).
@@ -6144,7 +6184,7 @@ impl App {
     }
 
     fn start_recording_to(&mut self, path: PathBuf) {
-        match crate::recorder::VideoRecorder::create(&path, FB_WIDTH, PRESENT_HEIGHT) {
+        match crate::recorder::VideoRecorder::create(&path, FB_WIDTH, present_height()) {
             Ok(rec) => {
                 // The Paula tap collects the mixed stereo output from this
                 // point on; capture_recorder_output drains it every frame.
@@ -6205,7 +6245,7 @@ impl App {
                     &self.present_fb,
                     FB_WIDTH,
                     self.present_rows,
-                    PRESENT_HEIGHT,
+                    present_height(),
                     &mut self.record_fb,
                 );
                 if let Err(e) = rec.push_frame(&self.record_fb) {
@@ -7226,8 +7266,61 @@ impl App {
         let Some(window) = self.render.as_ref().map(|r| r.window.clone()) else {
             return;
         };
-        let size = LogicalSize::new(FB_WIDTH as f64, WINDOW_PRESENT_HEIGHT as f64);
+        let size = LogicalSize::new(FB_WIDTH as f64, window_present_height() as f64);
         let _ = window.request_inner_size(size);
+    }
+
+    /// Menu "Pixel Aspect": flip between the 4:3 CRT presentation and
+    /// square pixels for the rest of the run (the config file default is
+    /// unchanged; set `[display] pixel_aspect` to make it stick).
+    fn toggle_pixel_aspect(&mut self) {
+        let next = match super::pixel_aspect() {
+            PixelAspect::Tv => PixelAspect::Square,
+            PixelAspect::Square => PixelAspect::Tv,
+        };
+        self.apply_pixel_aspect(next);
+    }
+
+    /// Switch the presentation pixel aspect live: the canvas height (and
+    /// with it the backing texture and the window) changes between the
+    /// 4:3 and the square-pixel size, so the texture must be rebuilt like
+    /// a DPI change (see resync_render_scale) and the window re-sized.
+    fn apply_pixel_aspect(&mut self, aspect: PixelAspect) {
+        if aspect == super::pixel_aspect() {
+            return;
+        }
+        // A video recording's frame size is fixed when the encoder is
+        // created; refuse to change the presentation under it.
+        if self.recorder.is_some() {
+            self.show_osd("Stop the video recording before changing pixel aspect");
+            return;
+        }
+        super::set_pixel_aspect(aspect);
+        if let Some(r) = self.render.as_mut() {
+            if let Err(e) = r.pixels.resize_buffer(
+                texture_width(r.texture_scale) as u32,
+                texture_height(r.texture_scale) as u32,
+            ) {
+                warn!("resize texture buffer for pixel aspect failed: {e}");
+            }
+        }
+        // Tool windows share the canvas-sized texture layout (panel
+        // centring reads the live canvas height), so their buffers and
+        // windows must follow the new size too.
+        let size = LogicalSize::new(FB_WIDTH as f64, window_present_height() as f64);
+        for kind in [ToolPanelKind::Debugger, ToolPanelKind::FrameAnalyzer] {
+            if let Some(tool) = self.tool_window_mut(kind) {
+                if let Err(e) = tool.pixels.resize_buffer(
+                    texture_width(tool.texture_scale) as u32,
+                    texture_height(tool.texture_scale) as u32,
+                ) {
+                    warn!("resize tool texture buffer for pixel aspect failed: {e}");
+                }
+                let _ = tool.window.request_inner_size(size);
+            }
+        }
+        self.resize_for_active_panel();
+        self.request_redraw();
     }
 
     fn request_main_redraw(&self) {
@@ -8194,7 +8287,7 @@ fn save_present_frame(
         present_fb,
         FB_WIDTH as u32,
         src_rows as u32,
-        PRESENT_HEIGHT as u32,
+        present_height() as u32,
     )
 }
 
@@ -8220,21 +8313,22 @@ mod tests {
         copy_window_present_frame, draw_status_bar, fdd_track_counter_rect, fdd_track_digit_rect,
         host_shortcut_modifier_pressed, host_to_amiga_rawkey, joystick_mode_uses_keyboard,
         joystick_toggle_rect, keyboard_joystick_key_for, led_row_rect, mask_present_frame_to_tv,
-        paint_test_screen, parse_amiga_key, pause_button_rect, power_button_rect,
+        paint_test_screen, parse_amiga_key, pause_button_rect, power_button_rect, present_height,
         presentation_h_shift_for, presentation_source_y_offset, raw_device_qualifier_family_held,
         raw_device_qualifier_rawkey, rawkey_is_held, rawkey_transition_is_duplicate,
         reboot_button_rect, repeated_main_key_should_drop, rgba, shot_button_rect,
         should_render_emulated_frame, standard_window_top_row, status_with_latched_fdd_track,
-        take_integral_mouse_delta, texture_height, texture_width, tv_source_h_bounds,
-        volume_percent_from_pos, volume_slider_track_rect, BarControl, DriveBar, JoystickInputMode,
-        KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar, StatusBarView, ToolPanelKind,
-        AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT, AMIGA_RAWKEY_RIGHT_ALT,
-        AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF,
-        CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF,
-        HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
-        STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
-        TRACK_SEGMENT_ON, TV_PAL_LIVE_PAD_X, TV_PAL_PRESENT_HEIGHT, TV_PAL_PRESENT_SOURCE_X,
-        TV_PAL_PRESENT_SOURCE_Y, TV_PAL_PRESENT_WIDTH, VOLUME_FILL, VOLUME_GLYPH_X,
+        take_integral_mouse_delta, texture_height, texture_width, tv_aperture_source_row,
+        tv_source_h_bounds, volume_percent_from_pos, volume_slider_track_rect, BarControl,
+        DriveBar, JoystickInputMode, KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar,
+        StatusBarView, ToolPanelKind, AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT,
+        AMIGA_RAWKEY_RIGHT_ALT, AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED,
+        CD_BODY, CD_LED_OFF, CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF,
+        FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF,
+        POWER_LED_ON, STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG,
+        TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON, TV_PAL_LIVE_PAD_X, TV_PAL_PRESENT_HEIGHT,
+        TV_PAL_PRESENT_SOURCE_X, TV_PAL_PRESENT_SOURCE_Y, TV_PAL_PRESENT_WIDTH, VOLUME_FILL,
+        VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::{FrontPanelStatus, RenderRegisterSnapshot};
@@ -9211,7 +9305,7 @@ mod tests {
         v.media = media(1, Some(true));
         draw_status_bar(&mut frame, &v, scale);
         let cd = led_row_rect(3, 4);
-        assert!(cd.y + cd.h <= PRESENT_HEIGHT + super::STATUS_BAR_HEIGHT);
+        assert!(cd.y + cd.h <= present_height() + super::STATUS_BAR_HEIGHT);
         assert_eq!(
             pixel(&frame, cd.x + cd.w / 2, cd.y + cd.h / 2, scale),
             CD_LED_OFF.to_le_bytes()
@@ -9260,7 +9354,7 @@ mod tests {
         let cd_eject = stacked.cd_eject.unwrap();
         assert!(cd_eject.x + cd_eject.w <= VOLUME_GLYPH_X);
         // Stacked buttons stay inside the status bar.
-        assert!(df2.y + df2.h <= PRESENT_HEIGHT + super::STATUS_BAR_HEIGHT);
+        assert!(df2.y + df2.h <= present_height() + super::STATUS_BAR_HEIGHT);
     }
 
     #[test]
@@ -9429,7 +9523,7 @@ mod tests {
         assert_eq!(pixel(&frame, 2, 0, scale), src[1].to_le_bytes());
         // The bottom output row resolves to the last woven source line.
         assert_eq!(
-            pixel(&frame, 0, PRESENT_HEIGHT * scale - 1, scale),
+            pixel(&frame, 0, present_height() * scale - 1, scale),
             src[(OUT_HEIGHT - 1) * FB_WIDTH].to_le_bytes()
         );
     }
@@ -9492,13 +9586,78 @@ mod tests {
     }
 
     #[test]
+    fn square_pixel_canvas_maps_woven_rows_one_to_one() {
+        use crate::video::deinterlace::OUT_HEIGHT;
+        use crate::video::PRESENT_HEIGHT_SQUARE;
+        // The square-pixel canvas is exactly the woven field: every
+        // scanline is one output row, so a standard 320x256 PAL display
+        // occupies precisely 640x512 output pixels.
+        assert_eq!(PRESENT_HEIGHT_SQUARE, OUT_HEIGHT);
+        for y in 0..OUT_HEIGHT {
+            assert_eq!(
+                crate::screenshot::scaled_source_row(y, OUT_HEIGHT, PRESENT_HEIGHT_SQUARE),
+                y
+            );
+        }
+    }
+
+    #[test]
+    fn tv_aperture_row_mapping_pads_square_bezel_and_covers_43() {
+        use crate::video::{PRESENT_HEIGHT_SQUARE, PRESENT_HEIGHT_TV};
+        // 4:3 canvas: no bezel rows; the 540 aperture rows map onto all
+        // 537 output rows exactly as before the square-pixel option.
+        assert_eq!(tv_aperture_source_row(0, PRESENT_HEIGHT_TV, 1), Some(0));
+        assert_eq!(
+            tv_aperture_source_row(PRESENT_HEIGHT_TV - 1, PRESENT_HEIGHT_TV, 1),
+            Some(TV_PAL_PRESENT_HEIGHT - 1)
+        );
+        // Square canvas: black bezel bands centre the aperture and its
+        // rows map 1:1.
+        let pad = (PRESENT_HEIGHT_SQUARE - TV_PAL_PRESENT_HEIGHT) / 2;
+        assert_eq!(tv_aperture_source_row(0, PRESENT_HEIGHT_SQUARE, 1), None);
+        assert_eq!(
+            tv_aperture_source_row(pad - 1, PRESENT_HEIGHT_SQUARE, 1),
+            None
+        );
+        assert_eq!(
+            tv_aperture_source_row(pad, PRESENT_HEIGHT_SQUARE, 1),
+            Some(0)
+        );
+        assert_eq!(
+            tv_aperture_source_row(pad + TV_PAL_PRESENT_HEIGHT - 1, PRESENT_HEIGHT_SQUARE, 1),
+            Some(TV_PAL_PRESENT_HEIGHT - 1)
+        );
+        assert_eq!(
+            tv_aperture_source_row(pad + TV_PAL_PRESENT_HEIGHT, PRESENT_HEIGHT_SQUARE, 1),
+            None
+        );
+        // HiDPI: bezel and 1:1 mapping scale with the texture factor.
+        assert_eq!(
+            tv_aperture_source_row(2 * pad - 1, PRESENT_HEIGHT_SQUARE, 2),
+            None
+        );
+        assert_eq!(
+            tv_aperture_source_row(2 * pad, PRESENT_HEIGHT_SQUARE, 2),
+            Some(0)
+        );
+        assert_eq!(
+            tv_aperture_source_row(2 * pad + 1, PRESENT_HEIGHT_SQUARE, 2),
+            Some(0)
+        );
+        assert_eq!(
+            tv_aperture_source_row(2 * pad + 2, PRESENT_HEIGHT_SQUARE, 2),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn present_row_selection_covers_every_source_line_at_hidpi() {
         use crate::video::deinterlace::OUT_HEIGHT;
         // The live window writes a HiDPI texture before the OS compositor
         // scales it. At that output size, every woven source row should be
         // represented by one or more whole texture rows without mixing
         // neighbouring Amiga scanlines.
-        let out_rows = PRESENT_HEIGHT * 2;
+        let out_rows = present_height() * 2;
         let mut hits = vec![0usize; OUT_HEIGHT];
         let mut prev = 0usize;
         for y in 0..out_rows {

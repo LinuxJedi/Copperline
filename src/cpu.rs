@@ -906,7 +906,7 @@ impl M68kMachine {
             &fb,
             crate::video::FB_WIDTH as u32,
             geometry.visible_lines as u32,
-            crate::video::PRESENT_HEIGHT as u32,
+            crate::video::present_height() as u32,
         ) {
             Ok(()) => log::info!("  screenshot: {path}"),
             Err(e) => log::warn!("  screenshot failed ({path}): {e:#}"),

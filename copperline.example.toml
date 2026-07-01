@@ -211,11 +211,15 @@ video = "PAL"
 
 
 # Presentation options. overscan: "tv" (default; mask deep horizontal
-# overscan like a CRT bezel) or "full". phosphor: CRT persistence
-# fraction (0.0-0.95, default 0.0): fuses field-rate flicker/dither like
-# a real tube at the cost of a slight motion trail.
+# overscan like a CRT bezel) or "full". pixel_aspect: "tv" (default; the
+# non-square pixel aspect of a 4:3 CRT) or "square" (one host row per
+# scanline, so a 320x256 lo-res screen is an exact 640x512 -- handy for
+# pixel-exact comparison against square-pixel emulators). phosphor: CRT
+# persistence fraction (0.0-0.95, default 0.0): fuses field-rate
+# flicker/dither like a real tube at the cost of a slight motion trail.
 # [display]
 # overscan = "tv"
+# pixel_aspect = "tv"
 # phosphor = 0.4
 
 

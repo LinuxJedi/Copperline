@@ -13,8 +13,8 @@ use super::window::{
     draw_rect_bevel, fill_rect, fill_rect_blend, rgba, scale_rect, JoystickInputMode, Rect,
     BUTTON_EDGE_DARK, BUTTON_EDGE_LIGHT, BUTTON_FACE, BUTTON_FACE_HOVER,
 };
-use super::{font, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL, PRESENT_HEIGHT};
-use crate::config::{MachineModel, WarpSpeed};
+use super::{font, present_height, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL};
+use crate::config::{MachineModel, PixelAspect, WarpSpeed};
 use crate::debugger::{BreakCond, CondOp, CondOperand};
 
 // ---------------------------------------------------------------------------
@@ -76,6 +76,7 @@ pub enum MenuItem {
     Calibration,
     Debugger,
     JoystickInput,
+    PixelAspect,
     Warp,
     WarpLimit,
     Record,
@@ -86,12 +87,13 @@ pub enum MenuItem {
     MachineConfig,
 }
 
-pub const MENU_ITEMS: [MenuItem; 14] = [
+pub const MENU_ITEMS: [MenuItem; 15] = [
     MenuItem::MachineConfig,
     MenuItem::FrameAnalyzer,
     MenuItem::Debugger,
     MenuItem::Calibration,
     MenuItem::JoystickInput,
+    MenuItem::PixelAspect,
     MenuItem::Warp,
     MenuItem::WarpLimit,
     MenuItem::Record,
@@ -110,6 +112,7 @@ fn menu_item_label(
     recording: bool,
     input_recording: bool,
     joystick_input_mode: JoystickInputMode,
+    pixel_aspect: PixelAspect,
 ) -> String {
     match item {
         MenuItem::FrameAnalyzer => "Frame Analyzer...".to_string(),
@@ -118,6 +121,13 @@ fn menu_item_label(
         MenuItem::Calibration => "Calibrate Gamepad...".to_string(),
         MenuItem::Debugger => "Debugger...".to_string(),
         MenuItem::JoystickInput => format!("Joystick Input  [{}]", joystick_input_mode.label()),
+        MenuItem::PixelAspect => {
+            let value = match pixel_aspect {
+                PixelAspect::Tv => "tv",
+                PixelAspect::Square => "square",
+            };
+            format!("Pixel Aspect {:>8}", format!("[{value}]"))
+        }
         MenuItem::Warp if warp => "Warp Speed      [on]".to_string(),
         MenuItem::Warp => "Warp Speed     [off]".to_string(),
         // Right-pad so the closing bracket stays put as the value width
@@ -139,7 +149,7 @@ fn menu_rect() -> Rect {
     let right = MENU_BUTTON_X + MENU_BUTTON_W;
     Rect {
         x: right.saturating_sub(MENU_W),
-        y: PRESENT_HEIGHT.saturating_sub(h + 2),
+        y: present_height().saturating_sub(h + 2),
         w: MENU_W,
         h,
     }
@@ -525,7 +535,7 @@ fn panel_rect(panel: &Panel) -> Rect {
     let (w, h) = panel_dims(panel);
     Rect {
         x: (FB_WIDTH.saturating_sub(w)) / 2,
-        y: (PRESENT_HEIGHT.saturating_sub(h)) / 2,
+        y: (present_height().saturating_sub(h)) / 2,
         w,
         h,
     }
@@ -958,7 +968,7 @@ fn draw_panel_chrome(frame: &mut [u8], panel: &Panel, hover: Option<UiControl>, 
                 x: 0,
                 y: 0,
                 w: FB_WIDTH,
-                h: PRESENT_HEIGHT,
+                h: present_height(),
             },
             scale,
         ),
@@ -1035,6 +1045,7 @@ fn draw_menu(
     recording: bool,
     input_recording: bool,
     joystick_input_mode: JoystickInputMode,
+    pixel_aspect: PixelAspect,
     scale: usize,
 ) {
     let rect = menu_rect();
@@ -1063,6 +1074,7 @@ fn draw_menu(
                 recording,
                 input_recording,
                 joystick_input_mode,
+                pixel_aspect,
             ),
             fg,
             MENU_TEXT_PX,
@@ -3104,6 +3116,7 @@ pub fn draw(
     recording: bool,
     input_recording: bool,
     joystick_input_mode: JoystickInputMode,
+    pixel_aspect: PixelAspect,
 ) {
     if let Some(panel) = &ui.panel {
         draw_panel_layer(frame, texture_scale, panel, hover, data);
@@ -3117,6 +3130,7 @@ pub fn draw(
             recording,
             input_recording,
             joystick_input_mode,
+            pixel_aspect,
             texture_scale,
         );
     }
@@ -3335,7 +3349,7 @@ mod tests {
     #[test]
     fn menu_sits_above_the_status_bar_and_hit_tests_items() {
         let rect = menu_rect();
-        assert!(rect.y + rect.h <= PRESENT_HEIGHT);
+        assert!(rect.y + rect.h <= present_height());
         assert!(rect.x + rect.w <= FB_WIDTH);
 
         let ui = UiState {
@@ -3366,27 +3380,32 @@ mod tests {
         let limit = menu.x + menu.w;
         let modes = [JoystickInputMode::Gamepad, JoystickInputMode::Keyboard];
         let speeds = [WarpSpeed::X2, WarpSpeed::X8, WarpSpeed::X16, WarpSpeed::Max];
+        let aspects = [PixelAspect::Tv, PixelAspect::Square];
         for item in MENU_ITEMS {
             for warp in [false, true] {
                 for recording in [false, true] {
                     for input_recording in [false, true] {
                         for &mode in &modes {
                             for &speed in &speeds {
-                                let label = menu_item_label(
-                                    item,
-                                    warp,
-                                    speed,
-                                    recording,
-                                    input_recording,
-                                    mode,
-                                );
-                                let text_w = label.chars().count() * font::GLYPH_W * MENU_TEXT_PX;
-                                let right = menu_item_rect(0).x + MENU_TEXT_INSET + text_w;
-                                assert!(
-                                    right <= limit,
-                                    "label {label:?} ({text_w}px) overflows the menu by {}px",
-                                    right.saturating_sub(limit)
-                                );
+                                for &aspect in &aspects {
+                                    let label = menu_item_label(
+                                        item,
+                                        warp,
+                                        speed,
+                                        recording,
+                                        input_recording,
+                                        mode,
+                                        aspect,
+                                    );
+                                    let text_w =
+                                        label.chars().count() * font::GLYPH_W * MENU_TEXT_PX;
+                                    let right = menu_item_rect(0).x + MENU_TEXT_INSET + text_w;
+                                    assert!(
+                                        right <= limit,
+                                        "label {label:?} ({text_w}px) overflows the menu by {}px",
+                                        right.saturating_sub(limit)
+                                    );
+                                }
                             }
                         }
                     }
@@ -3759,6 +3778,7 @@ mod tests {
             false,
             false,
             JoystickInputMode::Gamepad,
+            PixelAspect::Tv,
         );
         let menu = menu_rect();
         let probe = ((menu.y + MENU_PAD + 2) * w + menu.x + 4) * 4;
@@ -3791,6 +3811,7 @@ mod tests {
             false,
             false,
             JoystickInputMode::Gamepad,
+            PixelAspect::Tv,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "about");
@@ -3811,6 +3832,7 @@ mod tests {
             false,
             false,
             JoystickInputMode::Gamepad,
+            PixelAspect::Tv,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "shortcuts");
@@ -3848,6 +3870,7 @@ mod tests {
             false,
             false,
             JoystickInputMode::Gamepad,
+            PixelAspect::Tv,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "calibration");
@@ -3893,6 +3916,7 @@ mod tests {
             false,
             false,
             JoystickInputMode::Gamepad,
+            PixelAspect::Tv,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "debugger");
@@ -3935,6 +3959,7 @@ mod tests {
             false,
             false,
             JoystickInputMode::Gamepad,
+            PixelAspect::Tv,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "debugger-break");
@@ -4029,6 +4054,7 @@ mod tests {
             false,
             false,
             JoystickInputMode::Gamepad,
+            PixelAspect::Tv,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "debugger-audio");
@@ -4056,6 +4082,7 @@ mod tests {
             false,
             false,
             JoystickInputMode::Gamepad,
+            PixelAspect::Tv,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "launcher");
@@ -4123,6 +4150,7 @@ mod tests {
             false,
             false,
             JoystickInputMode::Gamepad,
+            PixelAspect::Tv,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "launcher-zorro");
@@ -4157,6 +4185,7 @@ mod tests {
             false,
             false,
             JoystickInputMode::Gamepad,
+            PixelAspect::Tv,
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "launcher-storage");

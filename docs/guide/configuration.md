@@ -278,8 +278,9 @@ recorded in [](../internals/chipset)).
 
 ```toml
 [display]
-overscan = "tv"   # "tv" (default) or "full"
-phosphor = 0.0    # CRT persistence fraction, 0.0 (off) to 0.95
+overscan = "tv"      # "tv" (default) or "full"
+pixel_aspect = "tv"  # "tv" (default, 4:3 CRT) or "square" (exact 2x2 lo-res)
+phosphor = 0.0       # CRT persistence fraction, 0.0 (off) to 0.95
 ```
 
 The emulated framebuffer always carries the full overscan field Denise
@@ -290,6 +291,18 @@ screenshots and `--dump-frames` crop standard PAL TV output to a 692x540
 aperture for reference-emulator comparison. `"full"` shows everything, which
 is useful when debugging display alignment. `COPPERLINE_OVERSCAN=full|tv`
 overrides this for a single run.
+
+`pixel_aspect` selects how emulated scanlines map to host rows. The default
+`"tv"` presents the field with the non-square pixel aspect of a 4:3 CRT:
+the full overscan scan fills a 4:3 picture, so PAL lo-res pixels come out
+slightly wider than tall, exactly as a real TV shows them (a 320x256 screen
+spans about 640x482 window pixels). `"square"` uses one host row per woven
+scanline instead, so every low-resolution pixel is an integer 2x2 square
+and a 320x256 PAL screen occupies precisely 640x512 window pixels --
+slightly taller than a real CRT picture, but exact for side-by-side pixel
+comparison with square-pixel emulators. The menu's *Pixel Aspect* item
+flips the mode live without touching the config, and
+`COPPERLINE_PIXEL_ASPECT=tv|square` overrides it for a single run.
 
 `phosphor` blends each presented frame with a fraction of the previous
 one, approximating the exponential decay of CRT phosphor. Software that

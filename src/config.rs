@@ -133,6 +133,9 @@ pub struct Config {
     /// screenshots (the emulated framebuffer always carries the full
     /// overscan field). See [`Overscan`].
     pub overscan: Overscan,
+    /// Presentation pixel aspect: how emulated scanlines map to host
+    /// rows in the window and in screenshots. See [`PixelAspect`].
+    pub pixel_aspect: PixelAspect,
     /// CRT phosphor persistence: the fraction of the previous presented
     /// frame each new frame keeps (0.0 = off). Approximates the phosphor
     /// decay that fuses field-rate dither and interlace flicker on a
@@ -162,6 +165,25 @@ pub enum Overscan {
     /// does this mode. The default.
     #[default]
     Tv,
+}
+
+/// How emulated scanlines map to host rows in the window and in
+/// screenshots. The `COPPERLINE_PIXEL_ASPECT` env var (tv/square)
+/// overrides the config for one run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PixelAspect {
+    /// Present the field with the non-square pixel aspect of a 4:3 CRT:
+    /// the full overscan scan maps onto a 4:3 output, so PAL lo-res
+    /// pixels come out slightly wider than tall, exactly as a real TV
+    /// shows them. The default.
+    #[default]
+    Tv,
+    /// Present with square pixels: one host row per woven scanline, so a
+    /// standard lo-res display is an exact 2x2 of its 320-wide bitmap
+    /// (e.g. 320x256 PAL occupies precisely 640x512 window pixels).
+    /// Slightly taller than a real 4:3 CRT picture, but every pixel is
+    /// an integer square, which suits side-by-side pixel comparisons.
+    Square,
 }
 
 /// Host input source for the emulated port-2 joystick/CD32 pad. `Gamepad` (the
@@ -744,6 +766,7 @@ impl Default for Config {
             floppy_connected: [true, false, false, false],
             floppy_playlists: std::array::from_fn(|_| Vec::new()),
             overscan: Overscan::Tv,
+            pixel_aspect: PixelAspect::Tv,
             phosphor: 0.0,
             joystick_input_mode: JoystickInputMode::Gamepad,
         }
@@ -988,6 +1011,10 @@ pub(crate) struct RawDisplay {
     /// "tv" (default, mask deep overscan like a CRT bezel) or "full".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) overscan: Option<String>,
+    /// "tv" (default, 4:3 CRT pixel aspect) or "square" (1:1 host
+    /// pixels; a lo-res display is an exact 2x2 of its bitmap).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pixel_aspect: Option<String>,
     /// CRT phosphor persistence fraction, 0.0 (off, default) to 0.95.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) phosphor: Option<f32>,
@@ -1467,6 +1494,10 @@ impl TryFrom<RawConfig> for Config {
             None => defaults.overscan,
             Some(s) => parse_overscan(s)?,
         };
+        let pixel_aspect = match raw.display.pixel_aspect.as_deref() {
+            None => defaults.pixel_aspect,
+            Some(s) => parse_pixel_aspect(s)?,
+        };
         let phosphor = match raw.display.phosphor {
             None => defaults.phosphor,
             Some(p) if (0.0..=0.95).contains(&p) => p,
@@ -1619,6 +1650,7 @@ impl TryFrom<RawConfig> for Config {
             floppy_connected,
             floppy_playlists,
             overscan,
+            pixel_aspect,
             phosphor,
             joystick_input_mode,
         })
@@ -1630,6 +1662,14 @@ pub(crate) fn parse_overscan(s: &str) -> Result<Overscan> {
         "full" => Ok(Overscan::Full),
         "tv" => Ok(Overscan::Tv),
         other => bail!("[display] overscan must be \"full\" or \"tv\", got \"{other}\""),
+    }
+}
+
+pub(crate) fn parse_pixel_aspect(s: &str) -> Result<PixelAspect> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "tv" => Ok(PixelAspect::Tv),
+        "square" => Ok(PixelAspect::Square),
+        other => bail!("[display] pixel_aspect must be \"tv\" or \"square\", got \"{other}\""),
     }
 }
 
@@ -2395,6 +2435,20 @@ mod tests {
         )?;
         assert_eq!(cfg.overscan, Overscan::Full);
         assert!(parse_config("[display]\noverscan = \"crop\"").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn display_pixel_aspect_parses_and_defaults_to_tv() -> Result<()> {
+        assert_eq!(parse_config("")?.pixel_aspect, PixelAspect::Tv);
+        let cfg = parse_config(
+            r#"
+            [display]
+            pixel_aspect = "Square"
+            "#,
+        )?;
+        assert_eq!(cfg.pixel_aspect, PixelAspect::Square);
+        assert!(parse_config("[display]\npixel_aspect = \"1:1\"").is_err());
         Ok(())
     }
 
