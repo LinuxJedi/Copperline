@@ -484,6 +484,9 @@ pub struct App {
     render: Option<Render>,
     debugger_tool_window: Option<ToolWindow>,
     frame_analyzer_tool_window: Option<ToolWindow>,
+    /// When the frame loop last requested a paced tool window repaint
+    /// (see TOOL_REDRAW_INTERVAL).
+    last_tool_redraw: Instant,
     debugger_panel: Option<ui::DebuggerPanel>,
     frame_analyzer_panel: Option<ui::FrameAnalyzerPanel>,
     render_worker: Option<RenderWorker>,
@@ -668,6 +671,15 @@ struct ToolWindow {
     cursor_pos: Option<(i32, i32)>,
 }
 
+/// Frame-loop repaints of the tool windows (debugger, frame analyzer) are
+/// paced to this wall-clock interval (20 Hz). Each repaint costs a full
+/// panel raster plus a whole-texture GPU upload on the emulation thread, so
+/// repainting at the 50 Hz emulated frame rate can push the loop past its
+/// frame budget and underrun the audio ring. Interactive updates (hover,
+/// clicks, stepping, debug stops) request immediate redraws and are not
+/// paced.
+const TOOL_REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolPanelKind {
     Debugger,
@@ -801,6 +813,7 @@ impl App {
             render: None,
             debugger_tool_window: None,
             frame_analyzer_tool_window: None,
+            last_tool_redraw: Instant::now(),
             debugger_panel: None,
             frame_analyzer_panel: None,
             render_worker,
@@ -1063,7 +1076,7 @@ impl ApplicationHandler for App {
         // Other platforms keep wgpu's default backend set (Metal on macOS,
         // DX12/Vulkan on Windows). cfg!() (not #[cfg]) keeps the Linux branch
         // type-checked on every host.
-        let pixels = match build_pixels_for_window(window.clone(), texture_scale) {
+        let pixels = match build_pixels_for_window(window.clone(), texture_scale, true) {
             Ok(p) => p,
             Err(e) => {
                 error!("pixels init failed: {e}");
@@ -1675,7 +1688,7 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            self.ensure_tool_windows_for_open_panels(event_loop);
+            self.refresh_tool_windows_paced(event_loop);
         }
         let now = Instant::now();
         // While powered off, leave the parked test screen in place; the
@@ -1688,9 +1701,10 @@ impl ApplicationHandler for App {
         // Skipping request_redraw for headless capture avoids the vsync gate so
         // the run advances as fast as the host allows; emulated state is
         // identical either way. (`headless_capture` was resolved above, before
-        // the step, to decide the warp burst.)
+        // the step, to decide the warp burst.) Only the emulator window tracks
+        // every presented frame; tool windows were paced above.
         if rendered && !headless_capture {
-            self.request_redraw();
+            self.request_main_redraw();
         }
 
         if self.dump_frame_if_due(now, event_loop) {
@@ -2268,6 +2282,7 @@ fn resync_render_scale(pixels: &mut Pixels<'static>, texture_scale: &mut usize, 
 fn build_pixels_for_window(
     window: Arc<Window>,
     texture_scale: usize,
+    vsync: bool,
 ) -> std::result::Result<Pixels<'static>, pixels::Error> {
     let inner = window.inner_size();
     let surface = SurfaceTexture::new(inner.width.max(1), inner.height.max(1), window);
@@ -2275,7 +2290,8 @@ fn build_pixels_for_window(
         texture_width(texture_scale) as u32,
         texture_height(texture_scale) as u32,
         surface,
-    );
+    )
+    .enable_vsync(vsync);
     let builder = if cfg!(target_os = "linux") {
         builder.wgpu_backend(
             pixels::wgpu::Backends::from_env().unwrap_or(pixels::wgpu::Backends::VULKAN),
@@ -5440,11 +5456,28 @@ impl App {
     }
 
     fn ensure_tool_windows_for_open_panels(&mut self, event_loop: &ActiveEventLoop) {
-        self.ensure_tool_window_for_kind(event_loop, ToolPanelKind::Debugger);
-        self.ensure_tool_window_for_kind(event_loop, ToolPanelKind::FrameAnalyzer);
+        self.ensure_tool_window_for_kind(event_loop, ToolPanelKind::Debugger, true);
+        self.ensure_tool_window_for_kind(event_loop, ToolPanelKind::FrameAnalyzer, true);
     }
 
-    fn ensure_tool_window_for_kind(&mut self, event_loop: &ActiveEventLoop, kind: ToolPanelKind) {
+    /// Frame-loop variant of ensure_tool_windows_for_open_panels: still
+    /// creates/destroys windows to match the open panels every call, but
+    /// paces the repaint of existing windows to TOOL_REDRAW_INTERVAL.
+    fn refresh_tool_windows_paced(&mut self, event_loop: &ActiveEventLoop) {
+        let due = self.last_tool_redraw.elapsed() >= TOOL_REDRAW_INTERVAL;
+        if due {
+            self.last_tool_redraw = Instant::now();
+        }
+        self.ensure_tool_window_for_kind(event_loop, ToolPanelKind::Debugger, due);
+        self.ensure_tool_window_for_kind(event_loop, ToolPanelKind::FrameAnalyzer, due);
+    }
+
+    fn ensure_tool_window_for_kind(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        kind: ToolPanelKind,
+        redraw: bool,
+    ) {
         if !self.tool_panel_is_open(kind) {
             *self.tool_window_slot(kind) = None;
             return;
@@ -5452,7 +5485,9 @@ impl App {
         let title = Self::tool_window_title(kind);
         if let Some(tool) = self.tool_window(kind) {
             tool.window.set_title(title);
-            tool.window.request_redraw();
+            if redraw {
+                tool.window.request_redraw();
+            }
             return;
         }
 
@@ -5473,7 +5508,11 @@ impl App {
             }
         };
         let texture_scale = texture_scale_for_window(&window);
-        let pixels = match build_pixels_for_window(window.clone(), texture_scale) {
+        // No vsync for tool windows: pixels.render() runs on the emulation
+        // thread, which already paces against the emulator window's vsynced
+        // present. A second vsync gate per frame can push the loop past its
+        // frame budget and underrun the audio ring.
+        let pixels = match build_pixels_for_window(window.clone(), texture_scale, false) {
             Ok(p) => p,
             Err(e) => {
                 warn!("tool window pixels init failed: {e}");
@@ -7164,10 +7203,14 @@ impl App {
         let _ = window.request_inner_size(size);
     }
 
-    fn request_redraw(&self) {
+    fn request_main_redraw(&self) {
         if let Some(render) = self.render.as_ref() {
             render.window.request_redraw();
         }
+    }
+
+    fn request_redraw(&self) {
+        self.request_main_redraw();
         if let Some(tool) = self.debugger_tool_window.as_ref() {
             tool.window.request_redraw();
         }
