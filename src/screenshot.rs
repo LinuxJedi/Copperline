@@ -41,11 +41,12 @@ pub fn save(path: &Path, fb: &[u32], width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
-/// Save `fb` with centre-aligned bilinear vertical scaling. Used for
+/// Save `fb` with centre-aligned vertical scaling. Used for
 /// PAL presentation screenshots, where the internal overscan field
-/// buffer should be viewed with non-square pixels; bilinear sampling
-/// keeps line thickness even across the picture (nearest-neighbour
-/// subsampling dropped source lines unevenly).
+/// buffer should be viewed with non-square pixels. The normal
+/// presentation path preserves source-row colours instead of blending
+/// adjacent scanlines; filtered output belongs behind an explicit
+/// display filter.
 pub fn save_scaled_y(
     path: &Path,
     fb: &[u32],
@@ -81,30 +82,24 @@ pub fn save_scaled_y(
     save(path, &scaled, width, out_height)
 }
 
-/// Centre-aligned bilinear vertical resample of `fb` into `scaled`
-/// (cleared and resized). Shared by the presentation screenshot writer
-/// and the video recorder, which scale the same field buffer per frame.
+/// Centre-aligned source row for presentation row `y`.
+#[inline]
+pub fn scaled_source_row(y: usize, src_rows: usize, dst_rows: usize) -> usize {
+    (((2 * y + 1) * src_rows) / (2 * dst_rows)).min(src_rows.saturating_sub(1))
+}
+
+/// Centre-aligned vertical resample of `fb` into `scaled` (cleared and
+/// resized). Shared by the presentation screenshot writer and the video
+/// recorder, which scale the same field buffer per frame.
 pub fn scale_y_into(fb: &[u32], width: usize, height: usize, out: usize, scaled: &mut Vec<u32>) {
     debug_assert!(fb.len() >= width * height);
     scaled.clear();
     scaled.resize(width * out, 0);
     for y in 0..out {
-        // Source-row centre for this output row in 24.8 fixed point:
-        // (y + 0.5) * height / out - 0.5.
-        let pos = ((2 * y as i64 + 1) * height as i64 * 128 / out as i64 - 128)
-            .clamp(0, ((height - 1) as i64) << 8) as usize;
-        let src_y0 = pos >> 8;
-        let frac = (pos & 0xFF) as u32;
-        let row0 = &fb[src_y0 * width..(src_y0 + 1) * width];
+        let src_y = scaled_source_row(y, height, out);
+        let row = &fb[src_y * width..(src_y + 1) * width];
         let dst = &mut scaled[y * width..(y + 1) * width];
-        if frac == 0 || src_y0 + 1 >= height {
-            dst.copy_from_slice(row0);
-        } else {
-            let row1 = &fb[(src_y0 + 1) * width..(src_y0 + 2) * width];
-            for (d, (&a, &b)) in dst.iter_mut().zip(row0.iter().zip(row1.iter())) {
-                *d = crate::video::blend_rgba(a, b, frac);
-            }
-        }
+        dst.copy_from_slice(row);
     }
 }
 
@@ -147,4 +142,22 @@ pub fn stretch_rows_x(fb: &mut [u32], width: usize, rows: usize, src_num: u32, s
 pub fn auto_filename() -> PathBuf {
     let ts = crate::timestamp::compact_now();
     PathBuf::from(format!("copperline-screenshot-{ts}.png"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertical_presentation_scale_preserves_source_pixel_values() {
+        let a = 0x1122_3344;
+        let b = 0x5566_7788;
+        let fb = [a, b, a, b, a, b];
+        let mut scaled = Vec::new();
+
+        scale_y_into(&fb, 1, fb.len(), 5, &mut scaled);
+
+        assert_eq!(scaled.len(), 5);
+        assert!(scaled.iter().all(|px| *px == a || *px == b));
+    }
 }

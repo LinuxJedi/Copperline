@@ -9,8 +9,8 @@ use super::deinterlace::{Deinterlacer, OUT_HEIGHT};
 use super::launcher::{LauncherField, LauncherState, MachineSetup, StatusMessage};
 use super::ui::{self, Panel, UiControl, UiState};
 use super::{
-    bitplane, blend_rgba, font, FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH,
-    HOST_SHORTCUT_MODIFIER_LABEL, MAX_FB_PIXELS, PRESENT_HEIGHT,
+    bitplane, font, FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL,
+    MAX_FB_PIXELS, PRESENT_HEIGHT,
 };
 use crate::audio::{AudioSink, CpalSink};
 use crate::bus::{
@@ -2344,17 +2344,6 @@ fn owner_name_from_code(code: u8) -> &'static str {
     }
 }
 
-/// Source-row sample position for presentation output row `y` of
-/// `dst_rows`: the centre-aligned bilinear position (y + 0.5) *
-/// src_rows / dst_rows - 0.5 as a whole source row plus a 0..256
-/// blend fraction toward the next row.
-#[inline]
-fn present_row_sample(y: usize, src_rows: usize, dst_rows: usize) -> (usize, u32) {
-    let pos = ((2 * y as i64 + 1) * src_rows as i64 * 128 / dst_rows as i64 - 128)
-        .clamp(0, ((src_rows - 1) as i64) << 8) as usize;
-    (pos >> 8, (pos & 0xFF) as u32)
-}
-
 fn copy_present_frame(src_fb: &[u32], src_rows: usize, frame: &mut [u8], texture_scale: usize) {
     debug_assert!(src_fb.len() >= src_rows * FB_WIDTH);
     debug_assert_eq!(
@@ -2364,24 +2353,12 @@ fn copy_present_frame(src_fb: &[u32], src_rows: usize, frame: &mut [u8], texture
     let dst_stride = texture_width(texture_scale) * 4;
     let out_rows = PRESENT_HEIGHT * texture_scale;
     // The 570 woven scanlines map onto the 537-row 4:3 presentation (times
-    // the HiDPI texture scale). Nearest-neighbour subsampling here made
-    // line thickness uneven across the picture (visible on crosshatch and
-    // dot test patterns), so resample vertically with a centre-aligned
-    // bilinear filter at full texture resolution: every source line gets
-    // equal coverage and the HiDPI rows carry the sub-line positioning.
-    let mut blended = [0u32; FB_WIDTH];
+    // the HiDPI texture scale). Select whole source rows instead of blending
+    // adjacent Amiga scanlines; normal presentation should not synthesize
+    // intermediate colours from line-to-line dithering.
     for y in 0..out_rows {
-        let (src_y0, frac) = present_row_sample(y, src_rows, out_rows);
-        let row0 = &src_fb[src_y0 * FB_WIDTH..(src_y0 + 1) * FB_WIDTH];
-        let row: &[u32] = if frac == 0 || src_y0 + 1 >= src_rows {
-            row0
-        } else {
-            let row1 = &src_fb[(src_y0 + 1) * FB_WIDTH..(src_y0 + 2) * FB_WIDTH];
-            for (d, (&a, &b)) in blended.iter_mut().zip(row0.iter().zip(row1.iter())) {
-                *d = blend_rgba(a, b, frac);
-            }
-            &blended
-        };
+        let src_y = screenshot::scaled_source_row(y, src_rows, out_rows);
+        let row = &src_fb[src_y * FB_WIDTH..(src_y + 1) * FB_WIDTH];
 
         let dst_off = y * dst_stride;
         match texture_scale {
@@ -7162,13 +7139,24 @@ impl App {
         if crate::envcfg::flag("COPPERLINE_DUMP_RENDER_META") {
             log_frame_dump_metadata(state.dumped, &self.emu);
         }
-        match screenshot::save_scaled_y(
-            &path,
-            &self.present_fb,
-            FB_WIDTH as u32,
-            self.present_rows as u32,
-            PRESENT_HEIGHT as u32,
-        ) {
+        let src_rows = self.present_rows;
+        let result = if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
+            screenshot::save(
+                &path,
+                &self.present_fb[..src_rows * FB_WIDTH],
+                FB_WIDTH as u32,
+                src_rows as u32,
+            )
+        } else {
+            screenshot::save_scaled_y(
+                &path,
+                &self.present_fb,
+                FB_WIDTH as u32,
+                src_rows as u32,
+                PRESENT_HEIGHT as u32,
+            )
+        };
+        match result {
             Ok(()) => {
                 state.last_saved_emulated_frame = Some(emulated_frame);
                 state.dumped += 1;
@@ -7922,7 +7910,7 @@ mod tests {
         host_shortcut_modifier_pressed, host_to_amiga_rawkey, joystick_mode_uses_keyboard,
         joystick_toggle_rect, keyboard_joystick_key_for, led_row_rect, mask_present_frame_to_tv,
         paint_test_screen, parse_amiga_key, pause_button_rect, power_button_rect,
-        present_row_sample, presentation_source_y_offset, raw_device_qualifier_family_held,
+        presentation_source_y_offset, raw_device_qualifier_family_held,
         raw_device_qualifier_rawkey, rawkey_is_held, rawkey_transition_is_duplicate,
         reboot_button_rect, repeated_main_key_should_drop, rgba, shot_button_rect,
         should_render_emulated_frame, standard_window_top_row, status_with_latched_fdd_track,
@@ -9135,38 +9123,31 @@ mod tests {
     }
 
     #[test]
-    fn present_row_sampling_gives_every_source_line_equal_coverage() {
+    fn present_row_selection_covers_every_source_line_at_hidpi() {
         use crate::video::deinterlace::OUT_HEIGHT;
-        // With nearest-neighbour subsampling, 33 of the 570 woven source
-        // rows received zero presentation coverage and the rest uneven
-        // amounts (visibly uneven crosshatch/dot test patterns). The
-        // bilinear sampling must spread coverage evenly: accumulate each
-        // source row's blend weight over all HiDPI output rows.
+        // The live window writes a HiDPI texture before the OS compositor
+        // scales it. At that output size, every woven source row should be
+        // represented by one or more whole texture rows without mixing
+        // neighbouring Amiga scanlines.
         let out_rows = PRESENT_HEIGHT * 2;
-        let mut weight = vec![0f64; OUT_HEIGHT];
+        let mut hits = vec![0usize; OUT_HEIGHT];
+        let mut prev = 0usize;
         for y in 0..out_rows {
-            let (src_y0, frac) = present_row_sample(y, OUT_HEIGHT, out_rows);
-            assert!(src_y0 < OUT_HEIGHT);
-            assert!(frac < 256);
-            weight[src_y0] += (256 - frac) as f64 / 256.0;
-            if frac > 0 {
-                weight[(src_y0 + 1).min(OUT_HEIGHT - 1)] += frac as f64 / 256.0;
-            }
+            let src_y = crate::screenshot::scaled_source_row(y, OUT_HEIGHT, out_rows);
+            assert!(src_y < OUT_HEIGHT);
+            assert!(src_y >= prev);
+            hits[src_y] += 1;
+            prev = src_y;
         }
-        let expected = out_rows as f64 / OUT_HEIGHT as f64;
-        for (y, w) in weight.iter().enumerate() {
+        for (y, count) in hits.iter().enumerate() {
             assert!(
-                *w > 0.0,
+                *count > 0,
                 "source row {y} dropped from the presentation entirely"
             );
-            // Edge rows are clamped toward the border; interior rows must
-            // sit close to the uniform coverage expectation.
-            if y > 0 && y + 1 < OUT_HEIGHT {
-                assert!(
-                    (*w - expected).abs() < 0.51,
-                    "source row {y} coverage {w} deviates from uniform {expected}"
-                );
-            }
+            assert!(
+                *count <= 2,
+                "source row {y} has unexpectedly thick presentation coverage: {count}"
+            );
         }
     }
 

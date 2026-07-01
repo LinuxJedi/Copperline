@@ -76,8 +76,8 @@ impl FrameGeometry {
 pub const PRESENT_HEIGHT: usize = FB_WIDTH * 3 / 4;
 
 /// Blend two RGBA pixels channel-wise: frac=0 returns a, frac=256
-/// returns b. Used by the bilinear vertical resamplers in the window
-/// presentation path and the screenshot writer.
+/// returns b. Used by horizontal resampling for programmable scan
+/// geometry.
 #[inline]
 pub fn blend_rgba(a: u32, b: u32, frac: u32) -> u32 {
     let inv = 256 - frac;

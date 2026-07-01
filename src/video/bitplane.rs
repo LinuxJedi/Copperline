@@ -2774,6 +2774,37 @@ fn bitplane_dma_output_start_x(
         .map(bitplane_fetch_framebuffer_x)
 }
 
+fn manual_bpl_dma_clip_x(
+    seg: &ManualBplSegment,
+    base_control: ControlState,
+    control_segments: &[ControlSegment],
+    dma_output_start_x: Option<usize>,
+) -> Option<usize> {
+    let mut clip_x = dma_output_start_x.filter(|&x| seg.x < x as i32);
+    let dma_planes = line_max_dma_planes(base_control, control_segments);
+    if dma_planes == 0 || !line_has_valid_ddf_window(base_control, control_segments) {
+        return clip_x;
+    }
+
+    let words_per_row = line_words_per_row(base_control, control_segments);
+    for word_idx in 0..words_per_row {
+        let plan = line_fetch_plan_for_word(base_control, control_segments, word_idx, dma_planes);
+        let Some(next_bpl1dat_hpos) = plan
+            .iter()
+            .find_map(|(hpos, plane)| (plane == 0 && hpos > seg.hpos).then_some(hpos))
+        else {
+            continue;
+        };
+        let next_bpl1dat_x = bitplane_fetch_framebuffer_x(next_bpl1dat_hpos);
+        if next_bpl1dat_x as i32 > seg.x {
+            clip_x = Some(clip_x.map_or(next_bpl1dat_x, |old| old.min(next_bpl1dat_x)));
+        }
+        break;
+    }
+
+    clip_x
+}
+
 fn bitplane_carry_words_for_line(
     block_start: bool,
     display_start_x: usize,
@@ -5607,11 +5638,12 @@ fn draw_manual_bpl_word(
     const MAX_MANUAL_BPL_NATIVE_SAMPLES: usize = MANUAL_BPL_WORD_BITS + MAX_BPLCON1_DELAY;
 
     let shifter = DeniseManualBitplaneShifter::new(seg.planes, MANUAL_BPL_WORD_BITS);
-    let dma_output_start_x = dma_output_start_x_by_line
-        .get(seg.line)
-        .copied()
-        .flatten()
-        .filter(|&x| seg.x < x as i32);
+    let dma_clip_x = manual_bpl_dma_clip_x(
+        seg,
+        base_controls[seg.line],
+        &control_segments[seg.line],
+        dma_output_start_x_by_line.get(seg.line).copied().flatten(),
+    );
     let mut x_cursor = seg.x;
     let mut native_idx = 0usize;
     while native_idx < MAX_MANUAL_BPL_NATIVE_SAMPLES {
@@ -5647,7 +5679,7 @@ fn draw_manual_bpl_word(
                 return false;
             }
             let x = x as usize;
-            if dma_output_start_x.is_some_and(|dma_x| x >= dma_x) {
+            if dma_clip_x.is_some_and(|dma_x| x >= dma_x) {
                 return false;
             }
             let pixel_control =
@@ -5694,7 +5726,7 @@ fn draw_manual_bpl_word(
                 continue;
             }
             let x = x as usize;
-            if dma_output_start_x.is_some_and(|dma_x| x >= dma_x) {
+            if dma_clip_x.is_some_and(|dma_x| x >= dma_x) {
                 continue;
             }
             let pixel_control =
@@ -13036,6 +13068,72 @@ mod tests {
 
         assert_eq!(fb[dma_output_x - 2], rgb12_to_rgba8(0x0F00));
         assert_eq!(fb[dma_output_x], rgb12_to_rgba8(0x000F));
+    }
+
+    #[test]
+    fn manual_bpl1dat_inside_diw_stops_at_next_dma_bpl1dat_load() {
+        let mut palette = Palette::new();
+        palette.write_ocs(1, 0x0F00);
+        let control = ControlState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x1000,
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16,
+            diwstop: (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | STANDARD_DIW_HSTOP as u16,
+            ddfstrt: 0x0050,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        let base_palettes = [palette; FB_HEIGHT];
+        let palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let base_controls = [control; FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let dma_output_x = bitplane_dma_output_start_x(
+            control,
+            &[],
+            control.display_window_x().0,
+            control.words_per_row(native_frame_width_for_control(control)),
+            control.dma_planes(),
+        )
+        .unwrap();
+        let next_dma_bpl1dat_x =
+            bitplane_fetch_framebuffer_x(bitplane_fetch_hpos_for_plane(control, 0, 0));
+        let mut fb = vec![rgb12_to_rgba8(0x000F); FB_PIXELS];
+        let mut playfield_mask = vec![0u8; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut clxdat = 0u16;
+        let mut planes = [0u16; 8];
+        planes[0] = 0xFFFF;
+        let hpos = 0x004A;
+        let segments = [ManualBplSegment {
+            line: 0,
+            hpos,
+            x: beam_to_framebuffer_x_unclamped(hpos),
+            planes,
+            palette,
+        }];
+        assert!(segments[0].x as usize > dma_output_x);
+        assert!(segments[0].x < next_dma_bpl1dat_x as i32);
+        let mut dma_output_start_x_by_line = vec![None; FB_HEIGHT];
+        dma_output_start_x_by_line[0] = Some(dma_output_x);
+
+        render_manual_bpl_segments_with_visible_line0(
+            &segments,
+            &mut fb,
+            &mut playfield_mask,
+            &mut collision_pixels,
+            &mut clxdat,
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &dma_output_start_x_by_line,
+            PAL_VISIBLE_LINE0,
+            0.0,
+            0,
+        );
+
+        assert_eq!(fb[next_dma_bpl1dat_x - 2], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[next_dma_bpl1dat_x], rgb12_to_rgba8(0x000F));
     }
 
     #[test]

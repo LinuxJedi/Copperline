@@ -52,8 +52,9 @@ loads BPL1DAT.
 Once that first DMA word is visible, the renderer samples the enabled
 bitplanes from the complete latched word; it does not expose the first word
 plane-by-plane according to each plane's individual DMA slot.
-If a manual BPL1DAT write starts a word before that DMA load point, replay
-stops the manual word where the DMA word replaces Denise's shifter.
+If a manual BPL1DAT write starts a word before a later DMA BPL1DAT load
+point, replay stops the manual word where that DMA word replaces Denise's
+shifter.
 BPLCON1-delayed samples at the left edge of a contiguous bitplane-DMA block
 come from the previous line's shifter tail when current-line DMA is already
 feeding Denise at the display edge. Block-start lines, and lines whose output
@@ -261,11 +262,14 @@ against a real emulator instance in the unit tests.
 
 `--screenshot-after` and `--dump-frames` render through the identical
 pipeline with the window hidden; PNGs are scaled to the same geometry the
-window would present. Because the default render worker may be one frame
-behind, these paths wait for the worker result matching the target emulated
-frame before writing the PNG. The [headless debugger](../debugger/headless)
-`COPPERLINE_DBG_SHOT` hook reuses the same path to capture the last
-completed frame at a breakpoint.
+window would present unless `COPPERLINE_SHOT_RAW=1` requests the unscaled
+woven framebuffer. The default vertical presentation scale selects whole
+source rows rather than blending adjacent Amiga scanlines, matching the
+normal unfiltered display path. Because the default render worker may be one
+frame behind, these paths wait for the worker result matching the target
+emulated frame before writing the PNG. The
+[headless debugger](../debugger/headless) `COPPERLINE_DBG_SHOT` hook reuses
+the same path to capture the last completed frame at a breakpoint.
 
 ## Video recording (`recorder.rs`)
 
@@ -281,11 +285,10 @@ Capture is locked to the emulated timeline, not the host clock. Paula
 carries an optional capture tap that collects every mixed stereo frame
 (before the master output volume); the window drains it once per
 emulated frame and, when the frame loop completed a new emulated frame,
-waits for the matching presentation buffer before pushing it through the
-same `scale_y_into` presentation resample as screenshots. At finish the
+waits for the matching presentation buffer before pushing it through the same
+`scale_y_into` source-row presentation scale as screenshots. At finish the
 AVI's video rate/scale is patched from the exact frames-to-audio-samples
-ratio, so
-a nominal "50 fps" label never drifts against PAL's true field rate and
-warp-speed captures play back at normal speed. The REC badge, status
-bar, OSD, and menus are drawn into the presentation texture after
-capture, so they never appear in the file.
+ratio, so a nominal "50 fps" label never drifts against PAL's true field rate
+and warp-speed captures play back at normal speed. The REC badge, status bar,
+OSD, and menus are drawn into the presentation texture after capture, so they
+never appear in the file.
