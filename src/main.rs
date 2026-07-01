@@ -241,6 +241,22 @@ fn expand_script_files(args: Vec<String>) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Parse the next CLI argument as `T`: the common shape behind most of
+/// this parser's `--flag VALUE` options, which otherwise each repeat the
+/// same "missing argument" / "not a valid value" error-handling pair.
+/// `missing` names what the whole flag needs when no argument follows;
+/// `invalid` explains what shape this particular value must have.
+fn next_arg<T: std::str::FromStr>(
+    args: &mut impl Iterator<Item = String>,
+    missing: &str,
+    invalid: &str,
+) -> Result<T> {
+    args.next()
+        .ok_or_else(|| anyhow!("{missing}"))?
+        .parse()
+        .map_err(|_| anyhow!("{invalid}"))
+}
+
 fn parse_args_from<I>(args: I) -> Result<CliArgs>
 where
     I: IntoIterator<Item = String>,
@@ -305,11 +321,11 @@ where
                 overrides.fpu = Some(false);
             }
             "--cpu-clock" => {
-                let mhz: f64 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--cpu-clock requires MHZ"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--cpu-clock MHZ must be a number"))?;
+                let mhz: f64 = next_arg(
+                    &mut args,
+                    "--cpu-clock requires MHZ",
+                    "--cpu-clock MHZ must be a number",
+                )?;
                 overrides.cpu_clock_mhz = Some(mhz);
             }
             "--chip" => {
@@ -343,64 +359,40 @@ where
                 );
             }
             "--click-after" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--click-after requires SECS BUTTON DURATION_MS"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--click-after SECS must be a number"))?;
-                let button_s = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--click-after requires SECS BUTTON DURATION_MS"))?;
+                const USAGE: &str = "--click-after requires SECS BUTTON DURATION_MS";
+                let secs: f32 = next_arg(&mut args, USAGE, "--click-after SECS must be a number")?;
+                let button_s = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 let button = match button_s.as_str() {
                     "left" | "lmb" | "l" => MouseButtonKind::Left,
                     "right" | "rmb" | "r" => MouseButtonKind::Right,
                     "middle" | "mmb" | "m" => MouseButtonKind::Middle,
                     _ => return Err(anyhow!("--click-after BUTTON must be left/right/middle")),
                 };
-                let dur_ms: u32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--click-after requires SECS BUTTON DURATION_MS"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--click-after DURATION_MS must be a number"))?;
+                let dur_ms: u32 = next_arg(
+                    &mut args,
+                    USAGE,
+                    "--click-after DURATION_MS must be a number",
+                )?;
                 click_after.push((secs, button, dur_ms));
             }
             "--joy-after" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--joy-after requires SECS BUTTON DURATION_MS"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--joy-after SECS must be a number"))?;
-                let button_s = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--joy-after requires SECS BUTTON DURATION_MS"))?;
+                const USAGE: &str = "--joy-after requires SECS BUTTON DURATION_MS";
+                let secs: f32 = next_arg(&mut args, USAGE, "--joy-after SECS must be a number")?;
+                let button_s = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 let button = JoyButtonKind::parse(&button_s).ok_or_else(|| {
                     anyhow!(
                         "--joy-after BUTTON must be up/down/left/right/red/blue/green/yellow/play/rwd/ffw"
                     )
                 })?;
-                let dur_ms: u32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--joy-after requires SECS BUTTON DURATION_MS"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--joy-after DURATION_MS must be a number"))?;
+                let dur_ms: u32 =
+                    next_arg(&mut args, USAGE, "--joy-after DURATION_MS must be a number")?;
                 joy_after.push((secs, button, dur_ms));
             }
             "--mouse-after" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--mouse-after requires SECS DX DY"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--mouse-after SECS must be a number"))?;
-                let dx: i32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--mouse-after requires SECS DX DY"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--mouse-after DX must be an integer"))?;
-                let dy: i32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--mouse-after requires SECS DX DY"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--mouse-after DY must be an integer"))?;
+                const USAGE: &str = "--mouse-after requires SECS DX DY";
+                let secs: f32 = next_arg(&mut args, USAGE, "--mouse-after SECS must be a number")?;
+                let dx: i32 = next_arg(&mut args, USAGE, "--mouse-after DX must be an integer")?;
+                let dy: i32 = next_arg(&mut args, USAGE, "--mouse-after DY must be an integer")?;
                 mouse_after.push((secs, dx, dy));
             }
             "--record-input" => {
@@ -410,18 +402,15 @@ where
                 record_input = Some(PathBuf::from(v));
             }
             "--insert-disk-after" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--insert-disk-after requires SECS DFN PATH"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--insert-disk-after SECS must be a number"))?;
-                let drive_s = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--insert-disk-after requires SECS DFN PATH"))?;
+                const USAGE: &str = "--insert-disk-after requires SECS DFN PATH";
+                let secs: f32 = next_arg(
+                    &mut args,
+                    USAGE,
+                    "--insert-disk-after SECS must be a number",
+                )?;
+                let drive_s = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 let drive_idx = parse_floppy_drive_idx(&drive_s, "--insert-disk-after")?;
-                let path = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--insert-disk-after requires SECS DFN PATH"))?;
+                let path = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 disk_insert_after.push(CliDiskInsert::Explicit(DiskInsertSpec {
                     secs,
                     drive_idx,
@@ -430,26 +419,20 @@ where
                 }));
             }
             "--defer-disk-insert" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--defer-disk-insert requires SECS DFN"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--defer-disk-insert SECS must be a number"))?;
-                let drive_s = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--defer-disk-insert requires SECS DFN"))?;
+                const USAGE: &str = "--defer-disk-insert requires SECS DFN";
+                let secs: f32 = next_arg(
+                    &mut args,
+                    USAGE,
+                    "--defer-disk-insert SECS must be a number",
+                )?;
+                let drive_s = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 let drive_idx = parse_floppy_drive_idx(&drive_s, "--defer-disk-insert")?;
                 disk_insert_after.push(CliDiskInsert::Configured { secs, drive_idx });
             }
             "--press-after" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--press-after requires SECS KEY"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--press-after SECS must be a number"))?;
-                let key_s = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--press-after requires SECS KEY"))?;
+                const USAGE: &str = "--press-after requires SECS KEY";
+                let secs: f32 = next_arg(&mut args, USAGE, "--press-after SECS must be a number")?;
+                let key_s = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 let rawkey = parse_amiga_key(&key_s)
                     .ok_or_else(|| anyhow!("--press-after KEY: unknown key {:?}", key_s))?;
                 press_after.push(KeyPressSpec {
@@ -459,21 +442,13 @@ where
                 });
             }
             "--key-after" | "--hold-key-after" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--key-after requires SECS KEY DURATION_MS"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--key-after SECS must be a number"))?;
-                let key_s = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--key-after requires SECS KEY DURATION_MS"))?;
+                const USAGE: &str = "--key-after requires SECS KEY DURATION_MS";
+                let secs: f32 = next_arg(&mut args, USAGE, "--key-after SECS must be a number")?;
+                let key_s = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 let rawkey = parse_amiga_key(&key_s)
                     .ok_or_else(|| anyhow!("--key-after KEY: unknown key {:?}", key_s))?;
-                let hold_ms: u32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--key-after requires SECS KEY DURATION_MS"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--key-after DURATION_MS must be a number"))?;
+                let hold_ms: u32 =
+                    next_arg(&mut args, USAGE, "--key-after DURATION_MS must be a number")?;
                 press_after.push(KeyPressSpec {
                     secs,
                     rawkey,
@@ -481,25 +456,17 @@ where
                 });
             }
             "--screenshot-after" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--screenshot-after requires SECS PATH"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--screenshot-after SECS must be a number"))?;
-                let path = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--screenshot-after requires SECS PATH"))?;
+                const USAGE: &str = "--screenshot-after requires SECS PATH";
+                let secs: f32 =
+                    next_arg(&mut args, USAGE, "--screenshot-after SECS must be a number")?;
+                let path = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 screenshot_after = Some((secs, PathBuf::from(path)));
             }
             "--save-state-after" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--save-state-after requires SECS PATH"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--save-state-after SECS must be a number"))?;
-                let path = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--save-state-after requires SECS PATH"))?;
+                const USAGE: &str = "--save-state-after requires SECS PATH";
+                let secs: f32 =
+                    next_arg(&mut args, USAGE, "--save-state-after SECS must be a number")?;
+                let path = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 save_state_after = Some((secs, PathBuf::from(path)));
             }
             "--load-state" => {
@@ -509,11 +476,11 @@ where
                 load_state = Some(PathBuf::from(v));
             }
             "--benchmark-until" | "--bench-until" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--benchmark-until requires SECS"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--benchmark-until SECS must be a number"))?;
+                let secs: f32 = next_arg(
+                    &mut args,
+                    "--benchmark-until requires SECS",
+                    "--benchmark-until SECS must be a number",
+                )?;
                 if secs <= 0.0 {
                     return Err(anyhow!("--benchmark-until SECS must be greater than zero"));
                 }
@@ -532,18 +499,18 @@ where
                 dump_dir = Some(PathBuf::from(path));
             }
             "--dump-start" => {
-                dump_start_secs = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--dump-start requires SECS"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--dump-start SECS must be a number"))?;
+                dump_start_secs = next_arg(
+                    &mut args,
+                    "--dump-start requires SECS",
+                    "--dump-start SECS must be a number",
+                )?;
             }
             "--dump-count" => {
-                let count: u32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--dump-count requires COUNT"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--dump-count COUNT must be a positive integer"))?;
+                let count: u32 = next_arg(
+                    &mut args,
+                    "--dump-count requires COUNT",
+                    "--dump-count COUNT must be a positive integer",
+                )?;
                 if count == 0 {
                     return Err(anyhow!("--dump-count COUNT must be greater than zero"));
                 }
@@ -565,11 +532,11 @@ where
                 audio_live = false;
             }
             "--profile-live-audio" => {
-                let secs: f32 = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--profile-live-audio requires SECS"))?
-                    .parse()
-                    .map_err(|_| anyhow!("--profile-live-audio SECS must be a number"))?;
+                let secs: f32 = next_arg(
+                    &mut args,
+                    "--profile-live-audio requires SECS",
+                    "--profile-live-audio SECS must be a number",
+                )?;
                 if secs <= 0.0 {
                     return Err(anyhow!(
                         "--profile-live-audio SECS must be greater than zero"

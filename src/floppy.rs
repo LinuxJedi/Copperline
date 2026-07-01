@@ -14,7 +14,7 @@ use anyhow::{bail, ensure, Context, Result};
 use flate2::read::{DeflateDecoder, GzDecoder};
 use flate2::CrcReader;
 use log::{debug, warn};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const CYLINDERS: usize = 80;
@@ -1134,7 +1134,7 @@ impl FloppyController {
             FloppyImageData::StandardAdf(image_data) => {
                 decode_non_empty_track_write(track, write_words).and_then(|sectors| {
                     apply_standard_adf_sectors(image_data, track, &sectors);
-                    std::fs::write(&path, &*image_data).context("writing standard ADF image")
+                    write_standard_adf_sectors_to_disk(&path, track, &sectors)
                 })
             }
             FloppyImageData::Tracks(tracks) => apply_extended_adf_write(
@@ -2514,6 +2514,31 @@ fn apply_standard_adf_sectors(
         let off = adf_sector_offset(track, *sector);
         image_data[off..off + BYTES_PER_SECTOR].copy_from_slice(sector_data);
     }
+}
+
+/// Write just the given sectors to their exact byte offsets in the ADF
+/// file on disk, instead of rewriting the whole (up to several-hundred-KB)
+/// image on every write-DMA completion: a disk write typically touches
+/// only one or a handful of the image's sectors.
+fn write_standard_adf_sectors_to_disk(
+    path: &Path,
+    track: usize,
+    sectors: &[(usize, [u8; BYTES_PER_SECTOR])],
+) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false) // partial write: the rest of the file must survive
+        .open(path)
+        .with_context(|| format!("opening {} for write-through", path.display()))?;
+    for (sector, sector_data) in sectors {
+        let off = adf_sector_offset(track, *sector);
+        file.seek(SeekFrom::Start(off as u64))
+            .with_context(|| format!("seeking to sector {sector} in {}", path.display()))?;
+        file.write_all(sector_data)
+            .with_context(|| format!("writing sector {sector} to {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn apply_amigados_track_sectors(

@@ -32,7 +32,7 @@
 //! CD-DA sectors into the host mixer ring (44.1 kHz, the mixer's native
 //! rate) and sends the drive's start/end notification packets.
 
-use crate::cdrom::{CdImage, DATA_SECTOR_BYTES, LEADIN_SECTORS};
+use crate::cdrom::{to_bcd, CdImage, DATA_SECTOR_BYTES, LEADIN_SECTORS};
 use crate::chipset::paula::CdAudioRing;
 
 pub const AKIKO_BASE: u32 = 0x00B8_0000;
@@ -88,10 +88,6 @@ fn get_long_byte(value: u32, offset: u32) -> u8 {
 fn put_long_byte(value: &mut u32, offset: u32, byte: u8) {
     let shift = 8 * (3 - offset);
     *value = (*value & !(0xFF << shift)) | (u32::from(byte) << shift);
-}
-
-fn to_bcd(v: u8) -> u8 {
-    ((v / 10) << 4) | (v % 10)
 }
 
 fn from_bcd(v: u8) -> u32 {
@@ -1216,7 +1212,21 @@ impl Akiko {
         let Some(disc) = self.disc.as_mut() else {
             return;
         };
-        // Use the highest available slot (Lotus Trilogy depends on it).
+        // Akiko has no per-sector destination register: the driver arms a
+        // 16-bit mask (PBX) of available 4 KB buffers and the engine
+        // consumes one buffer per incoming sector, clearing its bit. Fill
+        // order is the highest armed buffer first (priority-encode from
+        // bit 15). This ordering is empirical, not from a datasheet:
+        // WinUAE observes it on real CD32 silicon (its own comment cites
+        // the same regression title as this file's tests), but the only
+        // independent reverse-engineering (MAME) instead maps the buffer
+        // to (lba - lba_start) & 0x0F, i.e. sector-ordinal order gated by
+        // the arm mask -- not highest-bit-first. No HDL/datasheet ground
+        // truth exists to settle it (see docs/internals for chip-model
+        // cross-checking method). Keep highest-bit-first since WinUAE is
+        // the more hardware-validated CD32 reference, but treat this as a
+        // model, not confirmed hardware.
+        // TODO: verify buffer-fill order against real Akiko silicon.
         let slot = (15 - self.pbx.leading_zeros().saturating_sub(16)) & 15;
         let slot = if self.pbx & (1 << slot) != 0 {
             slot
@@ -1249,13 +1259,9 @@ impl Akiko {
         raw[3] = (self.sector_counter & 31) as u8;
 
         let base = self.addressdata + slot * 4096;
-        for (i, byte) in raw.iter().enumerate() {
-            chip_put_byte(chip_ram, base + i as u32, *byte);
-        }
+        chip_put_bytes(chip_ram, base, &raw);
         // Clear the slot's subcode area.
-        for i in 0..73 * 2 {
-            chip_put_byte(chip_ram, base + 0xC00 + i, 0);
-        }
+        chip_put_bytes(chip_ram, base + 0xC00, &[0u8; 73 * 2]);
         self.pbx &= !(1 << slot);
         self.intreq |= CDINT_PBX;
 
@@ -1263,13 +1269,11 @@ impl Akiko {
             // Sector-synchronous subcode delivery: zeroed payload with
             // the hardware's end markers.
             self.subcodeoffset = if self.subcodeoffset >= 128 { 0 } else { 128 };
-            for i in 0..96 {
-                chip_put_byte(
-                    chip_ram,
-                    self.subcode_address + u32::from(self.subcodeoffset) + i,
-                    0,
-                );
-            }
+            chip_put_bytes(
+                chip_ram,
+                self.subcode_address + u32::from(self.subcodeoffset),
+                &[0u8; 96],
+            );
             let tail = self.subcode_address + u32::from(self.subcodeoffset) + 96;
             chip_put_byte(chip_ram, tail, 0xFF);
             chip_put_byte(chip_ram, tail + 1, 0xFF);
@@ -1346,6 +1350,25 @@ fn chip_put_byte(chip_ram: &mut [u8], addr: u32, value: u8) {
         return;
     }
     chip_ram[(addr as usize) & (len - 1)] = value;
+}
+
+/// Like `chip_put_byte` but for a contiguous run: a single `copy_from_slice`
+/// in the common (non-wrapping) case instead of one masked store per byte,
+/// used for sector/subcode DMA where `bytes` can be a couple of KB.
+fn chip_put_bytes(chip_ram: &mut [u8], addr: u32, bytes: &[u8]) {
+    let len = chip_ram.len();
+    if len == 0 || bytes.is_empty() {
+        return;
+    }
+    let start = (addr as usize) & (len - 1);
+    let end = start + bytes.len();
+    if end <= len {
+        chip_ram[start..end].copy_from_slice(bytes);
+    } else {
+        let first_len = len - start;
+        chip_ram[start..].copy_from_slice(&bytes[..first_len]);
+        chip_put_bytes(chip_ram, 0, &bytes[first_len..]);
+    }
 }
 
 fn build_toc(disc: &CdImage) -> Vec<TocEntry> {
@@ -1828,6 +1851,9 @@ mod tests {
 
     #[test]
     fn data_read_command_dmas_sectors_into_pbx_slots() {
+        // Regression example: Lotus Trilogy's CD32 loader arms multiple
+        // PBX slots ahead of the data and depends on them filling highest
+        // slot first (see the comment on `run_sector_read`).
         let mut ring = CdAudioRing::default();
         let mut chip = vec![0u8; 256 * 1024];
         let mut akiko = Akiko::new();

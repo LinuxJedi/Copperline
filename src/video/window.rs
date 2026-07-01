@@ -2702,8 +2702,10 @@ fn bar_layout(media: &MediaBar) -> BarLayout {
         cd_load: None,
         cd_eject: None,
     };
-    let connected: Vec<usize> = (0..4).filter(|&idx| media.drives[idx].connected).collect();
-    let stacked = connected.len() > 2;
+    // At most 4 drives, so track membership/position without allocating a
+    // Vec on every call (this runs on every mouse-move and frame redraw).
+    let connected_count = (0..4).filter(|&idx| media.drives[idx].connected).count();
+    let stacked = connected_count > 2;
 
     let cluster = |x: usize, y: usize, h: usize| {
         let button = |x: usize, w: usize| Rect { x, y, w, h };
@@ -2718,7 +2720,11 @@ fn bar_layout(media: &MediaBar) -> BarLayout {
     };
 
     let mut drives_end_x = MEDIA_CLUSTER_X;
-    for (pos, &idx) in connected.iter().enumerate() {
+    let mut pos = 0usize;
+    for idx in 0..4 {
+        if !media.drives[idx].connected {
+            continue;
+        }
         let (x, y, h) = if stacked {
             // Row-major two-column grid: DF0 DF1 over DF2 DF3.
             let col = pos % 2;
@@ -2740,10 +2746,11 @@ fn bar_layout(media: &MediaBar) -> BarLayout {
         layout.drive_swap[idx] = Some(swap);
         layout.drive_eject[idx] = Some(eject);
         drives_end_x = drives_end_x.max(x + MEDIA_CLUSTER_W);
+        pos += 1;
     }
 
     if media.cd.is_some() {
-        let x = if connected.is_empty() {
+        let x = if connected_count == 0 {
             MEDIA_CLUSTER_X
         } else {
             drives_end_x + MEDIA_CD_GAP

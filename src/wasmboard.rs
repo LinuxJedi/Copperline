@@ -170,6 +170,7 @@ impl WasmRuntime {
             int6: instance.get_typed_func(&mut store, "int6").ok(),
         };
         if let Ok(init) = instance.get_typed_func::<(), ()>(&mut store, "init") {
+            refuel(&mut store);
             init.call(&mut store, ())
                 .context("WASM plugin init() trapped")?;
         }
@@ -237,15 +238,35 @@ fn load_resources(manifest: &WasmManifest) -> Result<HashMap<String, Vec<u8>>> {
     Ok(map)
 }
 
+/// Fuel budget refilled before every entry into a plugin. Copperline runs
+/// synchronously on the main emulation thread (see CLAUDE.md), so a plugin
+/// with a runaway loop in `init`/`read`/`write`/`tick`/`int2`/`int6` would
+/// otherwise hang the whole process forever with no recovery path. This
+/// bounds a single call to a large but finite instruction budget instead;
+/// exhausting it surfaces as an ordinary trap through the existing
+/// log-and-fall-back-to-default handling at each call site.
+const PLUGIN_FUEL_BUDGET: u64 = 50_000_000;
+
+/// Refill a store's fuel to [`PLUGIN_FUEL_BUDGET`] ahead of a plugin call.
+/// Only fails if fuel consumption isn't configured on the engine, which
+/// `make_engine` always enables.
+fn refuel(store: &mut Store<HostCtx>) {
+    store
+        .set_fuel(PLUGIN_FUEL_BUDGET)
+        .expect("engine always configures consume_fuel(true)");
+}
+
 /// Build the deterministic wasmtime engine. NaN canonicalization removes
 /// host-CPU NaN bit-pattern leakage; SIMD/relaxed-SIMD/threads are disabled
 /// (relaxed-SIMD is nondeterministic by spec, threads add shared-memory
-/// nondeterminism).
+/// nondeterminism). Fuel consumption caps how long any single call into a
+/// plugin can run (see [`PLUGIN_FUEL_BUDGET`]).
 fn make_engine() -> Result<Engine> {
     let mut cfg = Config::new();
     cfg.cranelift_nan_canonicalization(true);
     cfg.wasm_simd(false);
     cfg.wasm_relaxed_simd(false);
+    cfg.consume_fuel(true);
     // The `threads` wasmtime feature is not built in (see Cargo.toml), so shared
     // memory / atomics are unavailable -- no separate knob needed.
     Engine::new(&cfg).context("creating WASM engine")
@@ -344,7 +365,12 @@ fn register_host_fns(linker: &mut Linker<HostCtx>, caps: WasmCaps) -> Result<()>
             "env",
             "dma_read",
             |mut caller: Caller<'_, HostCtx>, addr: i32, ptr: i32, len: i32| -> Result<()> {
-                let len = len.max(0) as usize;
+                // Validate the destination window before allocating, so a
+                // plugin-controlled `len` can't force an oversized host
+                // allocation (see `checked_wasm_window`). `write_wasm_bytes`
+                // below re-validates the same window when it stores `buf`.
+                let mem_size = caller_memory(&mut caller)?.data_size(&caller);
+                let (_, len) = checked_wasm_window(ptr, len, mem_size)?;
                 let mut buf = vec![0u8; len];
                 with_amiga_memory(&caller, |amiga| {
                     DeviceHost::new(amiga).dma_read(addr as u32, &mut buf);
@@ -415,13 +441,29 @@ fn with_amiga_memory(caller: &Caller<'_, HostCtx>, f: impl FnOnce(&mut Memory)) 
     f(amiga);
 }
 
+/// Validate a plugin-supplied `[ptr, ptr+len)` window against the plugin's
+/// current linear-memory size, returning the clamped `(ptr, len)`. `ptr`
+/// and `len` are plugin-controlled and unrelated to how much memory the
+/// plugin actually has, so an out-of-range window is rejected *before* the
+/// host allocates `len` bytes -- otherwise a huge `len` (up to ~2 GiB via
+/// i32) would force an oversized host allocation per call. An out-of-range
+/// window is a clean error, exactly as the previous trap-on-access was.
+fn checked_wasm_window(ptr: i32, len: i32, mem_size: usize) -> Result<(usize, usize)> {
+    let ptr = ptr.max(0) as usize;
+    let len = len.max(0) as usize;
+    if ptr.checked_add(len).is_none_or(|end| end > mem_size) {
+        anyhow::bail!("WASM plugin memory window {ptr}+{len} exceeds {mem_size} bytes");
+    }
+    Ok((ptr, len))
+}
+
 /// Read `len` bytes from the plugin's linear memory at `ptr`.
 fn read_wasm_bytes(caller: &mut Caller<'_, HostCtx>, ptr: i32, len: i32) -> Result<Vec<u8>> {
     let memory = caller_memory(caller)?;
-    let len = len.max(0) as usize;
+    let (ptr, len) = checked_wasm_window(ptr, len, memory.data_size(&caller))?;
     let mut buf = vec![0u8; len];
     memory
-        .read(&mut *caller, ptr.max(0) as usize, &mut buf)
+        .read(&mut *caller, ptr, &mut buf)
         .context("reading WASM plugin memory")?;
     Ok(buf)
 }
@@ -481,6 +523,7 @@ impl WasmBoard {
         let Some(func) = sel(&rt.exports) else {
             return false;
         };
+        refuel(&mut rt.store);
         match func.call(&mut rt.store, ()) {
             Ok(v) => v != 0,
             Err(e) => {
@@ -498,6 +541,7 @@ impl ZorroDevice for WasmBoard {
             return 0xFFFF_FFFF;
         };
         rt.enter(host.memory_mut());
+        refuel(&mut rt.store);
         let result = func.call(&mut rt.store, (off as i32, size as i32));
         rt.leave();
         match result {
@@ -515,6 +559,7 @@ impl ZorroDevice for WasmBoard {
             return;
         };
         rt.enter(host.memory_mut());
+        refuel(&mut rt.store);
         let result = func.call(&mut rt.store, (off as i32, size as i32, value as i32));
         rt.leave();
         if let Err(e) = result {
@@ -528,6 +573,7 @@ impl ZorroDevice for WasmBoard {
             return;
         };
         rt.enter(host.memory_mut());
+        refuel(&mut rt.store);
         let result = func.call(&mut rt.store, cck as i32);
         rt.leave();
         if let Err(e) = result {
@@ -721,6 +767,58 @@ mod tests {
         }
         assert_eq!(fresh.read(0, 2, &mut host), 5);
         assert!(fresh.int2_line());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A runaway plugin: `tick` never returns. Copperline runs synchronously
+    /// on the main thread, so without a fuel cap this would hang the whole
+    /// emulator forever instead of trapping.
+    const INFINITE_LOOP_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "tick") (param $cck i32)
+            (loop $forever
+              (br $forever)))
+        )
+    "#;
+
+    #[test]
+    fn runaway_plugin_loop_traps_on_fuel_instead_of_hanging() {
+        let path = write_wasm("infinite_loop", INFINITE_LOOP_WAT);
+        let mut board = WasmBoard::from_file(&path, manifest("infinite_loop", false)).unwrap();
+        let mut mem = empty_memory();
+        let mut host = DeviceHost::new(&mut mem);
+
+        // Must return (the fuel budget traps the loop) rather than hang;
+        // the test process itself would time out if it didn't.
+        board.tick(1, &mut host);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `write(off, size, len)` calls `dma_read` with a caller-supplied
+    /// length instead of a fixed one, to exercise an oversized `len`.
+    const DMA_OVERSIZED_LEN_WAT: &str = r#"
+        (module
+          (import "env" "dma_read" (func $dma_read (param i32 i32 i32)))
+          (memory (export "memory") 1)
+          (func (export "write") (param $off i32) (param $size i32) (param $len i32)
+            (call $dma_read (i32.const 0) (i32.const 0) (local.get $len)))
+        )
+    "#;
+
+    #[test]
+    fn dma_read_with_oversized_len_does_not_allocate_unbounded_memory() {
+        let path = write_wasm("dma_oversized", DMA_OVERSIZED_LEN_WAT);
+        let mut board = WasmBoard::from_file(&path, manifest("dma_oversized", true)).unwrap();
+        let mut mem = empty_memory();
+        let mut host = DeviceHost::new(&mut mem);
+
+        // len = i32::MAX: without capping the allocation to the plugin's
+        // actual (1-page = 64 KiB) linear memory, this would attempt a
+        // ~2 GiB host allocation on every call.
+        board.write(0, 0, i32::MAX as u32, &mut host);
 
         let _ = std::fs::remove_file(&path);
     }

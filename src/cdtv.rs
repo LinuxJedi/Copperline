@@ -31,7 +31,7 @@
 //! Akiko. Subcode payload delivery (CD+G) is not implemented: SCOR
 //! pulses with the motor on, but SBCP never presents data.
 
-use crate::cdrom::{CdImage, LEADIN_SECTORS, RAW_SECTOR_BYTES};
+use crate::cdrom::{to_bcd, CdImage, LEADIN_SECTORS, RAW_SECTOR_BYTES};
 use crate::chipset::paula::CdAudioRing;
 use crate::memory::Memory;
 
@@ -61,10 +61,6 @@ const AUDIO_STATUS_NO_STATUS: u8 = 0x15;
 const CCK_PER_LINE: u32 = 227;
 /// Colour clocks per 1/75th second (one single-speed CD frame).
 const CCK_PER_CD_FRAME: u32 = crate::chipset::paula::PAULA_CLOCK_HZ / 75;
-
-fn to_bcd(v: u8) -> u8 {
-    ((v / 10) << 4) | (v % 10)
-}
 
 fn lsn_to_msf(lsn: u32) -> u32 {
     let msf = lsn + LEADIN_SECTORS;

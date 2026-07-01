@@ -5,9 +5,8 @@
 //! typed read/write methods for memory-mapped devices.
 
 use crate::chipset::agnus::{
-    ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, Agnus, AgnusRevision, AgnusTick,
-    VideoStandard, BEAMCON0_DUAL, BEAMCON0_HARDDIS, COLORCLOCKS_PER_LINE,
-    NTSC_LONG_COLORCLOCKS_PER_LINE,
+    sprite_dma_disabled_by_bitplane_ddf, Agnus, AgnusRevision, AgnusTick, VideoStandard,
+    BEAMCON0_DUAL, BEAMCON0_HARDDIS, COLORCLOCKS_PER_LINE, NTSC_LONG_COLORCLOCKS_PER_LINE,
 };
 use crate::chipset::blitter::Blitter;
 use crate::chipset::cia::{
@@ -28,7 +27,6 @@ use crate::memory::Memory;
 use crate::rtc::Msm6242Rtc;
 use crate::video::{beam::BeamEventIndex, FrameGeometry, FB_HEIGHT, FB_WIDTH, MAX_VISIBLE_LINES};
 use log::trace;
-use std::collections::HashSet;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -259,7 +257,6 @@ const CLXDAT_SPRITE_PLAYFIELD_MASK: u16 = 0x01FE;
 const CLXDAT_SPRITE_SPRITE_MASK: u16 = 0x7E00;
 const BITPLANE_DDF_HARD_START: u16 = 0x0018;
 const BITPLANE_DDF_HARD_STOP: u16 = 0x00D8;
-const OCS_LORES_BPL_SEQUENCE: [usize; 8] = [8, 4, 6, 2, 7, 3, 5, 1];
 const SPRITE_DMA_PAIR_CAPTURE_HPOS: [u32; 4] = [0x018, 0x020, 0x028, 0x030];
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const VIDEO_FETCH_TIMING_SAMPLE_RATE: u128 = 128;
@@ -1867,6 +1864,10 @@ impl Bus {
             dbg_ext_cck_x100: external_access_cck_x100_setting(),
         };
         bus.configure_chip_dma_masks();
+        // Re-derive the per-frame capture buffers from the same helper the
+        // reset paths use, rather than trusting the struct literal above to
+        // stay in lockstep with it by hand.
+        bus.reset_frame_capture_buffers();
         bus
     }
 
@@ -2039,6 +2040,48 @@ impl Bus {
         self.keyboard.next_event_cck()
     }
 
+    /// Reset the per-frame render/capture buffers to their empty starting
+    /// state. Shared by a real hardware reset (`reset_for_keyboard_reset`)
+    /// and the state-load path (`reset_transient_video_after_state_load`)
+    /// for exactly the fields those two callers already reset to
+    /// identical values, so a new capture-buffer field only has to be
+    /// listed here once instead of drifting between the two copies.
+    ///
+    /// Deliberately NOT included: `current_frame_render_blocked` and
+    /// `sprite_dma_frame_start_ptr` (the two callers legitimately disagree
+    /// on their value -- a state load derives them from the just-restored
+    /// beam/pointer state instead of zeroing them), and the fields only
+    /// `reset_for_keyboard_reset` touches (palettes, collision tracking,
+    /// frame geometry, DMA pointers/delays) because those are either
+    /// power-on-only resets or are themselves part of the serialized save
+    /// state and must not be clobbered after a state load.
+    fn reset_frame_capture_buffers(&mut self) {
+        self.last_frame_render_base = None;
+        self.last_frame_render_events.clear();
+        self.last_frame_beam_bottom_palette_events.clear();
+        self.current_frame_chip_ram.clear();
+        self.current_frame_chip_ram
+            .extend_from_slice(&self.mem.chip_ram);
+        self.last_frame_chip_ram.clear();
+        self.current_frame_chip_ram_writes.clear();
+        self.last_frame_chip_ram_writes.clear();
+        self.current_frame_bitplane_rows = empty_captured_bitplane_rows();
+        self.last_frame_bitplane_rows = empty_captured_bitplane_rows();
+        self.current_frame_sprite_lines.clear();
+        clear_captured_sprite_lines_by_y(&mut self.current_frame_sprite_lines_by_y);
+        self.current_frame_sprite_collision_sources = empty_sprite_collision_sources();
+        self.last_frame_sprite_lines.clear();
+        self.current_frame_held_sprites = [None; 8];
+        self.last_frame_held_sprites = [None; 8];
+        self.current_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
+        self.last_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
+        self.current_frame_sprite_dma_observed = false;
+        self.last_frame_sprite_dma_observed = false;
+        self.display_dma_sprite_state = [DisplaySpriteDmaState::default(); 8];
+        self.current_frame_bus_trace.clear();
+        self.last_frame_bus_trace = None;
+    }
+
     pub fn reset_for_keyboard_reset(&mut self) {
         let video_standard = self.agnus.video_standard();
         let agnus_revision = self.agnus.revision();
@@ -2089,7 +2132,6 @@ impl Bus {
         self.cpu_palette_target_writes = 0;
         self.cpu_palette_target_beam = None;
         self.current_frame_render_base = RenderRegisterSnapshot::default();
-        self.last_frame_render_base = None;
         self.current_frame_render_events.clear();
         self.current_frame_collision_events.clear();
         self.current_frame_collision_control_events.clear();
@@ -2099,33 +2141,14 @@ impl Bus {
         self.current_frame_collision_bpldat_index = None;
         self.current_frame_collision_sprite_index = None;
         self.current_frame_collision_may_have_dual_playfield = false;
-        self.last_frame_render_events.clear();
         self.beam_bottom_palette_events.clear();
         self.pending_beam_bottom_palette_events.clear();
-        self.last_frame_beam_bottom_palette_events.clear();
         self.current_frame_beam_top_palette = self.beam_top_palette;
         self.last_frame_beam_top_palette = Palette::new();
         self.last_frame_beam_top_palette_end = Palette::new();
         self.last_frame_beam_bottom_palette = Palette::new();
         self.last_frame_beam_bottom_palette_valid = false;
-        self.current_frame_chip_ram.clear();
-        self.current_frame_chip_ram
-            .extend_from_slice(&self.mem.chip_ram);
-        self.last_frame_chip_ram.clear();
-        self.current_frame_chip_ram_writes.clear();
-        self.last_frame_chip_ram_writes.clear();
-        self.current_frame_bitplane_rows = empty_captured_bitplane_rows();
-        self.last_frame_bitplane_rows = empty_captured_bitplane_rows();
-        self.current_frame_sprite_lines.clear();
-        clear_captured_sprite_lines_by_y(&mut self.current_frame_sprite_lines_by_y);
-        self.current_frame_sprite_collision_sources = empty_sprite_collision_sources();
-        self.last_frame_sprite_lines.clear();
-        self.current_frame_held_sprites = [None; 8];
-        self.last_frame_held_sprites = [None; 8];
-        self.current_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
-        self.last_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
-        self.current_frame_sprite_dma_observed = false;
-        self.last_frame_sprite_dma_observed = false;
+        self.reset_frame_capture_buffers();
         self.current_frame_display_snapshot_taken = false;
         self.current_frame_render_blocked = false;
         self.current_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
@@ -2135,8 +2158,6 @@ impl Bus {
         self.lazy_collision_vpos = RENDER_VISIBLE_START_VPOS;
         self.lazy_collision_hpos = RENDER_COPPER_WAIT_HPOS_FB0;
         self.collision_tracking_active = false;
-        self.current_frame_bus_trace.clear();
-        self.last_frame_bus_trace = None;
         self.cpu_bus_arbitration_enabled = false;
         self.blitter_slowdown_cpu_misses = 0;
         self.slice_bus_advanced_cck = 0;
@@ -2148,7 +2169,6 @@ impl Bus {
         self.display_dma_bplpt = [0; 8];
         self.display_dma_sprpt = [0; 8];
         self.sprite_dma_frame_start_ptr = [0; 8];
-        self.display_dma_sprite_state = [DisplaySpriteDmaState::default(); 8];
         self.display_dma_clipped_rows_advanced = false;
         self.bitplane_dmacon_delay = None;
         self.bitplane_bplcon0_delay = None;
@@ -2256,32 +2276,9 @@ impl Bus {
     }
 
     pub(crate) fn reset_transient_video_after_state_load(&mut self) {
-        self.last_frame_render_base = None;
-        self.last_frame_render_events.clear();
-        self.last_frame_beam_bottom_palette_events.clear();
-        self.current_frame_chip_ram.clear();
-        self.current_frame_chip_ram
-            .extend_from_slice(&self.mem.chip_ram);
-        self.last_frame_chip_ram.clear();
-        self.current_frame_chip_ram_writes.clear();
-        self.last_frame_chip_ram_writes.clear();
-        self.current_frame_bitplane_rows = empty_captured_bitplane_rows();
-        self.last_frame_bitplane_rows = empty_captured_bitplane_rows();
-        self.current_frame_sprite_lines.clear();
-        self.last_frame_sprite_lines.clear();
-        clear_captured_sprite_lines_by_y(&mut self.current_frame_sprite_lines_by_y);
-        self.current_frame_sprite_collision_sources = empty_sprite_collision_sources();
-        self.current_frame_held_sprites = [None; 8];
-        self.last_frame_held_sprites = [None; 8];
-        self.current_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
-        self.last_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
-        self.current_frame_sprite_dma_observed = false;
-        self.last_frame_sprite_dma_observed = false;
+        self.reset_frame_capture_buffers();
         self.current_frame_render_blocked = self.agnus.vpos != 0 || self.agnus.hpos != 0;
         self.sprite_dma_frame_start_ptr = self.display_dma_sprpt;
-        self.display_dma_sprite_state = [DisplaySpriteDmaState::default(); 8];
-        self.current_frame_bus_trace.clear();
-        self.last_frame_bus_trace = None;
     }
 
     pub fn emulated_seconds(&self) -> f64 {
@@ -3535,10 +3532,10 @@ impl Bus {
         if self.cia_a.irq_line_asserted() {
             self.paula.intreq |= INT_PORTS;
         }
-        match eff {
-            CiaSideEffect::KeyboardHandshakeStart => self.keyboard.amiga_kdat_edge(true),
-            CiaSideEffect::KeyboardHandshakeEnd => self.keyboard.amiga_kdat_edge(false),
-            _ => {}
+        match eff.keyboard_handshake {
+            Some(true) => self.keyboard.amiga_kdat_edge(true),
+            Some(false) => self.keyboard.amiga_kdat_edge(false),
+            None => {}
         }
         if reg == REG_PRA || reg == REG_DDRA {
             // CIA-A PRA bit 1 is /LED. On post-A1000 Amigas this line also
@@ -6609,7 +6606,12 @@ impl Bus {
         }
     }
 
-    fn begin_new_beam_frame(&mut self) {
+    /// The `COPPERLINE_DIAG_*` frame-start dumps (bpl-dma summary, slotmap
+    /// dump, copper-list length walk, BUF0/sprite snapshots), split out of
+    /// `begin_new_beam_frame` so that function's real frame-boundary
+    /// bookkeeping is reviewable on its own instead of interleaved with
+    /// ~200 lines of opt-in diagnostic logging.
+    fn diag_log_frame_start(&mut self) {
         if crate::envcfg::flag("COPPERLINE_DIAG_DISPLAY") {
             let lines: Vec<usize> = self
                 .dbg_bpl_cck
@@ -6827,6 +6829,10 @@ impl Bus {
                 );
             }
         }
+    }
+
+    fn begin_new_beam_frame(&mut self) {
+        self.diag_log_frame_start();
         // Only maintain the collision latch across the frame boundary once
         // software has shown it reads CLXDAT. Until then the full-frame scan is
         // unobservable work; see `collision_tracking_active`.
@@ -7765,7 +7771,15 @@ impl Bus {
             state.control.is_some() || state.next_ptr.is_none();
         let mut descriptor_loaded_after_stop_this_line = false;
 
-        let mut visited_descriptor_ptrs = HashSet::new();
+        // Loop-detection scratch for the descriptor chain below. A plain
+        // Vec with a linear `contains` check is used instead of a HashSet:
+        // chains are almost always 1-2 descriptors long in practice (this
+        // runs per active sprite per DMA-pair capture point per scanline),
+        // so a linear scan avoids both the heap allocation pattern and the
+        // hashing overhead a HashSet would pay for such a tiny set, while
+        // keeping the exact same "any previously-visited pointer" cycle
+        // check (not just a fixed lookback window).
+        let mut visited_descriptor_ptrs: Vec<u32> = Vec::new();
         loop {
             if state.terminated {
                 self.display_dma_sprite_state[sprite] = state;
@@ -7849,13 +7863,14 @@ impl Bus {
 
             let descriptor_ptr =
                 state.next_ptr.unwrap_or(self.display_dma_sprpt[sprite]) & ram_mask & !1;
-            if !visited_descriptor_ptrs.insert(descriptor_ptr) {
+            if visited_descriptor_ptrs.contains(&descriptor_ptr) {
                 state.terminated = true;
                 state.data_dma_active = false;
                 state.last_line = None;
                 self.display_dma_sprite_state[sprite] = state;
                 return None;
             }
+            visited_descriptor_ptrs.push(descriptor_ptr);
 
             // AGA wide fetches also widen the control-word slots: POS is the
             // first word of the first fetch, CTL the first word of the second.
@@ -8698,29 +8713,28 @@ fn bitplane_words_per_row(
     words.max(1)
 }
 
+// These fetch-mode helpers used to be independently-maintained twins of
+// the agnus.rs functions of the same name/shape; they now delegate to the
+// single agnus.rs implementation (kept as thin wrappers here so none of
+// this file's many call sites had to change).
 fn bitplane_shres(bplcon0: u16) -> bool {
-    bplcon0 & BPLCON0_SHRES != 0
+    crate::chipset::agnus::bitplane_shres(bplcon0)
 }
 
 fn bitplane_hires(bplcon0: u16) -> bool {
-    bplcon0 & 0x8000 != 0 && !bitplane_shres(bplcon0)
+    crate::chipset::agnus::bitplane_hires(bplcon0)
 }
 
-// Capture-side twins of the agnus fetch-mode helpers (see agnus.rs).
 fn bitplane_fetch_quantum(fmode: u16) -> u32 {
-    match fmode & 0x0003 {
-        0 => 1,
-        3 => 4,
-        _ => 2,
-    }
+    crate::chipset::agnus::bitplane_fetch_quantum(fmode)
 }
 
 fn bitplane_fetch_period(bplcon0: u16, fmode: u16) -> u32 {
-    bitplane_fetch_cck_per_word(bplcon0) * bitplane_fetch_quantum(fmode)
+    crate::chipset::agnus::bitplane_fetch_period(bplcon0, fmode)
 }
 
 fn bitplane_fetch_unit(bplcon0: u16, fmode: u16) -> u32 {
-    bitplane_fetch_period(bplcon0, fmode).max(8)
+    crate::chipset::agnus::bitplane_fetch_unit(bplcon0, fmode)
 }
 
 fn plane_mask_for_count(nplanes: usize) -> u16 {
@@ -8750,13 +8764,7 @@ fn sprite_fetch_quantum(fmode: u16) -> u32 {
 }
 
 fn bitplane_fetch_cck_per_word(bplcon0: u16) -> u32 {
-    if bitplane_shres(bplcon0) {
-        2
-    } else if bitplane_hires(bplcon0) {
-        4
-    } else {
-        8
-    }
+    crate::chipset::agnus::bitplane_fetch_cck_per_word(bplcon0)
 }
 
 fn chip_dma_addr_mask(chip_ram_len: usize) -> u32 {
@@ -8794,22 +8802,8 @@ fn effective_ddf_hpos(revision: AgnusRevision, bplcon0: u16, raw: u16) -> u16 {
     effective_ddf_start_hpos_raw(revision, bplcon0, raw)
 }
 
-fn ddf_register_mask(revision: AgnusRevision) -> u16 {
-    if matches!(revision, AgnusRevision::Ocs) {
-        0x00FC
-    } else {
-        0x00FE
-    }
-}
-
 fn effective_ddf_start_hpos_raw(revision: AgnusRevision, bplcon0: u16, raw: u16) -> u16 {
-    let _ = bplcon0;
-    raw & ddf_register_mask(revision)
-}
-
-fn effective_ddf_stop_hpos(revision: AgnusRevision, bplcon0: u16, raw: u16) -> u16 {
-    let _ = bplcon0;
-    raw & ddf_register_mask(revision)
+    crate::chipset::agnus::effective_bitplane_ddf_start_hpos(revision, bplcon0, raw)
 }
 
 fn effective_ddf_start_hpos(revision: AgnusRevision, bplcon0: u16, raw: u16) -> u16 {
@@ -8828,30 +8822,13 @@ fn effective_ddf_window(
     ddfstop: u16,
     harddis: bool,
 ) -> Option<(u16, u16)> {
-    let (hard_start, hard_stop) = ddf_hard_bounds(harddis);
-    let start = effective_ddf_start_hpos_raw(revision, bplcon0, ddfstrt);
-    let mut stop = effective_ddf_stop_hpos(revision, bplcon0, ddfstop);
-    if start == 0 || start > hard_stop {
-        return None;
-    }
-    if matches!(revision, AgnusRevision::Ocs) && stop == start {
-        stop = hard_stop;
-    }
-    let start = start.max(hard_start);
-    let stop = stop.min(hard_stop);
-    (stop >= start).then_some((start, stop))
+    crate::chipset::agnus::effective_bitplane_ddf_window(
+        revision, bplcon0, ddfstrt, ddfstop, harddis,
+    )
 }
 
 fn bitplane_fetch_order(bplcon0: u16, plane: usize) -> u32 {
-    if bitplane_hires(bplcon0) || bitplane_shres(bplcon0) {
-        return plane as u32;
-    }
-
-    let plane_num = plane + 1;
-    OCS_LORES_BPL_SEQUENCE
-        .iter()
-        .position(|&candidate| candidate == plane_num)
-        .unwrap_or(7) as u32
+    crate::chipset::agnus::bitplane_fetch_order(bplcon0, plane)
 }
 
 fn read_chip_word_wrapping(ram: &[u8], addr: u32) -> u16 {
