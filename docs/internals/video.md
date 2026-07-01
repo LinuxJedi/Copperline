@@ -121,10 +121,12 @@ The mapping from beam coordinates to framebuffer x is anchored by
 constants that encode the hardware's fetch-to-display pipeline delays --
 register writes, palette writes, and bitplane data each land at their own
 documented offset, and the bitplane fetch reference differs between lo-res
-and hi-res. Wide-FMODE DMA fetches start from the revision-masked DDFSTRT
-comparator value and complete whole units, but the displayed shifter origin
-is still quantized by the FMODE fetch gulp; the renderer keeps those two
-effects separate. Denise's output line starts at the horizontal blanking
+and hi-res. A standard hi-res `$81` DIW with `$3C` DDF starts its 640 fetched
+pixels at the display-window edge; there is no four-pixel leading border
+inside the window. Wide-FMODE DMA fetches start from the revision-masked
+DDFSTRT comparator value and complete whole units, but the displayed shifter
+origin is still quantized by the FMODE fetch gulp; the renderer keeps those
+two effects separate. Denise's output line starts at the horizontal blanking
 start counter; COLORxx writes before that counter are the wrapped tail of
 the previous output row, while the palette value they load is still the
 base colour for the following row. These anchors were calibrated against

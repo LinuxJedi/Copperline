@@ -50,11 +50,11 @@ const STANDARD_DIW_HSTART: i32 = 0x81;
 // phase: a hi-res fetch slot delivers its word to Denise's shifter on a
 // different beam edge than a lo-res slot, so the reference the renderer uses to
 // place the first fetched pixel differs by resolution. Lo-res references $80;
-// hi-res references $83 (verified against vAmiga: low-res HAM playfields align
-// with their bezel sprites at $80, while hi-res boot-screen text aligns at $83).
+// hi-res references $81 so a standard $81/$3C display starts its 640 fetched
+// pixels at the display-window edge instead of clipping the right edge.
 // See `fetch_reference` below.
 const DIW_HSTART_FETCH_REFERENCE_LORES: i32 = 0x80;
-const DIW_HSTART_FETCH_REFERENCE_HIRES: i32 = 0x83;
+const DIW_HSTART_FETCH_REFERENCE_HIRES: i32 = 0x81;
 // Register/copper-write x=0 anchor, in colour clocks. Moved left by 8 colour
 // clocks in lockstep with DIW_HSTART_FB0 (16 lo-res pixels) so register writes
 // and bitplane pixels still register against each other after widening.
@@ -536,27 +536,12 @@ impl ControlState {
     }
 
     /// Beam hpos the renderer treats as the origin for the first fetched
-    /// bitplane pixel. Hi-res delivers fetched words to Denise's shifter 3
-    /// colour clocks earlier in phase than lo-res, so the two resolutions
-    /// reference different anchors (see DIW_HSTART_FETCH_REFERENCE_* docs).
-    /// Super-hi-res (ECS, effectively unused under OCS) keeps the lo-res
-    /// anchor.
+    /// bitplane pixel. Hi-res and lo-res use separate references because their
+    /// fetch slots load Denise's shifter on different beam phases. Super-hi-res
+    /// (ECS, effectively unused under OCS) keeps the lo-res anchor.
     fn fetch_reference(&self) -> i32 {
         if self.hires() {
-            // Wide-FMODE hi-res fetches deliver their gulp to the shifter
-            // one colour clock earlier than the single-word fetch the $83
-            // reference was calibrated on: Lisa's bitplane delay is
-            // fetch-width-dependent (the classic WinUAE/FS-UAE
-            // `delayoffset` is computed from the fetch mode). With the
-            // FMODE=0 reference, AGA hi-res screens (system software,
-            // FMODE=3, DIW $81, DDFSTRT $38) sat 2 lo-res pixels right of
-            // FS-UAE: a colour-0 stripe inside the window's left edge and
-            // the bitmap's last pixels clipped at the right.
-            if self.fetch_quantum() > 1 {
-                DIW_HSTART_FETCH_REFERENCE_HIRES - 2
-            } else {
-                DIW_HSTART_FETCH_REFERENCE_HIRES
-            }
+            DIW_HSTART_FETCH_REFERENCE_HIRES
         } else {
             DIW_HSTART_FETCH_REFERENCE_LORES
         }
@@ -7375,8 +7360,9 @@ mod tests {
         assert_eq!(standard.native_x_offset(standard.diw_h_start(), repeat), 0);
 
         // Kickstart 2.05 insert-disk screen: hi-res but DDFSTRT=$40 (late), so
-        // there is no pre-fetch word - the origin is unsnapped and the
-        // calibrated boot art is untouched.
+        // there is no pre-fetch word. The late fetch starts 24 pixels into
+        // its narrower DIW after the standard hi-res $81/$3C phase is aligned
+        // to the display-window edge.
         let ks_boot = ControlState {
             diwstrt: 0x2C95,
             diwstop: 0x2CAD,
@@ -7384,7 +7370,7 @@ mod tests {
             ddfstop: 0x00D0,
             ..xsysinfo
         };
-        assert_eq!(ks_boot.native_x_offset(ks_boot.diw_h_start(), repeat), 20);
+        assert_eq!(ks_boot.native_x_offset(ks_boot.diw_h_start(), repeat), 24);
     }
 
     fn ocs_snapshot(
@@ -8085,16 +8071,15 @@ mod tests {
 
         // FMODE=0: the fetch gulp equals the DDF granularity, so the picture
         // follows DDFSTRT continuously. KS 2.05's insert-disk screen (DDF
-        // $40, DIW $95) is drawn for exactly this placement: its negative
-        // modulos overlap rows so the drive art's right edge lives in the
-        // next row's first bytes.
+        // $40, DIW $95) keeps the same late-DDF relation after the standard
+        // $81/$3C hi-res phase is aligned to the display-window edge.
         let kickstart_hires = RenderState {
             bplcon0: 0x8000,
             diwstrt: 0x6395,
             ddfstrt: 0x0040,
             ..blank_state()
         };
-        assert_eq!(kickstart_hires.native_x_offset(true, 1), 20);
+        assert_eq!(kickstart_hires.native_x_offset(true, 1), 24);
 
         // Wide FMODE fetches quantize the displayed shifter origin to the gulp
         // grid: AGA system screens program DDFSTRT $38 or $3C interchangeably
@@ -8122,12 +8107,10 @@ mod tests {
             wb_hires_overscan_fetch.fetch_start_native_x(true, 1),
             wb_with_standard_ddf.fetch_start_native_x(true, 1)
         );
-        // Wide-FMODE hi-res output sits one colour clock left of the
-        // FMODE=0-calibrated reference (Lisa's fetch-width-dependent
-        // bitplane delay): the AGA bitmap fills its standard
-        // $81 window exactly flush, matching FS-UAE. With the FMODE=0
-        // reference it painted 4 pixels right (colour-0 stripe at the
-        // window's left edge, last bitmap pixels clipped at the right).
+        // Wide-FMODE hi-res output uses the same corrected $81 display origin:
+        // the AGA bitmap fills its standard window exactly flush, matching
+        // FS-UAE. DDFSTRT $38 and $3C are still equivalent because both align
+        // to the same wide-FMODE gulp.
         assert_eq!(wb_hires_overscan_fetch.native_x_offset(true, 1), 0);
         assert_eq!(wb_hires_overscan_fetch.fetch_start_native_x(true, 1), 0);
 
@@ -8169,6 +8152,7 @@ mod tests {
         assert_eq!(diagrom_hires.display_window_x().0, 64);
         assert_eq!(diagrom_hires.clipped_display_pixels_before_frame(), 0);
         assert_eq!(diagrom_hires.native_x_offset(true, 1), 0);
+        assert_eq!(diagrom_hires.fetch_start_native_x(true, 1), 0);
 
         let lores_extra_fetch_word = RenderState {
             bplcon0: 0,

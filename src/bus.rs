@@ -15100,9 +15100,9 @@ mod tests {
         let mut fb = vec![0; FB_PIXELS];
         bitplane::render(&mut bus, &mut fb);
 
-        assert_eq!(fb[STANDARD_VISIBLE_X0 + 36], rgb12_to_rgba8(0x0000));
-        assert_eq!(fb[STANDARD_VISIBLE_X0 + 38], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[STANDARD_VISIBLE_X0 + 39], rgb12_to_rgba8(0x0000));
+        assert_eq!(fb[STANDARD_VISIBLE_X0 + 32], rgb12_to_rgba8(0x0000));
+        assert_eq!(fb[STANDARD_VISIBLE_X0 + 34], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[STANDARD_VISIBLE_X0 + 35], rgb12_to_rgba8(0x0000));
     }
 
     #[test]
