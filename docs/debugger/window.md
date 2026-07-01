@@ -10,6 +10,10 @@ Everything the debugger shows comes from
 side-effect-free peeks -- inspecting memory or registers never disturbs the
 emulated machine -- and stepping drives the same cycle-exact core as normal
 execution.
+While the machine runs, tool windows repaint at 20 Hz rather than every
+emulated frame: repainting shares the emulation thread, and a per-frame
+repaint costs enough to starve the audio output. Interaction (stepping,
+clicks, breakpoint stops) always repaints immediately.
 
 ```{figure} ../images/ui-preview-debugger.png
 :alt: The debugger window on the CPU tab
