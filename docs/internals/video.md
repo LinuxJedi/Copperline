@@ -261,8 +261,10 @@ framebuffer):
   crop standard PAL fields to a 692x540 aperture. The horizontal crop keeps a
   640-pixel standard display centred with 26 pixels of visible overscan on both
   sides; vertically it keeps the PAL title-bar/top-border position aligned with
-  the reference-emulator crop. `COPPERLINE_SHOT_RAW=1` bypasses this and writes
-  the raw 716x570 woven framebuffer.
+  the reference-emulator crop. The live window keeps its 716-pixel 4:3 texture
+  for the status bar and scaling path, but centres the same TV aperture inside
+  that texture instead of showing the raw framebuffer origin. `COPPERLINE_SHOT_RAW=1`
+  bypasses the PNG crop and writes the raw 716x570 woven framebuffer.
 - **Full-overscan horizontal recentring**: in `"full"` presentation, a standard
   (non-overscan) display is recentred because the framebuffer captures a deep
   slab of left overscan that would otherwise push the picture right of centre.

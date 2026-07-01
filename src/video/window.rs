@@ -291,6 +291,7 @@ const TV_PAL_PRESENT_WIDTH: usize = STANDARD_PAL_VISIBLE_WIDTH + 2 * 26;
 const TV_PAL_PRESENT_HEIGHT: usize = 540;
 const TV_PAL_PRESENT_SOURCE_X: usize = bitplane::STANDARD_VISIBLE_X0 - 26;
 const TV_PAL_PRESENT_SOURCE_Y: usize = 18;
+const TV_PAL_LIVE_PAD_X: usize = (FB_WIDTH - TV_PAL_PRESENT_WIDTH) / 2;
 const STATUS_BG: u32 = rgba(28, 28, 26);
 const STATUS_TOP: u32 = rgba(78, 76, 70);
 const STATUS_BOTTOM: u32 = rgba(12, 12, 11);
@@ -479,6 +480,7 @@ pub struct App {
     /// post-processed. The first `present_rows * FB_WIDTH` pixels are valid.
     present_fb: Vec<u32>,
     present_rows: usize,
+    present_geometry: FrameGeometry,
     render: Option<Render>,
     debugger_tool_window: Option<ToolWindow>,
     frame_analyzer_tool_window: Option<ToolWindow>,
@@ -686,6 +688,7 @@ struct RenderWorkerResult {
     timing: VideoRenderFrameTiming,
     presentation_fb: Vec<u32>,
     present_rows: usize,
+    geometry: FrameGeometry,
 }
 
 struct RenderWorker {
@@ -794,6 +797,7 @@ impl App {
             deinterlacer: Deinterlacer::with_phosphor(phosphor),
             present_fb: vec![0u32; FB_WIDTH * OUT_HEIGHT],
             present_rows: OUT_HEIGHT,
+            present_geometry: FrameGeometry::standard(STANDARD_PAL_VISIBLE_START_VPOS, 312, false),
             render: None,
             debugger_tool_window: None,
             frame_analyzer_tool_window: None,
@@ -1523,7 +1527,14 @@ impl ApplicationHandler for App {
                 let ui_data = self.build_panel_view_data();
                 if let Some(r) = self.render.as_mut() {
                     let frame = r.pixels.frame_mut();
-                    copy_present_frame(&self.present_fb, self.present_rows, frame, r.texture_scale);
+                    copy_window_present_frame(
+                        &self.present_fb,
+                        self.present_rows,
+                        frame,
+                        r.texture_scale,
+                        self.overscan,
+                        self.present_geometry,
+                    );
                     draw_status_bar(frame, &view, r.texture_scale);
                     if recording {
                         // Painted into the presentation texture only, so
@@ -1892,6 +1903,7 @@ fn render_job_to_presentation(
         timing: render_result.timing,
         presentation_fb: std::mem::take(presentation_fb),
         present_rows,
+        geometry,
     }
 }
 
@@ -2384,6 +2396,78 @@ fn copy_present_frame(src_fb: &[u32], src_rows: usize, frame: &mut [u8], texture
                 let dst = &mut frame[dst_off..dst_off + dst_stride];
                 for x in 0..FB_WIDTH * texture_scale {
                     dst[x * 4..x * 4 + 4].copy_from_slice(&row[x / texture_scale].to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+fn copy_window_present_frame(
+    src_fb: &[u32],
+    src_rows: usize,
+    frame: &mut [u8],
+    texture_scale: usize,
+    overscan: Overscan,
+    geometry: FrameGeometry,
+) {
+    if overscan == Overscan::Tv && is_standard_pal_presentation(geometry, src_rows) {
+        copy_tv_aperture_to_window(src_fb, src_rows, frame, texture_scale);
+    } else {
+        copy_present_frame(src_fb, src_rows, frame, texture_scale);
+    }
+}
+
+fn copy_tv_aperture_to_window(
+    src_fb: &[u32],
+    src_rows: usize,
+    frame: &mut [u8],
+    texture_scale: usize,
+) {
+    debug_assert!(src_fb.len() >= src_rows * FB_WIDTH);
+    debug_assert_eq!(
+        frame.len(),
+        texture_width(texture_scale) * texture_height(texture_scale) * 4
+    );
+    let dst_stride = texture_width(texture_scale) * 4;
+    let out_rows = PRESENT_HEIGHT * texture_scale;
+    for y in 0..out_rows {
+        let crop_y = screenshot::scaled_source_row(y, TV_PAL_PRESENT_HEIGHT, out_rows);
+        let src_y = (TV_PAL_PRESENT_SOURCE_Y + crop_y).min(src_rows - 1);
+        let row = &src_fb[src_y * FB_WIDTH..(src_y + 1) * FB_WIDTH];
+        let dst_off = y * dst_stride;
+        match texture_scale {
+            1 => {
+                let dst = &mut frame[dst_off..dst_off + dst_stride];
+                for x in 0..FB_WIDTH {
+                    let crop_x = x
+                        .saturating_sub(TV_PAL_LIVE_PAD_X)
+                        .min(TV_PAL_PRESENT_WIDTH - 1);
+                    let src_x = (TV_PAL_PRESENT_SOURCE_X + crop_x).min(FB_WIDTH - 1);
+                    dst[x * 4..x * 4 + 4].copy_from_slice(&row[src_x].to_le_bytes());
+                }
+            }
+            2 => {
+                for x in 0..FB_WIDTH {
+                    let crop_x = x
+                        .saturating_sub(TV_PAL_LIVE_PAD_X)
+                        .min(TV_PAL_PRESENT_WIDTH - 1);
+                    let src_x = (TV_PAL_PRESENT_SOURCE_X + crop_x).min(FB_WIDTH - 1);
+                    let pixel = row[src_x];
+                    let pair = pixel as u64 | ((pixel as u64) << 32);
+                    unsafe {
+                        (frame.as_mut_ptr().add(dst_off + x * 8) as *mut u64).write_unaligned(pair);
+                    }
+                }
+            }
+            _ => {
+                let dst = &mut frame[dst_off..dst_off + dst_stride];
+                for x in 0..FB_WIDTH * texture_scale {
+                    let out_x = x / texture_scale;
+                    let crop_x = out_x
+                        .saturating_sub(TV_PAL_LIVE_PAD_X)
+                        .min(TV_PAL_PRESENT_WIDTH - 1);
+                    let src_x = (TV_PAL_PRESENT_SOURCE_X + crop_x).min(FB_WIDTH - 1);
+                    dst[x * 4..x * 4 + 4].copy_from_slice(&row[src_x].to_le_bytes());
                 }
             }
         }
@@ -7275,6 +7359,7 @@ impl App {
         let old = std::mem::replace(&mut self.present_fb, result.presentation_fb);
         self.render_recycle_fb = old;
         self.present_rows = result.present_rows;
+        self.present_geometry = result.geometry;
         self.last_rendered_emulated_frame = Some(result.emulated_frame);
         true
     }
@@ -7403,6 +7488,7 @@ impl App {
             !geometry.programmable,
         );
         self.refresh_present_from_deinterlacer();
+        self.present_geometry = geometry;
         self.last_rendered_emulated_frame = Some(emulated_frame);
         self.last_submitted_render_frame = Some(emulated_frame);
         true
@@ -7915,7 +8001,7 @@ mod tests {
     use super::{
         bar_layout, center_present_frame_for_visible_start, center_present_frame_horizontally,
         control_at, copperline_icon_image, copperline_logo_image, copy_present_frame,
-        draw_status_bar, fdd_track_counter_rect, fdd_track_digit_rect,
+        copy_window_present_frame, draw_status_bar, fdd_track_counter_rect, fdd_track_digit_rect,
         host_shortcut_modifier_pressed, host_to_amiga_rawkey, joystick_mode_uses_keyboard,
         joystick_toggle_rect, keyboard_joystick_key_for, led_row_rect, mask_present_frame_to_tv,
         paint_test_screen, parse_amiga_key, pause_button_rect, power_button_rect,
@@ -7931,13 +8017,13 @@ mod tests {
         CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF,
         HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
         STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
-        TRACK_SEGMENT_ON, TV_PAL_PRESENT_HEIGHT, TV_PAL_PRESENT_SOURCE_X, TV_PAL_PRESENT_SOURCE_Y,
-        TV_PAL_PRESENT_WIDTH, VOLUME_FILL, VOLUME_GLYPH_X,
+        TRACK_SEGMENT_ON, TV_PAL_LIVE_PAD_X, TV_PAL_PRESENT_HEIGHT, TV_PAL_PRESENT_SOURCE_X,
+        TV_PAL_PRESENT_SOURCE_Y, TV_PAL_PRESENT_WIDTH, VOLUME_FILL, VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::{FrontPanelStatus, RenderRegisterSnapshot};
     use crate::config::{Overscan, WarpSpeed};
-    use crate::video::{FB_HEIGHT, FB_PIXELS, FB_WIDTH};
+    use crate::video::{FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH};
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -9129,6 +9215,52 @@ mod tests {
         assert_eq!(
             pixel(&frame, 0, PRESENT_HEIGHT * scale - 1, scale),
             src[(OUT_HEIGHT - 1) * FB_WIDTH].to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn tv_window_copy_centres_reference_aperture_in_live_texture() {
+        use crate::video::deinterlace::{OUT_HEIGHT, OUT_PIXELS};
+        let scale = 1;
+        let mut src = vec![0u32; OUT_PIXELS];
+        let row_y = TV_PAL_PRESENT_SOURCE_Y;
+        let standard_left = crate::video::bitplane::STANDARD_VISIBLE_X0;
+        let standard_right = standard_left + 320 * 2 - 1;
+        let left_marker = 0x1122_3344u32;
+        let right_marker = 0x5566_7788u32;
+        let left_edge = 0x99AA_BBCCu32;
+        let right_edge = 0xDDEE_FF00u32;
+
+        src[row_y * FB_WIDTH + TV_PAL_PRESENT_SOURCE_X] = left_edge;
+        src[row_y * FB_WIDTH + FB_WIDTH - 1] = right_edge;
+        src[row_y * FB_WIDTH + standard_left] = left_marker;
+        src[row_y * FB_WIDTH + standard_right] = right_marker;
+
+        let mut frame = vec![0u8; texture_width(scale) * texture_height(scale) * 4];
+        copy_window_present_frame(
+            &src,
+            OUT_HEIGHT,
+            &mut frame,
+            scale,
+            Overscan::Tv,
+            FrameGeometry::standard(STANDARD_PAL_VISIBLE_START_VPOS, 312, false),
+        );
+
+        let dst_standard_left = TV_PAL_LIVE_PAD_X + (standard_left - TV_PAL_PRESENT_SOURCE_X);
+        let dst_standard_right = dst_standard_left + 320 * 2 - 1;
+        assert_eq!(dst_standard_left, FB_WIDTH - 1 - dst_standard_right);
+        assert_eq!(
+            pixel(&frame, dst_standard_left, 0, scale),
+            left_marker.to_le_bytes()
+        );
+        assert_eq!(
+            pixel(&frame, dst_standard_right, 0, scale),
+            right_marker.to_le_bytes()
+        );
+        assert_eq!(pixel(&frame, 0, 0, scale), left_edge.to_le_bytes());
+        assert_eq!(
+            pixel(&frame, FB_WIDTH - 1, 0, scale),
+            right_edge.to_le_bytes()
         );
     }
 
