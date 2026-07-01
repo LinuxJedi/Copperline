@@ -662,6 +662,13 @@ struct Render {
     window: Arc<Window>,
     pixels: Pixels<'static>,
     texture_scale: usize,
+    /// True while the host window is minimized (Windows delivers a 0x0
+    /// Resized). Presenting while minimized deadlocks on Windows: DWM stops
+    /// consuming swapchain frames, so once the in-flight buffers fill,
+    /// pixels.render() blocks the main thread, the message pump dies, and
+    /// the window can never be restored (which is what would unblock the
+    /// present). Skip all rendering until a nonzero resize restores it.
+    minimized: bool,
 }
 
 struct ToolWindow {
@@ -669,6 +676,8 @@ struct ToolWindow {
     pixels: Pixels<'static>,
     texture_scale: usize,
     cursor_pos: Option<(i32, i32)>,
+    /// Same Windows minimized-present deadlock hazard as Render::minimized.
+    minimized: bool,
 }
 
 /// Frame-loop repaints of the tool windows (debugger, frame analyzer) are
@@ -1103,6 +1112,7 @@ impl ApplicationHandler for App {
             window,
             pixels,
             texture_scale,
+            minimized: false,
         });
         // Paint at least once so the status bar (and power button) is
         // visible immediately, even when the machine starts powered off
@@ -1502,9 +1512,15 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(size) => {
                 if let Some(r) = self.render.as_mut() {
-                    let _ = r
-                        .pixels
-                        .resize_surface(size.width.max(1), size.height.max(1));
+                    // A zero-sized resize is minimization (Windows reports
+                    // the minimized client area as 0x0). Leave the surface
+                    // untouched and stop rendering until the restore
+                    // delivers a nonzero size (see Render::minimized).
+                    r.minimized = size.width == 0 || size.height == 0;
+                    if r.minimized {
+                        return;
+                    }
+                    let _ = r.pixels.resize_surface(size.width, size.height);
                 }
                 // Resizing the surface discards its contents, leaving it
                 // blank (white) until the next present. When the machine is
@@ -1515,6 +1531,9 @@ impl ApplicationHandler for App {
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                if self.render.as_ref().is_some_and(|r| r.minimized) {
+                    return;
+                }
                 let status = status_with_latched_fdd_track(
                     self.emu.bus().front_panel_status(),
                     &mut self.last_fdd_track,
@@ -4912,9 +4931,13 @@ impl App {
             }
             WindowEvent::Resized(size) => {
                 if let Some(tool) = self.tool_window_mut(kind) {
-                    let _ = tool
-                        .pixels
-                        .resize_surface(size.width.max(1), size.height.max(1));
+                    // Same minimized-present deadlock guard as the main
+                    // window's Resized handler.
+                    tool.minimized = size.width == 0 || size.height == 0;
+                    if tool.minimized {
+                        return;
+                    }
+                    let _ = tool.pixels.resize_surface(size.width, size.height);
                 }
                 self.request_redraw();
             }
@@ -4934,6 +4957,9 @@ impl App {
             .and_then(|tool| tool.cursor_pos)
             .and_then(|pos| ui::panel_control_at(&panel, pos));
         if let Some(tool) = self.tool_window_mut(kind) {
+            if tool.minimized {
+                return;
+            }
             let frame = tool.pixels.frame_mut();
             frame.fill(0);
             ui::draw_panel_layer(frame, tool.texture_scale, &panel, hover, ui_data.as_ref());
@@ -5485,7 +5511,7 @@ impl App {
         let title = Self::tool_window_title(kind);
         if let Some(tool) = self.tool_window(kind) {
             tool.window.set_title(title);
-            if redraw {
+            if redraw && !tool.minimized {
                 tool.window.request_redraw();
             }
             return;
@@ -5529,6 +5555,7 @@ impl App {
             pixels,
             texture_scale,
             cursor_pos: None,
+            minimized: false,
         });
         self.request_redraw();
     }
@@ -7205,17 +7232,23 @@ impl App {
 
     fn request_main_redraw(&self) {
         if let Some(render) = self.render.as_ref() {
-            render.window.request_redraw();
+            if !render.minimized {
+                render.window.request_redraw();
+            }
         }
     }
 
     fn request_redraw(&self) {
         self.request_main_redraw();
         if let Some(tool) = self.debugger_tool_window.as_ref() {
-            tool.window.request_redraw();
+            if !tool.minimized {
+                tool.window.request_redraw();
+            }
         }
         if let Some(tool) = self.frame_analyzer_tool_window.as_ref() {
-            tool.window.request_redraw();
+            if !tool.minimized {
+                tool.window.request_redraw();
+            }
         }
     }
 
