@@ -182,6 +182,30 @@ pub fn present_h_shift_for(snapshot: &RenderRegisterSnapshot) -> usize {
     }
     present_h_shift(eff_start as u16, eff_stop as u16)
 }
+
+/// Whether a TV-style standard PAL aperture can crop the horizontal borders
+/// without cutting fetched playfield content. Wide DIW alone is not enough to
+/// reject the aperture: some software opens DIW into the border around a
+/// standard-width fetch and only exposes COLOR0 there. A fetch that reaches
+/// outside the standard window is true horizontal overscan and must stay on
+/// the full framebuffer.
+pub(crate) fn uses_standard_horizontal_content(snapshot: &RenderRegisterSnapshot) -> bool {
+    let control = ControlState::from_render_state(&RenderState::from_snapshot(*snapshot));
+    let diw_start = control.diw_h_start() as i32;
+    let mut diw_stop = control.diw_h_stop() as i32;
+    if diw_stop <= diw_start {
+        diw_stop += 0x100;
+    }
+    if diw_start >= STANDARD_DIW_HSTART && diw_stop <= STANDARD_DIW_HSTOP {
+        return true;
+    }
+    let Some((content_start, content_stop)) = control.bitplane_content_window_h() else {
+        return false;
+    };
+    let eff_start = diw_start.max(content_start);
+    let eff_stop = diw_stop.min(content_stop);
+    eff_start >= STANDARD_DIW_HSTART && eff_stop <= STANDARD_DIW_HSTOP && eff_stop > eff_start
+}
 const BPLCON0_ECSENA: u16 = 1 << 0;
 const BPLCON0_SHRES: u16 = 1 << 6;
 const BPLCON2_ZDBPSEL_SHIFT: u16 = 12;
@@ -7418,6 +7442,33 @@ mod tests {
             present_h_shift_for(&ocs_snapshot(0x5702, 0xFFFF, 0x0030, 0x00D8)),
             0
         );
+    }
+
+    #[test]
+    fn standard_horizontal_content_accepts_standard_fetch_inside_wide_diw() {
+        // A wide display window around a standard fetch only exposes border
+        // colour in the overscan area, so the TV aperture may still crop it.
+        assert!(uses_standard_horizontal_content(&ocs_snapshot(
+            0x5702, 0xFFFF, 0x0038, 0x00D0
+        )));
+        assert!(uses_standard_horizontal_content(&ocs_snapshot(
+            0x2C81, 0x2CC1, 0x0038, 0x00D0
+        )));
+    }
+
+    #[test]
+    fn standard_horizontal_content_rejects_true_overscan_fetch() {
+        let snapshot = RenderRegisterSnapshot {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: 0x8214,
+            diwstrt: 0x1D61,
+            diwstop: 0x37C7,
+            ddfstrt: 0x0028,
+            ddfstop: 0x00D8,
+            ..RenderRegisterSnapshot::default()
+        };
+
+        assert!(!uses_standard_horizontal_content(&snapshot));
     }
 
     #[test]

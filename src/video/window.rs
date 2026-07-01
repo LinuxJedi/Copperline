@@ -480,7 +480,7 @@ pub struct App {
     /// post-processed. The first `present_rows * FB_WIDTH` pixels are valid.
     present_fb: Vec<u32>,
     present_rows: usize,
-    present_geometry: FrameGeometry,
+    present_standard_tv_aperture: bool,
     render: Option<Render>,
     debugger_tool_window: Option<ToolWindow>,
     frame_analyzer_tool_window: Option<ToolWindow>,
@@ -688,7 +688,7 @@ struct RenderWorkerResult {
     timing: VideoRenderFrameTiming,
     presentation_fb: Vec<u32>,
     present_rows: usize,
-    geometry: FrameGeometry,
+    standard_tv_aperture: bool,
 }
 
 struct RenderWorker {
@@ -797,7 +797,7 @@ impl App {
             deinterlacer: Deinterlacer::with_phosphor(phosphor),
             present_fb: vec![0u32; FB_WIDTH * OUT_HEIGHT],
             present_rows: OUT_HEIGHT,
-            present_geometry: FrameGeometry::standard(STANDARD_PAL_VISIBLE_START_VPOS, 312, false),
+            present_standard_tv_aperture: true,
             render: None,
             debugger_tool_window: None,
             frame_analyzer_tool_window: None,
@@ -1533,7 +1533,7 @@ impl ApplicationHandler for App {
                         frame,
                         r.texture_scale,
                         self.overscan,
-                        self.present_geometry,
+                        self.present_standard_tv_aperture,
                     );
                     draw_status_bar(frame, &view, r.texture_scale);
                     if recording {
@@ -1903,7 +1903,7 @@ fn render_job_to_presentation(
         timing: render_result.timing,
         presentation_fb: std::mem::take(presentation_fb),
         present_rows,
-        geometry,
+        standard_tv_aperture: uses_standard_pal_tv_aperture(geometry, present_rows, &base),
     }
 }
 
@@ -2408,9 +2408,9 @@ fn copy_window_present_frame(
     frame: &mut [u8],
     texture_scale: usize,
     overscan: Overscan,
-    geometry: FrameGeometry,
+    standard_tv_aperture: bool,
 ) {
-    if overscan == Overscan::Tv && is_standard_pal_presentation(geometry, src_rows) {
+    if overscan == Overscan::Tv && standard_tv_aperture {
         copy_tv_aperture_to_window(src_fb, src_rows, frame, texture_scale);
     } else {
         copy_present_frame(src_fb, src_rows, frame, texture_scale);
@@ -7149,8 +7149,8 @@ impl App {
             path,
             &self.present_fb,
             src_rows,
-            self.emu.bus().frame_geometry(),
             self.overscan,
+            self.present_standard_tv_aperture,
         );
         match result {
             Ok(()) => info!("screenshot saved: {}", path.display()),
@@ -7222,8 +7222,8 @@ impl App {
             &path,
             &self.present_fb,
             src_rows,
-            self.emu.bus().frame_geometry(),
             self.overscan,
+            self.present_standard_tv_aperture,
         );
         match result {
             Ok(()) => {
@@ -7359,7 +7359,7 @@ impl App {
         let old = std::mem::replace(&mut self.present_fb, result.presentation_fb);
         self.render_recycle_fb = old;
         self.present_rows = result.present_rows;
-        self.present_geometry = result.geometry;
+        self.present_standard_tv_aperture = result.standard_tv_aperture;
         self.last_rendered_emulated_frame = Some(result.emulated_frame);
         true
     }
@@ -7488,7 +7488,8 @@ impl App {
             !geometry.programmable,
         );
         self.refresh_present_from_deinterlacer();
-        self.present_geometry = geometry;
+        self.present_standard_tv_aperture =
+            uses_standard_pal_tv_aperture(geometry, self.present_rows, &base);
         self.last_rendered_emulated_frame = Some(emulated_frame);
         self.last_submitted_render_frame = Some(emulated_frame);
         true
@@ -7957,8 +7958,8 @@ fn save_present_frame(
     path: &std::path::Path,
     present_fb: &[u32],
     src_rows: usize,
-    geometry: FrameGeometry,
     overscan: Overscan,
+    standard_tv_aperture: bool,
 ) -> anyhow::Result<()> {
     if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
         return screenshot::save(
@@ -7969,7 +7970,7 @@ fn save_present_frame(
         );
     }
 
-    if overscan == Overscan::Tv && is_standard_pal_presentation(geometry, src_rows) {
+    if overscan == Overscan::Tv && standard_tv_aperture {
         return screenshot::save_cropped_clamped(
             path,
             present_fb,
@@ -7993,6 +7994,15 @@ fn save_present_frame(
 
 fn is_standard_pal_presentation(geometry: FrameGeometry, src_rows: usize) -> bool {
     !geometry.programmable && geometry.frame_lines >= 312 && src_rows == OUT_HEIGHT
+}
+
+fn uses_standard_pal_tv_aperture(
+    geometry: FrameGeometry,
+    src_rows: usize,
+    snapshot: &RenderRegisterSnapshot,
+) -> bool {
+    is_standard_pal_presentation(geometry, src_rows)
+        && bitplane::uses_standard_horizontal_content(snapshot)
 }
 
 #[cfg(test)]
@@ -8023,7 +8033,7 @@ mod tests {
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::{FrontPanelStatus, RenderRegisterSnapshot};
     use crate::config::{Overscan, WarpSpeed};
-    use crate::video::{FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH};
+    use crate::video::{FB_HEIGHT, FB_PIXELS, FB_WIDTH};
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -9237,14 +9247,7 @@ mod tests {
         src[row_y * FB_WIDTH + standard_right] = right_marker;
 
         let mut frame = vec![0u8; texture_width(scale) * texture_height(scale) * 4];
-        copy_window_present_frame(
-            &src,
-            OUT_HEIGHT,
-            &mut frame,
-            scale,
-            Overscan::Tv,
-            FrameGeometry::standard(STANDARD_PAL_VISIBLE_START_VPOS, 312, false),
-        );
+        copy_window_present_frame(&src, OUT_HEIGHT, &mut frame, scale, Overscan::Tv, true);
 
         let dst_standard_left = TV_PAL_LIVE_PAD_X + (standard_left - TV_PAL_PRESENT_SOURCE_X);
         let dst_standard_right = dst_standard_left + 320 * 2 - 1;
@@ -9262,6 +9265,24 @@ mod tests {
             pixel(&frame, FB_WIDTH - 1, 0, scale),
             right_edge.to_le_bytes()
         );
+    }
+
+    #[test]
+    fn tv_window_copy_preserves_true_overscan_fetches() {
+        use crate::video::deinterlace::{OUT_HEIGHT, OUT_PIXELS};
+        let scale = 1;
+        let mut src = vec![0u32; OUT_PIXELS];
+        let left_overscan = 0x1122_3344u32;
+        let standard_crop_edge = 0x5566_7788u32;
+
+        src[0] = left_overscan;
+        src[TV_PAL_PRESENT_SOURCE_X] = standard_crop_edge;
+
+        let mut frame = vec![0u8; texture_width(scale) * texture_height(scale) * 4];
+        copy_window_present_frame(&src, OUT_HEIGHT, &mut frame, scale, Overscan::Tv, false);
+
+        assert_eq!(pixel(&frame, 0, 0, scale), left_overscan.to_le_bytes());
+        assert_ne!(pixel(&frame, 0, 0, scale), standard_crop_edge.to_le_bytes());
     }
 
     #[test]

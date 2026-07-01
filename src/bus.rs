@@ -5,8 +5,8 @@
 //! typed read/write methods for memory-mapped devices.
 
 use crate::chipset::agnus::{
-    ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, Agnus, AgnusRevision, AgnusTick,
-    VideoStandard, BEAMCON0_DUAL, BEAMCON0_HARDDIS, COLORCLOCKS_PER_LINE, NTSC_LINES,
+    sprite_dma_disabled_by_bitplane_ddf, Agnus, AgnusRevision, AgnusTick, VideoStandard,
+    BEAMCON0_DUAL, BEAMCON0_HARDDIS, COLORCLOCKS_PER_LINE, NTSC_LINES,
     NTSC_LONG_COLORCLOCKS_PER_LINE, PAL_LINES,
 };
 use crate::chipset::blitter::Blitter;
