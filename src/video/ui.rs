@@ -39,6 +39,15 @@ const ENTRY_BG: u32 = rgba(8, 10, 8);
 const ENTRY_TEXT: u32 = rgba(27, 220, 71);
 const SCRIM: u32 = rgba(0, 0, 0);
 const SCRIM_ALPHA: f32 = 0.45;
+// Audio-tab oscilloscope trace colours (Paula ch0..3 then CD-DA).
+const AUDIO_SCOPE_COLORS: [u32; 5] = [
+    rgba(120, 255, 150), // ch0 green
+    rgba(96, 200, 255),  // ch1 cyan
+    rgba(230, 130, 245), // ch2 magenta
+    rgba(240, 214, 96),  // ch3 yellow
+    rgba(255, 170, 90),  // CD amber
+];
+const AUDIO_MUTE_FACE: u32 = rgba(96, 44, 44);
 
 // ---------------------------------------------------------------------------
 // Menu
@@ -155,14 +164,16 @@ pub enum DebugTab {
     Cpu,
     Chipset,
     Copper,
+    Audio,
     Memory,
     Break,
 }
 
-pub const DEBUG_TABS: [DebugTab; 5] = [
+pub const DEBUG_TABS: [DebugTab; 6] = [
     DebugTab::Cpu,
     DebugTab::Chipset,
     DebugTab::Copper,
+    DebugTab::Audio,
     DebugTab::Memory,
     DebugTab::Break,
 ];
@@ -172,6 +183,7 @@ fn debug_tab_label(tab: DebugTab) -> &'static str {
         DebugTab::Cpu => "CPU",
         DebugTab::Chipset => "Chipset",
         DebugTab::Copper => "Copper",
+        DebugTab::Audio => "Audio",
         DebugTab::Memory => "Memory",
         DebugTab::Break => "Break",
     }
@@ -346,6 +358,13 @@ pub fn panel_control_at(panel: &Panel, pos: (i32, i32)) -> Option<UiControl> {
                     }
                 }
             }
+            if panel.tab == DebugTab::Audio {
+                for (control, button_rect) in audio_tab_button_rects(rect) {
+                    if button_rect.contains(pos) {
+                        return Some(control);
+                    }
+                }
+            }
         }
         Panel::FrameAnalyzer(_) => {
             if let Some(control) = analyzer_pick_control(rect, pos) {
@@ -410,6 +429,8 @@ pub enum UiControl {
     DebugRegToggle,
     /// Break tab: remove all breakpoints and watchpoints.
     DebugBreaksClear,
+    /// Audio tab: toggle mute for a channel (0..3 = Paula, 4 = CD audio).
+    DebugAudioMute(usize),
     /// Frame analyzer: run/pause the machine while keeping the pane open.
     AnalyzerRun,
     /// Frame analyzer: step/capture one complete Agnus frame.
@@ -626,6 +647,45 @@ fn break_tab_button_rects(rect: Rect) -> [(UiControl, Rect); 4] {
     ]
 }
 
+// Audio tab layout: a header line, four Paula channel blocks, then a CD row.
+// Each block has a mute button on the left, text detail in the middle, and an
+// oscilloscope box on the right.
+const AUDIO_HEADER_H: usize = 16;
+const AUDIO_ROW_H: usize = 46;
+const AUDIO_CD_ROW_H: usize = 30;
+const AUDIO_MUTE_W: usize = 54;
+const AUDIO_TEXT_X: usize = 70;
+const AUDIO_SCOPE_X: usize = 470;
+
+/// Geometry of one Audio-tab row: (mute button rect, scope box rect). `idx`
+/// 0..3 are the Paula channels, 4 is the CD-DA row.
+fn audio_row_geom(rect: Rect, idx: usize) -> (Rect, Rect) {
+    let top = debug_content_top(rect) + AUDIO_HEADER_H + idx.min(4) * AUDIO_ROW_H;
+    let row_h = if idx >= 4 {
+        AUDIO_CD_ROW_H
+    } else {
+        AUDIO_ROW_H
+    };
+    let mute = Rect {
+        x: rect.x + 8,
+        y: top,
+        w: AUDIO_MUTE_W,
+        h: row_h.saturating_sub(8),
+    };
+    let scope = Rect {
+        x: rect.x + AUDIO_SCOPE_X,
+        y: top,
+        w: rect.w.saturating_sub(AUDIO_SCOPE_X + 10),
+        h: row_h.saturating_sub(8),
+    };
+    (mute, scope)
+}
+
+/// The five Audio-tab mute buttons (four Paula channels then CD).
+fn audio_tab_button_rects(rect: Rect) -> [(UiControl, Rect); 5] {
+    std::array::from_fn(|i| (UiControl::DebugAudioMute(i), audio_row_geom(rect, i).0))
+}
+
 fn analyzer_raster_rect(rect: Rect) -> Rect {
     Rect {
         x: rect.x + 10,
@@ -713,6 +773,7 @@ pub struct CalibrationView {
     pub status: String,
 }
 
+#[derive(Clone)]
 pub struct DbgLine {
     pub text: String,
     pub highlight: bool,
@@ -744,6 +805,30 @@ pub struct DebuggerView {
     pub status: String,
     /// Pre-formatted content lines of the active tab.
     pub lines: Vec<DbgLine>,
+    /// Structured data for the Audio tab's per-channel mute buttons and
+    /// oscilloscopes. Some only when the Audio tab is active; the plain text
+    /// is also mirrored into `lines` for headless/text use.
+    pub audio: Option<AudioScopeView>,
+}
+
+/// Per-channel and CD audio state for the debugger Audio tab.
+pub struct AudioScopeView {
+    /// Header line (DMACON / AUDEN / ADKCON summary).
+    pub header: String,
+    /// The four Paula channels, in order.
+    pub channels: Vec<AudioRowView>,
+    /// The CD-DA row.
+    pub cd: AudioRowView,
+}
+
+/// One row of the Audio tab: text detail, mute state, and a scope trace.
+pub struct AudioRowView {
+    /// Formatted detail lines for this channel/row.
+    pub text: Vec<DbgLine>,
+    /// Whether this channel/stream is developer-muted.
+    pub muted: bool,
+    /// Oscilloscope samples (oldest..newest, output level -128..127).
+    pub scope: Vec<i8>,
 }
 
 pub struct AnalyzerMarker {
@@ -1227,27 +1312,35 @@ fn draw_debugger(
             );
         }
     }
-    // Content lines. Two transport rows sit at the bottom now (the main row
-    // plus the Step Over/Out row), so the text area ends above both.
-    let content_top = debug_content_top(rect);
-    let content_bottom = rect.y + rect.h - 2 * DEBUG_BUTTON_H - 16;
-    let pitch = 10;
-    let max_lines = content_bottom.saturating_sub(content_top) / pitch;
-    for (index, line) in view.lines.iter().take(max_lines).enumerate() {
-        let color = if line.highlight {
-            PANEL_TEXT_HILIGHT
-        } else {
-            PANEL_TEXT
-        };
-        draw_panel_text(
-            frame,
-            rect.x + 10,
-            content_top + index * pitch,
-            &line.text,
-            color,
-            1,
-            scale,
-        );
+    // The Audio tab is drawn as a custom graphical layout (mute buttons and
+    // oscilloscopes); every other tab is a plain list of content lines.
+    if panel.tab == DebugTab::Audio {
+        if let Some(audio) = &view.audio {
+            draw_audio_tab(frame, rect, audio, hover, scale);
+        }
+    } else {
+        // Content lines. Two transport rows sit at the bottom now (the main row
+        // plus the Step Over/Out row), so the text area ends above both.
+        let content_top = debug_content_top(rect);
+        let content_bottom = rect.y + rect.h - 2 * DEBUG_BUTTON_H - 16;
+        let pitch = 10;
+        let max_lines = content_bottom.saturating_sub(content_top) / pitch;
+        for (index, line) in view.lines.iter().take(max_lines).enumerate() {
+            let color = if line.highlight {
+                PANEL_TEXT_HILIGHT
+            } else {
+                PANEL_TEXT
+            };
+            draw_panel_text(
+                frame,
+                rect.x + 10,
+                content_top + index * pitch,
+                &line.text,
+                color,
+                1,
+                scale,
+            );
+        }
     }
     // Transport buttons and the hex-entry box.
     for (control, button_rect) in debug_button_rects(rect) {
@@ -1321,6 +1414,148 @@ fn draw_debugger(
                 );
             }
         }
+    }
+}
+
+/// Draw the Audio tab: a header line, four Paula channel blocks and a CD row,
+/// each with a mute button, text detail, and an output oscilloscope.
+fn draw_audio_tab(
+    frame: &mut [u8],
+    rect: Rect,
+    audio: &AudioScopeView,
+    hover: Option<UiControl>,
+    scale: usize,
+) {
+    let content_top = debug_content_top(rect);
+    draw_panel_text(
+        frame,
+        rect.x + 10,
+        content_top,
+        &audio.header,
+        PANEL_TEXT_HILIGHT,
+        1,
+        scale,
+    );
+    for idx in 0..5 {
+        let (mute_rect, scope_rect) = audio_row_geom(rect, idx);
+        let row = if idx < 4 {
+            audio.channels.get(idx)
+        } else {
+            Some(&audio.cd)
+        };
+        let Some(row) = row else { continue };
+        let control = UiControl::DebugAudioMute(idx);
+        draw_mute_button(frame, mute_rect, row.muted, hover == Some(control), scale);
+        // Text detail lines to the right of the mute button.
+        for (line, dbg) in row.text.iter().enumerate() {
+            let color = if dbg.highlight {
+                PANEL_TEXT_HILIGHT
+            } else {
+                PANEL_TEXT
+            };
+            draw_panel_text(
+                frame,
+                rect.x + AUDIO_TEXT_X,
+                mute_rect.y + line * 10,
+                &dbg.text,
+                color,
+                1,
+                scale,
+            );
+        }
+        let color = AUDIO_SCOPE_COLORS[idx.min(4)];
+        draw_audio_scope(frame, scope_rect, &row.scope, color, row.muted, scale);
+    }
+}
+
+/// A single mute toggle button: red-tinted face and "Muted" label when active.
+fn draw_mute_button(frame: &mut [u8], rect: Rect, muted: bool, hover: bool, scale: usize) {
+    let face = if muted {
+        AUDIO_MUTE_FACE
+    } else if hover {
+        BUTTON_FACE_HOVER
+    } else {
+        BUTTON_FACE
+    };
+    let scaled = scale_rect(rect, scale);
+    fill_rect(frame, scaled, face, scale);
+    draw_rect_bevel(frame, scaled, BUTTON_EDGE_LIGHT, BUTTON_EDGE_DARK, scale);
+    let label = if muted { "Muted" } else { "Mute" };
+    let text_w = label.chars().count() * font::GLYPH_W;
+    let x = rect.x + rect.w.saturating_sub(text_w) / 2;
+    let y = rect.y + rect.h.saturating_sub(font::GLYPH_H) / 2;
+    draw_panel_text(frame, x, y, label, BUTTON_TEXT, 1, scale);
+}
+
+/// Draw one oscilloscope box: dark background, centre zero line, and a trace
+/// of the newest samples (greyed when muted).
+fn draw_audio_scope(
+    frame: &mut [u8],
+    box_rect: Rect,
+    samples: &[i8],
+    color: u32,
+    muted: bool,
+    scale: usize,
+) {
+    let scaled = scale_rect(box_rect, scale);
+    fill_rect(frame, scaled, ENTRY_BG, scale);
+    draw_rect_bevel(frame, scaled, BUTTON_EDGE_DARK, BUTTON_EDGE_LIGHT, scale);
+    if box_rect.w < 3 || box_rect.h < 3 {
+        return;
+    }
+    // Interior, inset one pixel from the bevel.
+    let inner = Rect {
+        x: box_rect.x + 1,
+        y: box_rect.y + 1,
+        w: box_rect.w - 2,
+        h: box_rect.h - 2,
+    };
+    let centre_y = inner.y + inner.h / 2;
+    // Zero line.
+    fill_rect_clipped(
+        frame,
+        Rect {
+            x: inner.x,
+            y: centre_y,
+            w: inner.w,
+            h: 1,
+        },
+        inner,
+        PANEL_TEXT_DIM,
+        scale,
+    );
+    if samples.is_empty() {
+        return;
+    }
+    let trace = if muted { PANEL_TEXT_DIM } else { color };
+    // Map the newest `inner.w` samples across the box (1 sample per column),
+    // connecting consecutive points with a vertical span so the trace reads as
+    // a continuous waveform. Amplitude: +/-128 maps to half the box height.
+    let half = (inner.h / 2).max(1);
+    let start = samples.len().saturating_sub(inner.w);
+    let window = &samples[start..];
+    let sample_y = |s: i8| -> usize {
+        let offset = (s as i32 * half as i32) / 128;
+        (centre_y as i32 - offset).clamp(inner.y as i32, (inner.y + inner.h - 1) as i32) as usize
+    };
+    let mut prev_y = sample_y(window[0]);
+    for (col, &s) in window.iter().enumerate() {
+        let x = inner.x + col;
+        let y = sample_y(s);
+        let (top, bottom) = (prev_y.min(y), prev_y.max(y));
+        fill_rect_clipped(
+            frame,
+            Rect {
+                x,
+                y: top,
+                w: 1,
+                h: bottom - top + 1,
+            },
+            inner,
+            trace,
+            scale,
+        );
+        prev_y = y;
     }
 }
 
@@ -3059,6 +3294,24 @@ pub fn sr_flags(sr: u16) -> String {
     format!("{trace}{mode} IPL{ipl} {ccr}")
 }
 
+/// ADKCON audio-modulation attach bits (bits 0-7). Vx = the channel's
+/// volume modulates the next channel; Px = its period modulates the next.
+const ADKCON_AUDIO_BITS: [(u16, &str); 8] = [
+    (1 << 7, "3PN"),
+    (1 << 6, "2P3"),
+    (1 << 5, "1P2"),
+    (1 << 4, "0P1"),
+    (1 << 3, "3VN"),
+    (1 << 2, "2V3"),
+    (1 << 1, "1V2"),
+    (1 << 0, "0V1"),
+];
+
+/// The set ADKCON audio attach bits, or "-" when no channels are attached.
+pub fn adkcon_audio_flags(value: u16) -> String {
+    decode_bits(value, &ADKCON_AUDIO_BITS)
+}
+
 /// One hex-dump row: address, 16 bytes as hex, then printable ASCII.
 pub fn hex_dump_row(addr: u32, bytes: &[u8]) -> String {
     let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
@@ -3205,6 +3458,11 @@ mod tests {
         let tab = debug_tab_rect(rect, 3);
         assert_eq!(
             ui.control_at((tab.x as i32 + 2, tab.y as i32 + 2)),
+            Some(UiControl::DebugTab(DebugTab::Audio))
+        );
+        let tab = debug_tab_rect(rect, 4);
+        assert_eq!(
+            ui.control_at((tab.x as i32 + 2, tab.y as i32 + 2)),
             Some(UiControl::DebugTab(DebugTab::Memory))
         );
         let (control, step) = debug_button_rects(rect)[1];
@@ -3226,6 +3484,28 @@ mod tests {
         let pos = (toggle.x as i32 + 2, toggle.y as i32 + 2);
         assert_eq!(ui_break.control_at(pos), Some(UiControl::DebugBreakToggle));
         // On another tab the same position is just panel body.
+        assert_eq!(ui.control_at(pos), Some(UiControl::PanelBody));
+
+        // Audio-tab mute buttons hit-test only while the Audio tab is active.
+        let mut panel = DebuggerPanel::new();
+        panel.tab = DebugTab::Audio;
+        let ui_audio = UiState {
+            menu_open: false,
+            panel: Some(Panel::Debugger(panel)),
+        };
+        let (control, mute0) = audio_tab_button_rects(rect)[0];
+        assert_eq!(control, UiControl::DebugAudioMute(0));
+        let pos = (mute0.x as i32 + 2, mute0.y as i32 + 2);
+        assert_eq!(ui_audio.control_at(pos), Some(UiControl::DebugAudioMute(0)));
+        // The CD mute is the fifth (index 4) button.
+        let (cd_control, cd_mute) = audio_tab_button_rects(rect)[4];
+        assert_eq!(cd_control, UiControl::DebugAudioMute(4));
+        let cd_pos = (cd_mute.x as i32 + 2, cd_mute.y as i32 + 2);
+        assert_eq!(
+            ui_audio.control_at(cd_pos),
+            Some(UiControl::DebugAudioMute(4))
+        );
+        // On another tab that position does not resolve to a mute.
         assert_eq!(ui.control_at(pos), Some(UiControl::PanelBody));
 
         let mut panel = DebuggerPanel::new();
@@ -3593,6 +3873,7 @@ mod tests {
             reverse_available: true,
             status: "paused frame 1234 24.68s".to_string(),
             lines,
+            audio: None,
         });
         let mut panel = DebuggerPanel::new();
         panel.entry = "C00000".to_string();
@@ -3634,6 +3915,7 @@ mod tests {
             reverse_available: true,
             status: "paused frame 1234 24.68s".to_string(),
             lines,
+            audio: None,
         });
         let mut panel = DebuggerPanel::new();
         panel.tab = DebugTab::Break;
@@ -3656,6 +3938,100 @@ mod tests {
         );
         assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
         save(&frame, "debugger-break");
+
+        // Audio tab: the four Paula channels plus CD, with representative
+        // state, mute buttons (AUD2 shown muted), and synthetic scope traces.
+        let mut frame = vec![0u8; w * h * 4];
+        let wave = |amp: f32, cycles: f32| -> Vec<i8> {
+            (0..220)
+                .map(|i| {
+                    let t = i as f32 / 220.0 * cycles * std::f32::consts::TAU;
+                    (amp * t.sin()) as i8
+                })
+                .collect()
+        };
+        let header = "DMACON 8203  DMAEN on  AUDEN 1 1 . .   ADKCON 0000  -".to_string();
+        let channels = vec![
+            AudioRowView {
+                text: vec![
+                    DbgLine::hilit("AUD0 [Running]  DMA on  IRQ -"),
+                    DbgLine::plain("  LC 021A3C  LEN 0140  PER 01B0  VOL 40"),
+                    DbgLine::plain("  PTR 021B1C  words 00E2  acc 00A4  ph1  out -12"),
+                    DbgLine::plain("  pending: next-word"),
+                ],
+                muted: false,
+                scope: wave(96.0, 3.0),
+            },
+            AudioRowView {
+                text: vec![
+                    DbgLine::plain("AUD1 [StartPending]  DMA on  IRQ pend"),
+                    DbgLine::plain("  LC 030000  LEN 0080  PER 00F0  VOL 3F"),
+                    DbgLine::plain("  PTR 030000  words 0080  acc 0000  ph0  out 0"),
+                    DbgLine::plain("  pending: dma-req"),
+                ],
+                muted: false,
+                scope: wave(60.0, 6.0),
+            },
+            AudioRowView {
+                text: vec![
+                    DbgLine::plain("AUD2 [Off]  DMA off  IRQ -"),
+                    DbgLine::plain("  LC 000000  LEN 0000  PER 0000  VOL 00"),
+                    DbgLine::plain("  PTR 000000  words 0000  acc 0000  ph0  out 0"),
+                ],
+                muted: true,
+                scope: wave(40.0, 2.0),
+            },
+            AudioRowView {
+                text: vec![
+                    DbgLine::plain("AUD3 [Manual]  DMA off  IRQ -"),
+                    DbgLine::plain("  LC 000000  LEN 0000  PER 0140  VOL 20"),
+                    DbgLine::plain("  PTR 000000  words 0000  acc 0050  ph1  out 7"),
+                    DbgLine::plain("  pending: dma-disable manual"),
+                ],
+                muted: false,
+                scope: wave(48.0, 9.0),
+            },
+        ];
+        let cd = AudioRowView {
+            text: vec![
+                DbgLine::hilit("CD-DA  playing"),
+                DbgLine::plain("  peak  72"),
+            ],
+            muted: false,
+            scope: wave(72.0, 4.0),
+        };
+        let audio = AudioScopeView {
+            header,
+            channels,
+            cd,
+        };
+        let data = PanelViewData::Debugger(DebuggerView {
+            running: false,
+            reverse_available: true,
+            status: "paused frame 1234 24.68s".to_string(),
+            lines: Vec::new(),
+            audio: Some(audio),
+        });
+        let mut panel = DebuggerPanel::new();
+        panel.tab = DebugTab::Audio;
+        let ui = UiState {
+            menu_open: false,
+            panel: Some(Panel::Debugger(panel)),
+        };
+        draw(
+            &mut frame,
+            scale,
+            &ui,
+            Some(UiControl::DebugAudioMute(0)),
+            Some(&data),
+            false,
+            WarpSpeed::Max,
+            false,
+            false,
+            JoystickInputMode::Gamepad,
+        );
+        assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
+        save(&frame, "debugger-audio");
 
         // Configuration screen: an A1200 on the Memory tab.
         let mut frame = vec![0u8; w * h * 4];

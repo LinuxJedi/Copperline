@@ -76,9 +76,54 @@ enum ChanState {
     Running,
 }
 
+impl ChanState {
+    /// Short label for the debugger's audio tab.
+    fn name(self) -> &'static str {
+        match self {
+            ChanState::Off => "Off",
+            ChanState::Manual => "Manual",
+            ChanState::ManualHold => "ManualHold",
+            ChanState::StartPending => "StartPending",
+            ChanState::Running => "Running",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioDmaRequest {
     pub address: u32,
+}
+
+/// Read-only snapshot of one audio channel's live state, for the debugger
+/// window's Audio tab. Mirrors the private `AudChannel` fields; there is no
+/// serialized state here, so exposing it costs nothing at runtime.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioChannelDebug {
+    /// State-machine state (Off/Manual/ManualHold/StartPending/Running).
+    pub state: &'static str,
+    // CPU-visible latches.
+    pub lc: u32,
+    pub len: u16,
+    pub per: u16,
+    pub vol: u8,
+    // Live buffer position.
+    pub ptr: u32,
+    pub words_left: u32,
+    // Output engine.
+    pub period_acc: u32,
+    pub phase: u8,
+    pub current: i8,
+    /// AUDxEN was cleared mid-word and the disable is deferred to the next
+    /// word boundary (issue-74 behaviour).
+    pub dma_disable_pending: bool,
+    /// Length counter underflowed; the AUDxLC/AUDxLEN loop reload is deferred.
+    pub restart_pending: bool,
+    /// A CPU AUDxDAT write is waiting to play (manual mode).
+    pub manual_pending: bool,
+    /// A DMA fetch is pending to Agnus.
+    pub dma_request: bool,
+    /// The one-word fetch-ahead register holds a prefetched word.
+    pub next_word_ready: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -379,6 +424,10 @@ pub struct CdAudioRing {
 /// 32 sectors (~0.43 s) of buffered CD audio.
 const CD_AUDIO_RING_LIMIT: usize = 32 * 588;
 
+/// Length of each debugger oscilloscope ring (host output samples, ~5.8 ms
+/// at the 44.1 kHz mixer rate).
+const AUDIO_SCOPE_LEN: usize = 256;
+
 impl CdAudioRing {
     /// Decode one 2352-byte CD-DA sector (s16le interleaved stereo) into
     /// the ring. Returns false (dropping the sector) when full.
@@ -406,6 +455,15 @@ impl CdAudioRing {
 
     pub fn clear(&mut self) {
         self.samples.clear();
+    }
+}
+
+/// Push one sample into a debugger oscilloscope ring, evicting the oldest
+/// once the ring is full so it always holds the most recent AUDIO_SCOPE_LEN.
+fn scope_push(ring: &mut std::collections::VecDeque<i8>, sample: i8) {
+    ring.push_back(sample);
+    while ring.len() > AUDIO_SCOPE_LEN {
+        ring.pop_front();
     }
 }
 
@@ -477,6 +535,22 @@ pub struct Paula {
     // recordings stay full scale regardless of the volume slider) for
     // the window's video recorder to drain once per emulated frame.
     capture: Option<Vec<(f32, f32)>>,
+    // Developer mute switches (debugger audio tab). Muting a channel or the
+    // CD-DA stream silences its contribution to the host output only; the
+    // Paula state machine, counters and interrupts keep running exactly as
+    // before, so this is not emulated state and never touches a save state.
+    #[serde(skip)]
+    channel_muted: [bool; 4],
+    #[serde(skip)]
+    cd_muted: bool,
+    // Rolling per-channel and CD output-level scopes for the debugger's
+    // oscilloscope meters. Each holds the most recent AUDIO_SCOPE_LEN host
+    // output samples (output level = DAC sample * volume, -128..127). Purely
+    // a debug tap, so it is skipped by the save state.
+    #[serde(skip)]
+    channel_scope: [std::collections::VecDeque<i8>; 4],
+    #[serde(skip)]
+    cd_scope: std::collections::VecDeque<i8>,
 }
 
 impl Paula {
@@ -519,6 +593,12 @@ impl Paula {
             audio_mod_next_period: [false; 4],
             audio_min_period_cck: PAL_AUDIO_MIN_PERIOD_CCK,
             capture: None,
+            channel_muted: [false; 4],
+            cd_muted: false,
+            channel_scope: std::array::from_fn(|_| {
+                std::collections::VecDeque::with_capacity(AUDIO_SCOPE_LEN + 1)
+            }),
+            cd_scope: std::collections::VecDeque::with_capacity(AUDIO_SCOPE_LEN + 1),
         }
     }
 
@@ -535,6 +615,42 @@ impl Paula {
             Some(buf) => std::mem::take(buf),
             None => Vec::new(),
         }
+    }
+
+    /// Developer mute for one audio channel (debugger audio tab). Toggling
+    /// silences the channel's contribution to the host output without
+    /// disturbing its state machine, counters or interrupts.
+    pub fn toggle_channel_muted(&mut self, ch_idx: usize) {
+        if let Some(flag) = self.channel_muted.get_mut(ch_idx) {
+            *flag = !*flag;
+        }
+    }
+
+    pub fn channel_muted(&self, ch_idx: usize) -> bool {
+        self.channel_muted.get(ch_idx).copied().unwrap_or(false)
+    }
+
+    /// Developer mute for the CD-DA stream (CDTV/CD32).
+    pub fn toggle_cd_muted(&mut self) {
+        self.cd_muted = !self.cd_muted;
+    }
+
+    pub fn cd_muted(&self) -> bool {
+        self.cd_muted
+    }
+
+    /// Snapshot of a channel's oscilloscope ring (oldest..newest output
+    /// levels, up to AUDIO_SCOPE_LEN samples) for the debugger meter.
+    pub fn audio_scope_samples(&self, ch_idx: usize) -> Vec<i8> {
+        self.channel_scope
+            .get(ch_idx)
+            .map(|ring| ring.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of the CD-DA oscilloscope ring (oldest..newest).
+    pub fn cd_scope_samples(&self) -> Vec<i8> {
+        self.cd_scope.iter().copied().collect()
     }
 
     pub fn set_dma_addr_mask(&mut self, mask: u32) {
@@ -571,6 +687,28 @@ impl Paula {
     #[cfg(test)]
     pub fn audio_current_sample_for_test(&self, ch_idx: usize) -> Option<i8> {
         self.chans.get(ch_idx).map(|ch| ch.current)
+    }
+
+    /// Read-only snapshot of a channel's live state for the debugger.
+    pub fn audio_channel_debug(&self, ch_idx: usize) -> Option<AudioChannelDebug> {
+        let ch = self.chans.get(ch_idx)?;
+        Some(AudioChannelDebug {
+            state: ch.state.name(),
+            lc: ch.lc,
+            len: ch.len,
+            per: ch.per,
+            vol: ch.vol,
+            ptr: ch.ptr,
+            words_left: ch.words_left,
+            period_acc: ch.period_acc,
+            phase: ch.phase,
+            current: ch.current,
+            dma_disable_pending: ch.dma_disable_pending,
+            restart_pending: ch.restart_pending,
+            manual_pending: ch.manual_pending,
+            dma_request: ch.dma_request,
+            next_word_ready: ch.next_word.is_some(),
+        })
     }
 
     pub fn reset_registers(&mut self) {
@@ -1529,6 +1667,14 @@ impl Paula {
         // unclipped: worst case is +/-2.0 if both channels saturate
         // with full volume in opposite phase, which is essentially
         // never the case for real music.
+        // Tap each channel's output level (DAC sample * volume, -128..127)
+        // for the debugger oscilloscopes. This is pre-mute so a muted
+        // channel's trace still shows its activity (drawn greyed).
+        for i in 0..4 {
+            let level =
+                ((self.chans[i].current as i32 * self.chans[i].vol as i32) / 64).clamp(-128, 127);
+            scope_push(&mut self.channel_scope[i], level as i8);
+        }
         let l_raw = self.channel_mixed_sample(0) + self.channel_mixed_sample(3);
         let r_raw = self.channel_mixed_sample(1) + self.channel_mixed_sample(2);
         let scale = 1.0 / (128.0 * 64.0);
@@ -1546,7 +1692,16 @@ impl Paula {
         // CD audio (CD32/CDTV) is line-mixed with Paula's output after
         // the LED filter, like the real mixer stage, and also sits under
         // the master volume control.
-        let (cd_left, cd_right) = self.cd_audio.next_sample();
+        let (mut cd_left, mut cd_right) = self.cd_audio.next_sample();
+        // Record the pre-mute CD level for the debugger scope, then apply
+        // the developer CD mute so the trace still shows activity while the
+        // stream is silenced in the mix.
+        let cd_level = (((cd_left + cd_right) * 0.5).clamp(-1.0, 1.0) * 127.0) as i8;
+        scope_push(&mut self.cd_scope, cd_level);
+        if self.cd_muted {
+            cd_left = 0.0;
+            cd_right = 0.0;
+        }
         left += cd_left;
         right += cd_right;
         if let Some(capture) = &mut self.capture {
@@ -1557,7 +1712,7 @@ impl Paula {
     }
 
     fn channel_mixed_sample(&self, ch_idx: usize) -> i32 {
-        if self.channel_attached_as_modulator(ch_idx) {
+        if self.channel_muted[ch_idx] || self.channel_attached_as_modulator(ch_idx) {
             0
         } else {
             let ch = &self.chans[ch_idx];
@@ -2269,6 +2424,147 @@ mod tests {
         assert_eq!(paula.chans[0].state, ChanState::Running);
         assert_eq!(paula.chans[0].current, 0x12);
         assert_eq!(paula.chans[0].period_acc, 1);
+    }
+
+    #[test]
+    fn audio_channel_debug_snapshot_mirrors_live_state() {
+        let (mut paula, _) = paula_with_collect_sink();
+        let mut ram = vec![0u8; 64];
+        ram[0] = 0x12;
+        ram[1] = 0x34;
+        let dmacon = DMACON_DMAEN | 0x0001;
+
+        paula.write_audio_reg(0x00, 0);
+        paula.write_audio_reg(0x02, 0);
+        paula.write_audio_reg(0x04, 2);
+        paula.write_audio_reg(0x06, 8);
+        paula.write_audio_reg(0x08, 40);
+        paula.tick_audio(1, dmacon, &ram);
+        paula.tick_audio(3, dmacon, &ram);
+
+        let dbg = paula.audio_channel_debug(0).expect("channel 0 snapshot");
+        assert_eq!(dbg.state, "Running");
+        assert_eq!(dbg.per, 8);
+        assert_eq!(dbg.vol, 40);
+        assert_eq!(dbg.current, 0x12);
+        assert_eq!(dbg.period_acc, 4);
+        assert!(!dbg.dma_disable_pending);
+
+        // Clearing AUDxEN mid-word defers the disable; the snapshot exposes it.
+        paula.tick_audio(1, 0, &ram);
+        let dbg = paula.audio_channel_debug(0).expect("channel 0 snapshot");
+        assert_eq!(dbg.state, "Running");
+        assert!(dbg.dma_disable_pending);
+
+        assert!(paula.audio_channel_debug(4).is_none());
+    }
+
+    #[test]
+    fn audio_channel_mute_silences_mix_but_keeps_state() {
+        let (mut paula, _) = paula_with_collect_sink();
+        let mut ram = vec![0u8; 64];
+        ram[0] = 0x40;
+        ram[1] = 0x40;
+        let dmacon = DMACON_DMAEN | 0x0001;
+        paula.write_audio_reg(0x00, 0);
+        paula.write_audio_reg(0x02, 0);
+        paula.write_audio_reg(0x04, 2);
+        paula.write_audio_reg(0x06, 8);
+        paula.write_audio_reg(0x08, 40);
+        paula.tick_audio(1, dmacon, &ram);
+        paula.tick_audio(3, dmacon, &ram);
+
+        // The channel contributes to the stereo mix.
+        assert_ne!(paula.channel_mixed_sample(0), 0);
+        let before = paula.audio_channel_debug(0).unwrap();
+
+        // Muting zeroes the mix contribution but leaves the state machine,
+        // volume, output sample and pointer untouched.
+        paula.toggle_channel_muted(0);
+        assert!(paula.channel_muted(0));
+        assert_eq!(paula.channel_mixed_sample(0), 0);
+        let after = paula.audio_channel_debug(0).unwrap();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.current, before.current);
+        assert_eq!(after.vol, before.vol);
+        assert_eq!(after.ptr, before.ptr);
+
+        // Unmuting restores the contribution.
+        paula.toggle_channel_muted(0);
+        assert!(!paula.channel_muted(0));
+        assert_ne!(paula.channel_mixed_sample(0), 0);
+    }
+
+    #[test]
+    fn audio_scope_records_channel_output_level_even_when_muted() {
+        let (mut paula, _) = paula_with_collect_sink();
+        let mut ram = vec![0u8; 512 * 1024];
+        for byte in &mut ram[0..4] {
+            *byte = 0x40;
+        }
+        let dmacon = DMACON_DMAEN | 0x0001;
+        paula.write_audio_reg(0x00, 0);
+        paula.write_audio_reg(0x02, 0);
+        paula.write_audio_reg(0x04, 2);
+        paula.write_audio_reg(0x06, 80);
+        paula.write_audio_reg(0x08, 64);
+
+        paula.tick_audio(4000, dmacon, &ram);
+        let scope = paula.audio_scope_samples(0);
+        assert!(!scope.is_empty());
+        assert!(scope.len() <= AUDIO_SCOPE_LEN);
+        assert!(
+            scope.iter().any(|&s| s != 0),
+            "scope should trace the channel output"
+        );
+
+        // The scope tap is pre-mute, so a muted channel keeps tracing.
+        paula.toggle_channel_muted(0);
+        assert!(paula.channel_muted(0));
+        paula.tick_audio(4000, dmacon, &ram);
+        assert!(paula.audio_scope_samples(0).iter().any(|&s| s != 0));
+    }
+
+    #[test]
+    fn cd_audio_mute_zeroes_cd_contribution_but_scope_keeps_tracing() {
+        let (mut paula, frames) = paula_with_collect_sink();
+        paula.set_led_filter_enabled(false);
+        let ram = vec![0u8; 64];
+        // One CD-DA sector (2352 bytes = 588 s16le stereo frames) of a
+        // constant non-zero level.
+        let mut sector = vec![0u8; 2352];
+        for frame in sector.chunks_exact_mut(4) {
+            frame[0..2].copy_from_slice(&4000i16.to_le_bytes());
+            frame[2..4].copy_from_slice(&4000i16.to_le_bytes());
+        }
+        // No Paula channel audio, so the sink output is CD-only.
+        let dmacon = DMACON_DMAEN;
+        paula.cd_audio_mut().push_sector(&sector);
+        paula.tick_audio(4000, dmacon, &ram);
+        assert!(
+            frames
+                .borrow()
+                .iter()
+                .any(|&(l, r)| l.abs() > 1e-3 || r.abs() > 1e-3),
+            "CD audio should reach the sink"
+        );
+        assert!(paula.cd_scope_samples().iter().any(|&s| s != 0));
+
+        // Muted: the CD stream is silent in the mix, but the scope still
+        // records the pre-mute level.
+        frames.borrow_mut().clear();
+        paula.toggle_cd_muted();
+        assert!(paula.cd_muted());
+        paula.cd_audio_mut().push_sector(&sector);
+        paula.tick_audio(4000, dmacon, &ram);
+        assert!(
+            frames
+                .borrow()
+                .iter()
+                .all(|&(l, r)| l.abs() < 1e-6 && r.abs() < 1e-6),
+            "muted CD must be silent"
+        );
+        assert!(paula.cd_scope_samples().iter().any(|&s| s != 0));
     }
 
     #[test]

@@ -36,6 +36,29 @@ pointers, and the full palette.
 decoded targets and positions -- and highlights the instruction at the
 current Copper fetch address.
 
+**Audio** decodes Paula's four audio channels. A header line shows DMACON
+(master DMAEN and the per-channel AUDx enable bits) and ADKCON (the audio
+attach bits for volume/period modulation). Each channel then shows its DMA
+state-machine state (Off, Manual, ManualHold, StartPending, Running), whether
+its DMA is enabled, its interrupt-pending flag, the CPU latches
+(AUDxLC/LEN/PER/VOL), and the live playback state: the current pointer, words
+remaining, the period accumulator, the output phase, and the sample currently
+on the output. A `pending:` line appears when the channel is holding a
+deferred DMA-disable (AUDxEN cleared mid-word), a deferred loop reload, a
+manual AUDxDAT write, an outstanding DMA request, or a fetched-ahead word.
+Step frames (**Frame**) to watch the state machine advance -- the Running
+line is highlighted while a channel is actively streaming samples.
+
+Each channel row also has a **Mute** button on the left and an oscilloscope on
+the right; a fifth row at the bottom does the same for the **CD-DA** audio
+stream (CDTV/CD32). The oscilloscope traces the channel's output level (the DAC
+sample scaled by AUDxVOL), so both the waveform and its loudness are visible;
+the CD scope traces the mixed CD stereo level. Clicking **Mute** silences that
+channel (or the CD stream) in the host output while leaving its trace drawn
+(greyed) so you can still see what it would play. Mutes are developer aids:
+they change only the audio you hear, never the emulated Paula state, and are
+not part of a save state.
+
 **Memory** is a hex/ASCII dump, 256 bytes per page. Type a hex address in
 the `$` box and press Enter to jump there; the `<` and `>` buttons page by
 256 bytes.
