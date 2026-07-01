@@ -9,8 +9,8 @@ use super::deinterlace::{Deinterlacer, OUT_HEIGHT};
 use super::launcher::{LauncherField, LauncherState, MachineSetup, StatusMessage};
 use super::ui::{self, Panel, UiControl, UiState};
 use super::{
-    bitplane, blend_rgba, font, FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH,
-    HOST_SHORTCUT_MODIFIER_LABEL, MAX_FB_PIXELS, PRESENT_HEIGHT,
+    bitplane, font, FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL,
+    MAX_FB_PIXELS, PRESENT_HEIGHT,
 };
 use crate::audio::{AudioSink, CpalSink};
 use crate::bus::{
@@ -287,8 +287,11 @@ const STANDARD_PAL_VISIBLE_START_VPOS: u32 = 0x2C;
 // Default TV presentation keeps a small consumer-visible overscan margin while
 // still hiding the deep edge columns that often contain unfinished effects.
 const TV_HORIZONTAL_OVERSCAN_MARGIN: usize = 24 * 2;
-const TV_TOP_OVERSCAN_MARGIN: usize = 8;
-const TV_BOTTOM_CROP_ROWS: usize = 1;
+const TV_PAL_PRESENT_WIDTH: usize = STANDARD_PAL_VISIBLE_WIDTH + 2 * 26;
+const TV_PAL_PRESENT_HEIGHT: usize = 540;
+const TV_PAL_PRESENT_SOURCE_X: usize = bitplane::STANDARD_VISIBLE_X0 - 26;
+const TV_PAL_PRESENT_SOURCE_Y: usize = 18;
+const TV_PAL_LIVE_PAD_X: usize = (FB_WIDTH - TV_PAL_PRESENT_WIDTH) / 2;
 const STATUS_BG: u32 = rgba(28, 28, 26);
 const STATUS_TOP: u32 = rgba(78, 76, 70);
 const STATUS_BOTTOM: u32 = rgba(12, 12, 11);
@@ -477,6 +480,7 @@ pub struct App {
     /// post-processed. The first `present_rows * FB_WIDTH` pixels are valid.
     present_fb: Vec<u32>,
     present_rows: usize,
+    present_standard_tv_aperture: bool,
     render: Option<Render>,
     debugger_tool_window: Option<ToolWindow>,
     frame_analyzer_tool_window: Option<ToolWindow>,
@@ -560,8 +564,9 @@ pub struct App {
     disk_write_protected: [bool; 4],
     /// Index of the currently inserted disk within each drive's playlist.
     disk_playlist_index: [usize; 4],
-    /// Whether to horizontally recentre a standard (non-overscan) display
-    /// for presentation. On by default; set COPPERLINE_HCENTER=0 to disable.
+    /// Whether to horizontally recentre a standard (non-overscan) display for
+    /// full-overscan presentation. On by default; set COPPERLINE_HCENTER=0 to
+    /// disable. TV presentation keeps the framebuffer's fixed source origin.
     hcenter: bool,
     /// Presentation-level overscan handling ([display] overscan): Tv masks
     /// the deep-overscan margins with black like a CRT bezel.
@@ -683,6 +688,7 @@ struct RenderWorkerResult {
     timing: VideoRenderFrameTiming,
     presentation_fb: Vec<u32>,
     present_rows: usize,
+    standard_tv_aperture: bool,
 }
 
 struct RenderWorker {
@@ -791,6 +797,7 @@ impl App {
             deinterlacer: Deinterlacer::with_phosphor(phosphor),
             present_fb: vec![0u32; FB_WIDTH * OUT_HEIGHT],
             present_rows: OUT_HEIGHT,
+            present_standard_tv_aperture: true,
             render: None,
             debugger_tool_window: None,
             frame_analyzer_tool_window: None,
@@ -1520,7 +1527,14 @@ impl ApplicationHandler for App {
                 let ui_data = self.build_panel_view_data();
                 if let Some(r) = self.render.as_mut() {
                     let frame = r.pixels.frame_mut();
-                    copy_present_frame(&self.present_fb, self.present_rows, frame, r.texture_scale);
+                    copy_window_present_frame(
+                        &self.present_fb,
+                        self.present_rows,
+                        frame,
+                        r.texture_scale,
+                        self.overscan,
+                        self.present_standard_tv_aperture,
+                    );
                     draw_status_bar(frame, &view, r.texture_scale);
                     if recording {
                         // Painted into the presentation texture only, so
@@ -1889,6 +1903,7 @@ fn render_job_to_presentation(
         timing: render_result.timing,
         presentation_fb: std::mem::take(presentation_fb),
         present_rows,
+        standard_tv_aperture: uses_standard_pal_tv_aperture(geometry, present_rows, &base),
     }
 }
 
@@ -1900,9 +1915,9 @@ fn post_process_rendered_field(
     overscan: Overscan,
 ) -> usize {
     let field_rows = geometry.visible_lines.min(fb.len() / FB_WIDTH);
-    // Vertical/horizontal recentring and the TV bezel mask are 15 kHz
-    // CRT concepts anchored to the standard PAL/NTSC window; a
-    // programmable scan defines its own window and presents in full,
+    // Vertical centring, optional full-overscan horizontal recentring, and the
+    // TV bezel mask are 15 kHz CRT concepts anchored to the standard PAL/NTSC
+    // window; a programmable scan defines its own window and presents in full,
     // like a multisync monitor.
     if !geometry.programmable {
         center_present_frame_for_visible_start(fb, visible_start_vpos);
@@ -2344,17 +2359,6 @@ fn owner_name_from_code(code: u8) -> &'static str {
     }
 }
 
-/// Source-row sample position for presentation output row `y` of
-/// `dst_rows`: the centre-aligned bilinear position (y + 0.5) *
-/// src_rows / dst_rows - 0.5 as a whole source row plus a 0..256
-/// blend fraction toward the next row.
-#[inline]
-fn present_row_sample(y: usize, src_rows: usize, dst_rows: usize) -> (usize, u32) {
-    let pos = ((2 * y as i64 + 1) * src_rows as i64 * 128 / dst_rows as i64 - 128)
-        .clamp(0, ((src_rows - 1) as i64) << 8) as usize;
-    (pos >> 8, (pos & 0xFF) as u32)
-}
-
 fn copy_present_frame(src_fb: &[u32], src_rows: usize, frame: &mut [u8], texture_scale: usize) {
     debug_assert!(src_fb.len() >= src_rows * FB_WIDTH);
     debug_assert_eq!(
@@ -2364,24 +2368,12 @@ fn copy_present_frame(src_fb: &[u32], src_rows: usize, frame: &mut [u8], texture
     let dst_stride = texture_width(texture_scale) * 4;
     let out_rows = PRESENT_HEIGHT * texture_scale;
     // The 570 woven scanlines map onto the 537-row 4:3 presentation (times
-    // the HiDPI texture scale). Nearest-neighbour subsampling here made
-    // line thickness uneven across the picture (visible on crosshatch and
-    // dot test patterns), so resample vertically with a centre-aligned
-    // bilinear filter at full texture resolution: every source line gets
-    // equal coverage and the HiDPI rows carry the sub-line positioning.
-    let mut blended = [0u32; FB_WIDTH];
+    // the HiDPI texture scale). Select whole source rows instead of blending
+    // adjacent Amiga scanlines; normal presentation should not synthesize
+    // intermediate colours from line-to-line dithering.
     for y in 0..out_rows {
-        let (src_y0, frac) = present_row_sample(y, src_rows, out_rows);
-        let row0 = &src_fb[src_y0 * FB_WIDTH..(src_y0 + 1) * FB_WIDTH];
-        let row: &[u32] = if frac == 0 || src_y0 + 1 >= src_rows {
-            row0
-        } else {
-            let row1 = &src_fb[(src_y0 + 1) * FB_WIDTH..(src_y0 + 2) * FB_WIDTH];
-            for (d, (&a, &b)) in blended.iter_mut().zip(row0.iter().zip(row1.iter())) {
-                *d = blend_rgba(a, b, frac);
-            }
-            &blended
-        };
+        let src_y = screenshot::scaled_source_row(y, src_rows, out_rows);
+        let row = &src_fb[src_y * FB_WIDTH..(src_y + 1) * FB_WIDTH];
 
         let dst_off = y * dst_stride;
         match texture_scale {
@@ -2404,6 +2396,78 @@ fn copy_present_frame(src_fb: &[u32], src_rows: usize, frame: &mut [u8], texture
                 let dst = &mut frame[dst_off..dst_off + dst_stride];
                 for x in 0..FB_WIDTH * texture_scale {
                     dst[x * 4..x * 4 + 4].copy_from_slice(&row[x / texture_scale].to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+fn copy_window_present_frame(
+    src_fb: &[u32],
+    src_rows: usize,
+    frame: &mut [u8],
+    texture_scale: usize,
+    overscan: Overscan,
+    standard_tv_aperture: bool,
+) {
+    if overscan == Overscan::Tv && standard_tv_aperture {
+        copy_tv_aperture_to_window(src_fb, src_rows, frame, texture_scale);
+    } else {
+        copy_present_frame(src_fb, src_rows, frame, texture_scale);
+    }
+}
+
+fn copy_tv_aperture_to_window(
+    src_fb: &[u32],
+    src_rows: usize,
+    frame: &mut [u8],
+    texture_scale: usize,
+) {
+    debug_assert!(src_fb.len() >= src_rows * FB_WIDTH);
+    debug_assert_eq!(
+        frame.len(),
+        texture_width(texture_scale) * texture_height(texture_scale) * 4
+    );
+    let dst_stride = texture_width(texture_scale) * 4;
+    let out_rows = PRESENT_HEIGHT * texture_scale;
+    for y in 0..out_rows {
+        let crop_y = screenshot::scaled_source_row(y, TV_PAL_PRESENT_HEIGHT, out_rows);
+        let src_y = (TV_PAL_PRESENT_SOURCE_Y + crop_y).min(src_rows - 1);
+        let row = &src_fb[src_y * FB_WIDTH..(src_y + 1) * FB_WIDTH];
+        let dst_off = y * dst_stride;
+        match texture_scale {
+            1 => {
+                let dst = &mut frame[dst_off..dst_off + dst_stride];
+                for x in 0..FB_WIDTH {
+                    let crop_x = x
+                        .saturating_sub(TV_PAL_LIVE_PAD_X)
+                        .min(TV_PAL_PRESENT_WIDTH - 1);
+                    let src_x = (TV_PAL_PRESENT_SOURCE_X + crop_x).min(FB_WIDTH - 1);
+                    dst[x * 4..x * 4 + 4].copy_from_slice(&row[src_x].to_le_bytes());
+                }
+            }
+            2 => {
+                for x in 0..FB_WIDTH {
+                    let crop_x = x
+                        .saturating_sub(TV_PAL_LIVE_PAD_X)
+                        .min(TV_PAL_PRESENT_WIDTH - 1);
+                    let src_x = (TV_PAL_PRESENT_SOURCE_X + crop_x).min(FB_WIDTH - 1);
+                    let pixel = row[src_x];
+                    let pair = pixel as u64 | ((pixel as u64) << 32);
+                    unsafe {
+                        (frame.as_mut_ptr().add(dst_off + x * 8) as *mut u64).write_unaligned(pair);
+                    }
+                }
+            }
+            _ => {
+                let dst = &mut frame[dst_off..dst_off + dst_stride];
+                for x in 0..FB_WIDTH * texture_scale {
+                    let out_x = x / texture_scale;
+                    let crop_x = out_x
+                        .saturating_sub(TV_PAL_LIVE_PAD_X)
+                        .min(TV_PAL_PRESENT_WIDTH - 1);
+                    let src_x = (TV_PAL_PRESENT_SOURCE_X + crop_x).min(FB_WIDTH - 1);
+                    dst[x * 4..x * 4 + 4].copy_from_slice(&row[src_x].to_le_bytes());
                 }
             }
         }
@@ -7081,22 +7145,13 @@ impl App {
         // modes): the presentation resampler blends adjacent lines, so
         // per-scanline forensics need the unscaled field.
         let src_rows = self.present_rows;
-        let result = if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
-            screenshot::save(
-                path,
-                &self.present_fb[..src_rows * FB_WIDTH],
-                FB_WIDTH as u32,
-                src_rows as u32,
-            )
-        } else {
-            screenshot::save_scaled_y(
-                path,
-                &self.present_fb,
-                FB_WIDTH as u32,
-                src_rows as u32,
-                PRESENT_HEIGHT as u32,
-            )
-        };
+        let result = save_present_frame(
+            path,
+            &self.present_fb,
+            src_rows,
+            self.overscan,
+            self.present_standard_tv_aperture,
+        );
         match result {
             Ok(()) => info!("screenshot saved: {}", path.display()),
             Err(e) => warn!("screenshot save failed ({}): {e:#}", path.display()),
@@ -7162,13 +7217,15 @@ impl App {
         if crate::envcfg::flag("COPPERLINE_DUMP_RENDER_META") {
             log_frame_dump_metadata(state.dumped, &self.emu);
         }
-        match screenshot::save_scaled_y(
+        let src_rows = self.present_rows;
+        let result = save_present_frame(
             &path,
             &self.present_fb,
-            FB_WIDTH as u32,
-            self.present_rows as u32,
-            PRESENT_HEIGHT as u32,
-        ) {
+            src_rows,
+            self.overscan,
+            self.present_standard_tv_aperture,
+        );
+        match result {
             Ok(()) => {
                 state.last_saved_emulated_frame = Some(emulated_frame);
                 state.dumped += 1;
@@ -7302,6 +7359,7 @@ impl App {
         let old = std::mem::replace(&mut self.present_fb, result.presentation_fb);
         self.render_recycle_fb = old;
         self.present_rows = result.present_rows;
+        self.present_standard_tv_aperture = result.standard_tv_aperture;
         self.last_rendered_emulated_frame = Some(result.emulated_frame);
         true
     }
@@ -7430,6 +7488,8 @@ impl App {
             !geometry.programmable,
         );
         self.refresh_present_from_deinterlacer();
+        self.present_standard_tv_aperture =
+            uses_standard_pal_tv_aperture(geometry, self.present_rows, &base);
         self.last_rendered_emulated_frame = Some(emulated_frame);
         self.last_submitted_render_frame = Some(emulated_frame);
         true
@@ -7442,36 +7502,24 @@ impl App {
 /// it and so does this mask. The emulated framebuffer itself always carries
 /// the full field; this runs on the presentation copy only.
 ///
-/// The window is a realistic PAL TV visible area rather than the bare
-/// standard window: real sets show a margin of overscan, which intentional
-/// overscan displays rely on, while the deep-overscan junk the mask exists
-/// to hide sits further out. Default TV presentation keeps 24 lo-res pixels
-/// of horizontal overscan beside the standard PAL window; full overscan
-/// remains available through `Overscan::Full`. Vertically the default TV
-/// view keeps top overscan but uses a tight lower bezel: software can leave
-/// active border sprites or unfinished effects below the standard window, and
-/// a consumer crop normally hides that. `h_shift` is the horizontal centring
-/// shift already applied to the frame, so the bezel tracks the shifted picture
-/// instead of clipping its left edge; `standard_top_row` is the framebuffer row
-/// where the standard window's first line sits after vertical centring, so the
-/// bezel tracks the centred picture vertically too (a fixed line count from
-/// row 0 clipped the bottom of every standard 256-line screen by the centring
-/// margin).
-fn mask_present_frame_to_tv(fb: &mut [u32], h_shift: usize, standard_top_row: usize) {
+/// The window is a realistic PAL TV visible area rather than the bare standard
+/// window: real sets show a margin of overscan, which intentional overscan
+/// displays rely on, while the deep-overscan junk the mask exists to hide sits
+/// further out. Default TV presentation keeps 24 lo-res pixels of horizontal
+/// overscan beside the standard PAL window; full overscan remains available
+/// through `Overscan::Full`. The mask is horizontal only: vertical border
+/// colour changes are part of the Denise output and can be intentional
+/// effects, so rows above or below the standard display remain as rendered.
+/// `h_shift` is any horizontal presentation shift already applied to the
+/// frame, so the bezel tracks the shifted picture instead of clipping its left
+/// edge.
+fn mask_present_frame_to_tv(fb: &mut [u32], h_shift: usize, _standard_top_row: usize) {
     debug_assert!(fb.len() >= FB_PIXELS);
     let black = rgba(0, 0, 0);
     let (source_left, source_right) = tv_source_h_bounds();
     let left = source_left.saturating_sub(h_shift);
     let right = source_right.saturating_sub(h_shift).min(FB_WIDTH).max(left);
-    let top = standard_top_row.saturating_sub(TV_TOP_OVERSCAN_MARGIN);
-    let bottom = (standard_top_row + STANDARD_PAL_VISIBLE_LINES)
-        .saturating_sub(TV_BOTTOM_CROP_ROWS)
-        .min(FB_HEIGHT);
-    for (y, row) in fb.chunks_mut(FB_WIDTH).enumerate() {
-        if y < top || y >= bottom {
-            row.fill(black);
-            continue;
-        }
+    for row in fb.chunks_mut(FB_WIDTH) {
         row[..left].fill(black);
         if right < FB_WIDTH {
             row[right..].fill(black);
@@ -7489,8 +7537,8 @@ fn standard_window_top_row(visible_start_vpos: u32) -> usize {
 }
 
 /// Whether horizontal recentring is enabled. On unless COPPERLINE_HCENTER is
-/// set to a falsey value (0/false/off/no), so the standard display can be
-/// presented exactly as rendered when debugging alignment.
+/// set to a falsey value (0/false/off/no), so full-overscan presentation can
+/// show the standard display exactly as rendered when debugging alignment.
 fn hcenter_enabled() -> bool {
     match crate::envcfg::var("COPPERLINE_HCENTER") {
         Some(v) => !matches!(
@@ -7553,19 +7601,13 @@ fn presentation_source_y_offset(visible_start_vpos: u32) -> usize {
 
 fn presentation_h_shift_for(snapshot: &RenderRegisterSnapshot, overscan: Overscan) -> usize {
     match overscan {
-        // TV mode masks to a consumer-visible aperture, so center that aperture
-        // in the presentation texture even if the raw frame fetches into deeper
-        // horizontal overscan.
-        Overscan::Tv => tv_standard_h_shift(),
+        // TV mode is an aperture over the emulated framebuffer, matching the
+        // fixed source cutout used by reference emulators. Do not copy pixels
+        // sideways here: a standard hi-res screen already occupies the right
+        // edge of Copperline's 716-pixel cutout.
+        Overscan::Tv => 0,
         Overscan::Full => bitplane::present_h_shift_for(snapshot),
     }
-}
-
-fn tv_standard_h_shift() -> usize {
-    let (source_left, source_right) = tv_source_h_bounds();
-    let source_width = source_right.saturating_sub(source_left);
-    let centered_left = FB_WIDTH.saturating_sub(source_width) / 2;
-    source_left.saturating_sub(centered_left)
 }
 
 fn tv_source_h_bounds() -> (usize, usize) {
@@ -7912,33 +7954,85 @@ fn parse_u8(s: &str) -> Option<u8> {
     }
 }
 
+fn save_present_frame(
+    path: &std::path::Path,
+    present_fb: &[u32],
+    src_rows: usize,
+    overscan: Overscan,
+    standard_tv_aperture: bool,
+) -> anyhow::Result<()> {
+    if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
+        return screenshot::save(
+            path,
+            &present_fb[..src_rows * FB_WIDTH],
+            FB_WIDTH as u32,
+            src_rows as u32,
+        );
+    }
+
+    if overscan == Overscan::Tv && standard_tv_aperture {
+        return screenshot::save_cropped_clamped(
+            path,
+            present_fb,
+            FB_WIDTH,
+            src_rows,
+            TV_PAL_PRESENT_SOURCE_X,
+            TV_PAL_PRESENT_SOURCE_Y,
+            TV_PAL_PRESENT_WIDTH,
+            TV_PAL_PRESENT_HEIGHT,
+        );
+    }
+
+    screenshot::save_scaled_y(
+        path,
+        present_fb,
+        FB_WIDTH as u32,
+        src_rows as u32,
+        PRESENT_HEIGHT as u32,
+    )
+}
+
+fn is_standard_pal_presentation(geometry: FrameGeometry, src_rows: usize) -> bool {
+    !geometry.programmable && geometry.frame_lines >= 312 && src_rows == OUT_HEIGHT
+}
+
+fn uses_standard_pal_tv_aperture(
+    geometry: FrameGeometry,
+    src_rows: usize,
+    snapshot: &RenderRegisterSnapshot,
+) -> bool {
+    is_standard_pal_presentation(geometry, src_rows)
+        && bitplane::uses_standard_horizontal_content(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::ui::{Panel, UiControl};
     use super::{
         bar_layout, center_present_frame_for_visible_start, center_present_frame_horizontally,
         control_at, copperline_icon_image, copperline_logo_image, copy_present_frame,
-        draw_status_bar, fdd_track_counter_rect, fdd_track_digit_rect,
+        copy_window_present_frame, draw_status_bar, fdd_track_counter_rect, fdd_track_digit_rect,
         host_shortcut_modifier_pressed, host_to_amiga_rawkey, joystick_mode_uses_keyboard,
         joystick_toggle_rect, keyboard_joystick_key_for, led_row_rect, mask_present_frame_to_tv,
         paint_test_screen, parse_amiga_key, pause_button_rect, power_button_rect,
-        present_row_sample, presentation_source_y_offset, raw_device_qualifier_family_held,
+        presentation_h_shift_for, presentation_source_y_offset, raw_device_qualifier_family_held,
         raw_device_qualifier_rawkey, rawkey_is_held, rawkey_transition_is_duplicate,
         reboot_button_rect, repeated_main_key_should_drop, rgba, shot_button_rect,
         should_render_emulated_frame, standard_window_top_row, status_with_latched_fdd_track,
         take_integral_mouse_delta, texture_height, texture_width, tv_source_h_bounds,
-        tv_standard_h_shift, volume_percent_from_pos, volume_slider_track_rect, BarControl,
-        DriveBar, JoystickInputMode, KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar,
-        StatusBarView, ToolPanelKind, AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT,
-        AMIGA_RAWKEY_RIGHT_ALT, AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED,
-        CD_BODY, CD_LED_OFF, CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF,
-        FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF,
-        POWER_LED_ON, PRESENT_HEIGHT, STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS,
-        STATUS_BG, TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
+        volume_percent_from_pos, volume_slider_track_rect, BarControl, DriveBar, JoystickInputMode,
+        KeyboardJoystickHeld, KeyboardJoystickKey, MediaBar, StatusBarView, ToolPanelKind,
+        AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT, AMIGA_RAWKEY_RIGHT_ALT,
+        AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF,
+        CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF,
+        HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
+        STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
+        TRACK_SEGMENT_ON, TV_PAL_LIVE_PAD_X, TV_PAL_PRESENT_HEIGHT, TV_PAL_PRESENT_SOURCE_X,
+        TV_PAL_PRESENT_SOURCE_Y, TV_PAL_PRESENT_WIDTH, VOLUME_FILL, VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
-    use crate::bus::FrontPanelStatus;
-    use crate::config::WarpSpeed;
+    use crate::bus::{FrontPanelStatus, RenderRegisterSnapshot};
+    use crate::config::{Overscan, WarpSpeed};
     use crate::video::{FB_HEIGHT, FB_PIXELS, FB_WIDTH};
     use std::cell::RefCell;
     use std::path::PathBuf;
@@ -9135,38 +9229,88 @@ mod tests {
     }
 
     #[test]
-    fn present_row_sampling_gives_every_source_line_equal_coverage() {
+    fn tv_window_copy_centres_reference_aperture_in_live_texture() {
+        use crate::video::deinterlace::{OUT_HEIGHT, OUT_PIXELS};
+        let scale = 1;
+        let mut src = vec![0u32; OUT_PIXELS];
+        let row_y = TV_PAL_PRESENT_SOURCE_Y;
+        let standard_left = crate::video::bitplane::STANDARD_VISIBLE_X0;
+        let standard_right = standard_left + 320 * 2 - 1;
+        let left_marker = 0x1122_3344u32;
+        let right_marker = 0x5566_7788u32;
+        let left_edge = 0x99AA_BBCCu32;
+        let right_edge = 0xDDEE_FF00u32;
+
+        src[row_y * FB_WIDTH + TV_PAL_PRESENT_SOURCE_X] = left_edge;
+        src[row_y * FB_WIDTH + FB_WIDTH - 1] = right_edge;
+        src[row_y * FB_WIDTH + standard_left] = left_marker;
+        src[row_y * FB_WIDTH + standard_right] = right_marker;
+
+        let mut frame = vec![0u8; texture_width(scale) * texture_height(scale) * 4];
+        copy_window_present_frame(&src, OUT_HEIGHT, &mut frame, scale, Overscan::Tv, true);
+
+        let dst_standard_left = TV_PAL_LIVE_PAD_X + (standard_left - TV_PAL_PRESENT_SOURCE_X);
+        let dst_standard_right = dst_standard_left + 320 * 2 - 1;
+        assert_eq!(dst_standard_left, FB_WIDTH - 1 - dst_standard_right);
+        assert_eq!(
+            pixel(&frame, dst_standard_left, 0, scale),
+            left_marker.to_le_bytes()
+        );
+        assert_eq!(
+            pixel(&frame, dst_standard_right, 0, scale),
+            right_marker.to_le_bytes()
+        );
+        assert_eq!(pixel(&frame, 0, 0, scale), left_edge.to_le_bytes());
+        assert_eq!(
+            pixel(&frame, FB_WIDTH - 1, 0, scale),
+            right_edge.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn tv_window_copy_preserves_true_overscan_fetches() {
+        use crate::video::deinterlace::{OUT_HEIGHT, OUT_PIXELS};
+        let scale = 1;
+        let mut src = vec![0u32; OUT_PIXELS];
+        let left_overscan = 0x1122_3344u32;
+        let standard_crop_edge = 0x5566_7788u32;
+
+        src[0] = left_overscan;
+        src[TV_PAL_PRESENT_SOURCE_X] = standard_crop_edge;
+
+        let mut frame = vec![0u8; texture_width(scale) * texture_height(scale) * 4];
+        copy_window_present_frame(&src, OUT_HEIGHT, &mut frame, scale, Overscan::Tv, false);
+
+        assert_eq!(pixel(&frame, 0, 0, scale), left_overscan.to_le_bytes());
+        assert_ne!(pixel(&frame, 0, 0, scale), standard_crop_edge.to_le_bytes());
+    }
+
+    #[test]
+    fn present_row_selection_covers_every_source_line_at_hidpi() {
         use crate::video::deinterlace::OUT_HEIGHT;
-        // With nearest-neighbour subsampling, 33 of the 570 woven source
-        // rows received zero presentation coverage and the rest uneven
-        // amounts (visibly uneven crosshatch/dot test patterns). The
-        // bilinear sampling must spread coverage evenly: accumulate each
-        // source row's blend weight over all HiDPI output rows.
+        // The live window writes a HiDPI texture before the OS compositor
+        // scales it. At that output size, every woven source row should be
+        // represented by one or more whole texture rows without mixing
+        // neighbouring Amiga scanlines.
         let out_rows = PRESENT_HEIGHT * 2;
-        let mut weight = vec![0f64; OUT_HEIGHT];
+        let mut hits = vec![0usize; OUT_HEIGHT];
+        let mut prev = 0usize;
         for y in 0..out_rows {
-            let (src_y0, frac) = present_row_sample(y, OUT_HEIGHT, out_rows);
-            assert!(src_y0 < OUT_HEIGHT);
-            assert!(frac < 256);
-            weight[src_y0] += (256 - frac) as f64 / 256.0;
-            if frac > 0 {
-                weight[(src_y0 + 1).min(OUT_HEIGHT - 1)] += frac as f64 / 256.0;
-            }
+            let src_y = crate::screenshot::scaled_source_row(y, OUT_HEIGHT, out_rows);
+            assert!(src_y < OUT_HEIGHT);
+            assert!(src_y >= prev);
+            hits[src_y] += 1;
+            prev = src_y;
         }
-        let expected = out_rows as f64 / OUT_HEIGHT as f64;
-        for (y, w) in weight.iter().enumerate() {
+        for (y, count) in hits.iter().enumerate() {
             assert!(
-                *w > 0.0,
+                *count > 0,
                 "source row {y} dropped from the presentation entirely"
             );
-            // Edge rows are clamped toward the border; interior rows must
-            // sit close to the uniform coverage expectation.
-            if y > 0 && y + 1 < OUT_HEIGHT {
-                assert!(
-                    (*w - expected).abs() < 0.51,
-                    "source row {y} coverage {w} deviates from uniform {expected}"
-                );
-            }
+            assert!(
+                *count <= 2,
+                "source row {y} has unexpectedly thick presentation coverage: {count}"
+            );
         }
     }
 
@@ -9210,15 +9354,32 @@ mod tests {
     }
 
     #[test]
-    fn tv_horizontal_centering_centers_the_tv_aperture() {
-        let shift = tv_standard_h_shift();
-        let (source_left, source_right) = tv_source_h_bounds();
-        let source_width = source_right - source_left;
-        let centered_left = (FB_WIDTH - source_width) / 2;
-        let centered_right = centered_left + source_width;
+    fn tv_presentation_keeps_standard_hires_framebuffer_origin() {
+        let snapshot = RenderRegisterSnapshot {
+            bplcon0: 0x0200,
+            diwstrt: 0x0581,
+            diwstop: 0x40C1,
+            ddfstrt: 0x003C,
+            ddfstop: 0x00D0,
+            ..RenderRegisterSnapshot::default()
+        };
 
-        assert_eq!(source_left - shift, centered_left);
-        assert_eq!(source_right - shift, centered_right);
+        assert_eq!(presentation_h_shift_for(&snapshot, Overscan::Tv), 0);
+    }
+
+    #[test]
+    fn tv_pal_crop_centres_standard_display_in_aperture() {
+        let standard_left = crate::video::bitplane::STANDARD_VISIBLE_X0;
+        let standard_right = standard_left + 640;
+
+        assert_eq!(TV_PAL_PRESENT_WIDTH, 692);
+        assert_eq!(TV_PAL_PRESENT_HEIGHT, 540);
+        assert_eq!(standard_left - TV_PAL_PRESENT_SOURCE_X, 26);
+        assert_eq!(
+            TV_PAL_PRESENT_WIDTH - (standard_right - TV_PAL_PRESENT_SOURCE_X),
+            26
+        );
+        assert_eq!(TV_PAL_PRESENT_SOURCE_Y, 18);
     }
 
     #[test]
@@ -9240,41 +9401,38 @@ mod tests {
         let marker = rgba(0x12, 0x34, 0x56);
         let mut fb = vec![marker; FB_PIXELS];
 
-        // A standard screen centred by the presentation: window top at
+        // A standard screen after vertical presentation: window top at
         // framebuffer row 14 (the standard centring offset), with the TV
-        // aperture centred horizontally.
+        // aperture anchored to the emulated framebuffer.
         let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
-        let shift = tv_standard_h_shift();
+        let shift = 0;
         mask_present_frame_to_tv(&mut fb, shift, std_top);
 
         let (source_left, source_right) = tv_source_h_bounds();
         let left = source_left - shift;
         let right = source_right - shift;
         let mid_row = std_top + 100;
+        assert_eq!(right, FB_WIDTH);
         assert_eq!(fb[mid_row * FB_WIDTH + left - 1], rgba(0, 0, 0));
         assert_eq!(fb[mid_row * FB_WIDTH + left], marker);
         assert_eq!(fb[mid_row * FB_WIDTH + right - 1], marker);
-        assert_eq!(fb[mid_row * FB_WIDTH + right], rgba(0, 0, 0));
-        assert_eq!(fb[mid_row * FB_WIDTH + FB_WIDTH - 1], rgba(0, 0, 0));
+        assert_eq!(fb[mid_row * FB_WIDTH + FB_WIDTH - 1], marker);
         // The deep left overscan margin stays hidden.
         assert_eq!(fb[mid_row * FB_WIDTH], rgba(0, 0, 0));
-        // The vertical TV window tracks the centred standard window: 8
-        // lines of top overscan remain visible, while the bottom is cropped
-        // one source row inside the standard window like a tight lower bezel.
-        let top = std_top - 8;
-        assert_eq!(fb[(top - 1) * FB_WIDTH + left], rgba(0, 0, 0));
-        assert_eq!(fb[top * FB_WIDTH + left], marker);
+        // Vertical border rows remain visible; the TV mask only hides the
+        // deep horizontal margins.
+        assert_eq!(fb[(std_top - 1) * FB_WIDTH + left - 1], rgba(0, 0, 0));
+        assert_eq!(fb[(std_top - 1) * FB_WIDTH + left], marker);
         let bottom = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
-        assert_eq!(fb[(bottom - 1) * FB_WIDTH + left], marker);
-        assert_eq!(fb[bottom * FB_WIDTH + left], rgba(0, 0, 0));
+        assert_eq!(fb[bottom * FB_WIDTH + left - 1], rgba(0, 0, 0));
+        assert_eq!(fb[bottom * FB_WIDTH + left], marker);
     }
 
     #[test]
-    fn tv_horizontal_centering_preserves_visible_left_overscan_margin() {
+    fn tv_mask_preserves_visible_left_overscan_margin_without_shifting() {
         let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
         let mid_row = std_top + 100;
         let (source_left, _) = tv_source_h_bounds();
-        let shift = tv_standard_h_shift();
         let marker = rgba(0x12, 0x34, 0x56);
         let hidden_marker = rgba(0x98, 0x76, 0x54);
         let mut fb = vec![rgba(0, 0, 0); FB_PIXELS];
@@ -9282,14 +9440,10 @@ mod tests {
         fb[mid_row * FB_WIDTH + source_left - 1] = hidden_marker;
         fb[mid_row * FB_WIDTH + source_left] = marker;
 
-        center_present_frame_horizontally(&mut fb, shift);
-        mask_present_frame_to_tv(&mut fb, shift, std_top);
+        mask_present_frame_to_tv(&mut fb, 0, std_top);
 
-        assert_eq!(
-            fb[mid_row * FB_WIDTH + source_left - shift - 1],
-            rgba(0, 0, 0)
-        );
-        assert_eq!(fb[mid_row * FB_WIDTH + source_left - shift], marker);
+        assert_eq!(fb[mid_row * FB_WIDTH + source_left - 1], rgba(0, 0, 0));
+        assert_eq!(fb[mid_row * FB_WIDTH + source_left], marker);
     }
 
     #[test]
@@ -9314,6 +9468,25 @@ mod tests {
     }
 
     #[test]
+    fn tv_overscan_mask_preserves_vertical_border_rows() {
+        let marker = rgba(0x12, 0x34, 0x56);
+        let mut fb = vec![marker; FB_PIXELS];
+        let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
+        let shift = 0;
+        let (source_left, source_right) = tv_source_h_bounds();
+        let left = source_left - shift;
+        let right = source_right - shift;
+        let bottom = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
+
+        mask_present_frame_to_tv(&mut fb, shift, std_top);
+
+        assert_eq!(right, FB_WIDTH);
+        assert_eq!(fb[bottom * FB_WIDTH + left - 1], rgba(0, 0, 0));
+        assert_eq!(fb[bottom * FB_WIDTH + left], marker);
+        assert_eq!(fb[bottom * FB_WIDTH + right - 1], marker);
+    }
+
+    #[test]
     fn tv_overscan_mask_tracks_overscan_visible_starts() {
         // A deep-overscan frame (visible start above the standard window):
         // the centring shift is consumed, the standard window sits lower in
@@ -9327,13 +9500,14 @@ mod tests {
         mask_present_frame_to_tv(&mut fb, 0, std_top);
 
         let (left, _) = tv_source_h_bounds();
-        assert_eq!(fb[(std_top - 8 - 1) * FB_WIDTH + left], rgba(0, 0, 0));
-        assert_eq!(fb[(std_top - 8) * FB_WIDTH + left], marker);
+        assert_eq!(
+            fb[std_top.saturating_sub(1) * FB_WIDTH + left - 1],
+            rgba(0, 0, 0)
+        );
+        assert_eq!(fb[std_top.saturating_sub(1) * FB_WIDTH + left], marker);
         let bottom = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
-        assert_eq!(fb[(bottom - 1) * FB_WIDTH + left], marker);
-        if bottom < FB_HEIGHT {
-            assert_eq!(fb[bottom * FB_WIDTH + left], rgba(0, 0, 0));
-        }
+        assert_eq!(fb[bottom * FB_WIDTH + left - 1], rgba(0, 0, 0));
+        assert_eq!(fb[bottom * FB_WIDTH + left], marker);
     }
 
     #[test]

@@ -54,17 +54,23 @@ pub struct FrameGeometry {
     pub visible_lines: usize,
     /// Line length in colour clocks (HTOTAL+1 under VARBEAMEN, else 227).
     pub line_cck: u32,
+    /// Beam lines in the frame this geometry describes. This is transient
+    /// render metadata: older save states did not carry it, and the loader
+    /// re-derives it from Agnus after restore.
+    #[serde(skip)]
+    pub frame_lines: u32,
     /// BPLCON0.LACE at the frame start (field weaving).
     pub lace: bool,
 }
 
 impl FrameGeometry {
-    pub fn standard(visible_start_vpos: u32, lace: bool) -> Self {
+    pub fn standard(visible_start_vpos: u32, frame_lines: u32, lace: bool) -> Self {
         Self {
             programmable: false,
             visible_start_vpos,
             visible_lines: FB_HEIGHT,
             line_cck: 227,
+            frame_lines,
             lace,
         }
     }
@@ -76,8 +82,8 @@ impl FrameGeometry {
 pub const PRESENT_HEIGHT: usize = FB_WIDTH * 3 / 4;
 
 /// Blend two RGBA pixels channel-wise: frac=0 returns a, frac=256
-/// returns b. Used by the bilinear vertical resamplers in the window
-/// presentation path and the screenshot writer.
+/// returns b. Used by horizontal resampling for programmable scan
+/// geometry.
 #[inline]
 pub fn blend_rgba(a: u32, b: u32, frac: u32) -> u32 {
     let inv = 256 - frac;

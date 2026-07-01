@@ -52,8 +52,9 @@ loads BPL1DAT.
 Once that first DMA word is visible, the renderer samples the enabled
 bitplanes from the complete latched word; it does not expose the first word
 plane-by-plane according to each plane's individual DMA slot.
-If a manual BPL1DAT write starts a word before that DMA load point, replay
-stops the manual word where the DMA word replaces Denise's shifter.
+If a manual BPL1DAT write starts a word before a later DMA BPL1DAT load
+point, replay stops the manual word where that DMA word replaces Denise's
+shifter.
 BPLCON1-delayed samples at the left edge of a contiguous bitplane-DMA block
 come from the previous line's shifter tail when current-line DMA is already
 feeding Denise at the display edge. Block-start lines, and lines whose output
@@ -120,21 +121,37 @@ The mapping from beam coordinates to framebuffer x is anchored by
 constants that encode the hardware's fetch-to-display pipeline delays --
 register writes, palette writes, and bitplane data each land at their own
 documented offset, and the bitplane fetch reference differs between lo-res
-and hi-res. Wide-FMODE DMA fetches start from the revision-masked DDFSTRT
-comparator value and complete whole units, but the displayed shifter origin
-is still quantized by the FMODE fetch gulp; the renderer keeps those two
-effects separate. These
-anchors were calibrated against real-hardware captures and other
-emulators; `COPPERLINE_HCENTER=0` and `COPPERLINE_OVERSCAN=full` help when
-re-checking them.
+and hi-res. A standard hi-res `$81` DIW with `$3C` DDF starts its 640 fetched
+pixels at the display-window edge; there is no four-pixel leading border
+inside the window. Wide-FMODE DMA fetches start from the revision-masked
+DDFSTRT comparator value and complete whole units, but the displayed shifter
+origin is still quantized by the FMODE fetch gulp; the renderer keeps those
+two effects separate. Denise's output line starts at the horizontal blanking
+start counter; COLORxx writes before that counter are the wrapped tail of
+the previous output row, while the palette value they load is still the
+base colour for the following row. These anchors were calibrated against
+real-hardware captures and other emulators; `COPPERLINE_HCENTER=0` and
+`COPPERLINE_OVERSCAN=full` help when re-checking them.
+
+For FMODE=0 lo-res, the one-sample low-res phase bias is applied on both
+standard and late fetch origins. If a late DDF row completes exactly at
+DIWSTOP, the final visible DIW sample still includes undelayed planes; BPLCON1
+delay only retaps the per-plane shifters, it does not make the undelayed planes
+drop one sample before the display window closes.
 
 The framebuffer is a 716x285 overscan field (lo-res pixels doubled
 horizontally). It captures deep overscan on all sides.
+For standard 15 kHz PAL/NTSC fields, row zero is anchored at Copperline's
+fixed overscan top rather than the current DIWSTRT vertical value. DIW still
+acts as the hardware display-window flip-flop: it decides when the frame's
+chip-RAM snapshot and bitplane DMA capture begin, but changing DIWSTRT later
+in the field does not recenter the already-visible top border. Programmable
+VARBEAMEN scans instead use their programmed visible window as the render
+origin.
 
 Two vertical edge cases the replay honours:
 
-- A display window can open above the captured canvas (the canvas top
-  follows DIWSTRT down to a minimum start line). Bitplane pointers are
+- A display window can open above the captured canvas. Bitplane pointers are
   pre-advanced for those clipped rows by replaying the frame's
   BPLCON0/DMACON writes line by line, so only lines where bitplane DMA
   was actually enabled consume a row -- the CDTV boot screen opens its
@@ -152,8 +169,8 @@ Two vertical edge cases the replay honours:
 
 At frame end, `Bus::begin_new_beam_frame` freezes the just-finished frame:
 the render-event journal, chip-RAM snapshot, captured bitplane/sprite DMA
-rows, palette split, display geometry, visible start line, and Agnus
-programmable blanking latches become the source for
+rows, palette split, display geometry, frame line count, framebuffer start
+line, and Agnus programmable blanking latches become the source for
 `RenderInput::from_bus`. `render_from_input` consumes only that owned
 bundle, so the main thread can start emulating frame N+1 while the worker
 renders frame N.
@@ -234,19 +251,31 @@ framebuffer):
 - **Overscan mask**: `[display] overscan = "tv"` masks deep-overscan
   margins in black like a CRT bezel; `"full"` shows the entire field. The
   default TV mask is presentation-only: horizontally it keeps 24 lo-res
-  pixels of consumer-visible overscan beside the standard display, and it is
-  asymmetric vertically, keeping a little top overscan but cropping the lower
-  edge one source row inside the standard display bottom. This matches the
-  common case where lower-border sprite/effect junk is hidden by the display
-  crop.
-- **Horizontal recentring**: a standard (non-overscan) display is recentred
-  for presentation, since the framebuffer captures a deep slab of left
-  overscan that would otherwise push the picture right of centre compared
-  with vAmiga/FS-UAE. The decision keys off the bitplane data the display
-  actually fetches (DDF), not just the DIW window: a demo that opens DIW wide
-  open around a standard-width picture (Virtual Dreams' "Absolute Inebriation")
-  is still recentred, while a display that genuinely fetches bitplane data into
-  the overscan border is left exactly as rendered.
+  pixels of consumer-visible overscan beside the standard display and blacks
+  only the deeper horizontal margins. TV mode keeps the framebuffer's fixed
+  horizontal source origin, matching the way vAmiga and FS-UAE crop from their
+  rendered source texture instead of copying the picture sideways. Vertical
+  border colour changes remain visible because they are part of the Denise
+  output and are often deliberate border effects.
+- **PAL TV PNG aperture**: normal screenshots and `--dump-frames` in TV mode
+  crop standard horizontal content to a 692x540 aperture. The horizontal crop
+  keeps a 640-pixel standard display centred with 26 pixels of visible overscan
+  on both sides; vertically it keeps the PAL title-bar/top-border position
+  aligned with the reference-emulator crop. The live window keeps its 716-pixel
+  4:3 texture for the status bar and scaling path, but centres the same TV
+  aperture inside that texture instead of showing the raw framebuffer origin.
+  True horizontal overscan fetches are not cropped to this aperture: they stay
+  on the full-width TV path so intentional border content remains visible.
+  `COPPERLINE_SHOT_RAW=1` bypasses the PNG crop and writes the raw 716x570
+  woven framebuffer.
+- **Full-overscan horizontal recentring**: in `"full"` presentation, a standard
+  (non-overscan) display is recentred because the framebuffer captures a deep
+  slab of left overscan that would otherwise push the picture right of centre.
+  The decision keys off the bitplane data the display actually fetches (DDF),
+  not just the DIW window: a demo that opens DIW wide around a standard-width
+  picture (Virtual Dreams' "Absolute Inebriation") is still recentred, while a
+  display that genuinely fetches bitplane data into the overscan border is left
+  exactly as rendered.
 
 `ui.rs` implements the status bar widgets, the pop-up menu, the smaller
 overlay panels (About, Shortcuts, Calibration), and the shared debugger/tool
@@ -261,11 +290,14 @@ against a real emulator instance in the unit tests.
 
 `--screenshot-after` and `--dump-frames` render through the identical
 pipeline with the window hidden; PNGs are scaled to the same geometry the
-window would present. Because the default render worker may be one frame
-behind, these paths wait for the worker result matching the target emulated
-frame before writing the PNG. The [headless debugger](../debugger/headless)
-`COPPERLINE_DBG_SHOT` hook reuses the same path to capture the last
-completed frame at a breakpoint.
+window would present unless `COPPERLINE_SHOT_RAW=1` requests the unscaled
+woven framebuffer. The default vertical presentation scale selects whole
+source rows rather than blending adjacent Amiga scanlines, matching the
+normal unfiltered display path. Because the default render worker may be one
+frame behind, these paths wait for the worker result matching the target
+emulated frame before writing the PNG. The
+[headless debugger](../debugger/headless) `COPPERLINE_DBG_SHOT` hook reuses
+the same path to capture the last completed frame at a breakpoint.
 
 ## Video recording (`recorder.rs`)
 
@@ -281,11 +313,10 @@ Capture is locked to the emulated timeline, not the host clock. Paula
 carries an optional capture tap that collects every mixed stereo frame
 (before the master output volume); the window drains it once per
 emulated frame and, when the frame loop completed a new emulated frame,
-waits for the matching presentation buffer before pushing it through the
-same `scale_y_into` presentation resample as screenshots. At finish the
-AVI's video rate/scale is patched from the exact frames-to-audio-samples
-ratio, so
-a nominal "50 fps" label never drifts against PAL's true field rate and
-warp-speed captures play back at normal speed. The REC badge, status
-bar, OSD, and menus are drawn into the presentation texture after
-capture, so they never appear in the file.
+waits for the matching presentation buffer before pushing it through the same
+`scale_y_into` source-row presentation scale as the live window. At finish the
+AVI's video rate/scale is patched from the exact frames-to-audio-samples ratio,
+so a nominal "50 fps" label never drifts against PAL's true field rate and
+warp-speed captures play back at normal speed. The REC badge, status bar, OSD,
+and menus are drawn into the presentation texture after capture, so they never
+appear in the file.

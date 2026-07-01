@@ -210,10 +210,10 @@ video = "PAL"
 # slave = "data.hdf"
 
 
-# Presentation options. overscan: "tv" (default; mask deep overscan like
-# a CRT bezel) or "full". phosphor: CRT persistence fraction (0.0-0.95,
-# default 0.0): fuses field-rate flicker/dither like a real tube at the
-# cost of a slight motion trail.
+# Presentation options. overscan: "tv" (default; mask deep horizontal
+# overscan like a CRT bezel) or "full". phosphor: CRT persistence
+# fraction (0.0-0.95, default 0.0): fuses field-rate flicker/dither like
+# a real tube at the cost of a slight motion trail.
 # [display]
 # overscan = "tv"
 # phosphor = 0.4

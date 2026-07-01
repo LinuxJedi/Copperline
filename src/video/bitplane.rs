@@ -15,7 +15,9 @@ use crate::bus::{
     BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus, CapturedBitplaneRow,
     CapturedSpriteLine, HeldSpriteLine, RenderRegisterSnapshot, VideoRenderFrameTiming,
 };
-use crate::chipset::agnus::{ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, AgnusRevision};
+use crate::chipset::agnus::{
+    ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, AgnusRevision, COLORCLOCKS_PER_LINE,
+};
 #[cfg(test)]
 use crate::chipset::denise::BPLCON3_PF2OF_DEFAULT;
 use crate::chipset::denise::{
@@ -48,11 +50,11 @@ const STANDARD_DIW_HSTART: i32 = 0x81;
 // phase: a hi-res fetch slot delivers its word to Denise's shifter on a
 // different beam edge than a lo-res slot, so the reference the renderer uses to
 // place the first fetched pixel differs by resolution. Lo-res references $80;
-// hi-res references $83 (verified against vAmiga: low-res HAM playfields align
-// with their bezel sprites at $80, while hi-res boot-screen text aligns at $83).
+// hi-res references $81 so a standard $81/$3C display starts its 640 fetched
+// pixels at the display-window edge instead of clipping the right edge.
 // See `fetch_reference` below.
 const DIW_HSTART_FETCH_REFERENCE_LORES: i32 = 0x80;
-const DIW_HSTART_FETCH_REFERENCE_HIRES: i32 = 0x83;
+const DIW_HSTART_FETCH_REFERENCE_HIRES: i32 = 0x81;
 // Register/copper-write x=0 anchor, in colour clocks. Moved left by 8 colour
 // clocks in lockstep with DIW_HSTART_FB0 (16 lo-res pixels) so register writes
 // and bitplane pixels still register against each other after widening.
@@ -76,6 +78,11 @@ const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// alignment, sprite arming, or a missed write-domain delay, not this final
 /// colour-output anchor.
 const COLOR_WRITE_HPOS_FB0: i32 = 0x35;
+/// Denise's texture/output line starts at the hblank-start counter value. Beam
+/// positions before this are the wrapped tail of the previous output line, so
+/// a colour write there must draw at the far right of the previous row while
+/// still updating the palette seen by the following row.
+const DENISE_HBLANK_START_HPOS: u32 = 0x12;
 /// AGA BPLCON4's low sprite-palette byte follows Lisa's sprite colour lookup
 /// path, which reaches sprite output earlier than ordinary COLORxx palette
 /// writes. Keep it separate from COLOR replay so copper palette gradients stay
@@ -174,6 +181,30 @@ pub fn present_h_shift_for(snapshot: &RenderRegisterSnapshot) -> usize {
         return 0;
     }
     present_h_shift(eff_start as u16, eff_stop as u16)
+}
+
+/// Whether a TV-style standard PAL aperture can crop the horizontal borders
+/// without cutting fetched playfield content. Wide DIW alone is not enough to
+/// reject the aperture: some software opens DIW into the border around a
+/// standard-width fetch and only exposes COLOR0 there. A fetch that reaches
+/// outside the standard window is true horizontal overscan and must stay on
+/// the full framebuffer.
+pub(crate) fn uses_standard_horizontal_content(snapshot: &RenderRegisterSnapshot) -> bool {
+    let control = ControlState::from_render_state(&RenderState::from_snapshot(*snapshot));
+    let diw_start = control.diw_h_start() as i32;
+    let mut diw_stop = control.diw_h_stop() as i32;
+    if diw_stop <= diw_start {
+        diw_stop += 0x100;
+    }
+    if diw_start >= STANDARD_DIW_HSTART && diw_stop <= STANDARD_DIW_HSTOP {
+        return true;
+    }
+    let Some((content_start, content_stop)) = control.bitplane_content_window_h() else {
+        return false;
+    };
+    let eff_start = diw_start.max(content_start);
+    let eff_stop = diw_stop.min(content_stop);
+    eff_start >= STANDARD_DIW_HSTART && eff_stop <= STANDARD_DIW_HSTOP && eff_stop > eff_start
 }
 const BPLCON0_ECSENA: u16 = 1 << 0;
 const BPLCON0_SHRES: u16 = 1 << 6;
@@ -529,27 +560,12 @@ impl ControlState {
     }
 
     /// Beam hpos the renderer treats as the origin for the first fetched
-    /// bitplane pixel. Hi-res delivers fetched words to Denise's shifter 3
-    /// colour clocks earlier in phase than lo-res, so the two resolutions
-    /// reference different anchors (see DIW_HSTART_FETCH_REFERENCE_* docs).
-    /// Super-hi-res (ECS, effectively unused under OCS) keeps the lo-res
-    /// anchor.
+    /// bitplane pixel. Hi-res and lo-res use separate references because their
+    /// fetch slots load Denise's shifter on different beam phases. Super-hi-res
+    /// (ECS, effectively unused under OCS) keeps the lo-res anchor.
     fn fetch_reference(&self) -> i32 {
         if self.hires() {
-            // Wide-FMODE hi-res fetches deliver their gulp to the shifter
-            // one colour clock earlier than the single-word fetch the $83
-            // reference was calibrated on: Lisa's bitplane delay is
-            // fetch-width-dependent (the classic WinUAE/FS-UAE
-            // `delayoffset` is computed from the fetch mode). With the
-            // FMODE=0 reference, AGA hi-res screens (system software,
-            // FMODE=3, DIW $81, DDFSTRT $38) sat 2 lo-res pixels right of
-            // FS-UAE: a colour-0 stripe inside the window's left edge and
-            // the bitmap's last pixels clipped at the right.
-            if self.fetch_quantum() > 1 {
-                DIW_HSTART_FETCH_REFERENCE_HIRES - 2
-            } else {
-                DIW_HSTART_FETCH_REFERENCE_HIRES
-            }
+            DIW_HSTART_FETCH_REFERENCE_HIRES
         } else {
             DIW_HSTART_FETCH_REFERENCE_LORES
         }
@@ -834,6 +850,23 @@ impl ControlState {
             ((diw_h_start as i32 - self.fetch_reference()) * 2) / pixel_repeat as i32;
         let visible_phase = display_phase_native.max(0) as usize;
         native_x_offset.saturating_sub(visible_phase.min(native_x_offset))
+    }
+
+    fn holds_final_lowres_fetch_sample_at_diwstop(&self) -> bool {
+        if self.hires() || self.shres() || self.fetch_quantum() != 1 {
+            return false;
+        }
+        // DDFSTOP requests bitplane DMA shutdown; the sequencer drops BPRUN
+        // at the fetch-unit boundary. A late FMODE=0 low-res row whose
+        // completed fetch content ends exactly at DIWSTOP still presents the
+        // final latched word for the last DIW sample, without moving the
+        // row's fetch origin.
+        let ddf_start = effective_ddf_start_hpos(self.agnus_revision, false, self.ddfstrt);
+        if ddf_start <= 0x0038 {
+            return false;
+        }
+        self.bitplane_content_window_h()
+            .is_some_and(|(_content_start, content_stop)| content_stop == self.diw_h_stop() as i32)
     }
 
     fn fetch_origin_native_shift(&self, diw_h_start: u16, pixel_repeat: usize) -> i32 {
@@ -1156,6 +1189,17 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
         min_fetch_x: usize,
         native_x: usize,
     ) -> DeniseBitplaneSample {
+        self.sample_prepared_with_final_fetch_hold(nplanes, delays, min_fetch_x, native_x, false)
+    }
+
+    fn sample_prepared_with_final_fetch_hold(
+        &self,
+        nplanes: usize,
+        delays: &[usize; 8],
+        min_fetch_x: usize,
+        native_x: usize,
+        hold_final_fetch_sample: bool,
+    ) -> DeniseBitplaneSample {
         let mut idx = 0u8;
         let mut active = false;
         for (plane, words) in self.plane_words.iter().enumerate().take(nplanes) {
@@ -1181,9 +1225,21 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
             // The DMA fetch slots decide which word reaches Denise, but the
             // display shifter sees that word as a complete latched sample.
             // Do not expose the first word plane-by-plane at a late DDF edge.
-            if fetch_x >= self.fetched_pixels {
-                continue;
-            }
+            let fetch_x = if fetch_x >= self.fetched_pixels {
+                // A DDFSTOP-delayed final fetch keeps the last latched sample
+                // visible for the last DIW position. Apply this per plane so
+                // BPLCON1-delayed planes keep their own tap positions.
+                if hold_final_fetch_sample
+                    && self.fetched_pixels > 0
+                    && fetch_x == self.fetched_pixels
+                {
+                    self.fetched_pixels - 1
+                } else {
+                    continue;
+                }
+            } else {
+                fetch_x
+            };
             active = true;
             let word = words[fetch_x / 16];
             let bit = 15 - (fetch_x & 0x0F);
@@ -2051,12 +2107,23 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
             continue;
         }
 
-        let (line, mut beam_x) = beam_to_framebuffer_pos_with_visible_line0(
-            event.vpos,
-            event.hpos,
-            visible_line0,
-            base_palettes.len(),
-        );
+        let color_wraps_to_previous_line = matches!(off, 0x180..=0x1BE)
+            && color_write_wraps_to_previous_output_line(event.hpos)
+            && (event.vpos as i32) > visible_line0;
+        let (line, mut beam_x) = if color_wraps_to_previous_line {
+            let line = (event.vpos as i32 - visible_line0 - 1) as usize;
+            (
+                line.min(base_palettes.len().saturating_sub(1)),
+                color_write_wrapped_framebuffer_x(event.hpos),
+            )
+        } else {
+            beam_to_framebuffer_pos_with_visible_line0(
+                event.vpos,
+                event.hpos,
+                visible_line0,
+                base_palettes.len(),
+            )
+        };
         // An event from a line above the visible area happened before the
         // first framebuffer line started: it contributes to line 0's start
         // state, not a mid-line change at its horizontal position (which
@@ -2083,7 +2150,9 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
             if idx < 32 {
                 palette.write_entry(usize::from(entry), loct, color_register_value(event.value));
             }
-            let x = if before_visible_lines {
+            let x = if color_wraps_to_previous_line {
+                beam_x
+            } else if before_visible_lines {
                 0
             } else {
                 color_write_framebuffer_x(event.hpos)
@@ -2249,6 +2318,15 @@ fn beam_to_framebuffer_x_unclamped(hpos: u32) -> i32 {
 
 fn color_write_framebuffer_x(hpos: u32) -> usize {
     ((hpos as i32 - COLOR_WRITE_HPOS_FB0) * 4).clamp(0, FB_WIDTH as i32) as usize
+}
+
+fn color_write_wraps_to_previous_output_line(hpos: u32) -> bool {
+    hpos < DENISE_HBLANK_START_HPOS
+}
+
+fn color_write_wrapped_framebuffer_x(hpos: u32) -> usize {
+    ((hpos as i32 + COLORCLOCKS_PER_LINE as i32 - COLOR_WRITE_HPOS_FB0) * 4)
+        .clamp(0, FB_WIDTH as i32) as usize
 }
 
 fn sprite_palette_control_framebuffer_x(hpos: u32) -> usize {
@@ -2772,6 +2850,37 @@ fn bitplane_dma_output_start_x(
                 .find_map(|(hpos, plane)| (plane == 0).then_some(hpos))
         })
         .map(bitplane_fetch_framebuffer_x)
+}
+
+fn manual_bpl_dma_clip_x(
+    seg: &ManualBplSegment,
+    base_control: ControlState,
+    control_segments: &[ControlSegment],
+    dma_output_start_x: Option<usize>,
+) -> Option<usize> {
+    let mut clip_x = dma_output_start_x.filter(|&x| seg.x < x as i32);
+    let dma_planes = line_max_dma_planes(base_control, control_segments);
+    if dma_planes == 0 || !line_has_valid_ddf_window(base_control, control_segments) {
+        return clip_x;
+    }
+
+    let words_per_row = line_words_per_row(base_control, control_segments);
+    for word_idx in 0..words_per_row {
+        let plan = line_fetch_plan_for_word(base_control, control_segments, word_idx, dma_planes);
+        let Some(next_bpl1dat_hpos) = plan
+            .iter()
+            .find_map(|(hpos, plane)| (plane == 0 && hpos > seg.hpos).then_some(hpos))
+        else {
+            continue;
+        };
+        let next_bpl1dat_x = bitplane_fetch_framebuffer_x(next_bpl1dat_hpos);
+        if next_bpl1dat_x as i32 > seg.x {
+            clip_x = Some(clip_x.map_or(next_bpl1dat_x, |old| old.min(next_bpl1dat_x)));
+        }
+        break;
+    }
+
+    clip_x
 }
 
 fn bitplane_carry_words_for_line(
@@ -4240,7 +4349,7 @@ impl RenderInput {
             held_sprites: bus.frame_held_sprites(),
             sprite_display_enable_x_by_y: bus.frame_sprite_display_enable_x_by_y().to_vec(),
             sprite_dma_observed: bus.frame_sprite_dma_observed(),
-            frame_lines: bus.agnus.current_frame_lines(),
+            frame_lines: bus.frame_lines(),
             programmable_vertical_blank: bus.agnus.programmable_vertical_blank(),
             programmable_horizontal_blank: bus.agnus.programmable_horizontal_blank(),
             emulated_seconds: bus.emulated_seconds(),
@@ -5197,6 +5306,7 @@ fn render_planned_playfield_line(
         let background_rgb24 = rgb12_to_rgb24(color_rgb12(palette[0]));
         let nplanes = sample_control.nplanes().min(plan.plane_words.len());
         let delays = std::array::from_fn(|plane| sample_control.scroll_for_plane(plane));
+        let hold_final_fetch_sample = pixel_control.holds_final_lowres_fetch_sample_at_diwstop();
         let ham_mode = sample_control.hold_and_modify();
         let ham_history_start_native_x = if ham_mode {
             pixel_control.ham_history_start_native_x(
@@ -5281,7 +5391,13 @@ fn render_planned_playfield_line(
                     denise_shres_playfield_output(palette, left.idx, right.idx, &mut ham_color),
                 )
             } else {
-                let sample = plan.sample_prepared(nplanes, &delays, min_fetch_x, native_x);
+                let sample = plan.sample_prepared_with_final_fetch_hold(
+                    nplanes,
+                    &delays,
+                    min_fetch_x,
+                    native_x,
+                    hold_final_fetch_sample,
+                );
                 let ham_before = ham_color;
                 let output =
                     denise_playfield_output(pixel_control, palette, sample.idx, &mut ham_color);
@@ -5607,11 +5723,12 @@ fn draw_manual_bpl_word(
     const MAX_MANUAL_BPL_NATIVE_SAMPLES: usize = MANUAL_BPL_WORD_BITS + MAX_BPLCON1_DELAY;
 
     let shifter = DeniseManualBitplaneShifter::new(seg.planes, MANUAL_BPL_WORD_BITS);
-    let dma_output_start_x = dma_output_start_x_by_line
-        .get(seg.line)
-        .copied()
-        .flatten()
-        .filter(|&x| seg.x < x as i32);
+    let dma_clip_x = manual_bpl_dma_clip_x(
+        seg,
+        base_controls[seg.line],
+        &control_segments[seg.line],
+        dma_output_start_x_by_line.get(seg.line).copied().flatten(),
+    );
     let mut x_cursor = seg.x;
     let mut native_idx = 0usize;
     while native_idx < MAX_MANUAL_BPL_NATIVE_SAMPLES {
@@ -5647,7 +5764,7 @@ fn draw_manual_bpl_word(
                 return false;
             }
             let x = x as usize;
-            if dma_output_start_x.is_some_and(|dma_x| x >= dma_x) {
+            if dma_clip_x.is_some_and(|dma_x| x >= dma_x) {
                 return false;
             }
             let pixel_control =
@@ -5694,7 +5811,7 @@ fn draw_manual_bpl_word(
                 continue;
             }
             let x = x as usize;
-            if dma_output_start_x.is_some_and(|dma_x| x >= dma_x) {
+            if dma_clip_x.is_some_and(|dma_x| x >= dma_x) {
                 continue;
             }
             let pixel_control =
@@ -7267,8 +7384,9 @@ mod tests {
         assert_eq!(standard.native_x_offset(standard.diw_h_start(), repeat), 0);
 
         // Kickstart 2.05 insert-disk screen: hi-res but DDFSTRT=$40 (late), so
-        // there is no pre-fetch word - the origin is unsnapped and the
-        // calibrated boot art is untouched.
+        // there is no pre-fetch word. The late fetch starts 24 pixels into
+        // its narrower DIW after the standard hi-res $81/$3C phase is aligned
+        // to the display-window edge.
         let ks_boot = ControlState {
             diwstrt: 0x2C95,
             diwstop: 0x2CAD,
@@ -7276,7 +7394,7 @@ mod tests {
             ddfstop: 0x00D0,
             ..xsysinfo
         };
-        assert_eq!(ks_boot.native_x_offset(ks_boot.diw_h_start(), repeat), 20);
+        assert_eq!(ks_boot.native_x_offset(ks_boot.diw_h_start(), repeat), 24);
     }
 
     fn ocs_snapshot(
@@ -7324,6 +7442,33 @@ mod tests {
             present_h_shift_for(&ocs_snapshot(0x5702, 0xFFFF, 0x0030, 0x00D8)),
             0
         );
+    }
+
+    #[test]
+    fn standard_horizontal_content_accepts_standard_fetch_inside_wide_diw() {
+        // A wide display window around a standard fetch only exposes border
+        // colour in the overscan area, so the TV aperture may still crop it.
+        assert!(uses_standard_horizontal_content(&ocs_snapshot(
+            0x5702, 0xFFFF, 0x0038, 0x00D0
+        )));
+        assert!(uses_standard_horizontal_content(&ocs_snapshot(
+            0x2C81, 0x2CC1, 0x0038, 0x00D0
+        )));
+    }
+
+    #[test]
+    fn standard_horizontal_content_rejects_true_overscan_fetch() {
+        let snapshot = RenderRegisterSnapshot {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: 0x8214,
+            diwstrt: 0x1D61,
+            diwstop: 0x37C7,
+            ddfstrt: 0x0028,
+            ddfstop: 0x00D8,
+            ..RenderRegisterSnapshot::default()
+        };
+
+        assert!(!uses_standard_horizontal_content(&snapshot));
     }
 
     #[test]
@@ -7774,6 +7919,11 @@ mod tests {
             color_write_framebuffer_x((COLOR_WRITE_HPOS_FB0 + 4) as u32),
             16
         );
+        assert!(color_write_wraps_to_previous_output_line(2));
+        assert!(!color_write_wraps_to_previous_output_line(
+            DENISE_HBLANK_START_HPOS
+        ));
+        assert_eq!(color_write_wrapped_framebuffer_x(2), 704);
         assert_eq!(
             beam_to_framebuffer_x_unclamped(COLOR_WRITE_HPOS_FB0 as u32),
             52
@@ -7972,16 +8122,15 @@ mod tests {
 
         // FMODE=0: the fetch gulp equals the DDF granularity, so the picture
         // follows DDFSTRT continuously. KS 2.05's insert-disk screen (DDF
-        // $40, DIW $95) is drawn for exactly this placement: its negative
-        // modulos overlap rows so the drive art's right edge lives in the
-        // next row's first bytes.
+        // $40, DIW $95) keeps the same late-DDF relation after the standard
+        // $81/$3C hi-res phase is aligned to the display-window edge.
         let kickstart_hires = RenderState {
             bplcon0: 0x8000,
             diwstrt: 0x6395,
             ddfstrt: 0x0040,
             ..blank_state()
         };
-        assert_eq!(kickstart_hires.native_x_offset(true, 1), 20);
+        assert_eq!(kickstart_hires.native_x_offset(true, 1), 24);
 
         // Wide FMODE fetches quantize the displayed shifter origin to the gulp
         // grid: AGA system screens program DDFSTRT $38 or $3C interchangeably
@@ -8009,12 +8158,10 @@ mod tests {
             wb_hires_overscan_fetch.fetch_start_native_x(true, 1),
             wb_with_standard_ddf.fetch_start_native_x(true, 1)
         );
-        // Wide-FMODE hi-res output sits one colour clock left of the
-        // FMODE=0-calibrated reference (Lisa's fetch-width-dependent
-        // bitplane delay): the AGA bitmap fills its standard
-        // $81 window exactly flush, matching FS-UAE. With the FMODE=0
-        // reference it painted 4 pixels right (colour-0 stripe at the
-        // window's left edge, last bitmap pixels clipped at the right).
+        // Wide-FMODE hi-res output uses the same corrected $81 display origin:
+        // the AGA bitmap fills its standard window exactly flush, matching
+        // FS-UAE. DDFSTRT $38 and $3C are still equivalent because both align
+        // to the same wide-FMODE gulp.
         assert_eq!(wb_hires_overscan_fetch.native_x_offset(true, 1), 0);
         assert_eq!(wb_hires_overscan_fetch.fetch_start_native_x(true, 1), 0);
 
@@ -8056,6 +8203,7 @@ mod tests {
         assert_eq!(diagrom_hires.display_window_x().0, 64);
         assert_eq!(diagrom_hires.clipped_display_pixels_before_frame(), 0);
         assert_eq!(diagrom_hires.native_x_offset(true, 1), 0);
+        assert_eq!(diagrom_hires.fetch_start_native_x(true, 1), 0);
 
         let lores_extra_fetch_word = RenderState {
             bplcon0: 0,
@@ -8132,6 +8280,112 @@ mod tests {
             31
         );
         assert_eq!(late_fetch_standard_window.native_x_offset(false, 2), 0);
+    }
+
+    #[test]
+    fn late_lowres_ddf_reaches_diwstop_with_undelayed_planes_active() {
+        // Low-res FMODE=0 with DDFSTRT=$50 and DDFSTOP=$D0 fetches 17 words.
+        // When DIWSTOP is placed exactly at the completed DDF row's right edge,
+        // the final visible DIW sample still contains the undelayed even-plane
+        // bit. BPLCON1 may delay the odd planes, but it must not make the even
+        // planes fall one native sample past the fetched row at the right edge.
+        let control = ControlState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x2000,
+            bplcon1: 0x0009,
+            diwstrt: 0x2C91,
+            diwstop: 0x2CC1,
+            ddfstrt: 0x0050,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        assert_eq!(control.display_window_x(), (96, 704));
+        assert_eq!(control.words_per_row(0), 17);
+        assert_eq!(control.fetch_start_native_x(control.diw_h_start(), 2), 31);
+        assert_eq!(control.native_x_offset(control.diw_h_start(), 2), 0);
+        assert!(control.holds_final_lowres_fetch_sample_at_diwstop());
+
+        let last_visible_x = control.display_window_x().1 - control.framebuffer_pixel_repeat();
+        let output_native_x =
+            (last_visible_x - control.display_window_x().0) / control.framebuffer_pixel_repeat();
+        let native_x = output_native_x - control.fetch_start_native_x(control.diw_h_start(), 2);
+        assert_eq!(native_x, 272);
+
+        let plane1 = vec![0; 17];
+        let mut plane2 = vec![0; 17];
+        plane2[16] = 0x0001;
+        let planes = vec![plane1, plane2];
+        let plan = DenisePlannedPlayfieldLine::new(0, 96, 704, &planes, 17 * 16);
+        let delays = std::array::from_fn(|plane| control.scroll_for_plane(plane));
+        let sample = plan.sample_prepared_with_final_fetch_hold(
+            control.nplanes(),
+            &delays,
+            0,
+            native_x,
+            control.holds_final_lowres_fetch_sample_at_diwstop(),
+        );
+
+        assert!(sample.active);
+        assert_eq!(sample.idx, 0x02);
+    }
+
+    #[test]
+    fn late_lowres_ddf_stop_hold_keeps_left_origin_unadvanced() {
+        // The DDFSTOP hold keeps the final completed fetch visible at DIWSTOP,
+        // but it must not move the whole low-res FMODE=0 row one native sample
+        // to the right. A first-word bit therefore appears at the unadvanced
+        // late-DDF fetch origin on the left side of the display window.
+        let control = ControlState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x1000,
+            diwstrt: 0x2C91,
+            diwstop: 0x2CC1,
+            ddfstrt: 0x0050,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        assert_eq!(control.display_window_x(), (96, 704));
+        assert_eq!(control.fetch_start_native_x(control.diw_h_start(), 2), 31);
+        assert!(control.holds_final_lowres_fetch_sample_at_diwstop());
+
+        let mut plane = vec![0; 17];
+        plane[0] = 0x8000;
+        let planes = vec![plane];
+        let plan = DenisePlannedPlayfieldLine::new(0, 96, 704, &planes, 17 * 16);
+        let mut palette = Palette::new();
+        palette.write_ocs(1, 0x00F0);
+        let mut fb = vec![0; FB_PIXELS];
+        let mut playfield_mask = vec![0; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut clxdat = 0;
+
+        render_planned_playfield_line(
+            &plan,
+            &mut fb,
+            &mut playfield_mask,
+            &mut collision_pixels,
+            &mut clxdat,
+            palette,
+            &[],
+            0,
+            control,
+            &[],
+            0,
+            control.bplcon1,
+            false,
+            0,
+            PAL_VISIBLE_LINE0,
+            0.0,
+            0,
+        );
+
+        let first_fetch_x = control.display_window_x().0
+            + control.fetch_start_native_x(control.diw_h_start(), 2)
+                * control.framebuffer_pixel_repeat();
+        assert_eq!(first_fetch_x, 158);
+        assert_eq!(fb[first_fetch_x - 2], rgb12_to_rgba8_alpha(0, false));
+        assert_eq!(fb[first_fetch_x], rgb12_to_rgba8(0x00F0));
+        assert_eq!(fb[first_fetch_x + 1], rgb12_to_rgba8(0x00F0));
     }
 
     #[test]
@@ -12564,6 +12818,52 @@ mod tests {
     }
 
     #[test]
+    fn pre_hblank_color_write_updates_previous_row_tail_and_next_row_base() {
+        let mut state = blank_state();
+        state.palette.write_ocs(0, 0x0000);
+        let mut base_palettes = [state.palette; FB_HEIGHT];
+        let mut palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut base_controls = [ControlState::from_render_state(&state); FB_HEIGHT];
+        let mut control_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut manual_bpl_segments = Vec::new();
+        let beam_y = PAL_VISIBLE_LINE0 as u32 + 1;
+        let events = [beam_event(beam_y, 2, 0x0180, 0x0123)];
+
+        apply_render_events(
+            &mut state,
+            &events,
+            &mut base_palettes,
+            &mut palette_segments,
+            &mut base_controls,
+            &mut control_segments,
+            &mut manual_bpl_segments,
+        );
+
+        assert_eq!(base_palettes[0][0], 0x0000);
+        assert_eq!(base_palettes[1][0], 0x0123);
+        assert_eq!(palette_segments[0].len(), 1);
+        assert_eq!(
+            palette_segments[0][0].x,
+            color_write_wrapped_framebuffer_x(2)
+        );
+        assert_eq!(palette_segments[0][0].value, 0x0123);
+
+        let mut fb = vec![0; FB_PIXELS];
+        fill_background(
+            &mut fb,
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+        );
+
+        let wrapped_x = color_write_wrapped_framebuffer_x(2);
+        assert_eq!(fb[wrapped_x - 1], rgb12_to_rgba8(0x0000));
+        assert_eq!(fb[wrapped_x], rgb12_to_rgba8(0x0123));
+        assert_eq!(fb[FB_WIDTH], rgb12_to_rgba8(0x0123));
+    }
+
+    #[test]
     fn render_events_sample_bplcon_control_at_beam_positions() {
         let mut state = blank_state();
         let mut base_palettes = [state.palette; FB_HEIGHT];
@@ -13036,6 +13336,72 @@ mod tests {
 
         assert_eq!(fb[dma_output_x - 2], rgb12_to_rgba8(0x0F00));
         assert_eq!(fb[dma_output_x], rgb12_to_rgba8(0x000F));
+    }
+
+    #[test]
+    fn manual_bpl1dat_inside_diw_stops_at_next_dma_bpl1dat_load() {
+        let mut palette = Palette::new();
+        palette.write_ocs(1, 0x0F00);
+        let control = ControlState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x1000,
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16,
+            diwstop: (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | STANDARD_DIW_HSTOP as u16,
+            ddfstrt: 0x0050,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        let base_palettes = [palette; FB_HEIGHT];
+        let palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let base_controls = [control; FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let dma_output_x = bitplane_dma_output_start_x(
+            control,
+            &[],
+            control.display_window_x().0,
+            control.words_per_row(native_frame_width_for_control(control)),
+            control.dma_planes(),
+        )
+        .unwrap();
+        let next_dma_bpl1dat_x =
+            bitplane_fetch_framebuffer_x(bitplane_fetch_hpos_for_plane(control, 0, 0));
+        let mut fb = vec![rgb12_to_rgba8(0x000F); FB_PIXELS];
+        let mut playfield_mask = vec![0u8; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut clxdat = 0u16;
+        let mut planes = [0u16; 8];
+        planes[0] = 0xFFFF;
+        let hpos = 0x004A;
+        let segments = [ManualBplSegment {
+            line: 0,
+            hpos,
+            x: beam_to_framebuffer_x_unclamped(hpos),
+            planes,
+            palette,
+        }];
+        assert!(segments[0].x as usize > dma_output_x);
+        assert!(segments[0].x < next_dma_bpl1dat_x as i32);
+        let mut dma_output_start_x_by_line = vec![None; FB_HEIGHT];
+        dma_output_start_x_by_line[0] = Some(dma_output_x);
+
+        render_manual_bpl_segments_with_visible_line0(
+            &segments,
+            &mut fb,
+            &mut playfield_mask,
+            &mut collision_pixels,
+            &mut clxdat,
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &dma_output_start_x_by_line,
+            PAL_VISIBLE_LINE0,
+            0.0,
+            0,
+        );
+
+        assert_eq!(fb[next_dma_bpl1dat_x - 2], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[next_dma_bpl1dat_x], rgb12_to_rgba8(0x000F));
     }
 
     #[test]
