@@ -33,6 +33,13 @@ const BLTCON1_FCI: u16 = 1 << 2;
 const BLTCON1_DESC: u16 = 1 << 1;
 const BLTCON1_SING: u16 = 1 << 1;
 const BLTCON1_LINE: u16 = 1 << 0;
+// Bits 4/3/2 are reinterpreted in line mode (BLTCON1.LINEMODE=1) as the
+// octant-decode fields documented on the line-draw function below (SUD,
+// SUL, AUL), the same bit positions EFE/IFE/FCI use in normal mode -- the
+// same overloading this file already names twice for bit 1 (DESC/SING).
+const BLTCON1_SUD: u16 = BLTCON1_EFE;
+const BLTCON1_SUL: u16 = BLTCON1_IFE;
+const BLTCON1_AUL: u16 = BLTCON1_FCI;
 const CHIP_DMA_ADDR_MASK: u32 = 0x001F_FFFF;
 const CHIP_DMA_HIGH_MASK: u32 = 0x001F_0000;
 
@@ -1556,14 +1563,14 @@ fn line_step_sometimes(
     cpt: &mut u32,
     one_dot: &mut bool,
 ) -> i32 {
-    if bltcon1 & 0x0010 != 0 {
-        if bltcon1 & 0x0008 != 0 {
+    if bltcon1 & BLTCON1_SUD != 0 {
+        if bltcon1 & BLTCON1_SUL != 0 {
             line_step_y(-1, bplmod, cpt, one_dot);
         } else {
             line_step_y(1, bplmod, cpt, one_dot);
         }
         ash
-    } else if bltcon1 & 0x0008 != 0 {
+    } else if bltcon1 & BLTCON1_SUL != 0 {
         line_step_x(ash, -1, cpt)
     } else {
         line_step_x(ash, 1, cpt)
@@ -1571,14 +1578,14 @@ fn line_step_sometimes(
 }
 
 fn line_step_always(bltcon1: u16, ash: i32, bplmod: i32, cpt: &mut u32, one_dot: &mut bool) -> i32 {
-    if bltcon1 & 0x0010 != 0 {
-        if bltcon1 & 0x0004 != 0 {
+    if bltcon1 & BLTCON1_SUD != 0 {
+        if bltcon1 & BLTCON1_AUL != 0 {
             line_step_x(ash, -1, cpt)
         } else {
             line_step_x(ash, 1, cpt)
         }
     } else {
-        if bltcon1 & 0x0004 != 0 {
+        if bltcon1 & BLTCON1_AUL != 0 {
             line_step_y(-1, bplmod, cpt, one_dot);
         } else {
             line_step_y(1, bplmod, cpt, one_dot);
@@ -1635,6 +1642,128 @@ fn apply_fill(d: u16, fill_state: &mut u16, ife: bool, efe: bool) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run the same blit configuration through both the synchronous
+    /// reference implementation (`execute`, what most tests in this file
+    /// use for readability) and the scheduled per-DMA-slot pipeline
+    /// production actually runs, and assert they leave RAM and BZERO
+    /// identical. The two are independently-maintained code paths for the
+    /// same hardware math; without a direct cross-check, a bug introduced
+    /// in only one of them is invisible to every test that only exercises
+    /// the other. That's exactly how the double-advanced-A-shifter bug
+    /// documented below (`scheduled_disabled_a_window_mask_shifts_once_per_word`)
+    /// slipped through: every existing test drove `execute`, so nothing
+    /// caught the scheduled path computing the A channel twice per word.
+    fn assert_scheduled_matches_synchronous(
+        ram_size: usize,
+        bltsize: u16,
+        configure: impl Fn(&mut Blitter),
+        seed_ram: impl Fn(&mut [u8]),
+    ) {
+        let mut sync_ram = vec![0u8; ram_size];
+        seed_ram(&mut sync_ram);
+        let mut sync_b = Blitter::new();
+        configure(&mut sync_b);
+        sync_b.execute(bltsize, &mut sync_ram);
+
+        let mut sched_ram = vec![0u8; ram_size];
+        seed_ram(&mut sched_ram);
+        let mut sched_b = Blitter::new();
+        configure(&mut sched_b);
+        let snapshot = sched_ram.clone();
+        sched_b.start_scheduled(bltsize, &snapshot);
+        while !sched_b.tick_scheduled_slot(&mut sched_ram) {}
+
+        assert_eq!(
+            sched_ram, sync_ram,
+            "scheduled vs synchronous blit RAM diverged"
+        );
+        assert_eq!(sched_b.bzero, sync_b.bzero, "BZERO diverged");
+    }
+
+    #[test]
+    fn scheduled_matches_synchronous_for_normal_copy_with_shift() {
+        assert_scheduled_matches_synchronous(
+            256,
+            (1u16 << 6) | 2,
+            |b| {
+                b.bltcon0 = (4 << 12) | 0x09F0; // ASH=4, USEA|USED, D=A
+                b.bltcon1 = 0;
+                b.bltafwm = 0xFFFF;
+                b.bltalwm = 0xFFFF;
+                b.bltapt = 0x10;
+                b.bltdpt = 0x20;
+            },
+            |ram| {
+                ram[0x10] = 0xF0;
+                ram[0x11] = 0x00;
+                ram[0x12] = 0x0F;
+                ram[0x13] = 0xFF;
+            },
+        );
+    }
+
+    #[test]
+    fn scheduled_matches_synchronous_for_normal_copy_with_masks() {
+        assert_scheduled_matches_synchronous(
+            256,
+            (1u16 << 6) | 2,
+            |b| {
+                b.bltcon0 = 0x09F0;
+                b.bltcon1 = 0x0000;
+                b.bltafwm = 0x00FF;
+                b.bltalwm = 0xFF00;
+                b.bltapt = 0x10;
+                b.bltdpt = 0x20;
+            },
+            |ram| {
+                ram[0x10] = 0xAA;
+                ram[0x11] = 0xBB;
+                ram[0x12] = 0xCC;
+                ram[0x13] = 0xDD;
+            },
+        );
+    }
+
+    #[test]
+    fn scheduled_matches_synchronous_for_descending_area_fill() {
+        assert_scheduled_matches_synchronous(
+            64,
+            (1u16 << 6) | 1,
+            |b| {
+                b.bltcon0 = BLTCON0_USE_A | BLTCON0_USE_D | 0x00F0;
+                b.bltcon1 = BLTCON1_DESC | BLTCON1_IFE;
+                b.bltafwm = 0xFFFF;
+                b.bltalwm = 0xFFFF;
+                b.bltapt = 0x10;
+                b.bltdpt = 0x20;
+            },
+            |ram| write_word(ram, 0x10, 0x0022),
+        );
+    }
+
+    #[test]
+    fn scheduled_matches_synchronous_for_diagonal_line() {
+        assert_scheduled_matches_synchronous(
+            1024,
+            (16u16 << 6) | 2,
+            |b| {
+                b.bltcon0 = 0x0BCA; // ASH=0, USEA|USEC|USED, minterm $CA
+                b.bltcon1 = BLTCON1_LINE; // octant 0 (SUD=0 SUL=0 AUL=0)
+                b.bltafwm = 0xFFFF;
+                b.bltalwm = 0xFFFF;
+                b.bltadat = 0x8000;
+                b.bltbdat = 0xFFFF;
+                b.bltcpt = 0;
+                b.bltdpt = 0;
+                b.bltcmod = 32;
+                b.bltamod = 0;
+                b.bltbmod = 30;
+                b.bltapt = 0;
+            },
+            |_ram| {},
+        );
+    }
 
     /// A->D copy with the source pre-loaded into chip RAM. BLTCON0 =
     /// `0x09F0` (USE A + USE D + minterm $F0 == D := A), no shift, no
@@ -2548,7 +2677,7 @@ mod tests {
         let mut ram = vec![0u8; 128];
         let mut b = Blitter::new();
         b.bltcon0 = (14 << 12) | BLTCON0_USE_C | 0x00AA; // Minterm C.
-        b.bltcon1 = (2 << 12) | BLTCON1_LINE | 0x0010;
+        b.bltcon1 = (2 << 12) | BLTCON1_LINE | BLTCON1_SUD;
         b.bltcpt = 0;
         b.bltdpt = 0;
         b.bltcmod = 32;
@@ -2569,7 +2698,7 @@ mod tests {
         let mut ram = vec![0u8; 1024];
         let mut b = Blitter::new();
         b.bltcon0 = 0x0BCA;
-        b.bltcon1 = BLTCON1_LINE | BLTCON1_SIGN | BLTCON1_SING | 0x0010;
+        b.bltcon1 = BLTCON1_LINE | BLTCON1_SIGN | BLTCON1_SING | BLTCON1_SUD;
         b.bltafwm = 0xFFFF;
         b.bltalwm = 0xFFFF;
         b.bltadat = 0x8000;

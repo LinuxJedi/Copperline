@@ -521,21 +521,22 @@ impl Cia {
             _ => {}
         }
 
+        let mut effect = CiaSideEffect::default();
         if self.which == Which::A && matches!(reg, REG_PRA | REG_DDRA) {
             let now_no_overlay = self.cia_a_no_overlay_line();
             if !prev_no_overlay && now_no_overlay {
-                return CiaSideEffect::DisableOverlay;
+                effect.disable_overlay = true;
             }
         }
-        if started_timer {
-            CiaSideEffect::TimerStarted
-        } else if keyboard_handshake_start {
-            CiaSideEffect::KeyboardHandshakeStart
+        effect.timer_started = started_timer;
+        effect.keyboard_handshake = if keyboard_handshake_start {
+            Some(true)
         } else if keyboard_handshake_end {
-            CiaSideEffect::KeyboardHandshakeEnd
+            Some(false)
         } else {
-            CiaSideEffect::None
-        }
+            None
+        };
+        effect
     }
 
     /// Advance both timers by `ticks` (CIA PHI2 cycles = CPU/10).
@@ -817,28 +818,29 @@ impl TimerBInputMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CiaSideEffect {
-    None,
+/// Side effects from a single `Cia::write`. These are independent flags,
+/// not an exclusive choice: one CRA byte write can both start a timer
+/// (bit 0) and toggle SPMODE (bit 6) in the same write, and both must be
+/// reported or the keyboard handshake edge is silently dropped whenever
+/// it coincides with a timer start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CiaSideEffect {
     /// CIA-A /OVL was driven low: stop overlaying the ROM at $0 and
     /// switch to chip RAM there.
-    DisableOverlay,
+    pub disable_overlay: bool,
     /// CRA/CRB bit 0 transitioned 0 -> 1: a timer just started. The
     /// emulator preempts the current instruction slice so the next
     /// slice's dynamic cap (computed from `next_underflow_ticks`)
     /// takes effect for the new run, instead of leaving the slice
     /// to run all the way to its larger default size while the CPU
     /// tight-polls ICR/timer counts.
-    TimerStarted,
-    /// CIA-A CRA.SPMODE went 0 -> 1: serial output mode drives the SP
-    /// (KDAT) line low, which the keyboard MCU sees as the start of the
-    /// post-byte handshake pulse.
-    KeyboardHandshakeStart,
-    /// CIA-A CRA.SPMODE went 1 -> 0: SP (KDAT) released. The keyboard
-    /// MCU measures the pulse between Start and End and accepts any
-    /// deliberate handshake (it samples the line within microseconds;
-    /// only a zero-width double-write is ignored).
-    KeyboardHandshakeEnd,
+    pub timer_started: bool,
+    /// CIA-A CRA.SPMODE transitioned: `Some(true)` on 0 -> 1 (serial
+    /// output mode drives the SP/KDAT line low, which the keyboard MCU
+    /// sees as the start of the post-byte handshake pulse), `Some(false)`
+    /// on 1 -> 0 (SP released; the MCU measures the pulse between start
+    /// and end and accepts any deliberate handshake).
+    pub keyboard_handshake: Option<bool>,
 }
 
 /// Map a raw 24-bit Amiga bus address into a CIA register index using
@@ -873,13 +875,25 @@ mod tests {
         let mut cia = Cia::new(Which::A);
 
         assert_eq!(
-            cia.write(REG_CRA, CRA_SPMODE),
-            CiaSideEffect::KeyboardHandshakeStart
+            cia.write(REG_CRA, CRA_SPMODE).keyboard_handshake,
+            Some(true)
         );
         // Rewriting the same mode is not an edge.
-        assert_eq!(cia.write(REG_CRA, CRA_SPMODE), CiaSideEffect::None);
-        assert_eq!(cia.write(REG_CRA, 0), CiaSideEffect::KeyboardHandshakeEnd);
-        assert_eq!(cia.write(REG_CRA, 0), CiaSideEffect::None);
+        assert_eq!(cia.write(REG_CRA, CRA_SPMODE).keyboard_handshake, None);
+        assert_eq!(cia.write(REG_CRA, 0).keyboard_handshake, Some(false));
+        assert_eq!(cia.write(REG_CRA, 0).keyboard_handshake, None);
+    }
+
+    #[test]
+    fn cia_a_cra_write_reports_timer_start_and_keyboard_edge_together() {
+        // A single CRA byte can flip both START (bit 0) and SPMODE (bit 6)
+        // at once. Both side effects must be reported, or the keyboard MCU
+        // edge is silently dropped whenever it coincides with a timer
+        // start (this previously collapsed to TimerStarted only).
+        let mut cia = Cia::new(Which::A);
+        let effect = cia.write(REG_CRA, CRA_SPMODE | 0x01);
+        assert!(effect.timer_started);
+        assert_eq!(effect.keyboard_handshake, Some(true));
     }
 
     #[test]
@@ -1189,8 +1203,8 @@ mod tests {
     fn cia_a_driving_ovl_low_releases_reset_overlay() {
         let mut cia = Cia::new(Which::A);
 
-        assert_eq!(cia.write(REG_DDRA, 0x03), CiaSideEffect::None);
-        assert_eq!(cia.write(REG_PRA, 0x02), CiaSideEffect::DisableOverlay);
+        assert_eq!(cia.write(REG_DDRA, 0x03), CiaSideEffect::default());
+        assert!(cia.write(REG_PRA, 0x02).disable_overlay);
         assert_eq!(cia.read(REG_PRA) & 0x01, 0);
     }
 

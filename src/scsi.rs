@@ -251,7 +251,17 @@ impl ScsiDisk {
     /// payload. Returns the bus data phase and the status byte (for
     /// data-out commands the status is resolved by `complete_out`).
     pub fn execute(&mut self, cdb: &[u8], lun: u8) -> (ScsiExec, u8) {
-        let op = cdb[0];
+        let Some(&op) = cdb.first() else {
+            return self.check(SK_ILLEGAL_REQUEST, ASC_INVALID_FIELD_IN_CDB);
+        };
+        // The manual (Select + Transfer Info) path sizes the command
+        // phase from the driver's TC register, not from the opcode's
+        // real CDB length, so a short/malformed TC can hand us a `cdb`
+        // slice shorter than what this opcode's fields need. Reject it
+        // as a malformed CDB instead of indexing out of bounds below.
+        if cdb.len() < cdb_len(op) {
+            return self.check(SK_ILLEGAL_REQUEST, ASC_INVALID_FIELD_IN_CDB);
+        }
         // REQUEST SENSE must report (then clear) the previous command's
         // sense data; every other command starts with it cleared.
         if op != 0x03 {
@@ -410,7 +420,18 @@ impl ScsiDisk {
 
     /// Complete a data-out command once the payload has arrived.
     pub fn complete_out(&mut self, cdb: &[u8], data: &[u8]) -> u8 {
-        match cdb[0] {
+        // A data-out phase is only ever reached after `execute` accepted the
+        // command, which already rejects an empty or too-short CDB, so this
+        // guard cannot fire in normal flow. It stays as belt-and-suspenders
+        // against the raw indexing below: a malformed CDB commits nothing and
+        // reports GOOD (a no-op), never a spurious write at a garbage LBA.
+        let Some(&op) = cdb.first() else {
+            return GOOD;
+        };
+        if cdb.len() < cdb_len(op) {
+            return GOOD;
+        }
+        match op {
             0x0A | 0x2A => {
                 let lba = if cdb[0] == 0x0A {
                     u64::from(be24(cdb, 1) & 0x1F_FFFF)
@@ -1420,6 +1441,43 @@ mod tests {
         assert_eq!(sense[0], 0x70);
         assert_eq!(sense[2], SK_ILLEGAL_REQUEST);
         assert_eq!(sense[12], ASC_INVALID_OPCODE);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn execute_rejects_cdb_shorter_than_its_opcode_group_instead_of_panicking() {
+        // The manual (Select + Transfer Info) path sizes the command phase
+        // from the driver's TC register, not the opcode's real CDB length,
+        // so `execute()` can be handed a truncated `cdb` slice. It must
+        // reject that as a malformed CDB rather than indexing past the end.
+        let path = temp_image(64);
+        let mut disk = ScsiDisk::open(&path, 0, None).unwrap();
+
+        // Empty CDB.
+        let (exec, status) = disk.execute(&[], 0);
+        assert!(matches!(exec, ScsiExec::NoData));
+        assert_eq!(status, CHECK_CONDITION);
+
+        // WRITE(10) (0x2A) needs a 10-byte CDB; a short one must not panic
+        // when the opcode handler indexes cdb[7] for the transfer length.
+        let (exec, status) = disk.execute(&[0x2A, 0, 0, 0], 0);
+        assert!(matches!(exec, ScsiExec::NoData));
+        assert_eq!(status, CHECK_CONDITION);
+
+        // A correctly-sized CDB for the same opcode still works.
+        let (exec, status) = disk.execute(&[0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0], 0);
+        assert!(matches!(exec, ScsiExec::DataOut(n) if n == SECTOR_SIZE));
+        assert_eq!(status, GOOD);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn complete_out_rejects_short_cdb_instead_of_panicking() {
+        let path = temp_image(64);
+        let mut disk = ScsiDisk::open(&path, 0, None).unwrap();
+        assert_eq!(disk.complete_out(&[], &[0u8; SECTOR_SIZE]), GOOD);
+        assert_eq!(disk.complete_out(&[0x2A, 0, 0], &[0u8; SECTOR_SIZE]), GOOD);
         std::fs::remove_file(&path).ok();
     }
 

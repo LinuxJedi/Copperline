@@ -415,6 +415,11 @@ pub struct Paula {
     pub potgo: u16,
 
     chans: [AudChannel; 4],
+    // Scratch buffer for `advance_audio_channels_inner`'s modulation events,
+    // reused across calls instead of allocating fresh each time modulation
+    // fires: not logical machine state, so it is not part of the save state.
+    #[serde(skip)]
+    mod_events_scratch: Vec<AudioModEvent>,
     serial_tx_buffer: Option<u16>,
     serial_tx_shift: Option<SerialTxShift>,
     serial_rx_shift: Option<SerialRxShift>,
@@ -473,6 +478,7 @@ impl Paula {
                 AudChannel::new(),
                 AudChannel::new(),
             ],
+            mod_events_scratch: Vec::new(),
             serial_tx_buffer: None,
             serial_tx_shift: None,
             serial_rx_shift: None,
@@ -1315,7 +1321,11 @@ impl Paula {
 
     fn advance_audio_channels_inner<const MODULATE: bool>(&mut self, cck: u32) -> u16 {
         let mut irq_bits = 0;
-        let mut mod_events = MODULATE.then(Vec::new);
+        // Reuse the scratch buffer instead of allocating a fresh Vec (and
+        // freeing it again) on every call that has modulation enabled.
+        if MODULATE {
+            self.mod_events_scratch.clear();
+        }
         let ptr_mask = self.dma_ptr_mask();
         for ch_idx in 0..4 {
             let source_modulates = MODULATE && self.channel_drives_audio_modulation(ch_idx);
@@ -1384,27 +1394,21 @@ impl Paula {
                     if ch.phase == 0 {
                         ch.current = ch.word_hi;
                         if source_modulates {
-                            if let Some(mod_events) = mod_events.as_mut() {
-                                mod_events.push(AudioModEvent {
-                                    source: ch_idx,
-                                    word: ((ch.word_hi as u8 as u16) << 8)
-                                        | ch.word_lo as u8 as u16,
-                                    word_start: true,
-                                });
-                            }
+                            self.mod_events_scratch.push(AudioModEvent {
+                                source: ch_idx,
+                                word: ((ch.word_hi as u8 as u16) << 8) | ch.word_lo as u8 as u16,
+                                word_start: true,
+                            });
                         }
                         ch.phase = 1;
                     } else {
                         ch.current = ch.word_lo;
                         if source_modulates {
-                            if let Some(mod_events) = mod_events.as_mut() {
-                                mod_events.push(AudioModEvent {
-                                    source: ch_idx,
-                                    word: ((ch.word_hi as u8 as u16) << 8)
-                                        | ch.word_lo as u8 as u16,
-                                    word_start: false,
-                                });
-                            }
+                            self.mod_events_scratch.push(AudioModEvent {
+                                source: ch_idx,
+                                word: ((ch.word_hi as u8 as u16) << 8) | ch.word_lo as u8 as u16,
+                                word_start: false,
+                            });
                         }
                         ch.phase = 0;
                         // Whole 16-bit word consumed: promote the word the
@@ -1423,8 +1427,14 @@ impl Paula {
                 }
             }
         }
-        if let Some(mod_events) = mod_events {
-            self.apply_audio_modulation(&mod_events);
+        if MODULATE && !self.mod_events_scratch.is_empty() {
+            // Move the buffer out so `apply_audio_modulation` (which needs
+            // &mut self to update the modulated channels) isn't aliased
+            // against an immutable borrow of it, then move it back so its
+            // allocation survives for the next call.
+            let events = std::mem::take(&mut self.mod_events_scratch);
+            self.apply_audio_modulation(&events);
+            self.mod_events_scratch = events;
         }
         irq_bits
     }

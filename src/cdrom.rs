@@ -260,7 +260,19 @@ impl CdImage {
                 let region_end_sector = match file_tracks.get(j + 1) {
                     Some(next) => next.index0.unwrap_or_else(|| next.index1.unwrap()),
                     None => {
-                        let remaining = file_len - byte_offset;
+                        // Earlier tracks' INDEX values come straight from
+                        // the (untrusted) cue sheet; a corrupt/crafted one
+                        // can claim more bytes than the file actually has,
+                        // which would underflow this subtraction.
+                        let Some(remaining) = file_len.checked_sub(byte_offset) else {
+                            bail!(
+                                "{}: track {} starts {} bytes past the end of {}",
+                                cue_path.display(),
+                                track.number,
+                                byte_offset.saturating_sub(file_len),
+                                file_names[file_index],
+                            );
+                        };
                         if !remaining.is_multiple_of(track.kind.sector_bytes() as u64) {
                             bail!(
                                 "{}: track {} does not end on a sector boundary",
@@ -451,7 +463,7 @@ impl CdImage {
     }
 }
 
-fn to_bcd(v: u8) -> u8 {
+pub(crate) fn to_bcd(v: u8) -> u8 {
     ((v / 10) << 4) | (v % 10)
 }
 
@@ -659,6 +671,37 @@ mod tests {
         let _ = std::fs::remove_file(&bin1);
         let _ = std::fs::remove_file(&bin2);
         let _ = std::fs::remove_file(&bin3);
+    }
+
+    #[test]
+    fn track_index_claiming_more_than_the_file_holds_is_rejected_not_a_panic() {
+        // Track 1's INDEX 01 (used as track 2's region start, i.e. track
+        // 1's region end) claims a sector far beyond what the shared file
+        // actually contains. That inflates `byte_offset` past `file_len`
+        // by the time the last track computes its remaining-bytes span,
+        // which must be rejected as a malformed cue sheet instead of
+        // underflowing the subtraction.
+        let cue = temp_path("overrun.cue");
+        let bin = temp_path("overrun.bin");
+        write_file(&bin, &vec![0u8; 2 * RAW_SECTOR_BYTES]);
+        std::fs::write(
+            &cue,
+            format!(
+                concat!(
+                    "FILE \"{}\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                    "  TRACK 02 AUDIO\n    INDEX 01 00:10:00\n",
+                ),
+                bin.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        let err = CdImage::load(&cue).expect_err("overrunning cue sheet must be rejected");
+        assert!(
+            err.to_string().contains("past the end of"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&cue);
+        let _ = std::fs::remove_file(&bin);
     }
 
     #[test]

@@ -55,7 +55,6 @@ pub fn ddf_hard_bounds(harddis: bool) -> (u16, u16) {
 }
 const DEFAULT_HTOTAL: u16 = (COLORCLOCKS_PER_LINE - 1) as u16;
 
-#[cfg_attr(not(test), allow(dead_code))]
 const OCS_LORES_BPL_SEQUENCE: [usize; 8] = [8, 4, 6, 2, 7, 3, 5, 1];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -412,15 +411,15 @@ pub fn anchor_bitplane_fetch_start(start: u16, unit: u32) -> u16 {
     start
 }
 
-fn bitplane_shres(bplcon0: u16) -> bool {
+pub(crate) fn bitplane_shres(bplcon0: u16) -> bool {
     bplcon0 & 0x0040 != 0
 }
 
-fn bitplane_hires(bplcon0: u16) -> bool {
+pub(crate) fn bitplane_hires(bplcon0: u16) -> bool {
     bplcon0 & 0x8000 != 0 && !bitplane_shres(bplcon0)
 }
 
-fn bitplane_fetch_cck_per_word(bplcon0: u16) -> u32 {
+pub(crate) fn bitplane_fetch_cck_per_word(bplcon0: u16) -> u32 {
     if bitplane_shres(bplcon0) {
         2
     } else if bitplane_hires(bplcon0) {
@@ -440,7 +439,7 @@ pub fn bitplane_fetch_quantum(fmode: u16) -> u32 {
 }
 
 /// Colour clocks between successive fetches of one plane.
-fn bitplane_fetch_period(bplcon0: u16, fmode: u16) -> u32 {
+pub(crate) fn bitplane_fetch_period(bplcon0: u16, fmode: u16) -> u32 {
     bitplane_fetch_cck_per_word(bplcon0) * bitplane_fetch_quantum(fmode)
 }
 
@@ -448,11 +447,11 @@ fn bitplane_fetch_period(bplcon0: u16, fmode: u16) -> u32 {
 /// completes a whole unit. 8 cck at FMODE=0 (the classic block), growing
 /// with the fetch width when the per-plane period exceeds it (lores 16/32,
 /// hires 16 at FMODE=3).
-fn bitplane_fetch_unit(bplcon0: u16, fmode: u16) -> u32 {
+pub(crate) fn bitplane_fetch_unit(bplcon0: u16, fmode: u16) -> u32 {
     bitplane_fetch_period(bplcon0, fmode).max(8)
 }
 
-fn ddf_register_mask(revision: AgnusRevision) -> u16 {
+pub(crate) fn ddf_register_mask(revision: AgnusRevision) -> u16 {
     if matches!(revision, AgnusRevision::Ocs) {
         0x00FC
     } else {
@@ -577,8 +576,7 @@ fn bitplane_dma_fetch_timings(
     timings
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn bitplane_fetch_order(bplcon0: u16, plane: usize) -> u32 {
+pub(crate) fn bitplane_fetch_order(bplcon0: u16, plane: usize) -> u32 {
     if bitplane_hires(bplcon0) || bitplane_shres(bplcon0) {
         return plane as u32;
     }

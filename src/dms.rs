@@ -464,7 +464,13 @@ impl<'a> BitReader<'a> {
     }
 
     fn drop(&mut self, bits: u8) {
-        self.bitcount -= bits;
+        // `bits` is a fixed constant at most call sites, but a few pass a
+        // Huffman code length read straight from an untrusted .dms stream
+        // (see decode_c/decode_p); a corrupt length can exceed the bits
+        // actually buffered. Saturate rather than underflow so a bogus
+        // length degrades to a garbled decode (caught by the surrounding
+        // CRC check) instead of a panic.
+        self.bitcount = self.bitcount.saturating_sub(bits);
         self.bitbuf &= mask_bits(self.bitcount);
         while self.bitcount < 16 {
             let byte = self.data.get(self.pos).copied().unwrap_or(0);
@@ -581,7 +587,15 @@ impl HeavyState {
                 };
                 mask >>= 1;
             }
-            bits.drop(self.c_len[node as usize] - 12);
+            // `c_len[node]` is expected to exceed the 12-bit table prefix
+            // for any leaf reached by the tree walk (that's why it wasn't
+            // resolved directly by the table lookup above), but the length
+            // table comes straight from an untrusted .dms stream: a
+            // corrupt file that still passes make_table's Kraft-equality
+            // check could still violate that. Saturate rather than
+            // underflow; a bogus length here produces a garbled decode
+            // that the surrounding CRC check catches, instead of a panic.
+            bits.drop(self.c_len[node as usize].saturating_sub(12));
         }
         node
     }
@@ -602,7 +616,10 @@ impl HeavyState {
                 };
                 mask >>= 1;
             }
-            bits.drop(self.pt_len[node as usize] - 8);
+            // Same reasoning as decode_c above: saturate instead of
+            // underflowing on a length table that a corrupt stream could
+            // still have smuggled past the Kraft-equality check.
+            bits.drop(self.pt_len[node as usize].saturating_sub(8));
         }
 
         if node != self.np as u16 - 1 {
@@ -942,6 +959,25 @@ mod tests {
         let dms = make_uncompressed_dms(&adf);
         assert_eq!(decode_dms_adf(&dms)?, adf);
         Ok(())
+    }
+
+    #[test]
+    fn decode_c_saturates_instead_of_underflowing_on_a_bogus_short_code_length() {
+        // Force the table lookup to miss (so decode_c walks the tree) and
+        // land on a leaf whose code length is shorter than the 12-bit
+        // table prefix already consumed. A corrupt .dms Huffman length
+        // table that still passes make_table's Kraft-equality check could
+        // produce exactly this: `c_len[leaf] - 12` used to underflow.
+        let mut heavy = HeavyState::default();
+        heavy.c_table.fill(HeavyState::N1); // every 12-bit prefix misses
+        heavy.left[HeavyState::N1 as usize] = 5; // ... and both tree
+        heavy.right[HeavyState::N1 as usize] = 5; // branches land on leaf 5
+        heavy.c_len[5] = 5; // shorter than the 12-bit prefix
+
+        let data = [0u8; 8];
+        let mut bits = BitReader::new(&data);
+        let node = heavy.decode_c(&mut bits); // must not panic
+        assert_eq!(node, 5);
     }
 
     #[test]

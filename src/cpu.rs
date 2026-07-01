@@ -3,7 +3,6 @@
 //! M68K CPU wrapper and CPU-visible Amiga bus adapter.
 
 use crate::bus::{Bus, CpuBusAccessKind};
-use crate::chipset::cia::CiaSideEffect;
 use crate::chipset::paula::{pending_ipl, INT_MASTER};
 use crate::config::CpuModel;
 use crate::memory::{
@@ -1502,9 +1501,58 @@ impl M68kMachine {
     }
 }
 
+/// Which plain-memory region a CPU-visible address falls in, and the byte
+/// offset into that region's backing store. Shared by every access path
+/// (peek/debug-write for the debugger, and the real uncached read/write)
+/// so the plain-memory part of the address map -- overlay ROM, chip RAM,
+/// Zorro RAM, slow RAM, ROM, WCS, extended ROM -- is only decoded in one
+/// place. I/O regions (CIA, RTC, Gayle, custom chips, Zorro devices,
+/// autoconfig) are not plain memory and stay in `read_sized_uncached` /
+/// `write_sized`, which only reach them once this classifier returns
+/// `None`.
+enum PlainMemRegion {
+    OverlayRom(usize),
+    ChipRam(usize),
+    ZorroRam(usize, usize),
+    SlowRam(usize),
+    Rom(usize),
+    Wcs(usize),
+    ExtendedRom(usize),
+}
+
 impl CpuBus {
     fn mask(&self, address: u32) -> u32 {
         address & self.address_mask
+    }
+
+    fn classify_plain_memory(&self, addr: u32, size: usize) -> Option<PlainMemRegion> {
+        if let Some(off) = self.overlay_rom_offset(addr, size) {
+            return Some(PlainMemRegion::OverlayRom(off));
+        }
+        if let Some(off) = region_offset(self.bus.mem.chip_ram.len(), CHIP_RAM_BASE, addr, size) {
+            return Some(PlainMemRegion::ChipRam(off));
+        }
+        if let Some((board, off)) = self.bus.mem.zorro.region_at(addr, size) {
+            return Some(PlainMemRegion::ZorroRam(board, off));
+        }
+        if let Some(off) = region_offset(self.bus.mem.slow_ram.len(), SLOW_RAM_BASE, addr, size) {
+            return Some(PlainMemRegion::SlowRam(off));
+        }
+        if let Some(off) = region_offset(self.bus.mem.rom.len(), ROM_BASE, addr, size) {
+            return Some(PlainMemRegion::Rom(off));
+        }
+        if let Some(off) = region_offset(self.bus.mem.wcs.len(), WCS_BASE, addr, size) {
+            return Some(PlainMemRegion::Wcs(off));
+        }
+        if let Some(off) = region_offset(
+            self.bus.mem.extended_rom.len(),
+            self.bus.mem.extended_rom_base,
+            addr,
+            size,
+        ) {
+            return Some(PlainMemRegion::ExtendedRom(off));
+        }
+        None
     }
 
     fn peek_word(&self, address: u32) -> u16 {
@@ -1533,56 +1581,40 @@ impl CpuBus {
 
     fn peek_byte(&self, address: u32) -> u8 {
         let addr = self.mask(address);
-        if let Some(off) = self.overlay_rom_offset(addr, 1) {
-            return self.bus.mem.rom[off];
+        match self.classify_plain_memory(addr, 1) {
+            Some(PlainMemRegion::OverlayRom(off) | PlainMemRegion::Rom(off)) => {
+                self.bus.mem.rom[off]
+            }
+            Some(PlainMemRegion::ChipRam(off)) => self.bus.mem.chip_ram[off],
+            Some(PlainMemRegion::ZorroRam(board, off)) => self.bus.mem.zorro.board_ram(board)[off],
+            Some(PlainMemRegion::SlowRam(off)) => self.bus.mem.slow_ram[off],
+            Some(PlainMemRegion::Wcs(off)) => self.bus.mem.wcs[off],
+            Some(PlainMemRegion::ExtendedRom(off)) => self.bus.mem.extended_rom[off],
+            None => 0xFF,
         }
-        if let Some(off) = region_offset(self.bus.mem.chip_ram.len(), CHIP_RAM_BASE, addr, 1) {
-            return self.bus.mem.chip_ram[off];
-        }
-        if let Some((board, off)) = self.bus.mem.zorro.region_at(addr, 1) {
-            return self.bus.mem.zorro.board_ram(board)[off];
-        }
-        if let Some(off) = region_offset(self.bus.mem.slow_ram.len(), SLOW_RAM_BASE, addr, 1) {
-            return self.bus.mem.slow_ram[off];
-        }
-        if let Some(off) = region_offset(self.bus.mem.rom.len(), ROM_BASE, addr, 1) {
-            return self.bus.mem.rom[off];
-        }
-        if let Some(off) = region_offset(self.bus.mem.wcs.len(), WCS_BASE, addr, 1) {
-            return self.bus.mem.wcs[off];
-        }
-        if let Some(off) = region_offset(
-            self.bus.mem.extended_rom.len(),
-            self.bus.mem.extended_rom_base,
-            addr,
-            1,
-        ) {
-            return self.bus.mem.extended_rom[off];
-        }
-        0xFF
     }
 
     fn debug_write_byte(&mut self, address: u32, value: u8) -> bool {
         let addr = self.mask(address);
-        if self.overlay_rom_offset(addr, 1).is_some() {
-            return false;
+        match self.classify_plain_memory(addr, 1) {
+            Some(PlainMemRegion::ChipRam(off)) => {
+                self.bus.mem.chip_ram[off] = value;
+                self.invalidate_debug_write(addr, 1);
+                true
+            }
+            Some(PlainMemRegion::ZorroRam(board, off)) => {
+                self.bus.mem.zorro.board_ram_mut(board)[off] = value;
+                self.invalidate_debug_write(addr, 1);
+                true
+            }
+            Some(PlainMemRegion::SlowRam(off)) => {
+                self.bus.mem.slow_ram[off] = value;
+                self.invalidate_debug_write(addr, 1);
+                true
+            }
+            // Overlay ROM/ROM/WCS/extended ROM are not debugger-writable.
+            _ => false,
         }
-        if let Some(off) = region_offset(self.bus.mem.chip_ram.len(), CHIP_RAM_BASE, addr, 1) {
-            self.bus.mem.chip_ram[off] = value;
-            self.invalidate_debug_write(addr, 1);
-            return true;
-        }
-        if let Some((board, off)) = self.bus.mem.zorro.region_at(addr, 1) {
-            self.bus.mem.zorro.board_ram_mut(board)[off] = value;
-            self.invalidate_debug_write(addr, 1);
-            return true;
-        }
-        if let Some(off) = region_offset(self.bus.mem.slow_ram.len(), SLOW_RAM_BASE, addr, 1) {
-            self.bus.mem.slow_ram[off] = value;
-            self.invalidate_debug_write(addr, 1);
-            return true;
-        }
-        false
     }
 
     fn invalidate_debug_write(&mut self, addr: u32, size: usize) {
@@ -1698,47 +1730,45 @@ impl CpuBus {
 
     fn read_sized_uncached(&mut self, address: u32, size: usize, kind: CpuBusAccessKind) -> u32 {
         let addr = self.mask(address);
-        if let Some(off) = self.overlay_rom_offset(addr, size) {
-            self.bus.cpu_external_access(Self::access_words(size));
-            return read_be(&self.bus.mem.rom, off, size);
-        }
-        if let Some(off) = region_offset(self.bus.mem.chip_ram.len(), CHIP_RAM_BASE, addr, size) {
-            self.bus.grant_cpu_bus_access_at(Some(addr), size, kind);
-            return read_be(&self.bus.mem.chip_ram, off, size);
-        }
-        if let Some((board, off)) = self.bus.mem.zorro.region_at(addr, size) {
-            // Expansion (Zorro) RAM runs at external-bus speed, off the
-            // chip bus, exactly like the old fixed fast RAM mapping.
-            self.bus.cpu_external_access(Self::access_words(size));
-            return read_be(self.bus.mem.zorro.board_ram(board), off, size);
-        }
-        if let Some(off) = region_offset(self.bus.mem.slow_ram.len(), SLOW_RAM_BASE, addr, size) {
-            // "Slow"/trapdoor RAM at $C00000 is decoded by Gary and reached
-            // through Agnus on the chip bus, so the CPU contends for it cycle
-            // by cycle exactly like chip RAM (that is why it is "slow" and does
-            // not accelerate chip-bus-bound code). Arbitrate it like chip RAM,
-            // not as uncontended external memory.
-            self.bus.grant_cpu_bus_access_at(Some(addr), size, kind);
-            return read_be(&self.bus.mem.slow_ram, off, size);
-        }
-        if let Some(off) = region_offset(self.bus.mem.rom.len(), ROM_BASE, addr, size) {
-            self.bus.cpu_external_access(Self::access_words(size));
-            return read_be(&self.bus.mem.rom, off, size);
-        }
-        // A1000 WCS at $FC0000 (empty -> no match on other machines): the
-        // 256 KiB writable control store the boot ROM loads Kickstart into.
-        if let Some(off) = region_offset(self.bus.mem.wcs.len(), WCS_BASE, addr, size) {
-            self.bus.cpu_external_access(Self::access_words(size));
-            return read_be(&self.bus.mem.wcs, off, size);
-        }
-        if let Some(off) = region_offset(
-            self.bus.mem.extended_rom.len(),
-            self.bus.mem.extended_rom_base,
-            addr,
-            size,
-        ) {
-            self.bus.cpu_external_access(Self::access_words(size));
-            return read_be(&self.bus.mem.extended_rom, off, size);
+        match self.classify_plain_memory(addr, size) {
+            Some(PlainMemRegion::OverlayRom(off)) => {
+                self.bus.cpu_external_access(Self::access_words(size));
+                return read_be(&self.bus.mem.rom, off, size);
+            }
+            Some(PlainMemRegion::ChipRam(off)) => {
+                self.bus.grant_cpu_bus_access_at(Some(addr), size, kind);
+                return read_be(&self.bus.mem.chip_ram, off, size);
+            }
+            Some(PlainMemRegion::ZorroRam(board, off)) => {
+                // Expansion (Zorro) RAM runs at external-bus speed, off the
+                // chip bus, exactly like the old fixed fast RAM mapping.
+                self.bus.cpu_external_access(Self::access_words(size));
+                return read_be(self.bus.mem.zorro.board_ram(board), off, size);
+            }
+            Some(PlainMemRegion::SlowRam(off)) => {
+                // "Slow"/trapdoor RAM at $C00000 is decoded by Gary and reached
+                // through Agnus on the chip bus, so the CPU contends for it cycle
+                // by cycle exactly like chip RAM (that is why it is "slow" and does
+                // not accelerate chip-bus-bound code). Arbitrate it like chip RAM,
+                // not as uncontended external memory.
+                self.bus.grant_cpu_bus_access_at(Some(addr), size, kind);
+                return read_be(&self.bus.mem.slow_ram, off, size);
+            }
+            Some(PlainMemRegion::Rom(off)) => {
+                self.bus.cpu_external_access(Self::access_words(size));
+                return read_be(&self.bus.mem.rom, off, size);
+            }
+            // A1000 WCS at $FC0000 (empty -> no match on other machines): the
+            // 256 KiB writable control store the boot ROM loads Kickstart into.
+            Some(PlainMemRegion::Wcs(off)) => {
+                self.bus.cpu_external_access(Self::access_words(size));
+                return read_be(&self.bus.mem.wcs, off, size);
+            }
+            Some(PlainMemRegion::ExtendedRom(off)) => {
+                self.bus.cpu_external_access(Self::access_words(size));
+                return read_be(&self.bus.mem.extended_rom, off, size);
+            }
+            None => {}
         }
 
         if range_contains(CIA_A_BASE, CIA_A_SIZE, addr) {
@@ -1872,62 +1902,58 @@ impl CpuBus {
             // intentionally does NOT snoop writes, like real silicon.)
             dcache.invalidate_write(addr, size);
         }
-        if self.overlay_rom_offset(addr, size).is_some() {
-            self.bus.cpu_external_access(Self::access_words(size));
-            return;
-        }
-        if let Some(off) = region_offset(self.bus.mem.chip_ram.len(), CHIP_RAM_BASE, addr, size) {
-            self.bus
-                .grant_cpu_bus_access_at(Some(addr), size, CpuBusAccessKind::Write);
-            self.bus.record_cpu_chip_ram_write(off, size, value);
-            write_be(&mut self.bus.mem.chip_ram, off, size, value);
-            self.dbg_note_memw(addr, size);
-            return;
-        }
-        if let Some((board, off)) = self.bus.mem.zorro.region_at(addr, size) {
-            self.bus.cpu_external_access(Self::access_words(size));
-            write_be(self.bus.mem.zorro.board_ram_mut(board), off, size, value);
-            return;
-        }
-        if let Some(off) = region_offset(self.bus.mem.slow_ram.len(), SLOW_RAM_BASE, addr, size) {
-            // Slow/trapdoor RAM at $C00000 is on the chip bus (reached through
-            // Agnus), so CPU writes contend cycle by cycle like chip RAM rather
-            // than running at uncontended external-memory speed.
-            self.bus
-                .grant_cpu_bus_access_at(Some(addr), size, CpuBusAccessKind::Write);
-            write_be(&mut self.bus.mem.slow_ram, off, size, value);
-            self.dbg_note_memw(addr, size);
-            return;
-        }
-        if region_offset(self.bus.mem.rom.len(), ROM_BASE, addr, size).is_some() {
-            self.bus.cpu_external_access(Self::access_words(size));
-            // A1000: a CPU write anywhere in the boot-ROM window ($F80000-
-            // $FBFFFF) flips the latch to write-protect the WCS. The boot code
-            // does this once the Kickstart image is in place at $FC0000.
-            if !self.bus.mem.wcs.is_empty() {
-                self.bus.mem.wcs_write_protected = true;
+        match self.classify_plain_memory(addr, size) {
+            Some(PlainMemRegion::OverlayRom(_)) => {
+                self.bus.cpu_external_access(Self::access_words(size));
+                return;
             }
-            return;
-        }
-        // A1000 WCS at $FC0000: writable until the boot ROM locks the latch.
-        if let Some(off) = region_offset(self.bus.mem.wcs.len(), WCS_BASE, addr, size) {
-            self.bus.cpu_external_access(Self::access_words(size));
-            if !self.bus.mem.wcs_write_protected {
-                write_be(&mut self.bus.mem.wcs, off, size, value);
+            Some(PlainMemRegion::ChipRam(off)) => {
+                self.bus
+                    .grant_cpu_bus_access_at(Some(addr), size, CpuBusAccessKind::Write);
+                self.bus.record_cpu_chip_ram_write(off, size, value);
+                write_be(&mut self.bus.mem.chip_ram, off, size, value);
                 self.dbg_note_memw(addr, size);
+                return;
             }
-            return;
-        }
-        if region_offset(
-            self.bus.mem.extended_rom.len(),
-            self.bus.mem.extended_rom_base,
-            addr,
-            size,
-        )
-        .is_some()
-        {
-            self.bus.cpu_external_access(Self::access_words(size));
-            return;
+            Some(PlainMemRegion::ZorroRam(board, off)) => {
+                self.bus.cpu_external_access(Self::access_words(size));
+                write_be(self.bus.mem.zorro.board_ram_mut(board), off, size, value);
+                return;
+            }
+            Some(PlainMemRegion::SlowRam(off)) => {
+                // Slow/trapdoor RAM at $C00000 is on the chip bus (reached through
+                // Agnus), so CPU writes contend cycle by cycle like chip RAM rather
+                // than running at uncontended external-memory speed.
+                self.bus
+                    .grant_cpu_bus_access_at(Some(addr), size, CpuBusAccessKind::Write);
+                write_be(&mut self.bus.mem.slow_ram, off, size, value);
+                self.dbg_note_memw(addr, size);
+                return;
+            }
+            Some(PlainMemRegion::Rom(_)) => {
+                self.bus.cpu_external_access(Self::access_words(size));
+                // A1000: a CPU write anywhere in the boot-ROM window ($F80000-
+                // $FBFFFF) flips the latch to write-protect the WCS. The boot code
+                // does this once the Kickstart image is in place at $FC0000.
+                if !self.bus.mem.wcs.is_empty() {
+                    self.bus.mem.wcs_write_protected = true;
+                }
+                return;
+            }
+            // A1000 WCS at $FC0000: writable until the boot ROM locks the latch.
+            Some(PlainMemRegion::Wcs(off)) => {
+                self.bus.cpu_external_access(Self::access_words(size));
+                if !self.bus.mem.wcs_write_protected {
+                    write_be(&mut self.bus.mem.wcs, off, size, value);
+                    self.dbg_note_memw(addr, size);
+                }
+                return;
+            }
+            Some(PlainMemRegion::ExtendedRom(_)) => {
+                self.bus.cpu_external_access(Self::access_words(size));
+                return;
+            }
+            None => {}
         }
 
         if range_contains(CIA_A_BASE, CIA_A_SIZE, addr) {
@@ -1935,17 +1961,12 @@ impl CpuBus {
             let effect = self
                 .bus
                 .cia_a_write(u64::from(addr - CIA_A_BASE), size, u64::from(value));
-            match effect {
-                CiaSideEffect::DisableOverlay => {
-                    self.bus.overlay_disable_pending = true;
-                    self.bus.slice_preempted = true;
-                }
-                CiaSideEffect::TimerStarted => {
-                    self.bus.slice_preempted = true;
-                }
-                CiaSideEffect::KeyboardHandshakeStart
-                | CiaSideEffect::KeyboardHandshakeEnd
-                | CiaSideEffect::None => {}
+            if effect.disable_overlay {
+                self.bus.overlay_disable_pending = true;
+                self.bus.slice_preempted = true;
+            }
+            if effect.timer_started {
+                self.bus.slice_preempted = true;
             }
             return;
         }
@@ -1954,7 +1975,7 @@ impl CpuBus {
             let effect = self
                 .bus
                 .cia_b_write(u64::from(addr - CIA_B_BASE), size, u64::from(value));
-            if matches!(effect, CiaSideEffect::TimerStarted) {
+            if effect.timer_started {
                 self.bus.slice_preempted = true;
             }
             return;

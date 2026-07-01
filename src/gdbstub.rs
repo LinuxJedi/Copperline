@@ -10,7 +10,7 @@
 use crate::debugger::{custom_reg_name, UI_ADDR_MASK};
 use crate::emulator::Emulator;
 use crate::timetravel::ReverseOutcome;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -200,14 +200,14 @@ impl Session {
             _ if packet.starts_with("z2,") || packet.starts_with("z3,") || packet.starts_with("z4,") => {
                 self.remove_watchpoint(packet)?
             }
-            _ if packet == "s" || packet.starts_with("s") => {
+            _ if packet.starts_with('s') => {
                 if let Some(addr) = packet.strip_prefix('s').filter(|s| !s.is_empty()) {
                     let pc = parse_hex_u32(addr)?;
                     self.emu.machine.debug_set_register(17, pc);
                 }
                 self.step_forward()?
             }
-            _ if packet == "c" || packet.starts_with("c") => {
+            _ if packet.starts_with('c') => {
                 if let Some(addr) = packet.strip_prefix('c').filter(|s| !s.is_empty()) {
                     let pc = parse_hex_u32(addr)?;
                     self.emu.machine.debug_set_register(17, pc);
@@ -223,53 +223,71 @@ impl Session {
         Ok(PacketOutcome::Reply(reply))
     }
 
-    fn read_packet(&mut self) -> Result<Option<String>> {
-        let mut byte = [0u8; 1];
-        loop {
-            match self.stream.read_exact(&mut byte) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(e).context("reading GDB packet"),
-            }
-            match byte[0] {
-                b'+' | b'-' => continue,
-                b'$' => break,
-                0x03 => {
-                    self.stop = StopReason::Interrupted;
-                    return Ok(Some("?".to_string()));
-                }
-                _ => continue,
-            }
-        }
+    /// Hard cap on a single packet's payload, well above the `PacketSize=4000`
+    /// this stub advertises in qSupported but far short of unbounded: this is
+    /// network-facing input (the stub can bind non-loopback), so a peer that
+    /// never sends the `#` terminator must not be able to grow `payload`
+    /// without limit.
+    const MAX_PACKET_PAYLOAD_BYTES: usize = 1 << 20;
 
-        let mut payload = Vec::new();
+    fn read_packet(&mut self) -> Result<Option<String>> {
+        // Loop (rather than recurse) on a checksum mismatch: a peer sending
+        // many consecutive bad-checksum packets must not grow the call
+        // stack without bound.
         loop {
+            let mut byte = [0u8; 1];
+            loop {
+                match self.stream.read_exact(&mut byte) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(e) => return Err(e).context("reading GDB packet"),
+                }
+                match byte[0] {
+                    b'+' | b'-' => continue,
+                    b'$' => break,
+                    0x03 => {
+                        self.stop = StopReason::Interrupted;
+                        return Ok(Some("?".to_string()));
+                    }
+                    _ => continue,
+                }
+            }
+
+            let mut payload = Vec::new();
+            loop {
+                self.stream
+                    .read_exact(&mut byte)
+                    .context("reading GDB packet payload")?;
+                if byte[0] == b'#' {
+                    break;
+                }
+                payload.push(byte[0]);
+                if payload.len() > Self::MAX_PACKET_PAYLOAD_BYTES {
+                    bail!(
+                        "GDB packet exceeds {}-byte limit without a '#' terminator",
+                        Self::MAX_PACKET_PAYLOAD_BYTES
+                    );
+                }
+            }
+            let mut sum_bytes = [0u8; 2];
             self.stream
-                .read_exact(&mut byte)
-                .context("reading GDB packet payload")?;
-            if byte[0] == b'#' {
-                break;
+                .read_exact(&mut sum_bytes)
+                .context("reading GDB packet checksum")?;
+            let expected = parse_hex_byte(sum_bytes[0], sum_bytes[1])?;
+            let actual = checksum(&payload);
+            if expected != actual {
+                if !self.no_ack {
+                    self.stream.write_all(b"-").ok();
+                }
+                continue;
             }
-            payload.push(byte[0]);
-        }
-        let mut sum_bytes = [0u8; 2];
-        self.stream
-            .read_exact(&mut sum_bytes)
-            .context("reading GDB packet checksum")?;
-        let expected = parse_hex_byte(sum_bytes[0], sum_bytes[1])?;
-        let actual = checksum(&payload);
-        if expected != actual {
             if !self.no_ack {
-                self.stream.write_all(b"-").ok();
+                self.stream.write_all(b"+").ok();
             }
-            return self.read_packet();
+            return String::from_utf8(payload)
+                .map(Some)
+                .context("GDB packet is not UTF-8");
         }
-        if !self.no_ack {
-            self.stream.write_all(b"+").ok();
-        }
-        String::from_utf8(payload)
-            .map(Some)
-            .context("GDB packet is not UTF-8")
     }
 
     fn send_packet(&mut self, payload: &str) -> Result<()> {
@@ -336,6 +354,13 @@ impl Session {
         };
         let addr = parse_hex_u32(addr_s)?;
         let len = parse_hex_usize(len_s)?;
+        // `len` is a hex value the peer controls directly (independent of
+        // the packet's own byte length), so a tiny packet like "m0,ffffffff"
+        // could otherwise demand a multi-GB allocation. No real GDB request
+        // needs more than a small fraction of the address space at once.
+        if len > Self::MAX_PACKET_PAYLOAD_BYTES {
+            return Ok("E01".to_string());
+        }
         Ok(hex_encode(&self.emu.machine.debug_read_memory(addr, len)))
     }
 
@@ -506,7 +531,12 @@ impl Session {
         }
         let end = offset.saturating_add(len).min(bytes.len());
         let prefix = if end == bytes.len() { 'l' } else { 'm' };
-        let chunk = std::str::from_utf8(&bytes[offset..end]).expect("target XML is UTF-8");
+        // TARGET_XML is pure ASCII today, so any offset/len is a valid char
+        // boundary, but both come straight from the peer: don't let a future
+        // non-ASCII addition (or a boundary that happens to split a
+        // multi-byte char) turn into a panic instead of a clean error.
+        let chunk = std::str::from_utf8(&bytes[offset..end])
+            .map_err(|_| anyhow!("target XML slice landed on a non-UTF-8 boundary"))?;
         Ok(format!("{prefix}{chunk}"))
     }
 
