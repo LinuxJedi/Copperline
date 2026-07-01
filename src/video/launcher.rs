@@ -23,8 +23,8 @@ use crate::chipset::agnus::{AgnusRevision, VideoStandard};
 use crate::chipset::denise::DeniseRevision;
 use crate::config::{
     format_size, machine_profile_defaults, Chipset, Config, CpuModel, JoystickInputMode,
-    MachineModel, Overscan, PacingBudget, RawConfig, RawDrive, RawFloppyDrive, RawZorroBoard,
-    WarpSpeed,
+    MachineModel, Overscan, PacingBudget, PixelAspect, RawConfig, RawDrive, RawFloppyDrive,
+    RawZorroBoard, WarpSpeed,
 };
 use crate::zorro::{ConfigOption, ConfigOptionKind, LoadedZorroBoard};
 use anyhow::Result;
@@ -255,6 +255,7 @@ pub enum LauncherField {
     Cd32Nvram,
     // A/V and emulation
     Overscan,
+    PixelAspect,
     Phosphor,
     FloppySounds,
     FloppyVolume,
@@ -351,8 +352,9 @@ const CD_ROWS: [Row; 3] = [
     row(F::CdInsertDelay, "Insert delay", Cycle),
     row(F::Cd32Nvram, "CD32 NVRAM", PathRow),
 ];
-const AV_EMULATION_ROWS: [Row; 9] = [
+const AV_EMULATION_ROWS: [Row; 10] = [
     row(F::Overscan, "Overscan", Cycle),
+    row(F::PixelAspect, "Pixel aspect", Cycle),
     row(F::Phosphor, "Phosphor", Cycle),
     row(F::FloppySounds, "Floppy sounds", Toggle),
     row(F::FloppyVolume, "Floppy volume", Cycle),
@@ -440,6 +442,7 @@ const Z3_PRESETS: [usize; 8] = [
     1024 * 1024 * 1024,
 ];
 const OVERSCANS: [Overscan; 2] = [Overscan::Tv, Overscan::Full];
+const PIXEL_ASPECTS: [PixelAspect; 2] = [PixelAspect::Tv, PixelAspect::Square];
 const PACINGS: [PacingBudget; 2] = [PacingBudget::Cycles, PacingBudget::Instructions];
 const WARPS: [WarpSpeed; 5] = [
     WarpSpeed::X2,
@@ -504,6 +507,7 @@ pub struct MachineSetup {
     cd32_nvram: Option<PathBuf>,
     // A/V and emulation
     overscan: Overscan,
+    pixel_aspect: PixelAspect,
     phosphor: f32,
     floppy_sounds: bool,
     floppy_volume: u8,
@@ -578,6 +582,7 @@ impl MachineSetup {
             // on CD32, which we do not want to persist as an explicit setting.
             cd32_nvram: raw.cd.nvram.as_deref().map(PathBuf::from),
             overscan: cfg.overscan,
+            pixel_aspect: cfg.pixel_aspect,
             phosphor: cfg.phosphor,
             floppy_sounds: cfg.audio.floppy_sounds,
             floppy_volume: cfg.audio.floppy_sounds_volume,
@@ -739,6 +744,9 @@ impl MachineSetup {
         if self.overscan != base.overscan {
             raw.display.overscan = Some(overscan_name(self.overscan).to_string());
         }
+        if self.pixel_aspect != base.pixel_aspect {
+            raw.display.pixel_aspect = Some(pixel_aspect_name(self.pixel_aspect).to_string());
+        }
         if (self.phosphor - base.phosphor).abs() > 1e-6 {
             raw.display.phosphor = Some(self.phosphor);
         }
@@ -847,6 +855,7 @@ impl MachineSetup {
         self.slow_ram = base.slow_ram_bytes;
         self.z3_ram = base.z3_ram_bytes;
         self.overscan = base.overscan;
+        self.pixel_aspect = base.pixel_aspect;
         self.phosphor = base.phosphor;
         self.floppy_sounds = base.audio.floppy_sounds;
         self.floppy_volume = base.audio.floppy_sounds_volume;
@@ -1041,6 +1050,10 @@ impl MachineSetup {
                 Overscan::Tv => "TV".to_string(),
                 Overscan::Full => "Full".to_string(),
             },
+            F::PixelAspect => match self.pixel_aspect {
+                PixelAspect::Tv => "TV (4:3)".to_string(),
+                PixelAspect::Square => "Square".to_string(),
+            },
             F::Phosphor => {
                 if self.phosphor <= 0.0 {
                     "Off".to_string()
@@ -1125,6 +1138,9 @@ impl MachineSetup {
             }
             F::FloppyVolume => self.floppy_volume = step_u8(self.floppy_volume, forward, 0, 100),
             F::Overscan => self.overscan = cycle_slice(&OVERSCANS, self.overscan, forward),
+            F::PixelAspect => {
+                self.pixel_aspect = cycle_slice(&PIXEL_ASPECTS, self.pixel_aspect, forward)
+            }
             F::PacingBudget => {
                 self.pacing_budget = cycle_slice(&PACINGS, self.pacing_budget, forward)
             }
@@ -1570,6 +1586,13 @@ fn overscan_name(overscan: Overscan) -> &'static str {
     match overscan {
         Overscan::Tv => "tv",
         Overscan::Full => "full",
+    }
+}
+
+fn pixel_aspect_name(aspect: PixelAspect) -> &'static str {
+    match aspect {
+        PixelAspect::Tv => "tv",
+        PixelAspect::Square => "square",
     }
 }
 

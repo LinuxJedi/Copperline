@@ -130,6 +130,10 @@ Timing-model knobs that pair well with the debugger:
   forensics (which exact framebuffer row carries an artifact) need the raw
   field.
 - `COPPERLINE_OVERSCAN=full|tv` -- override the configured overscan mask.
+- `COPPERLINE_PIXEL_ASPECT=tv|square` -- override `[display] pixel_aspect`
+  for one run: `tv` is the 4:3 CRT presentation, `square` maps one host
+  row per woven scanline (a standard PAL screen becomes an exact 2x2 of
+  its bitmap in screenshots and the window).
 - `COPPERLINE_DEINTERLACE=0` -- disable the motion-adaptive deinterlacer.
 - `COPPERLINE_PHOSPHOR=0.0..0.95` -- CRT phosphor persistence for one run
   (overrides `[display] phosphor`).

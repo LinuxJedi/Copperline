@@ -76,10 +76,53 @@ impl FrameGeometry {
     }
 }
 
-/// 4:3 presentation height for screenshots/window scaling. This keeps
-/// the internal 716x285 overscan field buffer but presents it with the
-/// non-square pixel aspect of a standard Amiga display.
-pub const PRESENT_HEIGHT: usize = FB_WIDTH * 3 / 4;
+/// 4:3 presentation height for screenshots/window scaling: the internal
+/// 716x285 overscan field buffer is presented with the non-square pixel
+/// aspect of a standard Amiga display on a 4:3 CRT.
+pub const PRESENT_HEIGHT_TV: usize = FB_WIDTH * 3 / 4;
+
+/// Square-pixel presentation height: one host row per woven scanline
+/// (570 for a standard field), so a lo-res display is an exact 2x2 of
+/// its bitmap (320x256 PAL occupies precisely 640x512 output pixels).
+pub const PRESENT_HEIGHT_SQUARE: usize = deinterlace::OUT_HEIGHT;
+
+/// The active presentation pixel aspect (`[display] pixel_aspect`,
+/// runtime-toggled by the menu's Pixel Aspect item). Process-global like
+/// the envcfg snapshot: presentation layout helpers (status bar rects,
+/// hit tests, menu geometry) are free functions called from deep in the
+/// window/UI code, and all reads and writes happen on the main thread --
+/// the atomic only satisfies `static` safety.
+static SQUARE_PIXEL_ASPECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_pixel_aspect(aspect: crate::config::PixelAspect) {
+    SQUARE_PIXEL_ASPECT.store(
+        aspect == crate::config::PixelAspect::Square,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn pixel_aspect() -> crate::config::PixelAspect {
+    if SQUARE_PIXEL_ASPECT.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::config::PixelAspect::Square
+    } else {
+        crate::config::PixelAspect::Tv
+    }
+}
+
+/// Presentation height for the active pixel aspect. The pure
+/// [`present_height_for`] variant is what unit tests target, so they
+/// never have to mutate the process-global mode.
+pub fn present_height() -> usize {
+    present_height_for(pixel_aspect())
+}
+
+pub fn present_height_for(aspect: crate::config::PixelAspect) -> usize {
+    match aspect {
+        crate::config::PixelAspect::Tv => PRESENT_HEIGHT_TV,
+        crate::config::PixelAspect::Square => PRESENT_HEIGHT_SQUARE,
+    }
+}
 
 /// Blend two RGBA pixels channel-wise: frac=0 returns a, frac=256
 /// returns b. Used by horizontal resampling for programmable scan

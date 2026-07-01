@@ -1019,6 +1019,7 @@ fn main() -> Result<()> {
             .map(|d| d.write_protected)
             .unwrap_or(true)
     });
+    video::set_pixel_aspect(resolve_pixel_aspect(cfg.pixel_aspect));
     let app = App::new(
         emu,
         cfg.emulation.power_on,
@@ -1305,6 +1306,7 @@ fn build_placeholder_machine() -> Result<Emulator> {
 fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
     info!("no machine specified; opening the configuration screen");
     let emu = build_placeholder_machine()?;
+    video::set_pixel_aspect(resolve_pixel_aspect(config::PixelAspect::Tv));
     let mut app = App::new(
         emu,
         false,
@@ -1501,6 +1503,25 @@ pub(crate) fn resolve_overscan(from_config: crate::config::Overscan) -> crate::c
             Ok(o) => o,
             Err(e) => {
                 warn!("ignoring COPPERLINE_OVERSCAN: {e}");
+                from_config
+            }
+        },
+        None => from_config,
+    }
+}
+
+/// Resolve the presentation pixel aspect: the `COPPERLINE_PIXEL_ASPECT`
+/// env var (tv/square) overrides the `[display] pixel_aspect` config for
+/// one run, so headless A/B captures can pin a mode without editing the
+/// config.
+pub(crate) fn resolve_pixel_aspect(
+    from_config: crate::config::PixelAspect,
+) -> crate::config::PixelAspect {
+    match envcfg::var("COPPERLINE_PIXEL_ASPECT") {
+        Some(v) => match crate::config::parse_pixel_aspect(&v) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("ignoring COPPERLINE_PIXEL_ASPECT: {e}");
                 from_config
             }
         },
