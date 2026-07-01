@@ -843,6 +843,23 @@ impl ControlState {
         native_x_offset.saturating_sub(visible_phase.min(native_x_offset))
     }
 
+    fn holds_final_lowres_fetch_sample_at_diwstop(&self) -> bool {
+        if self.hires() || self.shres() || self.fetch_quantum() != 1 {
+            return false;
+        }
+        // DDFSTOP requests bitplane DMA shutdown; the sequencer drops BPRUN
+        // at the fetch-unit boundary. A late FMODE=0 low-res row whose
+        // completed fetch content ends exactly at DIWSTOP still presents the
+        // final latched word for the last DIW sample, without moving the
+        // row's fetch origin.
+        let ddf_start = effective_ddf_start_hpos(self.agnus_revision, false, self.ddfstrt);
+        if ddf_start <= 0x0038 {
+            return false;
+        }
+        self.bitplane_content_window_h()
+            .is_some_and(|(_content_start, content_stop)| content_stop == self.diw_h_stop() as i32)
+    }
+
     fn fetch_origin_native_shift(&self, diw_h_start: u16, pixel_repeat: usize) -> i32 {
         let display_native_shift =
             ((diw_h_start as i32 - self.fetch_reference()) * 2) / pixel_repeat as i32;
@@ -913,21 +930,6 @@ impl ControlState {
                 // lo-res phase bias must not push a standard-width DIW one sample
                 // past that completed early-DDF row at the right edge.
                 origin_shift -= 1;
-            }
-            if origin_shift < 0 {
-                if let Some((_content_start, content_stop)) = self.bitplane_content_window_h() {
-                    let diw_stop = self.diw_h_stop() as i32;
-                    if content_stop == diw_stop {
-                        // With a late FMODE=0 lo-res fetch whose completed DDF
-                        // row lands exactly on DIWSTOP, the same one-sample
-                        // lo-res phase bias must be applied to the delayed
-                        // fetch origin. Otherwise the final visible DIW sample
-                        // advances one native index past undelayed planes while
-                        // BPLCON1-delayed planes are still active, producing a
-                        // colour-0/partial-plane column at the right edge.
-                        origin_shift -= 1;
-                    }
-                }
             }
         }
         // A hi-res/SHRES FMODE=0 screen that starts DDFSTRT earlier than the
@@ -1178,6 +1180,17 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
         min_fetch_x: usize,
         native_x: usize,
     ) -> DeniseBitplaneSample {
+        self.sample_prepared_with_final_fetch_hold(nplanes, delays, min_fetch_x, native_x, false)
+    }
+
+    fn sample_prepared_with_final_fetch_hold(
+        &self,
+        nplanes: usize,
+        delays: &[usize; 8],
+        min_fetch_x: usize,
+        native_x: usize,
+        hold_final_fetch_sample: bool,
+    ) -> DeniseBitplaneSample {
         let mut idx = 0u8;
         let mut active = false;
         for (plane, words) in self.plane_words.iter().enumerate().take(nplanes) {
@@ -1203,9 +1216,21 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
             // The DMA fetch slots decide which word reaches Denise, but the
             // display shifter sees that word as a complete latched sample.
             // Do not expose the first word plane-by-plane at a late DDF edge.
-            if fetch_x >= self.fetched_pixels {
-                continue;
-            }
+            let fetch_x = if fetch_x >= self.fetched_pixels {
+                // A DDFSTOP-delayed final fetch keeps the last latched sample
+                // visible for the last DIW position. Apply this per plane so
+                // BPLCON1-delayed planes keep their own tap positions.
+                if hold_final_fetch_sample
+                    && self.fetched_pixels > 0
+                    && fetch_x == self.fetched_pixels
+                {
+                    self.fetched_pixels - 1
+                } else {
+                    continue;
+                }
+            } else {
+                fetch_x
+            };
             active = true;
             let word = words[fetch_x / 16];
             let bit = 15 - (fetch_x & 0x0F);
@@ -5272,6 +5297,7 @@ fn render_planned_playfield_line(
         let background_rgb24 = rgb12_to_rgb24(color_rgb12(palette[0]));
         let nplanes = sample_control.nplanes().min(plan.plane_words.len());
         let delays = std::array::from_fn(|plane| sample_control.scroll_for_plane(plane));
+        let hold_final_fetch_sample = pixel_control.holds_final_lowres_fetch_sample_at_diwstop();
         let ham_mode = sample_control.hold_and_modify();
         let ham_history_start_native_x = if ham_mode {
             pixel_control.ham_history_start_native_x(
@@ -5356,7 +5382,13 @@ fn render_planned_playfield_line(
                     denise_shres_playfield_output(palette, left.idx, right.idx, &mut ham_color),
                 )
             } else {
-                let sample = plan.sample_prepared(nplanes, &delays, min_fetch_x, native_x);
+                let sample = plan.sample_prepared_with_final_fetch_hold(
+                    nplanes,
+                    &delays,
+                    min_fetch_x,
+                    native_x,
+                    hold_final_fetch_sample,
+                );
                 let ham_before = ham_color;
                 let output =
                     denise_playfield_output(pixel_control, palette, sample.idx, &mut ham_color);
@@ -8234,14 +8266,15 @@ mod tests {
         };
         assert_eq!(control.display_window_x(), (96, 704));
         assert_eq!(control.words_per_row(0), 17);
-        assert_eq!(control.fetch_start_native_x(control.diw_h_start(), 2), 32);
+        assert_eq!(control.fetch_start_native_x(control.diw_h_start(), 2), 31);
         assert_eq!(control.native_x_offset(control.diw_h_start(), 2), 0);
+        assert!(control.holds_final_lowres_fetch_sample_at_diwstop());
 
         let last_visible_x = control.display_window_x().1 - control.framebuffer_pixel_repeat();
         let output_native_x =
             (last_visible_x - control.display_window_x().0) / control.framebuffer_pixel_repeat();
         let native_x = output_native_x - control.fetch_start_native_x(control.diw_h_start(), 2);
-        assert_eq!(native_x, 271);
+        assert_eq!(native_x, 272);
 
         let plane1 = vec![0; 17];
         let mut plane2 = vec![0; 17];
@@ -8249,10 +8282,75 @@ mod tests {
         let planes = vec![plane1, plane2];
         let plan = DenisePlannedPlayfieldLine::new(0, 96, 704, &planes, 17 * 16);
         let delays = std::array::from_fn(|plane| control.scroll_for_plane(plane));
-        let sample = plan.sample_prepared(control.nplanes(), &delays, 0, native_x);
+        let sample = plan.sample_prepared_with_final_fetch_hold(
+            control.nplanes(),
+            &delays,
+            0,
+            native_x,
+            control.holds_final_lowres_fetch_sample_at_diwstop(),
+        );
 
         assert!(sample.active);
         assert_eq!(sample.idx, 0x02);
+    }
+
+    #[test]
+    fn late_lowres_ddf_stop_hold_keeps_left_origin_unadvanced() {
+        // The DDFSTOP hold keeps the final completed fetch visible at DIWSTOP,
+        // but it must not move the whole low-res FMODE=0 row one native sample
+        // to the right. A first-word bit therefore appears at the unadvanced
+        // late-DDF fetch origin on the left side of the display window.
+        let control = ControlState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x1000,
+            diwstrt: 0x2C91,
+            diwstop: 0x2CC1,
+            ddfstrt: 0x0050,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        assert_eq!(control.display_window_x(), (96, 704));
+        assert_eq!(control.fetch_start_native_x(control.diw_h_start(), 2), 31);
+        assert!(control.holds_final_lowres_fetch_sample_at_diwstop());
+
+        let mut plane = vec![0; 17];
+        plane[0] = 0x8000;
+        let planes = vec![plane];
+        let plan = DenisePlannedPlayfieldLine::new(0, 96, 704, &planes, 17 * 16);
+        let mut palette = Palette::new();
+        palette.write_ocs(1, 0x00F0);
+        let mut fb = vec![0; FB_PIXELS];
+        let mut playfield_mask = vec![0; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut clxdat = 0;
+
+        render_planned_playfield_line(
+            &plan,
+            &mut fb,
+            &mut playfield_mask,
+            &mut collision_pixels,
+            &mut clxdat,
+            palette,
+            &[],
+            0,
+            control,
+            &[],
+            0,
+            control.bplcon1,
+            false,
+            0,
+            PAL_VISIBLE_LINE0,
+            0.0,
+            0,
+        );
+
+        let first_fetch_x = control.display_window_x().0
+            + control.fetch_start_native_x(control.diw_h_start(), 2)
+                * control.framebuffer_pixel_repeat();
+        assert_eq!(first_fetch_x, 158);
+        assert_eq!(fb[first_fetch_x - 2], rgb12_to_rgba8_alpha(0, false));
+        assert_eq!(fb[first_fetch_x], rgb12_to_rgba8(0x00F0));
+        assert_eq!(fb[first_fetch_x + 1], rgb12_to_rgba8(0x00F0));
     }
 
     #[test]
