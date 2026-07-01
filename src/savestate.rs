@@ -61,7 +61,9 @@ const STATE_MAGIC: &[u8; 8] = b"CLSSTATE";
 //  11: CpuCore MMU registers collapsed (removed tc/urp/srp/mmusr duplicates;
 //      mmu_sr retyped u16->u32) so the 040 MOVEC path and the page-table
 //      walker share one register set
-pub const STATE_VERSION: u32 = 11;
+//  12: Paula audio channels gained deferred AUDxEN-disable state so a DMA
+//      clear is observed at the current word boundary
+pub const STATE_VERSION: u32 = 12;
 
 /// Default state file name, timestamped like the screenshot/recorder names.
 pub fn auto_filename() -> std::path::PathBuf {

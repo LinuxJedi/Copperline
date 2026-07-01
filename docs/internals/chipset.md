@@ -119,6 +119,10 @@ modelled 68000 recognition latency), serial, and audio:
   a period accumulator clocked at CCK rate, and the hardware's one-word
   fetch-ahead (audible with short periods). Channel interrupts fire on
   buffer completion; LEN=0 plays a full 65536-word block, as on hardware.
+  Clearing AUDxEN while a DMA word is being output is deferred until the
+  current word boundary, so a clear/set pair shorter than the remaining
+  word time is missed by the audio state machine and playback continues
+  instead of restarting from AUDxLC.
   Output is mixed in emulated time to stereo with the LED filter, then
   resampled at the host boundary.
 - **Serial**: SERDAT through a one-word transmit buffer and a timed shift
