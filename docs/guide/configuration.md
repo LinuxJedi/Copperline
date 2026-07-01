@@ -285,9 +285,11 @@ phosphor = 0.0    # CRT persistence fraction, 0.0 (off) to 0.95
 The emulated framebuffer always carries the full overscan field Denise
 produces. `"tv"` masks the deep horizontal overscan margins in black like a
 CRT bezel, presenting the standard PAL window plus 24 lo-res pixels per side
-of TV-style overscan while preserving vertical border colour changes;
-`"full"` shows everything, which is useful when debugging display alignment.
-`COPPERLINE_OVERSCAN=full|tv` overrides this for a single run.
+of TV-style overscan while preserving vertical border colour changes. PNG
+screenshots and `--dump-frames` crop standard PAL TV output to a 692x540
+aperture for reference-emulator comparison. `"full"` shows everything, which
+is useful when debugging display alignment. `COPPERLINE_OVERSCAN=full|tv`
+overrides this for a single run.
 
 `phosphor` blends each presented frame with a fraction of the previous
 one, approximating the exponential decay of CRT phosphor. Software that

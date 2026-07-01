@@ -287,6 +287,10 @@ const STANDARD_PAL_VISIBLE_START_VPOS: u32 = 0x2C;
 // Default TV presentation keeps a small consumer-visible overscan margin while
 // still hiding the deep edge columns that often contain unfinished effects.
 const TV_HORIZONTAL_OVERSCAN_MARGIN: usize = 24 * 2;
+const TV_PAL_PRESENT_WIDTH: usize = STANDARD_PAL_VISIBLE_WIDTH + 2 * 26;
+const TV_PAL_PRESENT_HEIGHT: usize = 540;
+const TV_PAL_PRESENT_SOURCE_X: usize = bitplane::STANDARD_VISIBLE_X0 - 26;
+const TV_PAL_PRESENT_SOURCE_Y: usize = 18;
 const STATUS_BG: u32 = rgba(28, 28, 26);
 const STATUS_TOP: u32 = rgba(78, 76, 70);
 const STATUS_BOTTOM: u32 = rgba(12, 12, 11);
@@ -7057,22 +7061,13 @@ impl App {
         // modes): the presentation resampler blends adjacent lines, so
         // per-scanline forensics need the unscaled field.
         let src_rows = self.present_rows;
-        let result = if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
-            screenshot::save(
-                path,
-                &self.present_fb[..src_rows * FB_WIDTH],
-                FB_WIDTH as u32,
-                src_rows as u32,
-            )
-        } else {
-            screenshot::save_scaled_y(
-                path,
-                &self.present_fb,
-                FB_WIDTH as u32,
-                src_rows as u32,
-                PRESENT_HEIGHT as u32,
-            )
-        };
+        let result = save_present_frame(
+            path,
+            &self.present_fb,
+            src_rows,
+            self.emu.bus().frame_geometry(),
+            self.overscan,
+        );
         match result {
             Ok(()) => info!("screenshot saved: {}", path.display()),
             Err(e) => warn!("screenshot save failed ({}): {e:#}", path.display()),
@@ -7139,22 +7134,13 @@ impl App {
             log_frame_dump_metadata(state.dumped, &self.emu);
         }
         let src_rows = self.present_rows;
-        let result = if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
-            screenshot::save(
-                &path,
-                &self.present_fb[..src_rows * FB_WIDTH],
-                FB_WIDTH as u32,
-                src_rows as u32,
-            )
-        } else {
-            screenshot::save_scaled_y(
-                &path,
-                &self.present_fb,
-                FB_WIDTH as u32,
-                src_rows as u32,
-                PRESENT_HEIGHT as u32,
-            )
-        };
+        let result = save_present_frame(
+            &path,
+            &self.present_fb,
+            src_rows,
+            self.emu.bus().frame_geometry(),
+            self.overscan,
+        );
         match result {
             Ok(()) => {
                 state.last_saved_emulated_frame = Some(emulated_frame);
@@ -7881,6 +7867,48 @@ fn parse_u8(s: &str) -> Option<u8> {
     }
 }
 
+fn save_present_frame(
+    path: &std::path::Path,
+    present_fb: &[u32],
+    src_rows: usize,
+    geometry: FrameGeometry,
+    overscan: Overscan,
+) -> anyhow::Result<()> {
+    if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
+        return screenshot::save(
+            path,
+            &present_fb[..src_rows * FB_WIDTH],
+            FB_WIDTH as u32,
+            src_rows as u32,
+        );
+    }
+
+    if overscan == Overscan::Tv && is_standard_pal_presentation(geometry, src_rows) {
+        return screenshot::save_cropped_clamped(
+            path,
+            present_fb,
+            FB_WIDTH,
+            src_rows,
+            TV_PAL_PRESENT_SOURCE_X,
+            TV_PAL_PRESENT_SOURCE_Y,
+            TV_PAL_PRESENT_WIDTH,
+            TV_PAL_PRESENT_HEIGHT,
+        );
+    }
+
+    screenshot::save_scaled_y(
+        path,
+        present_fb,
+        FB_WIDTH as u32,
+        src_rows as u32,
+        PRESENT_HEIGHT as u32,
+    )
+}
+
+fn is_standard_pal_presentation(geometry: FrameGeometry, src_rows: usize) -> bool {
+    !geometry.programmable && geometry.frame_lines >= 312 && src_rows == OUT_HEIGHT
+}
+
 #[cfg(test)]
 mod tests {
     use super::ui::{Panel, UiControl};
@@ -7903,7 +7931,8 @@ mod tests {
         CD_LED_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF,
         HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_OFF, POWER_LED_ON, PRESENT_HEIGHT,
         STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF,
-        TRACK_SEGMENT_ON, VOLUME_FILL, VOLUME_GLYPH_X,
+        TRACK_SEGMENT_ON, TV_PAL_PRESENT_HEIGHT, TV_PAL_PRESENT_SOURCE_X, TV_PAL_PRESENT_SOURCE_Y,
+        TV_PAL_PRESENT_WIDTH, VOLUME_FILL, VOLUME_GLYPH_X,
     };
     use crate::audio::{AudioSink, NullSink};
     use crate::bus::{FrontPanelStatus, RenderRegisterSnapshot};
@@ -9183,6 +9212,21 @@ mod tests {
         };
 
         assert_eq!(presentation_h_shift_for(&snapshot, Overscan::Tv), 0);
+    }
+
+    #[test]
+    fn tv_pal_crop_centres_standard_display_in_aperture() {
+        let standard_left = crate::video::bitplane::STANDARD_VISIBLE_X0;
+        let standard_right = standard_left + 640;
+
+        assert_eq!(TV_PAL_PRESENT_WIDTH, 692);
+        assert_eq!(TV_PAL_PRESENT_HEIGHT, 540);
+        assert_eq!(standard_left - TV_PAL_PRESENT_SOURCE_X, 26);
+        assert_eq!(
+            TV_PAL_PRESENT_WIDTH - (standard_right - TV_PAL_PRESENT_SOURCE_X),
+            26
+        );
+        assert_eq!(TV_PAL_PRESENT_SOURCE_Y, 18);
     }
 
     #[test]

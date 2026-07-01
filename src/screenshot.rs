@@ -82,6 +82,59 @@ pub fn save_scaled_y(
     save(path, &scaled, width, out_height)
 }
 
+/// Save a rectangular viewport from `fb`, clamping source coordinates at the
+/// source edges. The clamp lets a presentation aperture extend slightly beyond
+/// the emulated capture buffer while preserving the captured border colour at
+/// the edge.
+pub fn save_cropped_clamped(
+    path: &Path,
+    fb: &[u32],
+    src_width: usize,
+    src_height: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    let cropped = crop_clamped(fb, src_width, src_height, x, y, width, height)?;
+    save(path, &cropped, width as u32, height as u32)
+}
+
+fn crop_clamped(
+    fb: &[u32],
+    src_width: usize,
+    src_height: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u32>> {
+    let expected = src_width * src_height;
+    if fb.len() < expected {
+        anyhow::bail!(
+            "framebuffer size mismatch: got {} pixels, expected at least {}x{}={}",
+            fb.len(),
+            src_width,
+            src_height,
+            expected
+        );
+    }
+    if src_width == 0 || src_height == 0 || width == 0 || height == 0 {
+        anyhow::bail!("invalid crop dimensions");
+    }
+
+    let mut cropped = vec![0; width * height];
+    for dst_y in 0..height {
+        let src_y = (y + dst_y).min(src_height - 1);
+        let dst = &mut cropped[dst_y * width..(dst_y + 1) * width];
+        for (dst_x, pixel) in dst.iter_mut().enumerate() {
+            let src_x = (x + dst_x).min(src_width - 1);
+            *pixel = fb[src_y * src_width + src_x];
+        }
+    }
+    Ok(cropped)
+}
+
 /// Centre-aligned source row for presentation row `y`.
 #[inline]
 pub fn scaled_source_row(y: usize, src_rows: usize, dst_rows: usize) -> usize {
@@ -159,5 +212,15 @@ mod tests {
 
         assert_eq!(scaled.len(), 5);
         assert!(scaled.iter().all(|px| *px == a || *px == b));
+    }
+
+    #[test]
+    fn cropped_clamped_view_extends_edge_pixels() -> Result<()> {
+        let fb = vec![1, 2, 3, 4, 5, 6];
+
+        let cropped = crop_clamped(&fb, 3, 2, 1, 0, 4, 2)?;
+
+        assert_eq!(cropped, vec![2, 3, 3, 3, 5, 6, 6, 6]);
+        Ok(())
     }
 }
