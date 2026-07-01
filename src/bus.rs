@@ -718,6 +718,8 @@ pub struct Bus {
     last_frame_sprite_dma_observed: bool,
     current_frame_display_snapshot_taken: bool,
     #[serde(skip)]
+    ocs_same_line_diw_start_blocked_vpos: Option<u32>,
+    #[serde(skip)]
     current_frame_render_blocked: bool,
     current_frame_visible_start_vpos: u32,
     last_frame_visible_start_vpos: u32,
@@ -1826,6 +1828,7 @@ impl Bus {
             current_frame_sprite_dma_observed: false,
             last_frame_sprite_dma_observed: false,
             current_frame_display_snapshot_taken: false,
+            ocs_same_line_diw_start_blocked_vpos: None,
             current_frame_render_blocked: false,
             current_frame_visible_start_vpos: RENDER_VISIBLE_START_VPOS,
             last_frame_visible_start_vpos: RENDER_VISIBLE_START_VPOS,
@@ -2181,6 +2184,7 @@ impl Bus {
         self.last_frame_beam_bottom_palette_valid = false;
         self.reset_frame_capture_buffers();
         self.current_frame_display_snapshot_taken = false;
+        self.ocs_same_line_diw_start_blocked_vpos = None;
         self.current_frame_render_blocked = false;
         self.current_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
         self.last_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
@@ -2316,6 +2320,16 @@ impl Bus {
         );
         self.current_frame_geometry.frame_lines = current_frame_lines;
         self.last_frame_geometry.frame_lines = current_frame_lines;
+        if self.current_frame_geometry.programmable {
+            self.current_frame_visible_start_vpos = self.current_frame_geometry.visible_start_vpos;
+        } else {
+            self.current_frame_visible_start_vpos = RENDER_MIN_OVERSCAN_START_VPOS;
+            self.current_frame_geometry.visible_start_vpos = RENDER_MIN_OVERSCAN_START_VPOS;
+        }
+        self.last_frame_visible_start_vpos = self.current_frame_visible_start_vpos;
+        self.last_frame_geometry.visible_start_vpos = self.current_frame_visible_start_vpos;
+        self.lazy_collision_vpos = self.current_frame_visible_start_vpos;
+        self.ocs_same_line_diw_start_blocked_vpos = None;
         self.reset_frame_capture_buffers();
         self.current_frame_render_blocked = self.agnus.vpos != 0 || self.agnus.hpos != 0;
         self.sprite_dma_frame_start_ptr = self.display_dma_sprpt;
@@ -3050,14 +3064,14 @@ impl Bus {
     }
 
     pub fn next_display_start_event_cck(&self) -> Option<u32> {
-        let visible_start = self.visible_start_vpos_for_current_control();
-        if self.current_frame_display_snapshot_taken || self.agnus.vpos >= visible_start {
+        let display_start = self.display_start_vpos_for_current_control();
+        if self.current_frame_display_snapshot_taken || self.agnus.vpos >= display_start {
             return None;
         }
-        self.agnus.cck_until_line_start(visible_start)
+        self.agnus.cck_until_line_start(display_start)
     }
 
-    fn visible_start_vpos_for_current_control(&self) -> u32 {
+    fn display_start_vpos_for_current_control(&self) -> u32 {
         // Programmable scans anchor at the geometry's visible window (from
         // the programmable vertical blank); the PAL/NTSC DIW clamp below
         // only makes sense for the fixed 15 kHz field.
@@ -3074,8 +3088,8 @@ impl Bus {
     /// Display geometry for the frame that is just starting, computed once
     /// at the frame wrap. Mid-frame BEAMCON0/HTOTAL/VTOTAL writes affect
     /// the live beam immediately but take presentation effect at the next
-    /// wrap, like the interlace long-field flag. Standard frames track the
-    /// DIW-refined visible start via `refresh_frame_geometry_visible_start`.
+    /// wrap, like the interlace long-field flag. Standard frames keep a fixed
+    /// overscan render top; DIW controls the display-start snapshot separately.
     fn compute_frame_geometry(&self) -> FrameGeometry {
         let lace = self.denise.bplcon0 & 0x0004 != 0;
         if let Some((start, lines)) = self.agnus.programmable_visible_window() {
@@ -3101,9 +3115,10 @@ impl Bus {
         }
     }
 
-    /// Keep a standard frame's geometry in step with the lazily refined
-    /// DIW visible start (programmable geometry derives its window from
-    /// the beam registers instead and is left alone).
+    /// Keep a standard frame's geometry in step with the framebuffer render
+    /// origin (programmable geometry derives its window from the beam registers
+    /// instead and is left alone).
+    #[cfg(test)]
     fn refresh_frame_geometry_visible_start(&mut self) {
         if !self.current_frame_geometry.programmable {
             self.current_frame_geometry.visible_start_vpos = self.current_frame_visible_start_vpos;
@@ -4131,6 +4146,7 @@ impl Bus {
                     );
                 }
                 self.denise.diwstrt = val;
+                self.ocs_same_line_diw_start_blocked_vpos = None;
                 // ECS DIWHIGH only supplies the window MSBs when it is written
                 // *after* DIWSTRT/DIWSTOP (HRM p.306). A later DIWSTRT/DIWSTOP
                 // write reverts to implicit (OCS-complement) MSB decoding until
@@ -4140,6 +4156,14 @@ impl Bus {
                 // DIWHIGH), so no bitplane DMA falls inside the window and the
                 // display goes black.
                 self.denise.diwhigh_written = false;
+                if matches!(self.agnus.revision(), AgnusRevision::Ocs)
+                    && !self.current_frame_display_snapshot_taken
+                    && !display_window_unprogrammed(self.denise.diwstrt, self.denise.diwstop)
+                    && u32::from(diw_v_start(self.denise.diwstrt, self.effective_diwhigh()))
+                        == self.agnus.vpos
+                {
+                    self.ocs_same_line_diw_start_blocked_vpos = Some(self.agnus.vpos);
+                }
                 self.capture_same_line_display_start_if_due();
                 false
             }
@@ -4155,6 +4179,16 @@ impl Bus {
                 }
                 self.denise.diwstop = val;
                 self.denise.diwhigh_written = false;
+                if self.ocs_same_line_diw_start_blocked_vpos == Some(self.agnus.vpos)
+                    && !display_window_contains_vpos(
+                        self.denise.diwstrt,
+                        self.denise.diwstop,
+                        self.effective_diwhigh(),
+                        self.agnus.vpos,
+                    )
+                {
+                    self.ocs_same_line_diw_start_blocked_vpos = None;
+                }
                 self.capture_same_line_display_start_if_due();
                 false
             }
@@ -5095,11 +5129,10 @@ impl Bus {
         }
         if tick.new_lines != 0 || tick.new_frames != 0 {
             self.bitplane_ddfstart_miss = None;
+            self.ocs_same_line_diw_start_blocked_vpos = None;
         }
-        let visible_start = self.visible_start_vpos_for_current_control();
-        if tick.new_frames == 0 && old_vpos < visible_start && self.agnus.vpos >= visible_start {
-            self.current_frame_visible_start_vpos = visible_start;
-            self.refresh_frame_geometry_visible_start();
+        let display_start = self.display_start_vpos_for_current_control();
+        if tick.new_frames == 0 && old_vpos < display_start && self.agnus.vpos >= display_start {
             self.capture_current_frame_display_start();
         }
         for _ in 0..tick.new_frames {
@@ -7000,8 +7033,9 @@ impl Bus {
         self.current_frame_chip_ram.clear();
         self.current_frame_beam_top_palette = self.beam_top_palette;
         self.current_frame_display_snapshot_taken = false;
+        self.ocs_same_line_diw_start_blocked_vpos = None;
         self.current_frame_render_blocked = false;
-        self.current_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
+        self.current_frame_visible_start_vpos = RENDER_MIN_OVERSCAN_START_VPOS;
         self.current_frame_render_base = self.capture_render_snapshot();
         // Carry each sprite channel's DMA pointer across the frame boundary the
         // way real Agnus does. A channel that finished the field (read its
@@ -7057,8 +7091,6 @@ impl Bus {
         if self.current_frame_display_snapshot_taken {
             return;
         }
-        self.current_frame_visible_start_vpos = self.visible_start_vpos_for_current_control();
-        self.refresh_frame_geometry_visible_start();
         self.lazy_collision_vpos = self.current_frame_visible_start_vpos;
         self.current_frame_chip_ram.clear();
         self.current_frame_chip_ram
@@ -7067,7 +7099,7 @@ impl Bus {
         self.current_frame_display_snapshot_taken = true;
         if !self.current_frame_render_blocked {
             self.advance_display_dma_for_clipped_rows();
-            self.advance_sprite_dma_to_visible_start();
+            self.advance_sprite_dma_to_display_start();
             self.capture_held_sprites_for_visible_window();
         }
     }
@@ -7481,8 +7513,8 @@ impl Bus {
         {
             return;
         }
-        let visible_start = self.visible_start_vpos_for_current_control();
-        if visible_start != self.agnus.vpos
+        let display_start = self.display_start_vpos_for_current_control();
+        if display_start != self.agnus.vpos
             || !display_window_contains_vpos(
                 self.denise.diwstrt,
                 self.denise.diwstop,
@@ -7581,27 +7613,35 @@ impl Bus {
         }
     }
 
-    fn advance_sprite_dma_to_visible_start(&mut self) {
-        let visible_start = self.current_frame_visible_start_vpos;
-        if visible_start == 0 {
+    fn advance_sprite_dma_to_display_start(&mut self) {
+        let display_start = self.display_start_vpos_for_current_control();
+        if display_start == 0 {
             return;
         }
 
         // Sprite DMA runs from the top of the frame, independent of the bitplane
-        // display window: a sprite that starts in the top border has its
-        // control/data words fetched before the first framebuffer line, so
-        // advance the DMA state across those offscreen lines. Crucially, SPREN
-        // can be toggled within the frame -- software may enable sprite DMA
-        // only briefly off-screen to load reused sprites, then clear it before
-        // the visible window and reposition the held sprites per line.
-        // So replay this frame's DMACON and SPRxPT writes across the offscreen
-        // span and run the sprite fetch only on lines where SPREN was actually
-        // enabled, rather than sampling registers at the visible start.
+        // display window. The frame snapshot is taken at the DIW-derived display
+        // start, which may be below the fixed standard-frame overscan render top,
+        // so replay sprite DMA up to that snapshot line and capture any top-border
+        // sprite lines along the way. Crucially, SPREN can be toggled within the
+        // frame -- software may enable sprite DMA only briefly off-screen to load
+        // reused sprites, then clear it before the visible window and reposition
+        // the held sprites per line. Replay this frame's DMACON and SPRxPT writes
+        // across the span and run the sprite fetch only on lines where SPREN was
+        // actually enabled, rather than sampling registers at the display start.
         let base = self.current_frame_render_base;
         // Seed from the previous field's carried SPRxPT frontier rather than the
         // last Copper/CPU write captured in `base.sprpt`. See
         // `sprite_dma_frame_start_ptr` for why finished channels must not snap
         // back to their stale descriptor address.
+        self.current_frame_sprite_lines
+            .retain(|line| line.beam_y >= display_start as i32);
+        for lines in &mut self.current_frame_sprite_lines_by_y {
+            lines.retain(|line| line.beam_y >= display_start as i32);
+        }
+        self.current_frame_sprite_collision_sources = empty_sprite_collision_sources();
+        self.current_frame_sprite_display_enable_x_by_y = empty_sprite_display_enable_x_by_y();
+        self.current_frame_sprite_dma_observed = !self.current_frame_sprite_lines.is_empty();
         self.display_dma_sprpt = self.sprite_dma_frame_start_ptr;
         self.display_dma_sprite_state = [DisplaySpriteDmaState::default(); 8];
         let mut dmacon = base.dmacon;
@@ -7610,12 +7650,12 @@ impl Bus {
             .iter()
             .filter(|w| {
                 let off = w.offset & 0x01FE;
-                w.vpos < visible_start && (off == 0x096 || (0x120..=0x13F).contains(&off))
+                w.vpos < display_start && (off == 0x096 || (0x120..=0x13F).contains(&off))
             })
             .map(|w| (w.vpos, w.hpos, w.offset & 0x01FE, w.value))
             .collect();
         let mut idx = 0;
-        for vpos in 0..visible_start {
+        for vpos in 0..display_start {
             for (pair, &capture_hpos) in SPRITE_DMA_PAIR_CAPTURE_HPOS.iter().enumerate() {
                 while idx < writes.len()
                     && (writes[idx].0 < vpos
@@ -8117,6 +8157,9 @@ impl Bus {
         new_hpos: u32,
         old_emulated_cck: u64,
     ) {
+        if self.ocs_same_line_diw_start_blocked_vpos == Some(vpos) {
+            return;
+        }
         let display_bplcon0 = self.effective_bitplane_bplcon0_at(old_emulated_cck);
         let mode = BitplaneMode::from_bplcon0(display_bplcon0, self.aga_enabled());
         let display_planes = mode.display_planes();
@@ -11188,6 +11231,8 @@ mod tests {
     #[test]
     fn display_start_deadline_tracks_snapshot_boundary() {
         let mut bus = empty_bus();
+        bus.current_frame_visible_start_vpos = RENDER_MIN_OVERSCAN_START_VPOS;
+        bus.refresh_frame_geometry_visible_start();
         bus.agnus.vpos = RENDER_VISIBLE_START_VPOS - 1;
         bus.agnus.hpos = COLORCLOCKS_PER_LINE - 3;
         bus.mem.chip_ram[0] = 0x12;
@@ -11196,6 +11241,14 @@ mod tests {
         let tick = bus.advance_chipset(3);
         assert_eq!(tick.new_lines, 1);
         assert!(bus.current_frame_display_snapshot_taken);
+        assert_eq!(
+            bus.current_frame_visible_start_vpos,
+            RENDER_MIN_OVERSCAN_START_VPOS
+        );
+        assert_eq!(
+            bus.current_frame_geometry.visible_start_vpos,
+            RENDER_MIN_OVERSCAN_START_VPOS
+        );
         assert_eq!(bus.current_frame_chip_ram[0], 0x12);
         assert_eq!(bus.next_display_start_event_cck(), None);
     }
@@ -11203,6 +11256,8 @@ mod tests {
     #[test]
     fn display_start_deadline_tracks_early_vertical_overscan_diw() {
         let mut bus = empty_bus();
+        bus.current_frame_visible_start_vpos = RENDER_MIN_OVERSCAN_START_VPOS;
+        bus.refresh_frame_geometry_visible_start();
         bus.denise.diwstrt = 0x1C81;
         bus.agnus.vpos = RENDER_MIN_OVERSCAN_START_VPOS - 1;
         bus.agnus.hpos = COLORCLOCKS_PER_LINE - 3;
@@ -13740,6 +13795,8 @@ mod tests {
     fn bitplane_dma_capture_maps_early_vertical_overscan_to_first_framebuffer_row() {
         let mut bus = empty_bus();
         bus.set_agnus_revision(AgnusRevision::Ecs8372Rev4);
+        bus.current_frame_visible_start_vpos = RENDER_MIN_OVERSCAN_START_VPOS;
+        bus.refresh_frame_geometry_visible_start();
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_BPLEN;
         bus.agnus.vpos = RENDER_MIN_OVERSCAN_START_VPOS;
         bus.agnus.hpos = 0x3E;
@@ -13771,7 +13828,8 @@ mod tests {
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_BPLEN;
         bus.agnus.vpos = RENDER_VISIBLE_START_VPOS;
         bus.agnus.hpos = 0x30;
-        bus.current_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS + 1;
+        bus.current_frame_visible_start_vpos = RENDER_MIN_OVERSCAN_START_VPOS;
+        bus.refresh_frame_geometry_visible_start();
         bus.denise.diwstrt = ((RENDER_VISIBLE_START_VPOS + 1) as u16) << 8 | 0x0083;
         bus.denise.diwstop = ((RENDER_VISIBLE_START_VPOS + 2) as u16) << 8 | 0x00C1;
         bus.denise.ddfstrt = 0x0038;
@@ -13792,9 +13850,10 @@ mod tests {
         assert!(bus.current_frame_display_snapshot_taken);
         assert_eq!(
             bus.current_frame_visible_start_vpos,
-            RENDER_VISIBLE_START_VPOS
+            RENDER_MIN_OVERSCAN_START_VPOS
         );
-        let row = bus.frame_captured_bitplane_rows()[0].as_ref().unwrap();
+        let fb_y = (RENDER_VISIBLE_START_VPOS - RENDER_MIN_OVERSCAN_START_VPOS) as usize;
+        let row = bus.frame_captured_bitplane_rows()[fb_y].as_ref().unwrap();
         assert_eq!(row.words_per_row, 2);
         assert_eq!(row.planes[0], vec![0x1111, 0x2222]);
     }
@@ -13805,7 +13864,8 @@ mod tests {
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_BPLEN;
         bus.agnus.vpos = RENDER_VISIBLE_START_VPOS;
         bus.agnus.hpos = 0x30;
-        bus.current_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS + 1;
+        bus.current_frame_visible_start_vpos = RENDER_MIN_OVERSCAN_START_VPOS;
+        bus.refresh_frame_geometry_visible_start();
         bus.denise.diwstrt = ((RENDER_VISIBLE_START_VPOS + 1) as u16) << 8 | 0x0083;
         bus.denise.diwstop = ((RENDER_VISIBLE_START_VPOS + 2) as u16) << 8 | 0x00C1;
         bus.denise.ddfstrt = 0x0038;
@@ -13824,7 +13884,8 @@ mod tests {
         bus.advance_chipset(0x20);
 
         assert!(!bus.current_frame_display_snapshot_taken);
-        assert!(bus.frame_captured_bitplane_rows()[0].is_none());
+        let fb_y = (RENDER_VISIBLE_START_VPOS - RENDER_MIN_OVERSCAN_START_VPOS) as usize;
+        assert!(bus.frame_captured_bitplane_rows()[fb_y].is_none());
         assert_eq!(bus.display_dma_bplpt[0], 0x0100);
     }
 
@@ -14001,6 +14062,8 @@ mod tests {
     fn bitplane_dma_capture_keeps_pal_overscan_bottom_rows() {
         let mut bus = empty_bus();
         bus.set_agnus_revision(AgnusRevision::Ecs8372Rev4);
+        bus.current_frame_visible_start_vpos = RENDER_MIN_OVERSCAN_START_VPOS;
+        bus.refresh_frame_geometry_visible_start();
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_BPLEN;
         bus.denise.diwstrt = 0x1C81;
         bus.denise.diwstop = 0x3EC1;

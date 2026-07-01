@@ -139,11 +139,17 @@ drop one sample before the display window closes.
 
 The framebuffer is a 716x285 overscan field (lo-res pixels doubled
 horizontally). It captures deep overscan on all sides.
+For standard 15 kHz PAL/NTSC fields, row zero is anchored at Copperline's
+fixed overscan top rather than the current DIWSTRT vertical value. DIW still
+acts as the hardware display-window flip-flop: it decides when the frame's
+chip-RAM snapshot and bitplane DMA capture begin, but changing DIWSTRT later
+in the field does not recenter the already-visible top border. Programmable
+VARBEAMEN scans instead use their programmed visible window as the render
+origin.
 
 Two vertical edge cases the replay honours:
 
-- A display window can open above the captured canvas (the canvas top
-  follows DIWSTRT down to a minimum start line). Bitplane pointers are
+- A display window can open above the captured canvas. Bitplane pointers are
   pre-advanced for those clipped rows by replaying the frame's
   BPLCON0/DMACON writes line by line, so only lines where bitplane DMA
   was actually enabled consume a row -- the CDTV boot screen opens its
@@ -161,8 +167,8 @@ Two vertical edge cases the replay honours:
 
 At frame end, `Bus::begin_new_beam_frame` freezes the just-finished frame:
 the render-event journal, chip-RAM snapshot, captured bitplane/sprite DMA
-rows, palette split, display geometry, frame line count, visible start line,
-and Agnus programmable blanking latches become the source for
+rows, palette split, display geometry, frame line count, framebuffer start
+line, and Agnus programmable blanking latches become the source for
 `RenderInput::from_bus`. `render_from_input` consumes only that owned
 bundle, so the main thread can start emulating frame N+1 while the worker
 renders frame N.
