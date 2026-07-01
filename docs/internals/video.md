@@ -129,6 +129,12 @@ anchors were calibrated against real-hardware captures and other
 emulators; `COPPERLINE_HCENTER=0` and `COPPERLINE_OVERSCAN=full` help when
 re-checking them.
 
+For FMODE=0 lo-res, the one-sample low-res phase bias is applied on both
+standard and late fetch origins. If a late DDF row completes exactly at
+DIWSTOP, the final visible DIW sample still includes undelayed planes; BPLCON1
+delay only retaps the per-plane shifters, it does not make the undelayed planes
+drop one sample before the display window closes.
+
 The framebuffer is a 716x285 overscan field (lo-res pixels doubled
 horizontally). It captures deep overscan on all sides.
 

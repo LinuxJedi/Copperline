@@ -907,6 +907,21 @@ impl ControlState {
                 // past that completed early-DDF row at the right edge.
                 origin_shift -= 1;
             }
+            if origin_shift < 0 {
+                if let Some((_content_start, content_stop)) = self.bitplane_content_window_h() {
+                    let diw_stop = self.diw_h_stop() as i32;
+                    if content_stop == diw_stop {
+                        // With a late FMODE=0 lo-res fetch whose completed DDF
+                        // row lands exactly on DIWSTOP, the same one-sample
+                        // lo-res phase bias must be applied to the delayed
+                        // fetch origin. Otherwise the final visible DIW sample
+                        // advances one native index past undelayed planes while
+                        // BPLCON1-delayed planes are still active, producing a
+                        // colour-0/partial-plane column at the right edge.
+                        origin_shift -= 1;
+                    }
+                }
+            }
         }
         // A hi-res/SHRES FMODE=0 screen that starts DDFSTRT earlier than the
         // standard $3C slot pre-fetches whole word(s) before the display window
@@ -8164,6 +8179,46 @@ mod tests {
             31
         );
         assert_eq!(late_fetch_standard_window.native_x_offset(false, 2), 0);
+    }
+
+    #[test]
+    fn late_lowres_ddf_reaches_diwstop_with_undelayed_planes_active() {
+        // Low-res FMODE=0 with DDFSTRT=$50 and DDFSTOP=$D0 fetches 17 words.
+        // When DIWSTOP is placed exactly at the completed DDF row's right edge,
+        // the final visible DIW sample still contains the undelayed even-plane
+        // bit. BPLCON1 may delay the odd planes, but it must not make the even
+        // planes fall one native sample past the fetched row at the right edge.
+        let control = ControlState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x2000,
+            bplcon1: 0x0009,
+            diwstrt: 0x2C91,
+            diwstop: 0x2CC1,
+            ddfstrt: 0x0050,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        assert_eq!(control.display_window_x(), (96, 704));
+        assert_eq!(control.words_per_row(0), 17);
+        assert_eq!(control.fetch_start_native_x(control.diw_h_start(), 2), 32);
+        assert_eq!(control.native_x_offset(control.diw_h_start(), 2), 0);
+
+        let last_visible_x = control.display_window_x().1 - control.framebuffer_pixel_repeat();
+        let output_native_x =
+            (last_visible_x - control.display_window_x().0) / control.framebuffer_pixel_repeat();
+        let native_x = output_native_x - control.fetch_start_native_x(control.diw_h_start(), 2);
+        assert_eq!(native_x, 271);
+
+        let plane1 = vec![0; 17];
+        let mut plane2 = vec![0; 17];
+        plane2[16] = 0x0001;
+        let planes = vec![plane1, plane2];
+        let plan = DenisePlannedPlayfieldLine::new(0, 96, 704, &planes, 17 * 16);
+        let delays = std::array::from_fn(|plane| control.scroll_for_plane(plane));
+        let sample = plan.sample_prepared(control.nplanes(), &delays, 0, native_x);
+
+        assert!(sample.active);
+        assert_eq!(sample.idx, 0x02);
     }
 
     #[test]
