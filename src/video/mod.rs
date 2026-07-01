@@ -54,17 +54,23 @@ pub struct FrameGeometry {
     pub visible_lines: usize,
     /// Line length in colour clocks (HTOTAL+1 under VARBEAMEN, else 227).
     pub line_cck: u32,
+    /// Beam lines in the frame this geometry describes. This is transient
+    /// render metadata: older save states did not carry it, and the loader
+    /// re-derives it from Agnus after restore.
+    #[serde(skip)]
+    pub frame_lines: u32,
     /// BPLCON0.LACE at the frame start (field weaving).
     pub lace: bool,
 }
 
 impl FrameGeometry {
-    pub fn standard(visible_start_vpos: u32, lace: bool) -> Self {
+    pub fn standard(visible_start_vpos: u32, frame_lines: u32, lace: bool) -> Self {
         Self {
             programmable: false,
             visible_start_vpos,
             visible_lines: FB_HEIGHT,
             line_cck: 227,
+            frame_lines,
             lace,
         }
     }

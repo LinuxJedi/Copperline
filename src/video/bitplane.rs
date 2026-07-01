@@ -15,7 +15,9 @@ use crate::bus::{
     BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus, CapturedBitplaneRow,
     CapturedSpriteLine, HeldSpriteLine, RenderRegisterSnapshot, VideoRenderFrameTiming,
 };
-use crate::chipset::agnus::{ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, AgnusRevision};
+use crate::chipset::agnus::{
+    ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, AgnusRevision, COLORCLOCKS_PER_LINE,
+};
 #[cfg(test)]
 use crate::chipset::denise::BPLCON3_PF2OF_DEFAULT;
 use crate::chipset::denise::{
@@ -76,6 +78,11 @@ const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// alignment, sprite arming, or a missed write-domain delay, not this final
 /// colour-output anchor.
 const COLOR_WRITE_HPOS_FB0: i32 = 0x35;
+/// Denise's texture/output line starts at the hblank-start counter value. Beam
+/// positions before this are the wrapped tail of the previous output line, so
+/// a colour write there must draw at the far right of the previous row while
+/// still updating the palette seen by the following row.
+const DENISE_HBLANK_START_HPOS: u32 = 0x12;
 /// AGA BPLCON4's low sprite-palette byte follows Lisa's sprite colour lookup
 /// path, which reaches sprite output earlier than ordinary COLORxx palette
 /// writes. Keep it separate from COLOR replay so copper palette gradients stay
@@ -2066,12 +2073,23 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
             continue;
         }
 
-        let (line, mut beam_x) = beam_to_framebuffer_pos_with_visible_line0(
-            event.vpos,
-            event.hpos,
-            visible_line0,
-            base_palettes.len(),
-        );
+        let color_wraps_to_previous_line = matches!(off, 0x180..=0x1BE)
+            && color_write_wraps_to_previous_output_line(event.hpos)
+            && (event.vpos as i32) > visible_line0;
+        let (line, mut beam_x) = if color_wraps_to_previous_line {
+            let line = (event.vpos as i32 - visible_line0 - 1) as usize;
+            (
+                line.min(base_palettes.len().saturating_sub(1)),
+                color_write_wrapped_framebuffer_x(event.hpos),
+            )
+        } else {
+            beam_to_framebuffer_pos_with_visible_line0(
+                event.vpos,
+                event.hpos,
+                visible_line0,
+                base_palettes.len(),
+            )
+        };
         // An event from a line above the visible area happened before the
         // first framebuffer line started: it contributes to line 0's start
         // state, not a mid-line change at its horizontal position (which
@@ -2098,7 +2116,9 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
             if idx < 32 {
                 palette.write_entry(usize::from(entry), loct, color_register_value(event.value));
             }
-            let x = if before_visible_lines {
+            let x = if color_wraps_to_previous_line {
+                beam_x
+            } else if before_visible_lines {
                 0
             } else {
                 color_write_framebuffer_x(event.hpos)
@@ -2264,6 +2284,15 @@ fn beam_to_framebuffer_x_unclamped(hpos: u32) -> i32 {
 
 fn color_write_framebuffer_x(hpos: u32) -> usize {
     ((hpos as i32 - COLOR_WRITE_HPOS_FB0) * 4).clamp(0, FB_WIDTH as i32) as usize
+}
+
+fn color_write_wraps_to_previous_output_line(hpos: u32) -> bool {
+    hpos < DENISE_HBLANK_START_HPOS
+}
+
+fn color_write_wrapped_framebuffer_x(hpos: u32) -> usize {
+    ((hpos as i32 + COLORCLOCKS_PER_LINE as i32 - COLOR_WRITE_HPOS_FB0) * 4)
+        .clamp(0, FB_WIDTH as i32) as usize
 }
 
 fn sprite_palette_control_framebuffer_x(hpos: u32) -> usize {
@@ -4286,7 +4315,7 @@ impl RenderInput {
             held_sprites: bus.frame_held_sprites(),
             sprite_display_enable_x_by_y: bus.frame_sprite_display_enable_x_by_y().to_vec(),
             sprite_dma_observed: bus.frame_sprite_dma_observed(),
-            frame_lines: bus.agnus.current_frame_lines(),
+            frame_lines: bus.frame_lines(),
             programmable_vertical_blank: bus.agnus.programmable_vertical_blank(),
             programmable_horizontal_blank: bus.agnus.programmable_horizontal_blank(),
             emulated_seconds: bus.emulated_seconds(),
@@ -7821,6 +7850,11 @@ mod tests {
             color_write_framebuffer_x((COLOR_WRITE_HPOS_FB0 + 4) as u32),
             16
         );
+        assert!(color_write_wraps_to_previous_output_line(2));
+        assert!(!color_write_wraps_to_previous_output_line(
+            DENISE_HBLANK_START_HPOS
+        ));
+        assert_eq!(color_write_wrapped_framebuffer_x(2), 704);
         assert_eq!(
             beam_to_framebuffer_x_unclamped(COLOR_WRITE_HPOS_FB0 as u32),
             52
@@ -12648,6 +12682,52 @@ mod tests {
         assert_eq!(fb[60], rgb12_to_rgba8(0x087A));
         assert_eq!(fb[91], rgb12_to_rgba8(0x087A));
         assert_eq!(fb[92], rgb12_to_rgba8(0x0000));
+    }
+
+    #[test]
+    fn pre_hblank_color_write_updates_previous_row_tail_and_next_row_base() {
+        let mut state = blank_state();
+        state.palette.write_ocs(0, 0x0000);
+        let mut base_palettes = [state.palette; FB_HEIGHT];
+        let mut palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut base_controls = [ControlState::from_render_state(&state); FB_HEIGHT];
+        let mut control_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut manual_bpl_segments = Vec::new();
+        let beam_y = PAL_VISIBLE_LINE0 as u32 + 1;
+        let events = [beam_event(beam_y, 2, 0x0180, 0x0123)];
+
+        apply_render_events(
+            &mut state,
+            &events,
+            &mut base_palettes,
+            &mut palette_segments,
+            &mut base_controls,
+            &mut control_segments,
+            &mut manual_bpl_segments,
+        );
+
+        assert_eq!(base_palettes[0][0], 0x0000);
+        assert_eq!(base_palettes[1][0], 0x0123);
+        assert_eq!(palette_segments[0].len(), 1);
+        assert_eq!(
+            palette_segments[0][0].x,
+            color_write_wrapped_framebuffer_x(2)
+        );
+        assert_eq!(palette_segments[0][0].value, 0x0123);
+
+        let mut fb = vec![0; FB_PIXELS];
+        fill_background(
+            &mut fb,
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+        );
+
+        let wrapped_x = color_write_wrapped_framebuffer_x(2);
+        assert_eq!(fb[wrapped_x - 1], rgb12_to_rgba8(0x0000));
+        assert_eq!(fb[wrapped_x], rgb12_to_rgba8(0x0123));
+        assert_eq!(fb[FB_WIDTH], rgb12_to_rgba8(0x0123));
     }
 
     #[test]

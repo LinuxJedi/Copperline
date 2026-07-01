@@ -5,8 +5,9 @@
 //! typed read/write methods for memory-mapped devices.
 
 use crate::chipset::agnus::{
-    sprite_dma_disabled_by_bitplane_ddf, Agnus, AgnusRevision, AgnusTick, VideoStandard,
-    BEAMCON0_DUAL, BEAMCON0_HARDDIS, COLORCLOCKS_PER_LINE, NTSC_LONG_COLORCLOCKS_PER_LINE,
+    ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, Agnus, AgnusRevision, AgnusTick,
+    VideoStandard, BEAMCON0_DUAL, BEAMCON0_HARDDIS, COLORCLOCKS_PER_LINE, NTSC_LINES,
+    NTSC_LONG_COLORCLOCKS_PER_LINE, PAL_LINES,
 };
 use crate::chipset::blitter::Blitter;
 use crate::chipset::cia::{
@@ -1708,6 +1709,18 @@ fn audio_min_period_for_agnus(agnus: &Agnus) -> u16 {
     scaled.clamp(1, u32::from(u16::MAX)) as u16
 }
 
+fn fixed_standard_frame_lines(video_standard: VideoStandard, lace: bool, long_field: bool) -> u32 {
+    let long_lines = match video_standard {
+        VideoStandard::Pal => PAL_LINES,
+        VideoStandard::Ntsc => NTSC_LINES,
+    };
+    if lace && !long_field {
+        long_lines.saturating_sub(1)
+    } else {
+        long_lines
+    }
+}
+
 impl Bus {
     pub fn new(mem: Memory, paula: Paula, floppy: FloppyController) -> Self {
         let current_frame_chip_ram = mem.chip_ram.clone();
@@ -1816,8 +1829,16 @@ impl Bus {
             current_frame_render_blocked: false,
             current_frame_visible_start_vpos: RENDER_VISIBLE_START_VPOS,
             last_frame_visible_start_vpos: RENDER_VISIBLE_START_VPOS,
-            current_frame_geometry: FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, false),
-            last_frame_geometry: FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, false),
+            current_frame_geometry: FrameGeometry::standard(
+                RENDER_VISIBLE_START_VPOS,
+                PAL_LINES,
+                false,
+            ),
+            last_frame_geometry: FrameGeometry::standard(
+                RENDER_VISIBLE_START_VPOS,
+                PAL_LINES,
+                false,
+            ),
             lazy_collision_vpos: RENDER_VISIBLE_START_VPOS,
             lazy_collision_hpos: RENDER_COPPER_WAIT_HPOS_FB0,
             collision_tracking_active: false,
@@ -1913,6 +1934,16 @@ impl Bus {
 
     pub fn set_video_standard(&mut self, video_standard: VideoStandard) {
         self.agnus.set_video_standard(video_standard);
+        self.current_frame_geometry.frame_lines = fixed_standard_frame_lines(
+            video_standard,
+            self.current_frame_geometry.lace,
+            self.current_frame_render_base.long_field,
+        );
+        self.last_frame_geometry.frame_lines = fixed_standard_frame_lines(
+            video_standard,
+            self.last_frame_geometry.lace,
+            self.frame_render_base().long_field,
+        );
         self.refresh_paula_audio_min_period();
     }
 
@@ -2153,8 +2184,11 @@ impl Bus {
         self.current_frame_render_blocked = false;
         self.current_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
         self.last_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
-        self.current_frame_geometry = FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, false);
-        self.last_frame_geometry = FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, false);
+        let frame_lines = self.agnus.current_frame_lines();
+        self.current_frame_geometry =
+            FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, frame_lines, false);
+        self.last_frame_geometry =
+            FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, frame_lines, false);
         self.lazy_collision_vpos = RENDER_VISIBLE_START_VPOS;
         self.lazy_collision_hpos = RENDER_COPPER_WAIT_HPOS_FB0;
         self.collision_tracking_active = false;
@@ -2276,6 +2310,12 @@ impl Bus {
     }
 
     pub(crate) fn reset_transient_video_after_state_load(&mut self) {
+        let current_frame_lines = self.frame_lines_for_geometry(
+            self.current_frame_geometry,
+            self.current_frame_render_base.long_field,
+        );
+        self.current_frame_geometry.frame_lines = current_frame_lines;
+        self.last_frame_geometry.frame_lines = current_frame_lines;
         self.reset_frame_capture_buffers();
         self.current_frame_render_blocked = self.agnus.vpos != 0 || self.agnus.hpos != 0;
         self.sprite_dma_frame_start_ptr = self.display_dma_sprpt;
@@ -3044,10 +3084,21 @@ impl Bus {
                 visible_start_vpos: start,
                 visible_lines: (lines as usize).clamp(1, MAX_VISIBLE_LINES),
                 line_cck: self.agnus.programmable_line_cck().unwrap_or(227),
+                frame_lines: self.agnus.current_frame_lines(),
                 lace,
             };
         }
-        FrameGeometry::standard(self.current_frame_visible_start_vpos, lace)
+        let frame_lines =
+            fixed_standard_frame_lines(self.agnus.video_standard(), lace, self.agnus.lof);
+        FrameGeometry::standard(self.current_frame_visible_start_vpos, frame_lines, lace)
+    }
+
+    fn frame_lines_for_geometry(&self, geometry: FrameGeometry, long_field: bool) -> u32 {
+        if geometry.programmable {
+            self.agnus.current_frame_lines()
+        } else {
+            fixed_standard_frame_lines(self.agnus.video_standard(), geometry.lace, long_field)
+        }
     }
 
     /// Keep a standard frame's geometry in step with the lazily refined
@@ -3338,6 +3389,18 @@ impl Bus {
             self.last_frame_geometry
         } else {
             self.current_frame_geometry
+        }
+    }
+
+    /// Beam-line count for the frame the renderer is about to draw. This is
+    /// latched with `FrameGeometry`; the fallback covers old in-process
+    /// snapshots whose transient geometry field predates `frame_lines`.
+    pub fn frame_lines(&self) -> u32 {
+        let frame_lines = self.frame_geometry().frame_lines;
+        if frame_lines == 0 {
+            self.agnus.current_frame_lines()
+        } else {
+            frame_lines
         }
     }
 
@@ -10682,7 +10745,7 @@ mod tests {
     use crate::audio::AudioSink;
     use crate::chipset::agnus::{
         AgnusRevision, AgnusTick, VideoStandard, BEAMCON0_DUAL, BEAMCON0_HARDDIS, BEAMCON0_PAL,
-        BEAMCON0_VARBEAMEN, COLORCLOCKS_PER_LINE, NTSC_LONG_COLORCLOCKS_PER_LINE,
+        BEAMCON0_VARBEAMEN, COLORCLOCKS_PER_LINE, NTSC_LONG_COLORCLOCKS_PER_LINE, PAL_LINES,
     };
     use crate::chipset::cia::{
         REG_CRA, REG_CRB, REG_ICR, REG_PRA, REG_TAHI, REG_TALO, REG_TBHI, REG_TBLO, REG_TODHI,
@@ -10698,7 +10761,7 @@ mod tests {
     use crate::memory::Memory;
     use crate::serial::SerialSink;
     use crate::video::beam::BeamEventIndex;
-    use crate::video::{bitplane, FB_PIXELS, FB_WIDTH};
+    use crate::video::{bitplane, FB_HEIGHT, FB_PIXELS, FB_WIDTH};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -15830,6 +15893,7 @@ mod tests {
         assert!(!standard.programmable);
         assert_eq!(standard.visible_lines, FB_HEIGHT);
         assert_eq!(standard.line_cck, 227);
+        assert_eq!(standard.frame_lines, PAL_LINES);
         assert_eq!(standard.visible_start_vpos, RENDER_VISIBLE_START_VPOS);
 
         // Programmable 31 kHz scan.
@@ -15853,6 +15917,66 @@ mod tests {
         assert_eq!(geometry.visible_start_vpos, 44);
         assert_eq!(geometry.visible_lines, 569);
         assert_eq!(geometry.line_cck, 114);
+        assert_eq!(geometry.frame_lines, 626);
+    }
+
+    /// The renderer draws the frame that just completed. If the next frame
+    /// programs a shorter VARBEAMEN scan before the host presents that
+    /// completed standard frame, the standard frame's bottom border still
+    /// belongs to the completed 313-line PAL field and must not be blanked
+    /// using the live shorter beam length.
+    #[test]
+    fn render_uses_completed_frame_line_count_for_bottom_border() {
+        let mut bus = empty_bus();
+        bus.set_agnus_revision(AgnusRevision::Ecs8372Rev4);
+        bus.current_frame_visible_start_vpos = 28;
+        bus.refresh_frame_geometry_visible_start();
+        bus.denise.palette.write_ocs(0, 0x0123);
+        bus.current_frame_render_base = bus.capture_render_snapshot();
+        bus.begin_new_beam_frame();
+
+        bus.agnus.write_vtotal(298);
+        bus.agnus.write_beamcon0(BEAMCON0_PAL | BEAMCON0_VARBEAMEN);
+        assert_eq!(bus.agnus.current_frame_lines(), 299);
+        assert_eq!(bus.frame_lines(), PAL_LINES);
+
+        let mut fb = vec![0; FB_PIXELS];
+        bitplane::render(&mut bus, &mut fb);
+
+        assert_eq!(
+            fb[(FB_HEIGHT - 1) * FB_WIDTH + (FB_WIDTH - 1)],
+            rgb12_to_rgba8(0x0123)
+        );
+    }
+
+    /// Save-state restore rebuilds transient render metadata from serialized
+    /// Agnus/Denise state. A restored standard PAL frame must keep the fixed
+    /// PAL frame end even if live Agnus has already been programmed for a
+    /// shorter VARBEAMEN frame.
+    #[test]
+    fn state_load_rebuilds_standard_frame_lines_from_fixed_video_standard() {
+        let mut bus = empty_bus();
+        bus.set_agnus_revision(AgnusRevision::Ecs8372Rev4);
+        bus.current_frame_visible_start_vpos = 28;
+        bus.refresh_frame_geometry_visible_start();
+        bus.current_frame_geometry.frame_lines = 0;
+        bus.denise.palette.write_ocs(0, 0x0123);
+        bus.current_frame_render_base = bus.capture_render_snapshot();
+
+        bus.agnus.write_vtotal(298);
+        bus.agnus.write_beamcon0(BEAMCON0_PAL | BEAMCON0_VARBEAMEN);
+        assert_eq!(bus.agnus.current_frame_lines(), 299);
+
+        bus.reset_transient_video_after_state_load();
+        assert_eq!(bus.frame_lines(), PAL_LINES);
+
+        let mut fb = vec![0; FB_PIXELS];
+        bitplane::render(&mut bus, &mut fb);
+
+        assert_eq!(
+            fb[(FB_HEIGHT - 1) * FB_WIDTH + (FB_WIDTH - 1)],
+            rgb12_to_rgba8(0x0123)
+        );
     }
 
     /// FMODE BSCAN2 makes both plane groups share one end-of-line modulo,

@@ -155,11 +155,11 @@ pub enum Overscan {
     /// Present the full 716x285 overscan field the renderer produces
     /// (everything a real Denise can display).
     Full,
-    /// Mask the deep-overscan margins with black, like a CRT bezel:
-    /// only the standard PAL window (320x256 lo-res centred area)
-    /// shows through. Demos often leave junk in the deep overscan
-    /// (e.g. HAM streams converging off-screen); a real TV hides it
-    /// behind the bezel, and so does this mode. The default.
+    /// Mask the deep horizontal overscan margins with black, like a CRT
+    /// bezel, while preserving vertical border colour changes. Demos often
+    /// leave junk in the deep horizontal overscan (e.g. HAM streams
+    /// converging off-screen); a real TV hides it behind the bezel, and so
+    /// does this mode. The default.
     #[default]
     Tv,
 }

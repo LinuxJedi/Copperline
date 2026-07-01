@@ -287,8 +287,6 @@ const STANDARD_PAL_VISIBLE_START_VPOS: u32 = 0x2C;
 // Default TV presentation keeps a small consumer-visible overscan margin while
 // still hiding the deep edge columns that often contain unfinished effects.
 const TV_HORIZONTAL_OVERSCAN_MARGIN: usize = 24 * 2;
-const TV_TOP_OVERSCAN_MARGIN: usize = 8;
-const TV_BOTTOM_CROP_ROWS: usize = 1;
 const STATUS_BG: u32 = rgba(28, 28, 26);
 const STATUS_TOP: u32 = rgba(78, 76, 70);
 const STATUS_BOTTOM: u32 = rgba(12, 12, 11);
@@ -7435,31 +7433,19 @@ impl App {
 /// overscan displays rely on, while the deep-overscan junk the mask exists
 /// to hide sits further out. Default TV presentation keeps 24 lo-res pixels
 /// of horizontal overscan beside the standard PAL window; full overscan
-/// remains available through `Overscan::Full`. Vertically the default TV
-/// view keeps top overscan but uses a tight lower bezel: software can leave
-/// active border sprites or unfinished effects below the standard window, and
-/// a consumer crop normally hides that. `h_shift` is the horizontal centring
-/// shift already applied to the frame, so the bezel tracks the shifted picture
-/// instead of clipping its left edge; `standard_top_row` is the framebuffer row
-/// where the standard window's first line sits after vertical centring, so the
-/// bezel tracks the centred picture vertically too (a fixed line count from
-/// row 0 clipped the bottom of every standard 256-line screen by the centring
-/// margin).
-fn mask_present_frame_to_tv(fb: &mut [u32], h_shift: usize, standard_top_row: usize) {
+/// remains available through `Overscan::Full`. The mask is horizontal only:
+/// vertical border colour changes are part of the Denise output and can be
+/// intentional effects, so rows above or below the standard display remain as
+/// rendered. `h_shift` is the horizontal centring shift already applied to the
+/// frame, so the bezel tracks the shifted picture instead of clipping its left
+/// edge.
+fn mask_present_frame_to_tv(fb: &mut [u32], h_shift: usize, _standard_top_row: usize) {
     debug_assert!(fb.len() >= FB_PIXELS);
     let black = rgba(0, 0, 0);
     let (source_left, source_right) = tv_source_h_bounds();
     let left = source_left.saturating_sub(h_shift);
     let right = source_right.saturating_sub(h_shift).min(FB_WIDTH).max(left);
-    let top = standard_top_row.saturating_sub(TV_TOP_OVERSCAN_MARGIN);
-    let bottom = (standard_top_row + STANDARD_PAL_VISIBLE_LINES)
-        .saturating_sub(TV_BOTTOM_CROP_ROWS)
-        .min(FB_HEIGHT);
-    for (y, row) in fb.chunks_mut(FB_WIDTH).enumerate() {
-        if y < top || y >= bottom {
-            row.fill(black);
-            continue;
-        }
+    for row in fb.chunks_mut(FB_WIDTH) {
         row[..left].fill(black);
         if right < FB_WIDTH {
             row[right..].fill(black);
@@ -9239,15 +9225,13 @@ mod tests {
         assert_eq!(fb[mid_row * FB_WIDTH + FB_WIDTH - 1], rgba(0, 0, 0));
         // The deep left overscan margin stays hidden.
         assert_eq!(fb[mid_row * FB_WIDTH], rgba(0, 0, 0));
-        // The vertical TV window tracks the centred standard window: 8
-        // lines of top overscan remain visible, while the bottom is cropped
-        // one source row inside the standard window like a tight lower bezel.
-        let top = std_top - 8;
-        assert_eq!(fb[(top - 1) * FB_WIDTH + left], rgba(0, 0, 0));
-        assert_eq!(fb[top * FB_WIDTH + left], marker);
+        // Vertical border rows remain visible; the TV mask only hides the
+        // deep horizontal margins.
+        assert_eq!(fb[(std_top - 1) * FB_WIDTH + left - 1], rgba(0, 0, 0));
+        assert_eq!(fb[(std_top - 1) * FB_WIDTH + left], marker);
         let bottom = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
-        assert_eq!(fb[(bottom - 1) * FB_WIDTH + left], marker);
-        assert_eq!(fb[bottom * FB_WIDTH + left], rgba(0, 0, 0));
+        assert_eq!(fb[bottom * FB_WIDTH + left - 1], rgba(0, 0, 0));
+        assert_eq!(fb[bottom * FB_WIDTH + left], marker);
     }
 
     #[test]
@@ -9295,6 +9279,25 @@ mod tests {
     }
 
     #[test]
+    fn tv_overscan_mask_preserves_vertical_border_rows() {
+        let marker = rgba(0x12, 0x34, 0x56);
+        let mut fb = vec![marker; FB_PIXELS];
+        let std_top = standard_window_top_row(STANDARD_PAL_VISIBLE_START_VPOS);
+        let shift = tv_standard_h_shift();
+        let (source_left, source_right) = tv_source_h_bounds();
+        let left = source_left - shift;
+        let right = source_right - shift;
+        let bottom = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
+
+        mask_present_frame_to_tv(&mut fb, shift, std_top);
+
+        assert_eq!(fb[bottom * FB_WIDTH + left - 1], rgba(0, 0, 0));
+        assert_eq!(fb[bottom * FB_WIDTH + left], marker);
+        assert_eq!(fb[bottom * FB_WIDTH + right - 1], marker);
+        assert_eq!(fb[bottom * FB_WIDTH + right], rgba(0, 0, 0));
+    }
+
+    #[test]
     fn tv_overscan_mask_tracks_overscan_visible_starts() {
         // A deep-overscan frame (visible start above the standard window):
         // the centring shift is consumed, the standard window sits lower in
@@ -9308,13 +9311,14 @@ mod tests {
         mask_present_frame_to_tv(&mut fb, 0, std_top);
 
         let (left, _) = tv_source_h_bounds();
-        assert_eq!(fb[(std_top - 8 - 1) * FB_WIDTH + left], rgba(0, 0, 0));
-        assert_eq!(fb[(std_top - 8) * FB_WIDTH + left], marker);
+        assert_eq!(
+            fb[std_top.saturating_sub(1) * FB_WIDTH + left - 1],
+            rgba(0, 0, 0)
+        );
+        assert_eq!(fb[std_top.saturating_sub(1) * FB_WIDTH + left], marker);
         let bottom = std_top + STANDARD_PAL_VISIBLE_LINES - 1;
-        assert_eq!(fb[(bottom - 1) * FB_WIDTH + left], marker);
-        if bottom < FB_HEIGHT {
-            assert_eq!(fb[bottom * FB_WIDTH + left], rgba(0, 0, 0));
-        }
+        assert_eq!(fb[bottom * FB_WIDTH + left - 1], rgba(0, 0, 0));
+        assert_eq!(fb[bottom * FB_WIDTH + left], marker);
     }
 
     #[test]

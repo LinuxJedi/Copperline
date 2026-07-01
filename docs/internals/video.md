@@ -124,10 +124,12 @@ documented offset, and the bitplane fetch reference differs between lo-res
 and hi-res. Wide-FMODE DMA fetches start from the revision-masked DDFSTRT
 comparator value and complete whole units, but the displayed shifter origin
 is still quantized by the FMODE fetch gulp; the renderer keeps those two
-effects separate. These
-anchors were calibrated against real-hardware captures and other
-emulators; `COPPERLINE_HCENTER=0` and `COPPERLINE_OVERSCAN=full` help when
-re-checking them.
+effects separate. Denise's output line starts at the horizontal blanking
+start counter; COLORxx writes before that counter are the wrapped tail of
+the previous output row, while the palette value they load is still the
+base colour for the following row. These anchors were calibrated against
+real-hardware captures and other emulators; `COPPERLINE_HCENTER=0` and
+`COPPERLINE_OVERSCAN=full` help when re-checking them.
 
 For FMODE=0 lo-res, the one-sample low-res phase bias is applied on both
 standard and late fetch origins. If a late DDF row completes exactly at
@@ -159,8 +161,8 @@ Two vertical edge cases the replay honours:
 
 At frame end, `Bus::begin_new_beam_frame` freezes the just-finished frame:
 the render-event journal, chip-RAM snapshot, captured bitplane/sprite DMA
-rows, palette split, display geometry, visible start line, and Agnus
-programmable blanking latches become the source for
+rows, palette split, display geometry, frame line count, visible start line,
+and Agnus programmable blanking latches become the source for
 `RenderInput::from_bus`. `render_from_input` consumes only that owned
 bundle, so the main thread can start emulating frame N+1 while the worker
 renders frame N.
@@ -241,11 +243,10 @@ framebuffer):
 - **Overscan mask**: `[display] overscan = "tv"` masks deep-overscan
   margins in black like a CRT bezel; `"full"` shows the entire field. The
   default TV mask is presentation-only: horizontally it keeps 24 lo-res
-  pixels of consumer-visible overscan beside the standard display, and it is
-  asymmetric vertically, keeping a little top overscan but cropping the lower
-  edge one source row inside the standard display bottom. This matches the
-  common case where lower-border sprite/effect junk is hidden by the display
-  crop.
+  pixels of consumer-visible overscan beside the standard display and blacks
+  only the deeper horizontal margins. Vertical border colour changes remain
+  visible because they are part of the Denise output and are often deliberate
+  border effects.
 - **Horizontal recentring**: a standard (non-overscan) display is recentred
   for presentation, since the framebuffer captures a deep slab of left
   overscan that would otherwise push the picture right of centre compared
