@@ -157,8 +157,8 @@ jobs:
 
   cargo-deny:
     name: Dependency policy (${{ matrix.name }})
-    # The browser and publisher player are standalone workspaces with their
-    # own lockfiles, so check all three shipped dependency graphs explicitly.
+    # Frontends have standalone workspaces and lockfiles, so check each
+    # shipped dependency graph explicitly.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -170,6 +170,8 @@ jobs:
             manifest: crates/copperline-web/Cargo.toml
           - name: player
             manifest: crates/copperline-player/Cargo.toml
+          - name: libretro
+            manifest: crates/copperline-libretro/Cargo.toml
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
