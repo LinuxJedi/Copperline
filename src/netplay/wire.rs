@@ -32,7 +32,7 @@ impl Packet {
         let mut out = Vec::with_capacity(MAX_PACKET);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(&crate::savestate::STATE_VERSION.to_le_bytes());
+        out.extend_from_slice(&crate::savestate::SCHEMA_FINGERPRINT.to_le_bytes());
         out.extend_from_slice(&self.session);
         out.extend_from_slice(&self.identity);
         out.extend_from_slice(&[
@@ -63,8 +63,8 @@ impl Packet {
         if bytes.len() >= 26 && &bytes[..4] == MAGIC && &bytes[10..26] == session {
             anyhow::ensure!(
                 bytes[4..6] == VERSION.to_le_bytes()
-                    && bytes[6..10] == crate::savestate::STATE_VERSION.to_le_bytes(),
-                "netplay incompatible build: protocol or save-state version differs; use the same Copperline build"
+                    && bytes[6..10] == crate::savestate::SCHEMA_FINGERPRINT.to_le_bytes(),
+                "netplay incompatible build: protocol version or state schema differs; use the same Copperline build"
             );
         }
         Ok(())
@@ -81,7 +81,7 @@ impl Packet {
         }
         if &take::<4>(&mut bytes)? != MAGIC
             || u16::from_le_bytes(take(&mut bytes)?) != VERSION
-            || u32::from_le_bytes(take(&mut bytes)?) != crate::savestate::STATE_VERSION
+            || u32::from_le_bytes(take(&mut bytes)?) != crate::savestate::SCHEMA_FINGERPRINT
         {
             return None;
         }

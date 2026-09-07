@@ -188,15 +188,17 @@ for replay. It retains eight recent checkpoint hashes. Snapshot storage has a
 
 ## Wire protocol
 
-`wire.rs` defines protocol version 2. Packets carry `CLNP`, protocol and
-save-state versions, a 16-byte session ID, a 32-byte initial-machine fingerprint,
+`wire.rs` defines protocol version 2. Packets carry `CLNP`, the protocol
+version and the save-state schema fingerprint
+(`savestate::SCHEMA_FINGERPRINT`: crate version, container version, and
+every chunk's version), a 16-byte session ID, a 32-byte initial-machine fingerprint,
 player index, handshake-ready flag, delay/window settings, cumulative input
 acknowledgement, the latest confirmed checkpoint, and up to 32 input records.
 Integers are little-endian. Records contain an eight-byte frame number, two-byte
 controller bitmap, sixteen-byte key bitmap, two signed two-byte mouse deltas,
 and one byte containing the three mouse buttons. Each record is 31 bytes and
-the maximum packet is 1103 bytes. Version 1 peers are rejected as incompatible;
-the file save-state version is unchanged.
+the maximum packet is 1103 bytes. Version 1 peers are rejected as incompatible,
+as are peers whose schema fingerprint differs.
 
 The initial fingerprint hashes Copperline's display build version and the entire
 normalized initial machine snapshot, including ROM and in-memory floppy data.
@@ -334,8 +336,9 @@ Browser startup keeps a local rollback checkpoint and the original serial sink
 until connection construction succeeds. Failure restores both before returning
 an error. Floppy sound settings remain serialized because they also control the
 sound generator timeline; browser setters and UI controls lock them during a
-session. The wire decoder reports incompatible protocol/save-state versions for
-the recognized session immediately, while unrelated traffic remains ignored.
+session. The wire decoder reports an incompatible protocol version or state
+schema for the recognized session immediately, while unrelated traffic remains
+ignored.
 
 ## Configuration screen
 

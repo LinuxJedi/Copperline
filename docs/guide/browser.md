@@ -62,9 +62,10 @@ The web version runs at [copperline.dev/try](https://copperline.dev/try/):
 The web build uses the same `.clstate` file format as the desktop version:
 
 - **Save state / Load state:** Download or upload state files (`.clstate`). Transfers
-  between browser and desktop require the same save-state format version and devices
-  supported by both builds. Desktop states that depend on host files or native-only
-  devices are not portable to the browser.
+  between browser and desktop require devices supported by both builds; the chunked
+  format carries states across releases that only add or drop state fields. Desktop
+  states that depend on host files or native-only devices are not portable to the
+  browser.
 - **Quick save / Quick load:** Stores the current session in browser local storage (IndexedDB)
   for instant resumption across page reloads.
 - **Saved states panel:** Manage named state slots in browser storage.

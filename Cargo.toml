@@ -222,7 +222,16 @@ plmpeg = { git = "https://github.com/CopperlineHQ/plmpeg-rs", rev = "d020ba1015b
 # non-functional tombstone release. Moving serializers would invalidate every
 # existing .clstate for no functional gain. Migrate only as part of a planned
 # savestate::STATE_VERSION bump with an explicit compatibility story.
+# In-process snapshots (reverse debugging, run-ahead, netplay rollback):
+# positional, same-build-only.
 bincode = "1"
+# Save-state files (src/savestate/chunk.rs): self-describing MessagePack
+# chunk payloads, so a struct can gain or lose fields between releases
+# without invalidating old states; rmpv carries the value tree that chunk
+# migrations rewrite.
+rmp = "0.8"
+rmp-serde = "1.3"
+rmpv = { version = "1.3", features = ["with-serde"] }
 toml = "1.1"
 png = "0.18"
 flate2 = "1"

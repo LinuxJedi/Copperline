@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = copperline::config::Config::default();
-    let emulator = copperline::emulator::build_machine(
+    let mut emulator = copperline::emulator::build_machine(
         &cfg,
         Box::new(copperline::audio::NullSink),
         false,

@@ -19,8 +19,10 @@ feature-dependent board variants use custom serialization. `CpuCore`
 serializes architectural state, prefetch state, MMU state, and timing
 configuration; runtime-only decoded-op, FastMem, and trace-JIT caches are
 skipped and rebuilt after deserialization. New fields are picked up by the
-derives automatically; the cost of that convenience is the versioning rule
-below.
+derives automatically, and because a state file names its fields, most
+struct changes need no version at all (see [Versioning](#versioning)).
+In a file the `Bus` is split into one chunk per subsystem; in memory it
+is one struct, and the split is a serialization-time view.
 
 What is captured:
 
@@ -132,75 +134,170 @@ disks travel inside the state, unsaved track writes included.
 ```
 offset  size  contents
 0       8     magic, ASCII "CLSSTATE"
-8       4     format version, u32 little-endian (STATE_VERSION)
-12      ...   MachineDescriptor, bincode (uncompressed)
-...     ...   zlib stream (RFC 1950) containing the payload
+8       4     container version, u32 little-endian (STATE_VERSION, 81)
+12      ...   DESC chunk: the MachineDescriptor, uncompressed
+...     ...   zlib stream (RFC 1950) of chunks, ending in an END chunk
 ```
 
-The `MachineDescriptor` sits uncompressed ahead of the zlib stream so a
-load can read it (and detect a machine mismatch) without inflating the
-whole machine; bincode consumes exactly its encoded bytes, leaving the
-reader positioned at the start of the zlib stream. `savestate::load`
-returns the descriptor to `Emulator::load_state` for the comparison.
+Every chunk, in the clear or inside the zlib stream, is framed the same
+way:
 
-The payload inside the zlib stream is five bincode values written
-back-to-back by `M68kMachine::write_state`, in this fixed order:
+```
+offset  size  contents
+0       4     tag, four ASCII bytes ("PAUL", "BUS ", "END ")
+4       4     chunk version, u32 little-endian
+8       8     payload length, u64 little-endian
+16      ...   payload
+```
 
-1. `CpuCore`
-2. `MachineRuntimeState`
-3. `icache: Option<Box<CpuCache>>`
-4. `dcache: Option<Box<CpuCache>>`
-5. `Bus`
+The `DESC` chunk sits uncompressed ahead of the zlib stream so a load can
+read it (and detect a machine mismatch) without inflating the whole
+machine; `savestate::load` returns the descriptor to `Emulator::load_state`
+for the comparison. `savestate::inspect` reads the header, the descriptor,
+and the chunk directory of a file without restoring anything.
 
-`M68kMachine::apply_state` reads them back in the same order and only
-swaps the machine onto the parsed state after every component has
-deserialized, so a truncated or corrupt file leaves the live machine
-untouched (`savestate::tests::truncated_payload_leaves_the_machine_untouched`).
+The zlib stream holds the chunks `M68kMachine::write_chunks` produces, in
+this order, then the zero-length `END ` marker (so a stream cut short after
+a complete chunk is still detected):
 
-Encoding details, for anyone reading a state file from outside:
+| Tag | Payload | Contents |
+|---|---|---|
+| `CPU ` | value | `CpuCore` |
+| `MACH` | value | `MachineRuntimeState` |
+| `ICAC`, `DCAC` | value | `Option<Box<CpuCache>>`, `nil` when absent |
+| `MEM ` | bus fields | `mem` (chip/slow/motherboard/accelerator RAM, ROMs, WCS), `ram_init` |
+| `CIAA`, `CIAB` | bus fields | `cia_a`, `cia_b` |
+| `PAUL` | bus fields | `paula` |
+| `AGNS` | bus fields | `agnus` |
+| `COPR` | bus fields | `copper` |
+| `DENI` | bus fields | `denise`, `denise_revision` |
+| `BLIT` | bus fields | `blitter` |
+| `FLOP` | bus fields | `floppy` (controller, drives, in-memory disk images) |
+| `RTC ` | bus fields | `rtc`, `rtc_present` |
+| `KEYB` | bus fields | `keyboard` (the 6500/1 MCU model) |
+| `INPT` | bus fields | `input` (controller ports) |
+| `GAYL` | bus fields | `gayle` |
+| `MOBO` | bus fields | `ramsey`, `gary`, `sdmac`, `ide_a4000` |
+| `AKIK` | bus fields | `akiko` |
+| `CDTV` | bus fields | `cdtv` |
+| `ZORR` | bus fields | `devices` (every `BoardDevice`) |
+| `CART` | bus fields | `cartridge` |
+| `UAEL` | bus fields | `uaelib` |
+| `BUS ` | bus rest | every other `Bus` field: DMA arbitration, interrupt latches, beam-event capture, presentation windows, diagnostics |
 
-- bincode 1.x legacy defaults: little-endian, **fixed-width** integers
-  (`u16` is 2 bytes, `u32` 4, `usize` 8), `bool` as one byte,
-  `Option<T>` as a one-byte tag (0/1) followed by the value, enum
-  variants as a `u32` index, and `Vec`/`String`/`PathBuf` as a `u64`
-  length prefix followed by the elements/UTF-8 bytes.
-- `BoardDevice` is the exception to derived enum indices: its custom serde
-  implementation in `zorro_device/state.rs` writes an explicit `u32` kind
-  followed by the board payload. IDs remain reserved when their Cargo feature
-  is disabled, and loading an unsupported kind reports the missing board.
-  Existing IDs must never be reused or renumbered. Format 79 introduces this
-  encoding; format 78 is rejected even when a particular build happened to
-  use the same IDs.
-- Arrays larger than 32 elements go through `serde-big-array` (the
-  AGA palette's two `[u16; 256]` nibble planes, autoconfig ROM images,
-  CPU-cache line arrays); on the wire they are simply the elements in
-  order, like any other array.
-- The payload is **not self-describing**: the schema is the Rust
-  structs at the `STATE_VERSION` that wrote the file. There are no field
-  names or tags in the stream.
-- Compression is `flate2` at `Compression::fast()`; any standard zlib
-  inflater reads it regardless of level. A Kickstart 2.05 machine
-  (512K chip + 512K ROM) compresses to roughly 400 KB.
+`Bus` keeps a single derived `Serialize`/`Deserialize`; the split is done
+by two serde adapters in `savestate/split.rs`. `BusSplitter` is a
+`Serializer` that only accepts a struct and files each field into the
+chunk that claims it (`savestate/chunk.rs` holds the table), so a field
+added to `Bus` lands in `BUS ` with no table edit. `BusJoiner` is the
+`Deserializer` counterpart: it presents the chunks' field maps to the
+derived visitor as one map, in whatever order the chunks appear, so
+`Bus::deserialize` sees what a single-map encoding would have given it.
+Each `bus fields` payload is therefore a map from field name to value;
+a `value` payload is the value itself.
+
+Chunk payloads are MessagePack in a fixed dialect (`chunk::encode`):
+
+- structs as maps keyed by field name; enum variants by name (a unit
+  variant is its name as a string, a variant with data is a one-entry map
+  `{name: data}`);
+- `Vec<u8>` and byte slices as MessagePack `bin` (the `rmp-serde`
+  `ForceIterables` bytes mode), so RAM, ROM, and disk images are stored
+  as raw bytes; other sequences and fixed arrays (including the
+  `serde-big-array` ones) as arrays;
+- integers at their natural MessagePack width, so a field widened from
+  `u8` to `u32` still reads its old values; `Option` as `nil` or the
+  value; `HashMap`/`BTreeMap` as maps.
+- `BoardDevice` keeps its custom encoding as a two-element array of an
+  explicit `u32` kind and the board payload (`zorro_device/state.rs`).
+  IDs stay reserved when their Cargo feature is disabled, and loading an
+  unsupported kind reports the missing board. Existing IDs must never be
+  reused or renumbered.
+
+Before a payload reaches a decoder, `chunk::check_shape` walks it once
+without building anything: it must be exactly one well-formed value that
+ends at the end of the payload and nests no deeper than 64 levels, so a
+crafted payload cannot drive the recursive decoders off the stack. The
+chunk reader itself grows its payload buffer one MiB at a time, so a
+header claiming more bytes than the stream holds fails at the end of the
+stream having allocated no more than one step past what exists; a state's
+legitimate size is unbounded by design (memory-backed disk images ride in
+the payload), so there is deliberately no fixed cap.
+
+Compression is `flate2` at `Compression::fast()`; any standard zlib
+inflater reads it regardless of level.
+
+Container versions 1 through 80 were a different layout: the descriptor
+and five bincode components (`CpuCore`, `MachineRuntimeState`, the two
+caches, the whole `Bus`) written positionally, with no field names and
+one global version. Those files are refused with a message saying the
+state must be saved again from a current build; there is no reader for
+them.
+
+In-process snapshots do not use this container. `M68kMachine::write_state`
+writes the same five components as unframed positional bincode for the
+reverse-debugging ring, run-ahead, and netplay rollback checkpoints
+(`emulator.rs`), where speed matters and only the build that wrote a blob
+ever reads it. `write_chunks` is its file-format twin; both go through
+the same `adopt_state` tail on restore.
 
 ## Versioning
 
-`STATE_VERSION` (in `savestate.rs`) is compared exactly on load; a
-mismatch fails with a message naming both versions. Because the payload
-is positional bincode of the live structs, **any** shape change to any
-serialized struct -- a field added, removed, reordered, or retyped
-anywhere under `Bus`, the chipset modules, `CpuCore`, floppy or
-expansion state, *or the header `MachineDescriptor`* -- silently changes
-the wire layout. The rule is
-therefore: bump `STATE_VERSION` whenever such a change lands, so stale
-files are refused with a clear version message instead of failing with a
-confusing decode error (or worse, decoding into nonsense). There is no
-migration machinery; old states are simply invalidated.
+Three things are versioned, at three rates:
 
-Version 80 adds the private netplay hard-drive backing. Its immutable media
-reference is valid only while that disk is alive in the current process;
-rollback checkpoints store changed sectors separately. Normal file-backed and
-in-memory-volume saves retain their existing contents. Netplay does not expose
-file save/load operations or accept checkpoints from the other peer.
+- **The container** (`STATE_VERSION`): the framing above. It moves only
+  when the framing changes, and a mismatch is refused outright.
+- **Each chunk** (`chunk::CHUNKS`): the meaning of one subsystem's
+  payload. A chunk written at an older version than the build reads is
+  upgraded on load by the `chunk::Migration` steps registered for it
+  (`chunk::MIGRATIONS`), one version at a time, as a rewrite of the
+  decoded value tree, before the payload is decoded into the live structs.
+  A missing step fails the load naming the chunk and both versions; a
+  chunk from a newer build is refused as such.
+- **Nothing**, for most struct changes. Because payloads name their
+  fields, the derived deserializers tolerate a field the file has that the
+  struct no longer has (ignored), a field the struct has that the file
+  lacks when it is an `Option` or carries `#[serde(default)]` (defaulted),
+  reordered fields, and widened integers. Unknown chunks are skipped, so a
+  build may add a chunk without invalidating its states for older builds.
+
+The rule for a change to a serialized struct is therefore:
+
+1. Adding a field: give it `#[serde(default)]` (or `#[serde(default =
+   "fn")]`, or make it an `Option`) when the default is the right reading
+   of a state that predates it. No version changes. Without a default the
+   field is required and every older state fails to load naming the chunk
+   and field, which is only acceptable while the format is on a
+   development branch.
+2. Removing or reordering a field: nothing to do.
+3. Renaming a field whose old value must carry over: `#[serde(alias =
+   "old_name")]`.
+4. Changing what a field means, or its representation in a way the
+   MessagePack reader cannot bridge (an integer that became a struct, a
+   tuple whose elements changed roles, a widened enum whose old variants
+   were renumbered): bump the owning chunk's version in `chunk::CHUNKS`,
+   note it in the version comment there, and add a `Migration` for the
+   previous version that rewrites the old shape. Add a test that loads a
+   payload of the old shape through it.
+5. Adding a subsystem: give it a chunk (table entry naming its `Bus`
+   fields) rather than letting it grow the `BUS ` catch-all.
+
+`savestate::SCHEMA_FINGERPRINT` hashes the crate version, the container
+version, and every chunk's tag and version; the netplay handshake
+(`netplay/wire.rs`) carries it so two peers agree they serialize a machine
+identically before trusting each other's frame checksums.
+
+`savestate::tests` cover each of these paths against a real machine:
+unknown chunks and reordered chunks
+(`unknown_chunks_are_skipped_and_chunk_order_does_not_matter`), fields a
+struct no longer has or did not have yet
+(`states_survive_fields_a_struct_no_longer_has_or_did_not_have_yet`),
+migrations and newer-chunk refusal
+(`older_chunk_versions_load_through_migrations_and_newer_ones_are_refused`),
+the table naming real `Bus` fields
+(`every_bus_chunk_holds_exactly_the_fields_it_claims`), and hostile
+lengths and nesting
+(`hostile_chunk_lengths_and_nesting_fail_instead_of_exhausting_memory`).
 
 ## Snapshot point and atomicity
 
@@ -251,10 +348,15 @@ The regression checks cover serialization, failure recovery and replay:
   explicit error coverage.
 - `savestate::tests` cover failed writes and failed publication preserving
   existing destinations and cleaning up temporary files, magic/version
-  rejection, the truncated-payload atomicity guarantee, the header descriptor round
-  trip (`round_trips_the_machine_descriptor`), and that a CD controller
-  travels in the state so the bar's CD controls appear on load
-  (`cd_controller_travels_in_the_state`);
+  rejection (including the flat pre-81 layout), the truncated-payload
+  atomicity guarantee, the header descriptor round trip
+  (`round_trips_the_machine_descriptor`), the chunk directory a file
+  presents (`state_file_is_a_directory_of_versioned_subsystem_chunks`),
+  the split/join adapters on their own
+  (`splitter_routes_struct_fields_by_chunk_and_joiner_reassembles_them`),
+  the compatibility paths listed under [Versioning](#versioning), and
+  that a CD controller travels in the state so the bar's CD controls
+  appear on load (`cd_controller_travels_in_the_state`);
   `config::tests::rom_fingerprint_distinguishes_same_shape_kickstarts`
   covers flagging a swapped same-shape Kickstart;
   `emulator::tests::pacing_cost_scales_with_cpu_clock` covers the

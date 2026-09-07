@@ -705,9 +705,10 @@ content above.
   remaining difference around guest input-buffer refills when restoring
   mid-decode; that case is not established as bit-exact.
 - **Save-state layout**: decoder warmup history, tone-filter coefficients,
-  and filter memory are serialized machine state. Changes to their layout
-  require a `savestate::STATE_VERSION` bump, independently of the board's
-  register-protocol version.
+  and filter memory are serialized machine state, in the `ZORR` chunk.
+  A new field needs `#[serde(default)]`; a change of meaning bumps that
+  chunk's version with a migration (`docs/internals/savestate.md`,
+  "Versioning"), independently of the board's register-protocol version.
 - **DSP chain implementation**: `Biquad` is Direct Form II transposed,
   reusing `src/chipset/paula.rs`'s `AnalogLedFilter`/`BiquadLowPass`
   structure and `process` shape rather than a second filter convention in

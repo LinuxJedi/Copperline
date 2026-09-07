@@ -683,9 +683,14 @@ In-tree functional boards implement the `ZorroDevice` trait
    `src/main.rs`): assign it a slot, add its `BoardSpec` to the chain, and
    push the `BoardDevice` onto `Bus::devices` (the A2091 block, and the
    lide-compatible IDE board's block right after it, are worked templates).
-   Bump `savestate::STATE_VERSION` (with a comment explaining why) whenever
-   the serialized layout changes -- adding a `BoardDevice` variant always
-   counts, since the enum itself is part of every save state.
+   Give the new `BoardDevice` variant the next free kind ID in
+   `zorro_device/state.rs` (IDs are never reused). A new board needs no
+   save-state version change: boards travel in the `ZORR` chunk, whose
+   payload names its fields, so older states simply lack the board. Bump
+   that chunk's version in `savestate/chunk.rs` (with a migration) only if
+   an existing board's serialized meaning changes in a way a
+   `#[serde(default)]` cannot express (`docs/internals/savestate.md`,
+   "Versioning").
 4. Add unit tests next to the existing ones in `src/zorro.rs`, which cover
    ROM nibble encoding, Zorro II/III base assignment, chain advance,
    shut-up, and power-on reset -- they are the best worked examples of the

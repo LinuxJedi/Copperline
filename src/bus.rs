@@ -720,8 +720,12 @@ pub(crate) struct RollbackState {
 // fields (open files, audio/serial sinks, wall-clock anchors, memo caches)
 // are #[serde(skip)] and reattached by the savestate loader; everything else
 // is emulated state and must round-trip. New fields are picked up by the
-// derive automatically -- bump savestate::STATE_VERSION when the layout
-// changes incompatibly.
+// derive automatically. In a state file each field lands in the chunk of
+// its subsystem (src/savestate/chunk.rs: `paula` in PAUL, `agnus` in AGNS,
+// anything unclaimed in BUS), and the payloads name their fields, so a new
+// field needs only `#[serde(default)]` (or to be an Option) for older
+// states to keep loading; bump the owning chunk's version, with a
+// migration, only when a change has no correct default.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Bus {
     pub mem: Memory,
