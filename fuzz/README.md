@@ -14,7 +14,7 @@ cargo +nightly fuzz run dms            # one target...
 cargo +nightly fuzz run floppy_image   # ADF/extADF/DMS/SCP/IPF/gzip/zip
 cargo +nightly fuzz run cd_image       # CUE/BIN, bare ISO, NRG, and CHD
 cargo +nightly fuzz run hardfile_classification # HDF/RDSK/bare-volume classification
-cargo +nightly fuzz run savestate      # .clstate bincode machine images
+cargo +nightly fuzz run savestate      # .clstate chunked machine images
 ```
 
 Crashes land in `fuzz/artifacts/<target>/`; reproduce one by passing the
@@ -25,9 +25,10 @@ overwrite inputs.
 
 The save-state target starts from
 `corpus/savestate/current.clstate`, a valid state that gets mutations past
-the magic, format version, descriptor, and zlib wrapper into the machine
-payload. Whenever `savestate::STATE_VERSION` changes, regenerate and commit
-that seed from this directory:
+the magic, container version, descriptor chunk, and zlib wrapper into the
+machine chunks. Whenever `savestate::STATE_VERSION` or a chunk version in
+`src/savestate/chunk.rs` changes, regenerate and commit that seed from this
+directory:
 
 ```sh
 cargo +nightly run --example generate_savestate_seed

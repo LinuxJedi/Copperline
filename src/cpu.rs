@@ -9,7 +9,8 @@ use crate::memory::{
     ACCEL_RAM_BASE, AUTOCONFIG_BASE, AUTOCONFIG_SIZE, CHIP_RAM_BASE, CHIP_WINDOW_SIZE, ROM_BASE,
     SLOW_RAM_BASE, WCS_BASE,
 };
-use anyhow::{anyhow, Result};
+use crate::savestate::{chunk, split};
+use anyhow::{anyhow, bail, Result};
 use log::{debug, trace};
 use m68k::core::memory::{BusFault, BusFaultKind};
 use m68k::{AddressBus, BatchExit, CpuCore, CpuType, FastMem, StepResult};
@@ -293,6 +294,56 @@ struct MachineRollbackState {
     bus: crate::bus::RollbackState,
     sampled_irq_level: u8,
     ipl_sample_held: bool,
+}
+
+/// The components a state parses into before the machine swaps onto them.
+struct RestoredState {
+    cpu: CpuCore,
+    runtime: MachineRuntimeState,
+    icache: Option<Box<crate::cache::CpuCache>>,
+    dcache: Option<Box<crate::cache::CpuCache>>,
+    bus: Bus,
+}
+
+/// The value chunks of a state file, collected while the `Bus` streams in.
+#[derive(Default)]
+struct Components {
+    cpu: Option<CpuCore>,
+    runtime: Option<MachineRuntimeState>,
+    icache: Option<Option<Box<crate::cache::CpuCache>>>,
+    dcache: Option<Option<Box<crate::cache::CpuCache>>>,
+}
+
+impl chunk::ValueSink for Components {
+    fn value(&mut self, spec: &'static chunk::ChunkSpec, payload: Vec<u8>) -> Result<()> {
+        if spec.tag == chunk::CPU.tag {
+            self.cpu = Some(chunk::decode(&payload)?);
+        } else if spec.tag == chunk::MACH.tag {
+            self.runtime = Some(chunk::decode(&payload)?);
+        } else if spec.tag == chunk::ICAC.tag {
+            self.icache = Some(chunk::decode(&payload)?);
+        } else if spec.tag == chunk::DCAC.tag {
+            self.dcache = Some(chunk::decode(&payload)?);
+        } else {
+            bail!(
+                "unexpected {} chunk in the state body",
+                chunk::tag_name(spec.tag)
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Components {
+    fn need<T>(part: Option<T>, spec: &chunk::ChunkSpec) -> Result<T> {
+        part.ok_or_else(|| {
+            anyhow!(
+                "state has no {} chunk ({})",
+                chunk::tag_name(spec.tag),
+                spec.name
+            )
+        })
+    }
 }
 
 /// Longest 68000-family instruction worth attributing to one PC when
@@ -1461,24 +1512,112 @@ impl M68kMachine {
         &mut self.bus.bus
     }
 
-    /// Serialize the machine's emulated state (CPU core, timing carries,
-    /// cache models, Bus) into `w`, in the fixed component order
-    /// `apply_state` reads back. Host-side state (debugger instrumentation,
-    /// sinks, trace files) is not written. Call only at an emulated-frame
-    /// boundary; mid-frame the renderer capture buffers are inconsistent.
-    pub(crate) fn write_state<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
-        serialize_component(w, &self.cpu, "CPU core")?;
-        let runtime = MachineRuntimeState {
+    fn runtime_state(&self) -> MachineRuntimeState {
+        MachineRuntimeState {
             last_cacr: self.last_cacr,
             sync_cck_on: self.sync_cck_on,
             cpu_clocks_per_cck: self.cpu_clocks_per_cck,
             cpu_clock_carry: self.cpu_clock_carry,
-        };
-        serialize_component(w, &runtime, "machine runtime")?;
+        }
+    }
+
+    /// Serialize the machine's emulated state (CPU core, timing carries,
+    /// cache models, Bus) into `w` as positional bincode, in the fixed
+    /// component order `apply_state` reads back. This is the in-process
+    /// snapshot form (reverse debugging, run-ahead, netplay rollback): fast,
+    /// unframed, and only ever read by the build that wrote it. Files use
+    /// `write_chunks`. Host-side state (debugger instrumentation, sinks,
+    /// trace files) is not written. Call only at an emulated-frame boundary;
+    /// mid-frame the renderer capture buffers are inconsistent.
+    pub(crate) fn write_state<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
+        serialize_component(w, &self.cpu, "CPU core")?;
+        serialize_component(w, &self.runtime_state(), "machine runtime")?;
         serialize_component(w, &self.bus.icache, "icache")?;
         serialize_component(w, &self.bus.dcache, "dcache")?;
         serialize_component(w, &self.bus.bus, "bus")?;
         Ok(())
+    }
+
+    /// The file-format counterpart of `write_state`: the same components as
+    /// tagged, versioned chunks, with the `Bus` split by subsystem
+    /// (`savestate::chunk` lists them) and streamed chunk by chunk, so the
+    /// save holds at most one block of payload beyond the machine itself.
+    /// Same snapshot-point rules. Hands the writer back for `finish`.
+    pub(crate) fn write_chunks<W: std::io::Write>(
+        &self,
+        mut out: chunk::ChunkWriter<W>,
+    ) -> Result<chunk::ChunkWriter<W>> {
+        out.value(&chunk::CPU, &self.cpu)?;
+        out.value(&chunk::MACH, &self.runtime_state())?;
+        out.value(&chunk::ICAC, &self.bus.icache)?;
+        out.value(&chunk::DCAC, &self.bus.dcache)?;
+        split::BusSplitter::split(&self.bus.bus, out).map_err(|e| anyhow!("serializing bus: {e}"))
+    }
+
+    /// Counterpart of `write_chunks`: decode every chunk as it arrives on
+    /// `stream` (upgrading chunks written at older versions through
+    /// `migrations`), then swap the machine onto the restored state exactly
+    /// as `apply_state` does. The live machine is untouched if any chunk
+    /// fails to decode.
+    pub(crate) fn apply_chunks<R: std::io::Read>(
+        &mut self,
+        stream: R,
+        migrations: &[chunk::Migration],
+    ) -> Result<()> {
+        let mut components = Components::default();
+        let mut joiner = split::BusJoiner::new(stream, migrations, &mut components);
+        let restored: std::result::Result<Bus, _> = serde::Deserialize::deserialize(&mut joiner);
+        let bus = match restored {
+            Ok(bus) => bus,
+            Err(e) => {
+                // serde reports a required field a chunk lacks as "missing
+                // field `name`"; say which chunk should have carried it,
+                // or that the chunk itself is absent.
+                let text = e.to_string();
+                let field = text
+                    .strip_prefix("missing field `")
+                    .and_then(|rest| rest.strip_suffix('`'));
+                return Err(match field {
+                    Some(field) => {
+                        let spec = chunk::chunk_for_field(field);
+                        let name = chunk::tag_name(spec.tag);
+                        if joiner.seen().contains(&spec.tag) {
+                            anyhow!("the {name} chunk ({}) has no `{field}` field", spec.name)
+                        } else {
+                            anyhow!("state has no {name} chunk ({})", spec.name)
+                        }
+                    }
+                    None => anyhow!("restoring the bus from its chunks: {text}"),
+                });
+            }
+        };
+        let seen = joiner.seen().to_vec();
+        joiner.finish()?;
+        // A required chunk whose fields all happened to default would have
+        // slipped past the visitor; name it anyway.
+        if let Some(missing) =
+            chunk::bus_chunks().find(|spec| spec.required && !seen.contains(&spec.tag))
+        {
+            bail!(
+                "state has no {} chunk ({})",
+                chunk::tag_name(missing.tag),
+                missing.name
+            );
+        }
+        let cpu = Components::need(components.cpu, &chunk::CPU)?;
+        let runtime = Components::need(components.runtime, &chunk::MACH)?;
+        let icache = Components::need(components.icache, &chunk::ICAC)?;
+        let dcache = Components::need(components.dcache, &chunk::DCAC)?;
+        self.adopt_state(
+            RestoredState {
+                cpu,
+                runtime,
+                icache,
+                dcache,
+                bus,
+            },
+            None,
+        )
     }
 
     pub(crate) fn write_rollback_state<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
@@ -1510,11 +1649,31 @@ impl M68kMachine {
         r: &mut R,
         rollback: Option<MachineRollbackState>,
     ) -> Result<()> {
-        let cpu: CpuCore = deserialize_component(r, "CPU core")?;
-        let runtime: MachineRuntimeState = deserialize_component(r, "machine runtime")?;
-        let icache: Option<Box<crate::cache::CpuCache>> = deserialize_component(r, "icache")?;
-        let dcache: Option<Box<crate::cache::CpuCache>> = deserialize_component(r, "dcache")?;
-        let mut bus: Bus = deserialize_component(r, "bus")?;
+        let state = RestoredState {
+            cpu: deserialize_component(r, "CPU core")?,
+            runtime: deserialize_component(r, "machine runtime")?,
+            icache: deserialize_component(r, "icache")?,
+            dcache: deserialize_component(r, "dcache")?,
+            bus: deserialize_component(r, "bus")?,
+        };
+        self.adopt_state(state, rollback)
+    }
+
+    /// Swap the machine onto a fully parsed state. Host resources (audio
+    /// and serial sinks, blitter trace file) move across to the restored
+    /// Bus; debugger state and breakpoints stay live.
+    fn adopt_state(
+        &mut self,
+        state: RestoredState,
+        rollback: Option<MachineRollbackState>,
+    ) -> Result<()> {
+        let RestoredState {
+            cpu,
+            runtime,
+            icache,
+            dcache,
+            mut bus,
+        } = state;
 
         bus.adopt_host_resources(&mut self.bus.bus)?;
         bus.adopt_ui_debug_state(&mut self.bus.bus);

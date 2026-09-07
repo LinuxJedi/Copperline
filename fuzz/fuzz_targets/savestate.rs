@@ -1,6 +1,7 @@
 //! Fuzz the save-state loader. `.clstate` files are untrusted input (a
-//! downloaded state, a shared speedrun snapshot), and the loader parses a
-//! full bincode machine image before anything else validates it.
+//! downloaded state, a shared speedrun snapshot), and the loader parses the
+//! chunk container (framing, block runs, MessagePack payloads, migrations)
+//! into a full machine before anything else validates it.
 
 #![no_main]
 

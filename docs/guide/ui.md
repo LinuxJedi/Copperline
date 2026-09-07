@@ -941,11 +941,16 @@ machine continues from exactly the saved point, byte-for-byte -- the core
 is deterministic, so a resumed run is indistinguishable from one that was
 never interrupted.
 
-States are taken at emulated-frame boundaries and are versioned: a file
-from an older, incompatible build is refused with a clear message rather
-than producing a corrupt machine. Save-state format 79 uses stable expansion-board
-identifiers across feature selections; a build still needs support for every
-board present in the snapshot. Format 78 and older states must be recreated.
+States are taken at emulated-frame boundaries and are versioned per
+subsystem: the file is a set of tagged chunks (CPU, memory, Paula, Agnus,
+floppy, expansion boards, ...) that name their fields, so a state keeps
+loading across releases that add or drop state fields, and a release that
+changes what a subsystem's state means upgrades that chunk on load. A file
+a build cannot read is refused with a message naming the chunk and
+versions rather than producing a corrupt machine. A build still needs
+support for every expansion board present in the snapshot. States written
+by Copperline 0.19 and earlier used a flat layout with a single version
+and must be recreated.
 
 Saving over an existing file replaces it only after the new snapshot has
 been completely written and flushed. A failed save leaves the previous
