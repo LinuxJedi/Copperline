@@ -92,6 +92,29 @@ unsafe extern "C" fn audio_one_frame(data: *const i16, frames: usize) -> usize {
 }
 
 #[test]
+fn modifier_aliases_keep_the_correct_amiga_key_held() {
+    let root = tempfile::tempdir().unwrap();
+    let config = core::configuration("A500", "PAL", false, root.path()).unwrap();
+    let mut core = Core::load(&config, None, root.path().into(), true).unwrap();
+    // libretro RCTRL/LCTRL, LMETA/LSUPER, and RMETA/RSUPER respectively.
+    for (aliases, raw) in [([305, 306], 0x63), ([310, 311], 0x66), ([309, 312], 0x67)] {
+        for held in [vec![aliases[0]], aliases.to_vec(), vec![aliases[1]], vec![]] {
+            core.controls.poll(&mut core.emu, |_, device, key| {
+                i16::from(device == KEYBOARD && held.contains(&key))
+            });
+            let pressed: Vec<_> = core
+                .controls
+                .keys
+                .iter()
+                .enumerate()
+                .filter_map(|(key, held)| held.then_some(key))
+                .collect();
+            assert_eq!(pressed, if held.is_empty() { vec![] } else { vec![raw] });
+        }
+    }
+}
+
+#[test]
 fn partial_audio_batches_keep_their_unconsumed_samples() {
     let root = tempfile::tempdir().unwrap();
     setup(root.path(), false, false);
