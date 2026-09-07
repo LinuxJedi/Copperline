@@ -3,12 +3,16 @@
 //! The chunk layer of a `.clstate` file: tagged, individually versioned,
 //! length-framed records whose payloads are self-describing MessagePack.
 //!
-//! [`ChunkWriter`] frames payloads; [`ChunkSet`] reads a whole stream back,
-//! growing its buffers only as far as the bytes actually present (never as
-//! far as a claimed length), and hands each known chunk to its decoder once
-//! any [`Migration`] steps have brought it up to the version this build
-//! reads. Unknown tags are skipped, so a build can add a chunk without
-//! invalidating its states for older builds that still understand the rest.
+//! [`ChunkWriter`] frames payloads, either whole when their length is known
+//! or as a run of blocks ([`ChunkBody`]) when they are produced
+//! incrementally. [`read_header`] and [`Body`] read them back straight from
+//! the stream, so neither side ever holds more than one block of a payload
+//! beyond what its consumer keeps: a machine with gigabytes of memory-backed
+//! disk images saves and loads with the same memory footprint the flat
+//! format had. Buffers grow only as far as the bytes actually present,
+//! never as far as a claimed length. Unknown tags are skipped, so a build
+//! can add a chunk without invalidating its states for older builds that
+//! still understand the rest.
 //!
 //! Payload encoding ([`encode`]/[`decode`]): structs as maps keyed by field
 //! name, enum variants by name, byte vectors as MessagePack `bin`, integers
@@ -20,9 +24,8 @@
 //! cannot express; a [`Migration`] step then rewrites the older shape, as a
 //! value tree, before it is decoded into the live structs.
 
-use std::borrow::Cow;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{self, Cursor, Read, Take, Write};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
@@ -31,16 +34,26 @@ use serde::Serialize;
 /// A chunk's four-character tag.
 pub type Tag = [u8; 4];
 
-/// The end-of-stream marker: a zero-length chunk after the last real one, so
-/// a stream cut short after a complete chunk is still detected.
+/// The end-of-stream marker: an empty version-0 chunk after the last real
+/// one, so a stream cut short after a complete chunk is still detected.
 pub const END: Tag = *b"END ";
+
+/// In a chunk header, a payload length of all ones means the payload
+/// follows as length-prefixed blocks rather than as that many bytes: the
+/// writer streamed it without knowing the length up front.
+pub(crate) const STREAMED: u64 = u64::MAX;
+
+/// Block size for streamed payloads, and the most a payload buffer grows
+/// per read.
+const BLOCK: usize = 1 << 20;
 
 /// What a chunk carries.
 #[derive(Debug)]
 pub(crate) enum Payload {
     /// One serialized value, written by `M68kMachine::write_chunks`.
     Value,
-    /// A map of the named `Bus` fields.
+    /// A map of the named `Bus` fields, which must be contiguous in `Bus`
+    /// declaration order so the chunk can stream.
     BusFields(&'static [&'static str]),
     /// A map of every `Bus` field no `BusFields` chunk claims.
     BusRest,
@@ -109,8 +122,6 @@ pub(crate) const DENI: ChunkSpec = bus(b"DENI", 1, "Denise", &["denise", "denise
 pub(crate) const BLIT: ChunkSpec = bus(b"BLIT", 1, "blitter", &["blitter"], true);
 pub(crate) const FLOP: ChunkSpec = bus(b"FLOP", 1, "floppy controller", &["floppy"], true);
 pub(crate) const RTC: ChunkSpec = bus(b"RTC ", 1, "real-time clock", &["rtc", "rtc_present"], true);
-pub(crate) const KEYB: ChunkSpec = bus(b"KEYB", 1, "keyboard", &["keyboard"], true);
-pub(crate) const INPT: ChunkSpec = bus(b"INPT", 1, "controller ports", &["input"], true);
 pub(crate) const GAYL: ChunkSpec = bus(b"GAYL", 1, "Gayle", &["gayle"], false);
 pub(crate) const MOBO: ChunkSpec = bus(
     b"MOBO",
@@ -119,13 +130,16 @@ pub(crate) const MOBO: ChunkSpec = bus(
     &["ramsey", "gary", "sdmac", "ide_a4000"],
     false,
 );
+pub(crate) const UAEL: ChunkSpec = bus(b"UAEL", 1, "uaelib trap", &["uaelib"], false);
+pub(crate) const CART: ChunkSpec = bus(b"CART", 1, "freezer cartridge", &["cartridge"], false);
 pub(crate) const AKIK: ChunkSpec = bus(b"AKIK", 1, "Akiko", &["akiko"], false);
 pub(crate) const CDTV: ChunkSpec = bus(b"CDTV", 1, "CDTV controller", &["cdtv"], false);
 pub(crate) const ZORR: ChunkSpec = bus(b"ZORR", 1, "expansion boards", &["devices"], true);
-pub(crate) const CART: ChunkSpec = bus(b"CART", 1, "freezer cartridge", &["cartridge"], false);
-pub(crate) const UAEL: ChunkSpec = bus(b"UAEL", 1, "uaelib trap", &["uaelib"], false);
+pub(crate) const KEYB: ChunkSpec = bus(b"KEYB", 1, "keyboard", &["keyboard"], true);
+pub(crate) const INPT: ChunkSpec = bus(b"INPT", 1, "controller ports", &["input"], true);
 /// Everything else on the `Bus`: DMA arbitration, interrupt latches, beam
-/// event capture, presentation windows, diagnostics.
+/// event capture, presentation windows, diagnostics. Written last, since
+/// its fields are scattered through the struct.
 pub(crate) const BUS: ChunkSpec = ChunkSpec {
     tag: *b"BUS ",
     version: 1,
@@ -134,10 +148,11 @@ pub(crate) const BUS: ChunkSpec = ChunkSpec {
     required: true,
 };
 
-/// Every chunk this build writes, in file order.
+/// Every chunk this build writes, in file order: the `Bus` chunks follow
+/// the order of their fields in `Bus`, which is what lets them stream.
 pub(crate) const CHUNKS: &[ChunkSpec] = &[
-    DESC, CPU, MACH, ICAC, DCAC, MEM, CIAA, CIAB, PAUL, AGNS, COPR, DENI, BLIT, FLOP, RTC, KEYB,
-    INPT, GAYL, MOBO, AKIK, CDTV, ZORR, CART, UAEL, BUS,
+    DESC, CPU, MACH, ICAC, DCAC, MEM, CIAA, CIAB, PAUL, AGNS, COPR, DENI, BLIT, FLOP, RTC, GAYL,
+    MOBO, UAEL, CART, AKIK, CDTV, ZORR, KEYB, INPT, BUS,
 ];
 
 pub(crate) fn spec_for(tag: Tag) -> Option<&'static ChunkSpec> {
@@ -217,9 +232,9 @@ impl serde::de::Error for CodecError {
 }
 
 /// Serialize `value` in the state payload dialect.
-pub(crate) fn encode<T: Serialize + ?Sized>(
+pub(crate) fn encode<W: Write, T: Serialize + ?Sized>(
     value: &T,
-    out: &mut Vec<u8>,
+    out: &mut W,
 ) -> std::result::Result<(), rmp_serde::encode::Error> {
     let mut serializer = rmp_serde::Serializer::new(out)
         .with_struct_map()
@@ -227,17 +242,17 @@ pub(crate) fn encode<T: Serialize + ?Sized>(
     value.serialize(&mut serializer)
 }
 
-/// Nesting deeper than any state struct: the walker refuses payloads past
-/// it before the recursive decoders see them.
-const MAX_NESTING: usize = 64;
+/// Nesting deeper than any state struct. The streaming decoder enforces it
+/// itself; `check_shape` enforces it on payloads that are decoded from
+/// memory, in particular by the value-tree decoder migrations use, which
+/// has no limit of its own.
+pub(crate) const MAX_NESTING: usize = 64;
 
 /// Walk one MessagePack value without building it, checking that it is
 /// well formed, ends exactly at the end of `bytes`, and nests no deeper
-/// than `MAX_NESTING`. The value-tree decoder that migrations use recurses
-/// per nesting level with no limit of its own, so a crafted payload of tens
-/// of thousands of nested arrays would otherwise overflow the stack instead
-/// of failing the load; and a payload known to hold exactly one value lets
-/// the decoders skip their own trailing-byte bookkeeping.
+/// than `MAX_NESTING`, so a crafted payload of tens of thousands of nested
+/// arrays fails the load instead of driving a recursive decoder off the
+/// stack.
 pub(crate) fn check_shape(bytes: &[u8]) -> Result<()> {
     use rmp::Marker;
     let mut cursor = bytes;
@@ -312,8 +327,8 @@ pub(crate) fn check_shape(bytes: &[u8]) -> Result<()> {
     }
 }
 
-/// Decode one value from a whole payload, which must hold exactly that
-/// value (`check_shape` refuses anything else before the decoder runs).
+/// Decode one value from a whole payload held in memory, which must hold
+/// exactly that value (`check_shape` refuses anything else first).
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     check_shape(bytes)?;
     let mut deserializer = rmp_serde::Deserializer::from_read_ref(bytes);
@@ -321,6 +336,7 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 }
 
 /// Frames chunks onto a byte sink.
+#[derive(Debug)]
 pub(crate) struct ChunkWriter<W: Write> {
     inner: W,
 }
@@ -328,6 +344,12 @@ pub(crate) struct ChunkWriter<W: Write> {
 impl<W: Write> ChunkWriter<W> {
     pub fn new(inner: W) -> Self {
         Self { inner }
+    }
+
+    fn header(&mut self, tag: Tag, version: u32, len: u64) -> io::Result<()> {
+        self.inner.write_all(&tag)?;
+        self.inner.write_all(&version.to_le_bytes())?;
+        self.inner.write_all(&len.to_le_bytes())
     }
 
     /// Frame an already encoded `payload` as `spec`'s chunk at its current
@@ -338,10 +360,7 @@ impl<W: Write> ChunkWriter<W> {
     }
 
     pub fn write_raw(&mut self, tag: Tag, version: u32, payload: &[u8]) -> Result<()> {
-        self.inner.write_all(&tag)?;
-        self.inner.write_all(&version.to_le_bytes())?;
-        self.inner
-            .write_all(&(payload.len() as u64).to_le_bytes())?;
+        self.header(tag, version, payload.len() as u64)?;
         self.inner.write_all(payload)?;
         Ok(())
     }
@@ -353,55 +372,273 @@ impl<W: Write> ChunkWriter<W> {
         self.write(spec, &payload)
     }
 
+    /// Open `spec`'s chunk for a payload written incrementally as blocks.
+    /// The body hands the writer back on `ChunkBody::finish`.
+    pub fn stream(mut self, spec: &ChunkSpec) -> Result<ChunkBody<W>> {
+        self.header(spec.tag, spec.version, STREAMED)
+            .with_context(|| format!("writing {} chunk ({})", tag_name(spec.tag), spec.name))?;
+        Ok(ChunkBody {
+            writer: self,
+            buf: Vec::with_capacity(BLOCK),
+        })
+    }
+
     /// Write the end marker and hand the sink back.
     pub fn finish(mut self) -> Result<W> {
-        self.write_raw(END, 0, &[])?;
+        self.header(END, 0, 0)?;
         Ok(self.inner)
     }
 }
 
-/// One chunk as read from a stream.
-#[derive(Debug)]
-pub(crate) struct Chunk {
-    pub tag: Tag,
-    pub version: u32,
-    pub payload: Vec<u8>,
+/// A streamed chunk payload: collects up to a block's worth of bytes, then
+/// writes them as one length-prefixed block, and a zero-length block on
+/// `finish`. A payload of any size therefore costs one block of memory.
+pub(crate) struct ChunkBody<W: Write> {
+    writer: ChunkWriter<W>,
+    buf: Vec<u8>,
 }
 
-/// How much a payload buffer grows per read: the most a state can
-/// over-allocate past the bytes it actually holds.
-const FILL_STEP: u64 = 1 << 20;
+impl<W: Write> ChunkBody<W> {
+    fn flush_block(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            let len = u32::try_from(self.buf.len()).expect("blocks are at most BLOCK bytes");
+            self.writer.inner.write_all(&len.to_le_bytes())?;
+            self.writer.inner.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
 
-/// Read one chunk. The payload buffer grows a step at a time, so a header
-/// claiming more bytes than the stream holds fails at the end of the
-/// stream having allocated no more than one step beyond what exists.
-pub(crate) fn read_chunk<R: Read>(reader: &mut R) -> Result<Chunk> {
+    /// Close the payload and hand the chunk writer back.
+    pub fn finish(mut self) -> Result<ChunkWriter<W>> {
+        self.flush_block()?;
+        self.writer.inner.write_all(&0u32.to_le_bytes())?;
+        Ok(self.writer)
+    }
+}
+
+impl<W: Write> Write for ChunkBody<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let room = BLOCK - self.buf.len();
+        let take = bytes.len().min(room);
+        self.buf.extend_from_slice(&bytes[..take]);
+        if self.buf.len() >= BLOCK {
+            self.flush_block()?;
+        }
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One chunk's header as read from a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkHeader {
+    pub tag: Tag,
+    pub version: u32,
+    /// Payload length, or `STREAMED`.
+    pub len: u64,
+}
+
+pub(crate) fn read_header<R: Read>(reader: &mut R) -> Result<ChunkHeader> {
     let mut header = [0u8; 16];
     reader
         .read_exact(&mut header)
         .context("reading chunk header")?;
-    let tag: Tag = header[0..4].try_into().expect("four tag bytes");
-    let version = u32::from_le_bytes(header[4..8].try_into().expect("four version bytes"));
-    let len = u64::from_le_bytes(header[8..16].try_into().expect("eight length bytes"));
-    let mut payload = Vec::new();
-    let mut remaining = len;
-    while remaining > 0 {
-        let step = remaining.min(FILL_STEP) as usize;
-        let start = payload.len();
-        payload.resize(start + step, 0);
-        reader.read_exact(&mut payload[start..]).with_context(|| {
-            format!(
-                "reading {} chunk payload ({len} bytes claimed)",
-                tag_name(tag)
-            )
-        })?;
-        remaining -= step as u64;
-    }
-    Ok(Chunk {
-        tag,
-        version,
-        payload,
+    Ok(ChunkHeader {
+        tag: header[0..4].try_into().expect("four tag bytes"),
+        version: u32::from_le_bytes(header[4..8].try_into().expect("four version bytes")),
+        len: u64::from_le_bytes(header[8..16].try_into().expect("eight length bytes")),
     })
+}
+
+/// Check the end marker and that nothing follows it. Reading on past the
+/// marker also drives the zlib decoder through the end of its stream, so
+/// a corrupt trailer checksum surfaces here. (A stream cut off after the
+/// marker is not an error: every chunk before it arrived complete.)
+pub(crate) fn finish_stream<R: Read>(end: &ChunkHeader, reader: &mut R) -> Result<()> {
+    if end.version != 0 || end.len != 0 {
+        bail!(
+            "malformed END marker (version {}, length {})",
+            end.version,
+            end.len
+        );
+    }
+    let mut probe = [0u8; 1];
+    match reader.read(&mut probe) {
+        Ok(0) => Ok(()),
+        Ok(_) => bail!("data after the END marker"),
+        Err(e) => Err(e).context("verifying the end of the compressed body"),
+    }
+}
+
+/// A run of length-prefixed blocks, ended by a zero-length block.
+pub(crate) struct BlockReader<R: Read> {
+    inner: R,
+    remaining: u32,
+    done: bool,
+}
+
+impl<R: Read> BlockReader<R> {
+    /// Hand the stream back once the last block has been read.
+    fn finish(mut self) -> Result<R> {
+        if !self.done {
+            if self.remaining != 0 {
+                bail!("{} unread bytes in the payload", self.remaining);
+            }
+            let next = self.next_block()?;
+            if next != 0 {
+                bail!("an unread payload block of {next} bytes");
+            }
+        }
+        Ok(self.inner)
+    }
+
+    fn next_block(&mut self) -> io::Result<u32> {
+        let mut len = [0u8; 4];
+        self.inner.read_exact(&mut len)?;
+        let len = u32::from_le_bytes(len);
+        if len == 0 {
+            self.done = true;
+        }
+        self.remaining = len;
+        Ok(len)
+    }
+}
+
+impl<R: Read> Read for BlockReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 && self.next_block()? == 0 {
+            return Ok(0);
+        }
+        let want = buf.len().min(self.remaining as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "payload block cut short",
+            ));
+        }
+        self.remaining -= n as u32;
+        Ok(n)
+    }
+}
+
+/// One chunk's payload, read straight from the stream: either the `len`
+/// bytes its header named, or a run of blocks.
+pub(crate) enum Body<R: Read> {
+    Plain(Take<R>),
+    Blocks(BlockReader<R>),
+}
+
+impl<R: Read> Body<R> {
+    pub fn open(header: &ChunkHeader, reader: R) -> Self {
+        if header.len == STREAMED {
+            Self::Blocks(BlockReader {
+                inner: reader,
+                remaining: 0,
+                done: false,
+            })
+        } else {
+            Self::Plain(reader.take(header.len))
+        }
+    }
+
+    /// Hand the stream back; the payload must have been consumed exactly.
+    pub fn finish(self) -> Result<R> {
+        match self {
+            Self::Plain(take) => {
+                if take.limit() != 0 {
+                    bail!("{} unread bytes in the payload", take.limit());
+                }
+                Ok(take.into_inner())
+            }
+            Self::Blocks(blocks) => blocks.finish(),
+        }
+    }
+
+    /// Drain the payload, returning its byte count and the stream.
+    pub fn skip(mut self) -> Result<(u64, R)> {
+        let count = io::copy(&mut self, &mut io::sink()).context("skipping chunk payload")?;
+        self.check_complete()?;
+        Ok((count, self.finish()?))
+    }
+
+    /// Read the whole payload, growing the buffer one block at a time so
+    /// a header claiming more than the stream holds fails at the end of
+    /// the stream having allocated no more than one block past it.
+    pub fn read_to_vec(mut self) -> Result<(Vec<u8>, R)> {
+        let mut out = Vec::new();
+        loop {
+            let start = out.len();
+            out.resize(start + BLOCK, 0);
+            let mut filled = 0;
+            while filled < BLOCK {
+                match self.read(&mut out[start + filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => return Err(e).context("reading chunk payload"),
+                }
+            }
+            out.truncate(start + filled);
+            if filled < BLOCK {
+                break;
+            }
+        }
+        self.check_complete()?;
+        Ok((out, self.finish()?))
+    }
+
+    /// After a read to end of payload: a plain payload the stream ran out
+    /// of before `len` bytes is truncation, not unread data.
+    fn check_complete(&self) -> Result<()> {
+        if let Self::Plain(take) = self {
+            if take.limit() != 0 {
+                bail!(
+                    "chunk payload cut short: {} bytes claimed but missing",
+                    take.limit()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for Body<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(take) => take.read(buf),
+            Self::Blocks(blocks) => blocks.read(buf),
+        }
+    }
+}
+
+/// Where a streamed `Bus` chunk's field map is being decoded from.
+pub(crate) enum PartSource<R: Read> {
+    /// Straight from the stream.
+    Stream(Body<R>),
+    /// A payload rewritten by a migration, held in memory.
+    Owned(Cursor<Vec<u8>>),
+}
+
+impl<R: Read> Read for PartSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Stream(body) => body.read(buf),
+            Self::Owned(cursor) => cursor.read(buf),
+        }
+    }
+}
+
+/// Receives the non-`Bus` chunks a `BusJoiner` meets while feeding the
+/// `Bus` visitor, already upgraded to the version this build reads.
+pub(crate) trait ValueSink {
+    fn value(&mut self, spec: &'static ChunkSpec, payload: Vec<u8>) -> Result<()>;
 }
 
 /// One upgrade step for a chunk: rewrites a payload written at `from` into
@@ -418,130 +655,48 @@ pub(crate) struct Migration {
 /// previous version keep loading.
 pub(crate) const MIGRATIONS: &[Migration] = &[];
 
-/// Bring a chunk's payload to `spec.version`: borrowed as written when the
+/// Bring a chunk's payload to `spec.version`: returned as is when the
 /// versions match, rewritten through the migration steps when older.
-pub(crate) fn upgrade<'a>(
+pub(crate) fn upgrade(
     spec: &ChunkSpec,
-    chunk: &'a Chunk,
+    version: u32,
+    payload: Vec<u8>,
     migrations: &[Migration],
-) -> Result<Cow<'a, [u8]>> {
+) -> Result<Vec<u8>> {
     let name = tag_name(spec.tag);
-    if chunk.version == spec.version {
-        return Ok(Cow::Borrowed(&chunk.payload));
+    if version == spec.version {
+        return Ok(payload);
     }
-    if chunk.version > spec.version {
+    if version > spec.version {
         bail!(
-            "{name} chunk ({}) is version {}, newer than the version {} this build reads; \
+            "{name} chunk ({}) is version {version}, newer than the version {} this build reads; \
              the state comes from a newer Copperline",
             spec.name,
-            chunk.version,
             spec.version
         );
     }
-    check_shape(&chunk.payload).with_context(|| format!("{name} chunk ({})", spec.name))?;
-    let mut value = rmpv::decode::read_value(&mut &chunk.payload[..])
+    check_shape(&payload).with_context(|| format!("{name} chunk ({})", spec.name))?;
+    let mut value = rmpv::decode::read_value(&mut &payload[..])
         .map_err(|e| anyhow!("{name} chunk ({}): {e}", spec.name))?;
-    let mut version = chunk.version;
-    while version < spec.version {
+    let mut at = version;
+    while at < spec.version {
         let step = migrations
             .iter()
-            .find(|m| m.tag == spec.tag && m.from == version)
+            .find(|m| m.tag == spec.tag && m.from == at)
             .ok_or_else(|| {
                 anyhow!(
-                    "{name} chunk ({}) is version {}; this build reads version {} and has \
-                     no upgrade from version {version}",
+                    "{name} chunk ({}) is version {version}; this build reads version {} and has \
+                     no upgrade from version {at}",
                     spec.name,
-                    chunk.version,
                     spec.version
                 )
             })?;
         (step.apply)(&mut value)
-            .with_context(|| format!("upgrading {name} chunk from version {version}"))?;
-        version += 1;
+            .with_context(|| format!("upgrading {name} chunk from version {at}"))?;
+        at += 1;
     }
     let mut out = Vec::new();
     rmpv::encode::write_value(&mut out, &value)
         .map_err(|e| anyhow!("re-encoding upgraded {name} chunk: {e}"))?;
-    Ok(Cow::Owned(out))
-}
-
-/// One `Bus` chunk's spec and its payload at the version this build reads.
-pub(crate) type BusPart<'a> = (&'static ChunkSpec, Cow<'a, [u8]>);
-
-/// The chunks of one state, read up to the end marker.
-pub(crate) struct ChunkSet {
-    chunks: Vec<Chunk>,
-}
-
-impl ChunkSet {
-    /// Read chunks until the end marker. Unknown tags are dropped with a
-    /// warning; a tag seen twice is an error.
-    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
-        let mut chunks: Vec<Chunk> = Vec::new();
-        loop {
-            let chunk = read_chunk(reader)?;
-            if chunk.tag == END {
-                break;
-            }
-            if chunks.iter().any(|seen| seen.tag == chunk.tag) {
-                bail!("duplicate {} chunk", tag_name(chunk.tag));
-            }
-            if spec_for(chunk.tag).is_none() {
-                log::warn!(
-                    "save state: skipping unknown {} chunk (version {}, {} bytes)",
-                    tag_name(chunk.tag),
-                    chunk.version,
-                    chunk.payload.len()
-                );
-                continue;
-            }
-            chunks.push(chunk);
-        }
-        Ok(Self { chunks })
-    }
-
-    pub fn get(&self, spec: &ChunkSpec) -> Option<&Chunk> {
-        self.chunks.iter().find(|chunk| chunk.tag == spec.tag)
-    }
-
-    /// `spec`'s payload at the version this build reads, if the chunk is
-    /// present.
-    pub fn payload(
-        &self,
-        spec: &ChunkSpec,
-        migrations: &[Migration],
-    ) -> Result<Option<Cow<'_, [u8]>>> {
-        self.get(spec)
-            .map(|chunk| upgrade(spec, chunk, migrations))
-            .transpose()
-    }
-
-    /// Decode a `Payload::Value` chunk.
-    pub fn value<T: DeserializeOwned>(
-        &self,
-        spec: &ChunkSpec,
-        migrations: &[Migration],
-    ) -> Result<T> {
-        let payload = self
-            .payload(spec, migrations)?
-            .ok_or_else(|| anyhow!("state has no {} chunk ({})", tag_name(spec.tag), spec.name))?;
-        decode(&payload)
-            .with_context(|| format!("reading {} chunk ({})", tag_name(spec.tag), spec.name))
-    }
-
-    /// Every `Bus` chunk present, upgraded, in file order; a required one
-    /// missing is an error.
-    pub fn bus_parts(&self, migrations: &[Migration]) -> Result<Vec<BusPart<'_>>> {
-        let mut parts = Vec::new();
-        for spec in bus_chunks() {
-            match self.payload(spec, migrations)? {
-                Some(payload) => parts.push((spec, payload)),
-                None if spec.required => {
-                    bail!("state has no {} chunk ({})", tag_name(spec.tag), spec.name)
-                }
-                None => {}
-            }
-        }
-        Ok(parts)
-    }
+    Ok(out)
 }

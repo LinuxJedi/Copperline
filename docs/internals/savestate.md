@@ -146,9 +146,16 @@ way:
 offset  size  contents
 0       4     tag, four ASCII bytes ("PAUL", "BUS ", "END ")
 4       4     chunk version, u32 little-endian
-8       8     payload length, u64 little-endian
+8       8     payload length, u64 little-endian, or all ones
 16      ...   payload
 ```
+
+A payload length of all ones (`chunk::STREAMED`) means the writer did not
+know the length up front and the payload follows as a run of blocks, each
+a `u32` little-endian length followed by that many bytes, ended by a
+zero-length block. Blocks are at most 1 MiB. The `Bus` chunks are written
+this way; the descriptor and the value chunks carry their length. A reader
+accepts either form for any chunk.
 
 The `DESC` chunk sits uncompressed ahead of the zlib stream so a load can
 read it (and detect a machine mismatch) without inflating the whole
@@ -157,8 +164,13 @@ for the comparison. `savestate::inspect` reads the header, the descriptor,
 and the chunk directory of a file without restoring anything.
 
 The zlib stream holds the chunks `M68kMachine::write_chunks` produces, in
-this order, then the zero-length `END ` marker (so a stream cut short after
-a complete chunk is still detected):
+this order (the `Bus` chunks follow the order of their fields in `Bus`,
+with the catch-all last), then the `END ` marker: version 0, empty, and
+followed by nothing but the end of the zlib stream. A stream cut short
+before the marker is refused; data after it is refused; reading up to the
+end of the stream is what makes the zlib decoder verify its trailer
+checksum. A file cut off after the marker still loads, since every chunk
+before it arrived complete.
 
 | Tag | Payload | Contents |
 |---|---|---|
@@ -174,27 +186,39 @@ a complete chunk is still detected):
 | `BLIT` | bus fields | `blitter` |
 | `FLOP` | bus fields | `floppy` (controller, drives, in-memory disk images) |
 | `RTC ` | bus fields | `rtc`, `rtc_present` |
-| `KEYB` | bus fields | `keyboard` (the 6500/1 MCU model) |
-| `INPT` | bus fields | `input` (controller ports) |
 | `GAYL` | bus fields | `gayle` |
 | `MOBO` | bus fields | `ramsey`, `gary`, `sdmac`, `ide_a4000` |
+| `UAEL` | bus fields | `uaelib` |
+| `CART` | bus fields | `cartridge` |
 | `AKIK` | bus fields | `akiko` |
 | `CDTV` | bus fields | `cdtv` |
 | `ZORR` | bus fields | `devices` (every `BoardDevice`) |
-| `CART` | bus fields | `cartridge` |
-| `UAEL` | bus fields | `uaelib` |
+| `KEYB` | bus fields | `keyboard` (the 6500/1 MCU model) |
+| `INPT` | bus fields | `input` (controller ports) |
 | `BUS ` | bus rest | every other `Bus` field: DMA arbitration, interrupt latches, beam-event capture, presentation windows, diagnostics |
 
 `Bus` keeps a single derived `Serialize`/`Deserialize`; the split is done
 by two serde adapters in `savestate/split.rs`. `BusSplitter` is a
-`Serializer` that only accepts a struct and files each field into the
-chunk that claims it (`savestate/chunk.rs` holds the table), so a field
-added to `Bus` lands in `BUS ` with no table edit. `BusJoiner` is the
-`Deserializer` counterpart: it presents the chunks' field maps to the
-derived visitor as one map, in whatever order the chunks appear, so
-`Bus::deserialize` sees what a single-map encoding would have given it.
-Each `bus fields` payload is therefore a map from field name to value;
-a `value` payload is the value itself.
+`Serializer` that only accepts a struct and streams each field into the
+chunk that claims it (`savestate/chunk.rs` holds the table): a chunk
+opens when its first field arrives and closes when a field of another
+chunk does, so a chunk's fields must be adjacent in `Bus` (the splitter
+refuses a chunk that closes short), and only the catch-all `BUS ` chunk,
+whose fields are scattered through the struct, is buffered until the end.
+A field added to `Bus` lands there with no table edit. `BusJoiner` is the
+`Deserializer` counterpart: it pulls chunks from the stream as the derived
+visitor asks for the next field, decoding each `Bus` chunk's field map
+straight from the stream and handing the value chunks to the machine, in
+whatever order the chunks appear, so `Bus::deserialize` sees what a
+single-map encoding would have given it. Each `bus fields` payload is
+therefore a map from field name to value; a `value` payload is the value
+itself.
+
+Neither side holds a copy of the state: saving keeps at most one block of
+the chunk being written plus the catch-all buffer (a few MiB of glue), and
+loading keeps at most one block of the chunk being read plus what has been
+decoded so far. A machine with gigabytes of memory-backed disk images
+therefore saves and loads with the same footprint the flat format had.
 
 Chunk payloads are MessagePack in a fixed dialect (`chunk::encode`):
 
@@ -214,15 +238,19 @@ Chunk payloads are MessagePack in a fixed dialect (`chunk::encode`):
   unsupported kind reports the missing board. Existing IDs must never be
   reused or renumbered.
 
-Before a payload reaches a decoder, `chunk::check_shape` walks it once
-without building anything: it must be exactly one well-formed value that
-ends at the end of the payload and nests no deeper than 64 levels, so a
-crafted payload cannot drive the recursive decoders off the stack. The
-chunk reader itself grows its payload buffer one MiB at a time, so a
-header claiming more bytes than the stream holds fails at the end of the
-stream having allocated no more than one step past what exists; a state's
-legitimate size is unbounded by design (memory-backed disk images ride in
-the payload), so there is deliberately no fixed cap.
+A `Bus` chunk decoded from the stream runs under the decoder's own
+nesting limit (64 levels), and its framing must end exactly with its last
+field. A payload that is decoded from memory (the descriptor, the value
+chunks, and any chunk a migration rewrites, whose value-tree decoder has
+no limit of its own) is first walked by `chunk::check_shape` without
+building anything: it must be exactly one well-formed value that ends at
+the end of the payload and nests no deeper than 64 levels. So a crafted
+payload cannot drive a recursive decoder off the stack. Payload buffers
+grow one MiB at a time as bytes arrive, so a header or block claiming more
+than the stream holds fails at the end of the stream having allocated no
+more than one MiB past what exists; a state's legitimate size is unbounded
+by design (memory-backed disk images ride in the payload), so there is
+deliberately no fixed cap.
 
 Compression is `flate2` at `Compression::fast()`; any standard zlib
 inflater reads it regardless of level.
@@ -280,7 +308,8 @@ The rule for a change to a serialized struct is therefore:
    previous version that rewrites the old shape. Add a test that loads a
    payload of the old shape through it.
 5. Adding a subsystem: give it a chunk (table entry naming its `Bus`
-   fields) rather than letting it grow the `BUS ` catch-all.
+   fields, which must sit next to each other in `Bus`) rather than letting
+   it grow the `BUS ` catch-all.
 
 `savestate::SCHEMA_FINGERPRINT` hashes the crate version, the container
 version, and every chunk's tag and version; the netplay handshake
@@ -295,8 +324,9 @@ struct no longer has or did not have yet
 migrations and newer-chunk refusal
 (`older_chunk_versions_load_through_migrations_and_newer_ones_are_refused`),
 the table naming real `Bus` fields
-(`every_bus_chunk_holds_exactly_the_fields_it_claims`), and hostile
-lengths and nesting
+(`every_bus_chunk_holds_exactly_the_fields_it_claims`), the end marker and
+trailer checks (`the_end_marker_and_the_compressed_trailer_are_verified`),
+and hostile lengths and nesting
 (`hostile_chunk_lengths_and_nesting_fail_instead_of_exhausting_memory`).
 
 ## Snapshot point and atomicity
@@ -353,7 +383,7 @@ The regression checks cover serialization, failure recovery and replay:
   (`round_trips_the_machine_descriptor`), the chunk directory a file
   presents (`state_file_is_a_directory_of_versioned_subsystem_chunks`),
   the split/join adapters on their own
-  (`splitter_routes_struct_fields_by_chunk_and_joiner_reassembles_them`),
+  (`splitter_streams_struct_fields_by_chunk_and_joiner_reassembles_them`),
   the compatibility paths listed under [Versioning](#versioning), and
   that a CD controller travels in the state so the bar's CD controls
   appear on load (`cd_controller_travels_in_the_state`);

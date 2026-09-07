@@ -10,7 +10,7 @@ use crate::memory::{
     SLOW_RAM_BASE, WCS_BASE,
 };
 use crate::savestate::{chunk, split};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use log::{debug, trace};
 use m68k::core::memory::{BusFault, BusFaultKind};
 use m68k::{AddressBus, BatchExit, CpuCore, CpuType, FastMem, StepResult};
@@ -303,6 +303,47 @@ struct RestoredState {
     icache: Option<Box<crate::cache::CpuCache>>,
     dcache: Option<Box<crate::cache::CpuCache>>,
     bus: Bus,
+}
+
+/// The value chunks of a state file, collected while the `Bus` streams in.
+#[derive(Default)]
+struct Components {
+    cpu: Option<CpuCore>,
+    runtime: Option<MachineRuntimeState>,
+    icache: Option<Option<Box<crate::cache::CpuCache>>>,
+    dcache: Option<Option<Box<crate::cache::CpuCache>>>,
+}
+
+impl chunk::ValueSink for Components {
+    fn value(&mut self, spec: &'static chunk::ChunkSpec, payload: Vec<u8>) -> Result<()> {
+        if spec.tag == chunk::CPU.tag {
+            self.cpu = Some(chunk::decode(&payload)?);
+        } else if spec.tag == chunk::MACH.tag {
+            self.runtime = Some(chunk::decode(&payload)?);
+        } else if spec.tag == chunk::ICAC.tag {
+            self.icache = Some(chunk::decode(&payload)?);
+        } else if spec.tag == chunk::DCAC.tag {
+            self.dcache = Some(chunk::decode(&payload)?);
+        } else {
+            bail!(
+                "unexpected {} chunk in the state body",
+                chunk::tag_name(spec.tag)
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Components {
+    fn need<T>(part: Option<T>, spec: &chunk::ChunkSpec) -> Result<T> {
+        part.ok_or_else(|| {
+            anyhow!(
+                "state has no {} chunk ({})",
+                chunk::tag_name(spec.tag),
+                spec.name
+            )
+        })
+    }
 }
 
 /// Longest 68000-family instruction worth attributing to one PC when
@@ -1499,56 +1540,74 @@ impl M68kMachine {
 
     /// The file-format counterpart of `write_state`: the same components as
     /// tagged, versioned chunks, with the `Bus` split by subsystem
-    /// (`savestate::chunk` lists them). Same snapshot-point rules.
+    /// (`savestate::chunk` lists them) and streamed chunk by chunk, so the
+    /// save holds at most one block of payload beyond the machine itself.
+    /// Same snapshot-point rules. Hands the writer back for `finish`.
     pub(crate) fn write_chunks<W: std::io::Write>(
         &self,
-        out: &mut chunk::ChunkWriter<W>,
-    ) -> Result<()> {
+        mut out: chunk::ChunkWriter<W>,
+    ) -> Result<chunk::ChunkWriter<W>> {
         out.value(&chunk::CPU, &self.cpu)?;
         out.value(&chunk::MACH, &self.runtime_state())?;
         out.value(&chunk::ICAC, &self.bus.icache)?;
         out.value(&chunk::DCAC, &self.bus.dcache)?;
-        let parts = split::BusSplitter::split(&self.bus.bus)
-            .map_err(|e| anyhow!("serializing bus: {e}"))?;
-        for (spec, payload) in &parts {
-            out.write(spec, payload)?;
-        }
-        Ok(())
+        split::BusSplitter::split(&self.bus.bus, out).map_err(|e| anyhow!("serializing bus: {e}"))
     }
 
-    /// Counterpart of `write_chunks`: decode every component (upgrading
-    /// chunks written at older versions through `migrations`), then swap the
-    /// machine onto the restored state exactly as `apply_state` does. The
-    /// live machine is untouched if any chunk fails to decode.
-    pub(crate) fn apply_chunks(
+    /// Counterpart of `write_chunks`: decode every chunk as it arrives on
+    /// `stream` (upgrading chunks written at older versions through
+    /// `migrations`), then swap the machine onto the restored state exactly
+    /// as `apply_state` does. The live machine is untouched if any chunk
+    /// fails to decode.
+    pub(crate) fn apply_chunks<R: std::io::Read>(
         &mut self,
-        chunks: &chunk::ChunkSet,
+        stream: R,
         migrations: &[chunk::Migration],
     ) -> Result<()> {
-        let cpu = chunks.value(&chunk::CPU, migrations)?;
-        let runtime = chunks.value(&chunk::MACH, migrations)?;
-        let icache = chunks.value(&chunk::ICAC, migrations)?;
-        let dcache = chunks.value(&chunk::DCAC, migrations)?;
-        let parts = chunks.bus_parts(migrations)?;
-        let bus = serde::Deserialize::deserialize(split::BusJoiner::new(&parts)).map_err(|e| {
-            // serde reports a required field a chunk lacks as "missing field
-            // `name`"; say which chunk should have carried it.
-            let text = e.to_string();
-            match text
-                .strip_prefix("missing field `")
-                .and_then(|rest| rest.strip_suffix('`'))
-            {
-                Some(field) => {
-                    let spec = chunk::chunk_for_field(field);
-                    anyhow!(
-                        "the {} chunk ({}) has no `{field}` field",
-                        chunk::tag_name(spec.tag),
-                        spec.name
-                    )
-                }
-                None => anyhow!("restoring the bus from its chunks: {text}"),
+        let mut components = Components::default();
+        let mut joiner = split::BusJoiner::new(stream, migrations, &mut components);
+        let restored: std::result::Result<Bus, _> = serde::Deserialize::deserialize(&mut joiner);
+        let bus = match restored {
+            Ok(bus) => bus,
+            Err(e) => {
+                // serde reports a required field a chunk lacks as "missing
+                // field `name`"; say which chunk should have carried it,
+                // or that the chunk itself is absent.
+                let text = e.to_string();
+                let field = text
+                    .strip_prefix("missing field `")
+                    .and_then(|rest| rest.strip_suffix('`'));
+                return Err(match field {
+                    Some(field) => {
+                        let spec = chunk::chunk_for_field(field);
+                        let name = chunk::tag_name(spec.tag);
+                        if joiner.seen().contains(&spec.tag) {
+                            anyhow!("the {name} chunk ({}) has no `{field}` field", spec.name)
+                        } else {
+                            anyhow!("state has no {name} chunk ({})", spec.name)
+                        }
+                    }
+                    None => anyhow!("restoring the bus from its chunks: {text}"),
+                });
             }
-        })?;
+        };
+        let seen = joiner.seen().to_vec();
+        joiner.finish()?;
+        // A required chunk whose fields all happened to default would have
+        // slipped past the visitor; name it anyway.
+        if let Some(missing) =
+            chunk::bus_chunks().find(|spec| spec.required && !seen.contains(&spec.tag))
+        {
+            bail!(
+                "state has no {} chunk ({})",
+                chunk::tag_name(missing.tag),
+                missing.name
+            );
+        }
+        let cpu = Components::need(components.cpu, &chunk::CPU)?;
+        let runtime = Components::need(components.runtime, &chunk::MACH)?;
+        let icache = Components::need(components.icache, &chunk::ICAC)?;
+        let dcache = Components::need(components.dcache, &chunk::DCAC)?;
         self.adopt_state(
             RestoredState {
                 cpu,

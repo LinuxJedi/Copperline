@@ -493,8 +493,8 @@ pub fn save_to_writer<W: Write>(
     // The descriptor sits uncompressed ahead of the zlib stream so it can be
     // read (and a mismatch detected) without decompressing the whole machine.
     chunk::ChunkWriter::new(&mut writer).value(&chunk::DESC, descriptor)?;
-    let mut body = chunk::ChunkWriter::new(ZlibEncoder::new(writer, Compression::fast()));
-    machine.write_chunks(&mut body)?;
+    let body = chunk::ChunkWriter::new(ZlibEncoder::new(writer, Compression::fast()));
+    let body = machine.write_chunks(body)?;
     let encoder = body.finish()?;
     encoder.finish().and_then(|mut w| w.flush())?;
     Ok(())
@@ -534,9 +534,7 @@ pub(crate) fn load_with_migrations<R: Read>(
 ) -> Result<MachineDescriptor> {
     read_header(&mut reader)?;
     let descriptor = read_descriptor(&mut reader, migrations)?;
-    let mut decoder = ZlibDecoder::new(reader);
-    let chunks = chunk::ChunkSet::read(&mut decoder).context("reading save state chunks")?;
-    machine.apply_chunks(&chunks, migrations)?;
+    machine.apply_chunks(ZlibDecoder::new(reader), migrations)?;
     Ok(descriptor)
 }
 
@@ -572,7 +570,7 @@ fn read_descriptor<R: Read>(
     reader: &mut R,
     migrations: &[chunk::Migration],
 ) -> Result<MachineDescriptor> {
-    let header = chunk::read_chunk(reader).context("reading machine descriptor")?;
+    let header = chunk::read_header(reader).context("reading machine descriptor")?;
     if header.tag != chunk::DESC.tag {
         bail!(
             "expected the {} chunk after the save state header, found {}",
@@ -580,7 +578,10 @@ fn read_descriptor<R: Read>(
             chunk::tag_name(header.tag)
         );
     }
-    let payload = chunk::upgrade(&chunk::DESC, &header, migrations)?;
+    let (payload, _) = chunk::Body::open(&header, reader)
+        .read_to_vec()
+        .context("reading machine descriptor")?;
+    let payload = chunk::upgrade(&chunk::DESC, header.version, payload, migrations)?;
     chunk::decode(&payload).context("reading machine descriptor")
 }
 
@@ -606,23 +607,29 @@ pub struct StateSummary {
 }
 
 /// Describe a state without restoring it: header version, descriptor, and
-/// the chunk directory. Reads the whole body, so it costs about as much as
-/// a load minus the decoding.
+/// the chunk directory. Reads the whole body (checking its framing and end
+/// marker like a load does), so it costs about as much as a load minus the
+/// decoding.
 pub fn inspect<R: Read>(mut reader: R) -> Result<StateSummary> {
     let version = read_header(&mut reader)?;
     let descriptor = read_descriptor(&mut reader, chunk::MIGRATIONS)?;
     let mut decoder = ZlibDecoder::new(reader);
     let mut chunks = Vec::new();
     loop {
-        let raw = chunk::read_chunk(&mut decoder).context("reading save state chunks")?;
-        if raw.tag == chunk::END {
+        let header = chunk::read_header(&mut decoder).context("reading save state chunks")?;
+        if header.tag == chunk::END {
+            chunk::finish_stream(&header, &mut decoder).context("reading save state chunks")?;
             break;
         }
+        let (len, rest) = chunk::Body::open(&header, decoder)
+            .skip()
+            .with_context(|| format!("reading {} chunk", chunk::tag_name(header.tag)))?;
+        decoder = rest;
         chunks.push(ChunkSummary {
-            tag: chunk::tag_name(raw.tag),
-            version: raw.version,
-            len: raw.payload.len() as u64,
-            known: chunk::spec_for(raw.tag).is_some(),
+            tag: chunk::tag_name(header.tag),
+            version: header.version,
+            len,
+            known: chunk::spec_for(header.tag).is_some(),
         });
     }
     Ok(StateSummary {
@@ -1192,41 +1199,69 @@ mod tests {
 
     // ---- the chunked container -------------------------------------------
 
+    /// One body chunk, as tests rewrite them.
+    #[derive(Clone)]
+    struct RawChunk {
+        tag: chunk::Tag,
+        version: u32,
+        payload: Vec<u8>,
+    }
+
     /// A state blob's uncompressed prefix (header and DESC chunk) and the
     /// chunks of its body, for tests that rewrite a file.
-    fn unpack(blob: &[u8]) -> (Vec<u8>, Vec<chunk::Chunk>) {
+    fn unpack(blob: &[u8]) -> (Vec<u8>, Vec<RawChunk>) {
         let mut cursor = blob;
         assert_eq!(read_header(&mut cursor).unwrap(), STATE_VERSION);
-        let descriptor = chunk::read_chunk(&mut cursor).unwrap();
+        let descriptor = chunk::read_header(&mut cursor).unwrap();
         assert_eq!(descriptor.tag, chunk::DESC.tag);
+        let (_, rest) = chunk::Body::open(&descriptor, cursor)
+            .read_to_vec()
+            .unwrap();
+        cursor = rest;
         let prefix = blob[..blob.len() - cursor.len()].to_vec();
         let mut decoder = ZlibDecoder::new(cursor);
         let mut chunks = Vec::new();
         loop {
-            let chunk = chunk::read_chunk(&mut decoder).unwrap();
-            if chunk.tag == chunk::END {
+            let header = chunk::read_header(&mut decoder).unwrap();
+            if header.tag == chunk::END {
+                chunk::finish_stream(&header, &mut decoder).unwrap();
                 break;
             }
-            chunks.push(chunk);
+            let (payload, rest) = chunk::Body::open(&header, decoder).read_to_vec().unwrap();
+            decoder = rest;
+            chunks.push(RawChunk {
+                tag: header.tag,
+                version: header.version,
+                payload,
+            });
         }
         (prefix, chunks)
     }
 
-    fn pack(prefix: &[u8], chunks: &[chunk::Chunk]) -> Vec<u8> {
+    /// Reassemble a state from `unpack`'s parts, chunks in plain (known
+    /// length) form, then whatever `tail` adds before the END marker.
+    fn pack_with(
+        prefix: &[u8],
+        chunks: &[RawChunk],
+        tail: impl FnOnce(&mut ZlibEncoder<&mut Vec<u8>>),
+    ) -> Vec<u8> {
         let mut out = prefix.to_vec();
         let mut body = chunk::ChunkWriter::new(ZlibEncoder::new(&mut out, Compression::fast()));
         for chunk in chunks {
             body.write_raw(chunk.tag, chunk.version, &chunk.payload)
                 .unwrap();
         }
-        body.finish().unwrap().finish().unwrap();
+        let mut encoder = body.finish().unwrap();
+        tail(&mut encoder);
+        encoder.finish().unwrap();
         out
     }
 
-    fn chunk_mut<'a>(
-        chunks: &'a mut [chunk::Chunk],
-        spec: &chunk::ChunkSpec,
-    ) -> &'a mut chunk::Chunk {
+    fn pack(prefix: &[u8], chunks: &[RawChunk]) -> Vec<u8> {
+        pack_with(prefix, chunks, |_| {})
+    }
+
+    fn chunk_mut<'a>(chunks: &'a mut [RawChunk], spec: &chunk::ChunkSpec) -> &'a mut RawChunk {
         chunks
             .iter_mut()
             .find(|chunk| chunk.tag == spec.tag)
@@ -1288,20 +1323,23 @@ mod tests {
         let summary = inspect(blob.as_slice()).unwrap();
         assert_eq!(summary.version, STATE_VERSION);
         assert_eq!(summary.descriptor, MachineDescriptor::default());
+        // The body's chunks come in the table's order, which for the bus
+        // chunks is the order of their fields in `Bus`.
         let tags: Vec<&str> = summary.chunks.iter().map(|c| c.tag.as_str()).collect();
-        assert_eq!(
-            tags,
-            [
-                "CPU", "MACH", "ICAC", "DCAC", "MEM", "CIAA", "CIAB", "PAUL", "AGNS", "COPR",
-                "DENI", "BLIT", "FLOP", "RTC", "KEYB", "INPT", "GAYL", "MOBO", "AKIK", "CDTV",
-                "ZORR", "CART", "UAEL", "BUS",
-            ]
-        );
+        let expected: Vec<String> = chunk::CHUNKS
+            .iter()
+            .skip(1)
+            .map(|spec| chunk::tag_name(spec.tag))
+            .collect();
+        assert_eq!(tags, expected);
         assert!(summary.chunks.iter().all(|c| c.known));
         for (summary, spec) in summary.chunks.iter().zip(chunk::CHUNKS.iter().skip(1)) {
             assert_eq!(summary.version, spec.version, "{}", summary.tag);
             assert!(summary.len > 0, "{} chunk is empty", summary.tag);
         }
+        // Bus chunks stream as blocks; value chunks carry their length.
+        let (_, chunks) = unpack(&blob);
+        assert_eq!(chunks.len(), summary.chunks.len());
     }
 
     #[test]
@@ -1309,7 +1347,11 @@ mod tests {
         let (_, chunks) = unpack(&saved_blob(&test_machine()));
         let mut claimed = std::collections::BTreeSet::new();
         for spec in chunk::bus_chunks() {
-            let payload = &chunks.iter().find(|c| c.tag == spec.tag).unwrap().payload;
+            let payload = &chunks
+                .iter()
+                .find(|c| c.tag == spec.tag)
+                .unwrap_or_else(|| panic!("state has no {} chunk", chunk::tag_name(spec.tag)))
+                .payload;
             let keys: std::collections::BTreeSet<String> = map_keys(payload).into_iter().collect();
             match spec.payload {
                 chunk::Payload::BusFields(fields) => {
@@ -1338,7 +1380,7 @@ mod tests {
         chunks.reverse();
         chunks.insert(
             3,
-            chunk::Chunk {
+            RawChunk {
                 tag: *b"XTRA",
                 version: 7,
                 payload: b"a chunk from a build this one has never heard of".to_vec(),
@@ -1365,7 +1407,7 @@ mod tests {
 
         // A field this build does not know (one a later build added) is
         // ignored, wherever it sits.
-        let mut future = chunks.iter().map(clone_chunk).collect::<Vec<_>>();
+        let mut future = chunks.clone();
         let paula = chunk_mut(&mut future, &chunk::PAUL);
         paula.payload = edit_map(&paula.payload, |entries| {
             entries.push((
@@ -1379,7 +1421,7 @@ mod tests {
 
         // A field with a default that an older build never wrote reads as
         // that default: `log_unmapped` is an Option on the bus glue.
-        let mut older = chunks.iter().map(clone_chunk).collect::<Vec<_>>();
+        let mut older = chunks.clone();
         let glue = chunk_mut(&mut older, &chunk::BUS);
         glue.payload = edit_map(&glue.payload, |entries| {
             let before = entries.len();
@@ -1395,7 +1437,7 @@ mod tests {
         assert!(restored.bus().log_unmapped.is_none());
 
         // A field with no default that is missing names its chunk.
-        let mut broken = chunks.iter().map(clone_chunk).collect::<Vec<_>>();
+        let mut broken = chunks.clone();
         let glue = chunk_mut(&mut broken, &chunk::BUS);
         glue.payload = edit_map(&glue.payload, |entries| {
             entries.retain(|(key, _)| key.as_str() != Some("pending_vbi"));
@@ -1407,14 +1449,19 @@ mod tests {
         assert!(reported.contains("BUS chunk"), "{reported}");
         assert!(reported.contains("`pending_vbi`"), "{reported}");
         assert_eq!(untouched.pc(), before_pc);
-    }
 
-    fn clone_chunk(chunk: &chunk::Chunk) -> chunk::Chunk {
-        chunk::Chunk {
-            tag: chunk.tag,
-            version: chunk.version,
-            payload: chunk.payload.clone(),
-        }
+        // A required chunk that is absent altogether is named as such.
+        let without: Vec<RawChunk> = chunks
+            .iter()
+            .filter(|c| c.tag != chunk::AGNS.tag)
+            .cloned()
+            .collect();
+        let err = load_from_reader(&mut untouched, pack(&prefix, &without).as_slice()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no AGNS chunk (Agnus)"),
+            "{err:#}"
+        );
+        assert_eq!(untouched.pc(), before_pc);
     }
 
     #[test]
@@ -1426,7 +1473,7 @@ mod tests {
 
         // A state whose PAUL chunk predates version 1: it called the field
         // `paula_v0`, which the version-1 build renamed to `paula`.
-        let mut old = chunks.iter().map(clone_chunk).collect::<Vec<_>>();
+        let mut old = chunks.clone();
         let paula = chunk_mut(&mut old, &chunk::PAUL);
         paula.version = 0;
         paula.payload = edit_map(&paula.payload, |entries| {
@@ -1475,7 +1522,7 @@ mod tests {
         assert_eq!(saved_blob(&restored), saved_blob(&reference));
 
         // A chunk from a newer build is refused as such.
-        let mut newer = chunks.iter().map(clone_chunk).collect::<Vec<_>>();
+        let mut newer = chunks.clone();
         chunk_mut(&mut newer, &chunk::AGNS).version = chunk::AGNS.version + 1;
         let err =
             load_from_reader(&mut test_machine(), pack(&prefix, &newer).as_slice()).unwrap_err();
@@ -1485,47 +1532,149 @@ mod tests {
     }
 
     #[test]
+    fn the_end_marker_and_the_compressed_trailer_are_verified() {
+        let machine = test_machine();
+        let blob = saved_blob(&machine);
+        let (prefix, chunks) = unpack(&blob);
+
+        // Data after END, inside the compressed body.
+        let extra = pack_with(&prefix, &chunks, |encoder| {
+            chunk::ChunkWriter::new(encoder)
+                .write_raw(*b"LATE", 1, b"after the end")
+                .unwrap();
+        });
+        let err = load_from_reader(&mut test_machine(), extra.as_slice()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("data after the END marker"),
+            "{err:#}"
+        );
+        let err = inspect(extra.as_slice()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("data after the END marker"),
+            "{err:#}"
+        );
+
+        // An END marker that is not empty and version 0.
+        let mut bad_end = prefix.clone();
+        {
+            let mut body =
+                chunk::ChunkWriter::new(ZlibEncoder::new(&mut bad_end, Compression::fast()));
+            for chunk in &chunks {
+                body.write_raw(chunk.tag, chunk.version, &chunk.payload)
+                    .unwrap();
+            }
+            body.write_raw(chunk::END, 3, &[]).unwrap();
+            let mut encoder = body.finish().unwrap();
+            encoder.flush().unwrap();
+            encoder.finish().unwrap();
+        }
+        let err = load_from_reader(&mut test_machine(), bad_end.as_slice()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("malformed END marker"),
+            "{err:#}"
+        );
+
+        // A corrupt zlib trailer (the checksum is the file's last bytes).
+        let mut corrupt = blob.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        let mut untouched = test_machine();
+        let before_pc = untouched.pc();
+        assert!(load_from_reader(&mut untouched, corrupt.as_slice()).is_err());
+        assert_eq!(untouched.pc(), before_pc);
+        assert!(inspect(corrupt.as_slice()).is_err());
+    }
+
+    #[test]
     fn hostile_chunk_lengths_and_nesting_fail_instead_of_exhausting_memory() {
-        // A descriptor chunk claiming u64::MAX bytes, followed by ten.
+        // A descriptor chunk claiming u64::MAX - 1 bytes, followed by ten.
         let mut bytes = STATE_MAGIC.to_vec();
         bytes.extend_from_slice(&STATE_VERSION.to_le_bytes());
         bytes.extend_from_slice(b"DESC");
         bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.extend_from_slice(&(u64::MAX - 1).to_le_bytes());
         bytes.extend_from_slice(&[0u8; 10]);
         let err = load_from_reader(&mut test_machine(), bytes.as_slice()).unwrap_err();
-        assert!(format!("{err:#}").contains("bytes claimed"), "{err:#}");
+        assert!(format!("{err:#}").contains("cut short"), "{err:#}");
 
-        // The same length on a body chunk, read directly.
+        // The same on a body chunk with a plain length, read directly.
         let mut bogus = b"MEM ".to_vec();
         bogus.extend_from_slice(&1u32.to_le_bytes());
         bogus.extend_from_slice(&(1u64 << 40).to_le_bytes());
         bogus.extend_from_slice(&[0u8; 100]);
-        let err = chunk::read_chunk(&mut std::io::Cursor::new(bogus)).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("1099511627776 bytes claimed"),
-            "{err:#}"
-        );
+        let mut cursor = bogus.as_slice();
+        let header = chunk::read_header(&mut cursor).unwrap();
+        let err = chunk::Body::open(&header, cursor)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("cut short"), "{err:#}");
 
-        // A payload of 100k nested arrays is refused before any recursive
-        // decoder sees it, on both the direct and the migration path.
+        // And a streamed chunk whose first block claims 3 GiB.
+        let mut bogus = b"MEM ".to_vec();
+        bogus.extend_from_slice(&1u32.to_le_bytes());
+        bogus.extend_from_slice(&chunk::STREAMED.to_le_bytes());
+        bogus.extend_from_slice(&0xC000_0000u32.to_le_bytes());
+        bogus.extend_from_slice(&[0u8; 100]);
+        let mut cursor = bogus.as_slice();
+        let header = chunk::read_header(&mut cursor).unwrap();
+        let err = chunk::Body::open(&header, cursor)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("cut short"), "{err:#}");
+
+        // A payload nested 100k arrays deep is refused by every decoder it
+        // could reach: the value walker for payloads held in memory (the
+        // migration path), and the streaming decoder's own depth limit for
+        // a bus chunk read straight from the file.
         let nested = vec![0x91u8; 100_000];
         let err = chunk::check_shape(&nested).unwrap_err();
         assert!(format!("{err:#}").contains("nested deeper"), "{err:#}");
         let (prefix, mut chunks) = unpack(&saved_blob(&test_machine()));
         let paula = chunk_mut(&mut chunks, &chunk::PAUL);
-        paula.payload = nested.clone();
+        let mut deep = vec![0x81, 0xA1, b'x'];
+        deep.extend_from_slice(&nested);
+        deep.push(0xC0);
+        paula.payload = deep;
         let err =
             load_from_reader(&mut test_machine(), pack(&prefix, &chunks).as_slice()).unwrap_err();
-        assert!(format!("{err:#}").contains("nested deeper"), "{err:#}");
+        assert!(format!("{err:#}").contains("depth limit"), "{err:#}");
         chunk_mut(&mut chunks, &chunk::PAUL).version = 0;
         let err =
             load_from_reader(&mut test_machine(), pack(&prefix, &chunks).as_slice()).unwrap_err();
         assert!(format!("{err:#}").contains("nested deeper"), "{err:#}");
     }
 
+    /// A sink for a test struct that has no value chunks.
+    struct NoValues;
+
+    impl chunk::ValueSink for NoValues {
+        fn value(&mut self, spec: &'static chunk::ChunkSpec, _payload: Vec<u8>) -> Result<()> {
+            bail!("unexpected {} chunk", chunk::tag_name(spec.tag))
+        }
+    }
+
+    fn body_chunks(bytes: &[u8]) -> Vec<RawChunk> {
+        let mut cursor = bytes;
+        let mut chunks = Vec::new();
+        loop {
+            let header = chunk::read_header(&mut cursor).unwrap();
+            if header.tag == chunk::END {
+                chunk::finish_stream(&header, &mut cursor).unwrap();
+                break;
+            }
+            let (payload, rest) = chunk::Body::open(&header, cursor).read_to_vec().unwrap();
+            cursor = rest;
+            chunks.push(RawChunk {
+                tag: header.tag,
+                version: header.version,
+                payload,
+            });
+        }
+        chunks
+    }
+
     #[test]
-    fn splitter_routes_struct_fields_by_chunk_and_joiner_reassembles_them() {
+    fn splitter_streams_struct_fields_by_chunk_and_joiner_reassembles_them() {
         #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
         struct Fake {
             paula: u32,
@@ -1540,29 +1689,63 @@ mod tests {
             agnus: (1, 2),
             newer: Some("later".into()),
         };
-        let parts = split::BusSplitter::split(&value).unwrap();
-        let payload = |spec: &chunk::ChunkSpec| {
-            parts
-                .iter()
-                .find(|(s, _)| s.tag == spec.tag)
-                .map(|(_, p)| p.clone())
-                .unwrap()
-        };
-        assert_eq!(map_keys(&payload(&chunk::PAUL)), ["paula"]);
-        assert_eq!(map_keys(&payload(&chunk::AGNS)), ["agnus"]);
-        assert_eq!(map_keys(&payload(&chunk::BUS)), ["extra", "newer"]);
-        assert!(map_keys(&payload(&chunk::DENI)).is_empty());
-        assert_eq!(parts.len(), chunk::bus_chunks().count());
+        let writer =
+            split::BusSplitter::split(&value, chunk::ChunkWriter::new(Vec::new())).unwrap();
+        let bytes = writer.finish().unwrap();
+        let chunks = body_chunks(&bytes);
+        // Chunks appear as their fields do, the catch-all last; chunks
+        // with no field present are not written.
+        let tags: Vec<String> = chunks.iter().map(|c| chunk::tag_name(c.tag)).collect();
+        assert_eq!(tags, ["PAUL", "AGNS", "BUS"]);
+        assert_eq!(map_keys(&chunks[0].payload), ["paula"]);
+        assert_eq!(map_keys(&chunks[1].payload), ["agnus"]);
+        assert_eq!(map_keys(&chunks[2].payload), ["extra", "newer"]);
 
-        let borrowed: Vec<chunk::BusPart<'_>> = parts
-            .iter()
-            .map(|(spec, payload)| (*spec, std::borrow::Cow::Borrowed(payload.as_slice())))
-            .collect();
-        let back: Fake = serde::Deserialize::deserialize(split::BusJoiner::new(&borrowed)).unwrap();
+        let mut sink = NoValues;
+        let mut joiner = split::BusJoiner::new(bytes.as_slice(), &[], &mut sink);
+        let back: Fake = serde::Deserialize::deserialize(&mut joiner).unwrap();
+        joiner.finish().unwrap();
         assert_eq!(back, value);
 
         // Only structs split.
-        let err = split::BusSplitter::split(&42u32).unwrap_err();
+        let err =
+            split::BusSplitter::split(&42u32, chunk::ChunkWriter::new(Vec::new())).unwrap_err();
         assert!(err.to_string().contains("struct"), "{err}");
+
+        // A chunk's fields must be adjacent so it can stream, and every
+        // field the table lists must exist: either way the chunk closes
+        // short.
+        #[derive(serde::Serialize)]
+        struct Scattered {
+            denise: u8,
+            agnus: u8,
+            denise_revision: u8,
+        }
+        let err = split::BusSplitter::split(
+            &Scattered {
+                denise: 1,
+                agnus: 2,
+                denise_revision: 3,
+            },
+            chunk::ChunkWriter::new(Vec::new()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DENI chunk claims 2 bus fields but 1"),
+            "{err}"
+        );
+        #[derive(serde::Serialize)]
+        struct Partial {
+            denise: u8,
+        }
+        let err =
+            split::BusSplitter::split(&Partial { denise: 1 }, chunk::ChunkWriter::new(Vec::new()))
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DENI chunk claims 2 bus fields but 1"),
+            "{err}"
+        );
     }
 }
