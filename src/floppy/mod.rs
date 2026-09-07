@@ -27,7 +27,8 @@ pub const SIDES: usize = 2;
 pub const SECTORS_PER_TRACK: usize = 11;
 pub const BYTES_PER_SECTOR: usize = 512;
 pub const ADF_SIZE: usize = CYLINDERS * SIDES * SECTORS_PER_TRACK * BYTES_PER_SECTOR;
-const MAX_EXTENDED_TRACKS: usize = 2 * 83;
+// IPF and SCP represent cylinders 0..=83, including unformatted slots.
+const MAX_EXTENDED_TRACKS: usize = 2 * 84;
 const SCP_TRACKS: usize = 168;
 
 const CIAA_DSKCHANGE: u8 = 1 << 2;
@@ -620,6 +621,19 @@ impl FloppyController {
         }
     }
 
+    /// Capture disk media for netplay without losing raw-track timing or
+    /// legacy sync metadata. The result is accepted by
+    /// [`Self::insert_netplay_disk_image_bytes_with_limit`], contains no
+    /// filesystem paths, and is bounded before copying.
+    pub fn export_netplay_disk_image(&self, drive_idx: usize, limit: usize) -> Result<Vec<u8>> {
+        let image = self
+            .drives
+            .get(drive_idx)
+            .and_then(|drive| drive.image.as_ref())
+            .with_context(|| format!("floppy.df{drive_idx} is empty or invalid"))?;
+        transfer::encode(image, limit)
+    }
+
     /// Adopt disk contents for rollback and remove host-specific path metadata.
     /// Memory backing prevents guest writes from escaping a netplay session.
     pub fn prepare_netplay_images(&mut self) {
@@ -759,6 +773,47 @@ impl FloppyController {
         write_protected: bool,
         limit: usize,
     ) -> Result<()> {
+        self.insert_memory_disk_with_decoder(
+            drive_idx,
+            bytes,
+            label,
+            write_protected,
+            limit,
+            FloppyImage::from_memory_bytes,
+        )
+    }
+
+    /// Restore the disk-only container produced by
+    /// [`Self::export_netplay_disk_image`] into memory. Ordinary image loaders
+    /// never sniff this format, so an ADF bootblock cannot collide with its
+    /// signature. A rejected transfer leaves the mounted image unchanged.
+    pub fn insert_netplay_disk_image_bytes_with_limit(
+        &mut self,
+        drive_idx: usize,
+        bytes: Vec<u8>,
+        label: PathBuf,
+        write_protected: bool,
+        limit: usize,
+    ) -> Result<()> {
+        self.insert_memory_disk_with_decoder(
+            drive_idx,
+            bytes,
+            label,
+            write_protected,
+            limit,
+            FloppyImage::from_netplay_bytes,
+        )
+    }
+
+    fn insert_memory_disk_with_decoder(
+        &mut self,
+        drive_idx: usize,
+        bytes: Vec<u8>,
+        label: PathBuf,
+        write_protected: bool,
+        limit: usize,
+        decode: fn(Vec<u8>, PathBuf, bool, usize) -> Result<FloppyImage>,
+    ) -> Result<()> {
         ensure!(
             drive_idx < self.drives.len(),
             "invalid floppy drive df{}",
@@ -775,7 +830,7 @@ impl FloppyController {
              using a disk image in it"
         );
         ensure!(bytes.len() <= limit, "floppy image exceeds {limit} bytes");
-        let image = FloppyImage::from_memory_bytes(bytes, label, write_protected, limit)
+        let image = decode(bytes, label, write_protected, limit)
             .with_context(|| format!("loading floppy.df{} image", drive_idx))?;
         ensure!(
             write_protected || !image.write_protected,
@@ -4605,6 +4660,7 @@ fn write_chip_word(chip_ram: &mut [u8], addr: u32, word: u16) {
 }
 
 mod formats;
+mod transfer;
 
 #[cfg(test)]
 mod tests;

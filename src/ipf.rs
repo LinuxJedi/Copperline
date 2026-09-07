@@ -1573,6 +1573,10 @@ pub(crate) mod tests {
         image(track, &area, ENCODER_CAPS, 1)
     }
 
+    pub(crate) fn copylock_ipf_image() -> Vec<u8> {
+        density_ipf_image(DENSITY_COPYLOCK_AMIGA, 720, 1176)
+    }
+
     /// Copylock's key sectors are mastered at other cell rates: the CAPS
     /// profile speeds block 4 by 5.5%, block 5 by 0.5% and slows block 6 by
     /// 4.5%, each run beginning at the gap before its block and ending with

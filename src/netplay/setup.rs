@@ -400,7 +400,9 @@ impl Bundle {
             if let Some(protected) = emu.bus().floppy.disk_image_write_protected(drive) {
                 bundle.add(
                     Kind::Floppy(drive as u8),
-                    emu.bus().floppy.export_disk_image(drive)?,
+                    emu.bus()
+                        .floppy
+                        .export_netplay_disk_image(drive, Kind::Floppy(drive as u8).limit()?)?,
                     !protected,
                 )?;
             }
@@ -600,7 +602,7 @@ impl Bundle {
             if let Kind::Floppy(drive) = info.kind {
                 emu.bus_mut()
                     .floppy
-                    .insert_memory_disk_image_bytes_with_limit(
+                    .insert_netplay_disk_image_bytes_with_limit(
                         drive as usize,
                         bytes.clone(),
                         format!("netplay-df{drive}").into(),
@@ -755,10 +757,27 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn(|| -> Result<()> {
-                let emu = super::super::tests::emulator()?;
+                let mut emu = super::super::tests::emulator()?;
                 let cfg = super::super::tests::safe_config()?;
+                emu.bus_mut().floppy.insert_disk_image_bytes(
+                    0,
+                    crate::ipf::tests::copylock_ipf_image(),
+                    "protection.ipf".into(),
+                    true,
+                )?;
+                let disk = emu
+                    .bus()
+                    .floppy
+                    .export_netplay_disk_image(0, 16 * 1024 * 1024)?;
                 let bundle = Bundle::capture(&cfg, &emu)?;
                 let host = bundle.stage()?;
+                assert_eq!(
+                    host.emu
+                        .bus()
+                        .floppy
+                        .export_netplay_disk_image(0, 16 * 1024 * 1024)?,
+                    disk
+                );
                 let buffers: Vec<_> = bundle.files.iter().map(Vec::as_ptr).collect();
                 let parts = bundle.into_parts()?;
                 assert_eq!(
