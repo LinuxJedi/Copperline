@@ -2323,6 +2323,13 @@ impl Emulator {
         self.step_frame_with_pc_outside(None).map(|_| ())
     }
 
+    /// Advance to the next hardware video-frame boundary. Frontends whose
+    /// caller owns pacing (such as libretro) use this with an unpaced machine;
+    /// `step_frame` instead advances a desktop CPU-budget quantum.
+    pub fn step_video_frame(&mut self) -> Result<()> {
+        self.step_netplay_frame(false)
+    }
+
     /// Advance to the next hardware video frame for netplay. The normal
     /// frontend quantum is a CPU budget and can end within a raster frame;
     /// network inputs need a boundary defined entirely by the guest hardware.

@@ -501,6 +501,17 @@ pub fn load_from_reader<R: Read>(
     machine: &mut M68kMachine,
     mut reader: R,
 ) -> Result<MachineDescriptor> {
+    let descriptor = read_descriptor(&mut reader)?;
+    let mut decoder = ZlibDecoder::new(reader);
+    machine.apply_state(&mut decoder)?;
+    Ok(descriptor)
+}
+
+/// Read and validate a state's header without restoring its machine.
+/// Frontends with a fixed configuration can reject a different machine
+/// before loading it. The reader is left at the compressed machine payload;
+/// this checks the format version and descriptor, not the payload itself.
+pub fn read_descriptor<R: Read>(mut reader: R) -> Result<MachineDescriptor> {
     let mut magic = [0u8; STATE_MAGIC.len()];
     reader
         .read_exact(&mut magic)
@@ -521,11 +532,7 @@ pub fn load_from_reader<R: Read>(
     }
     // Read the descriptor straight from the reader; bincode consumes exactly
     // its encoded bytes, leaving the reader positioned at the zlib stream.
-    let descriptor: MachineDescriptor = deserialize_from_state(&mut reader)
-        .map_err(|e| anyhow!("reading machine descriptor: {e}"))?;
-    let mut decoder = ZlibDecoder::new(reader);
-    machine.apply_state(&mut decoder)?;
-    Ok(descriptor)
+    deserialize_from_state(&mut reader).map_err(|e| anyhow!("reading machine descriptor: {e}"))
 }
 
 #[cfg(test)]
@@ -995,6 +1002,31 @@ mod tests {
         load(&mut machine, &save_path).unwrap();
         let _ = std::fs::remove_file(&save_path);
         let _ = std::fs::remove_file(&truncated_path);
+    }
+
+    #[test]
+    fn descriptor_read_stops_before_payload_and_checks_header() {
+        let descriptor = MachineDescriptor {
+            cpu: CpuModel::M68EC020,
+            ..MachineDescriptor::default()
+        };
+        let mut bytes = STATE_MAGIC.to_vec();
+        bytes.extend(STATE_VERSION.to_le_bytes());
+        bincode::serialize_into(&mut bytes, &descriptor).unwrap();
+        let header_len = bytes.len();
+        // This is deliberately not a valid compressed machine.
+        bytes.extend(b"unread payload");
+        let mut reader = bytes.as_slice();
+        assert_eq!(read_descriptor(&mut reader).unwrap(), descriptor);
+        assert_eq!(reader, b"unread payload");
+        for end in 0..header_len {
+            assert!(read_descriptor(&bytes[..end]).is_err());
+        }
+        bytes[0] ^= 1;
+        assert!(read_descriptor(bytes.as_slice()).is_err());
+        bytes[0] ^= 1;
+        bytes[8..12].copy_from_slice(&(STATE_VERSION + 1).to_le_bytes());
+        assert!(read_descriptor(bytes.as_slice()).is_err());
     }
 
     #[test]

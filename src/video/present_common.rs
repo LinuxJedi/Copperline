@@ -593,6 +593,13 @@ impl Default for PresentationLatch {
 }
 
 impl PresentationLatch {
+    /// Whether neutral fields retain the standard TV aperture. Frontends
+    /// that save presentation state can restore this classification by
+    /// resolving a `Standard` or `Full` frame before the next field.
+    pub fn uses_standard_aperture(&self) -> bool {
+        self.standard_aperture
+    }
+
     /// Back to the power-on default, for presentation discontinuities
     /// (machine swap, reset, state load).
     pub fn reset(&mut self) {

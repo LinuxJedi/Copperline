@@ -106,6 +106,7 @@ src/
     launcher/       # field metadata, value edits and config conversion
     font.rs         # 8x8 overlay font
 crates/copperline-web/   # standalone wasm-bindgen browser frontend (WebEmu + page glue)
+crates/copperline-libretro/ # standalone libretro C ABI frontend
 crates/cputest-runner/   # WinUAE cputest instruction-suite runner for the m68k core
 tests/              # self-contained integration tests and ignored local-asset tests
 timing-test/        # bootable cross-emulator timing-measurement disk
@@ -134,6 +135,18 @@ The browser dependency deliberately leaves it disabled: browser status still
 measures coarse core and render cost at the wrapper boundary, but the
 instruction and renderer hot paths do not maintain native-only counters or
 sample host clocks.
+
+The [libretro frontend](../guide/libretro.md) builds against that same portable
+surface. Its caller supplies pacing and synchronous audio/video/input callbacks.
+`Emulator::step_video_frame` advances to the next hardware field using the
+precise stepping path shared with netplay, whereas desktop `step_frame` may
+end a CPU-budget quantum within a field. `Agnus::nominal_frame_cck` supplies
+the mean field length, including alternating interlace fields and NTSC lines,
+for frontend refresh reporting. The adapter uses the shared renderer and TV
+presentation helpers, keeps floppy writes in memory until eject/unload, and
+wraps ordinary machine state bytes with playlist and pending-input state.
+`savestate::read_descriptor` lets it check the stored machine configuration
+before restoring the payload, without changing the save-state format.
 
 The flow of a frame:
 

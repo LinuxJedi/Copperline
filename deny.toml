@@ -1,4 +1,4 @@
-# Shared cargo-deny policy for the native emulator and its shipped web/player
+# Shared cargo-deny policy for the native emulator and its shipped
 # frontends. Run with `cargo deny --all-features --locked check`; CI applies
 # the same file to each standalone manifest.
 

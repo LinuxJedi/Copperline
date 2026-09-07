@@ -1,0 +1,74 @@
+name: Libretro
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: libretro-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Libretro (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            library: libcopperline_libretro.so
+            installed: copperline_libretro.so
+          - os: macos-latest
+            library: libcopperline_libretro.dylib
+            installed: copperline_libretro.dylib
+          - os: windows-latest
+            library: copperline_libretro.dll
+            installed: copperline_libretro.dll
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: crates/copperline-libretro -> target
+      - name: Formatting and lint
+        run: |
+          cargo fmt --manifest-path crates/copperline-libretro/Cargo.toml --check
+          cargo clippy --manifest-path crates/copperline-libretro/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Deterministic frontend tests
+        run: cargo test --manifest-path crates/copperline-libretro/Cargo.toml --profile ci --locked
+      - name: Build release core
+        run: cargo build --manifest-path crates/copperline-libretro/Cargo.toml --release --locked
+      - name: Shared-library ABI and replay
+        run: |
+          python tools/check-libretro.py "crates/copperline-libretro/target/release/${{ matrix.library }}" --screenshot libretro.png
+          python tools/check-libretro.py "crates/copperline-libretro/target/release/${{ matrix.library }}" --model A1200 --video NTSC
+      - name: Package core
+        run: |
+          mkdir -p libretro-package/aros
+          cp "crates/copperline-libretro/target/release/${{ matrix.library }}" "libretro-package/${{ matrix.installed }}"
+          cp crates/copperline-libretro/copperline_libretro.info libretro-package/
+          cp LICENSE libretro-package/
+          cp assets/aros/LICENSE assets/aros/ACKNOWLEDGEMENTS assets/aros/README.md libretro-package/aros/
+          cp -R assets/aros/patches libretro-package/aros/
+          cp docs/guide/libretro.md libretro-package/README.md
+      - uses: actions/upload-artifact@v7
+        with:
+          name: copperline-libretro-${{ runner.os }}-${{ runner.arch }}
+          path: libretro-package/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libretro-capture-${{ runner.os }}
+          path: libretro.png

@@ -43,6 +43,9 @@ jobs:
       - name: crates/copperline-web
         working-directory: crates/copperline-web
         run: cargo tree --locked > /dev/null
+      - name: crates/copperline-libretro
+        working-directory: crates/copperline-libretro
+        run: cargo tree --locked > /dev/null
       - name: crates/cputest-runner
         working-directory: crates/cputest-runner
         run: cargo tree --locked > /dev/null
