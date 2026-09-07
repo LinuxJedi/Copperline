@@ -3853,7 +3853,7 @@ fn scp_flux_image_decodes_read_only_raw_mfm_track() -> Result<()> {
 
     let transfer = ctrl.export_netplay_disk_image(0, 16 * 1024 * 1024)?;
     let received =
-        FloppyImage::from_memory_bytes(transfer, "received".into(), true, 16 * 1024 * 1024)?;
+        FloppyImage::from_netplay_bytes(transfer, "received".into(), true, 16 * 1024 * 1024)?;
     assert_eq!(
         bincode::serialize(&received.data)?,
         bincode::serialize(&ctrl.drives[0].image.as_ref().unwrap().data)?,
@@ -5955,6 +5955,33 @@ fn netplay_normalizes_all_floppy_paths_and_preserves_memory_backing() -> Result<
 }
 
 #[test]
+fn netplay_standard_adf_never_sniffs_bootblock_as_transfer_metadata() -> Result<()> {
+    let mut adf = vec![0x5a; ADF_SIZE];
+    adf[..8].copy_from_slice(transfer::SIGNATURE);
+    let mut controller = FloppyController::default();
+    controller.insert_memory_disk_image_bytes(0, adf.clone(), "ordinary.adf".into(), false)?;
+    let transferred = controller.export_netplay_disk_image(0, ADF_SIZE + 11)?;
+    assert_eq!(transferred.len(), ADF_SIZE + 11);
+    assert!(controller
+        .export_netplay_disk_image(0, ADF_SIZE + 10)
+        .is_err());
+    controller.insert_netplay_disk_image_bytes_with_limit(
+        0,
+        transferred,
+        "received".into(),
+        false,
+        ADF_SIZE + 11,
+    )?;
+    assert_eq!(controller.export_disk_image(0)?, adf);
+    // A raw ADF is accepted only through the normal loader, even when its
+    // first bytes happen to spell the netplay signature.
+    assert!(controller
+        .insert_netplay_disk_image_bytes_with_limit(0, adf, "unwrapped".into(), false, ADF_SIZE,)
+        .is_err());
+    Ok(())
+}
+
+#[test]
 fn netplay_ipf_transfer_preserves_all_tracks_and_mastered_density() -> Result<()> {
     let mut host = FloppyController::default();
     host.insert_disk_image_bytes(
@@ -5979,7 +6006,7 @@ fn netplay_ipf_transfer_preserves_all_tracks_and_mastered_density() -> Result<()
     let expected = bincode::serialize(&source.data)?;
     let bytes = host.export_netplay_disk_image(0, 16 * 1024 * 1024)?;
     let mut guest = FloppyController::default();
-    guest.insert_memory_disk_image_bytes_with_limit(
+    guest.insert_netplay_disk_image_bytes_with_limit(
         0,
         bytes.clone(),
         "received".into(),
@@ -5996,7 +6023,13 @@ fn netplay_ipf_transfer_preserves_all_tracks_and_mastered_density() -> Result<()
     assert_eq!(restored.export_netplay_disk_image(0, bytes.len())?, bytes);
     assert!(host.export_netplay_disk_image(0, bytes.len() - 1).is_err());
     assert!(guest
-        .insert_memory_disk_image_bytes(0, bytes, "writable".into(), false)
+        .insert_netplay_disk_image_bytes_with_limit(
+            0,
+            bytes,
+            "writable".into(),
+            false,
+            16 * 1024 * 1024
+        )
         .is_err());
     // A normal ADF download still reloads all 168 slots, although that public
     // format cannot represent the density profile carried by netplay.
@@ -6054,7 +6087,7 @@ fn netplay_track_transfer_preserves_legacy_multi_revolution_and_empty_metadata()
         tracks[167] = Some(FloppyTrackImage::AmigaDos(vec![0x69; 512]));
     }
     let bytes = transfer::encode(&image, 4096)?;
-    let received = FloppyImage::from_memory_bytes(bytes, "received".into(), false, 4096)?;
+    let received = FloppyImage::from_netplay_bytes(bytes, "received".into(), false, 4096)?;
     assert_eq!(
         bincode::serialize(&received.data)?,
         bincode::serialize(&image.data)?
@@ -6075,7 +6108,7 @@ fn netplay_track_transfer_rejects_invalid_lengths_without_replacing_media() -> R
         false,
     )?;
     let mut raw = transfer::SIGNATURE.to_vec();
-    raw.extend_from_slice(&[0, 0, 1, 0, 2]); // flags, one raw track
+    raw.extend_from_slice(&[0, 0, 1, 1, 0, 2]); // flags, track image, one raw track
     raw.extend_from_slice(&16u32.to_le_bytes()); // bits
     raw.extend_from_slice(&2u32.to_le_bytes()); // stored bytes
     raw.extend_from_slice(&[1, 0]); // one revolution, no legacy sync
@@ -6085,12 +6118,27 @@ fn netplay_track_transfer_rejects_invalid_lengths_without_replacing_media() -> R
     raw.extend_from_slice(&u32::MAX.to_le_bytes()); // no density
     assert!(transfer::decode(&raw).is_ok());
     let mut invalid: Vec<Vec<u8>> = (0..raw.len()).map(|end| raw[..end].to_vec()).collect();
-    for (offset, value) in [(10, 169), (12, 3), (21, 0), (22, 2)] {
+    for (offset, value) in [(10, 2), (11, 169), (13, 3), (22, 0), (22, 2), (23, 2)] {
         let mut bytes = raw.clone();
         bytes[offset] = value;
         invalid.push(bytes);
     }
-    for offset in [13, 17, 23, 29, 33] {
+    // One time per meaningful bit, including each captured revolution. Both
+    // shorter and longer arrays must fail even when fully present on the wire.
+    for count in [1u32, 15, 16, 17] {
+        let mut bytes = raw[..30].to_vec();
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for _ in 0..count {
+            bytes.extend_from_slice(&2000u32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // no density
+        if count == 16 {
+            assert!(transfer::decode(&bytes).is_ok());
+        } else {
+            invalid.push(bytes);
+        }
+    }
+    for offset in [14, 18, 24, 30, 34] {
         // lengths and optional array counts
         let mut bytes = raw.clone();
         bytes[offset..offset + 4].copy_from_slice(&(u32::MAX - 1).to_le_bytes());
@@ -6101,13 +6149,13 @@ fn netplay_track_transfer_rejects_invalid_lengths_without_replacing_media() -> R
     invalid.push(trailing);
     for (start_bit, permille) in [(16u32, 1000u16), (0, 0)] {
         let mut bytes = raw.clone();
-        bytes[33..37].copy_from_slice(&1u32.to_le_bytes());
+        bytes[34..38].copy_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&start_bit.to_le_bytes());
         bytes.extend_from_slice(&permille.to_le_bytes());
         invalid.push(bytes);
     }
     let mut unordered = raw.clone();
-    unordered[33..37].copy_from_slice(&2u32.to_le_bytes());
+    unordered[34..38].copy_from_slice(&2u32.to_le_bytes());
     for start_bit in [4u32, 4] {
         unordered.extend_from_slice(&start_bit.to_le_bytes());
         unordered.extend_from_slice(&1000u16.to_le_bytes());
@@ -6115,11 +6163,11 @@ fn netplay_track_transfer_rejects_invalid_lengths_without_replacing_media() -> R
     invalid.push(unordered);
     for bytes in invalid {
         assert!(controller
-            .insert_memory_disk_image_bytes_with_limit(0, bytes, "rejected".into(), false, 4096)
+            .insert_netplay_disk_image_bytes_with_limit(0, bytes, "rejected".into(), false, 4096)
             .is_err());
     }
     assert!(controller
-        .insert_memory_disk_image_bytes_with_limit(
+        .insert_netplay_disk_image_bytes_with_limit(
             0,
             raw.clone(),
             "too-large".into(),

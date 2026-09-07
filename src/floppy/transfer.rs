@@ -2,30 +2,16 @@
 
 //! Lossless disk media for desktop netplay. UAE extended ADF cannot carry
 //! mastered density profiles or flux cell times. This versioned container
-//! carries decoded tracks only, with no paths or controller/save-state data.
+//! carries disk media only, with no paths or controller/save-state data.
 
 use super::formats::{DensitySpan, FloppyImage, FloppyImageData, FloppyTrackImage};
-use super::{BYTES_PER_SECTOR, MAX_EXTENDED_TRACKS};
+use super::{ADF_SIZE, BYTES_PER_SECTOR, MAX_EXTENDED_TRACKS};
 use anyhow::{bail, ensure, Context, Result};
 
 pub(super) const SIGNATURE: &[u8; 8] = b"CLFLOP01";
 const ABSENT: u32 = u32::MAX;
 
 pub(super) fn encode(image: &FloppyImage, limit: usize) -> Result<Vec<u8>> {
-    let tracks = match &image.data {
-        FloppyImageData::StandardAdf(bytes) => {
-            ensure!(
-                bytes.len() <= limit,
-                "floppy transfer exceeds {limit} bytes"
-            );
-            return Ok(bytes.clone());
-        }
-        FloppyImageData::Tracks(tracks) => tracks,
-    };
-    ensure!(
-        tracks.len() <= MAX_EXTENDED_TRACKS,
-        "too many floppy tracks"
-    );
     let mut out = Writer {
         bytes: Vec::new(),
         limit,
@@ -35,6 +21,20 @@ pub(super) fn encode(image: &FloppyImage, limit: usize) -> Result<Vec<u8>> {
         u8::from(image.write_protected),
         u8::from(image.legacy_extended_adf),
     ])?;
+    let tracks = match &image.data {
+        FloppyImageData::StandardAdf(bytes) => {
+            ensure!(bytes.len() == ADF_SIZE, "invalid standard ADF size");
+            out.put(&[0])?;
+            out.put(bytes)?;
+            return Ok(out.bytes);
+        }
+        FloppyImageData::Tracks(tracks) => tracks,
+    };
+    ensure!(
+        tracks.len() <= MAX_EXTENDED_TRACKS,
+        "too many floppy tracks"
+    );
+    out.put(&[1])?;
     out.put(&(tracks.len() as u16).to_le_bytes())?;
     for track in tracks {
         match track {
@@ -91,6 +91,19 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(FloppyImageData, bool, bool)> {
     );
     let protected = input.flag()?;
     let legacy = input.flag()?;
+    match input.byte()? {
+        0 => {
+            let data = input.take(ADF_SIZE)?;
+            ensure!(input.0.is_empty(), "trailing floppy transfer data");
+            return Ok((
+                FloppyImageData::StandardAdf(data.to_vec()),
+                protected,
+                legacy,
+            ));
+        }
+        1 => {}
+        _ => bail!("invalid floppy image type"),
+    }
     let count = input.u16()? as usize;
     ensure!(count <= MAX_EXTENDED_TRACKS, "too many floppy tracks");
     let mut tracks = Vec::with_capacity(count);
@@ -124,18 +137,29 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(FloppyImageData, bool, bool)> {
                     u64::from(bit_len) <= payload.len() as u64 * 8,
                     "floppy bit length exceeds data"
                 );
+                let rev_words = u64::from(bit_len).div_ceil(16);
+                ensure!(
+                    rev_words * u64::from(revolutions) <= (payload.len() / 2) as u64,
+                    "floppy revolutions exceed data"
+                );
+                ensure!(
+                    (bit_len > 0 && legacy_sync.is_none()) || revolutions == 1,
+                    "empty or legacy floppy track must have one revolution"
+                );
                 let words = payload
                     .chunks_exact(2)
                     .map(|b| u16::from_le_bytes([b[0], b[1]]))
                     .collect();
-                let bitcell_ns = input
-                    .optional_array(4)?
-                    .map(|bytes| bytes.chunks_exact(4).map(le_u32).collect::<Vec<_>>());
-                if let Some(cells) = &bitcell_ns {
+                let cell_bytes = input.optional_array(4)?;
+                if let Some(bytes) = cell_bytes {
                     ensure!(
-                        cells.len() as u64 <= payload.len() as u64 * 8,
-                        "too many floppy cell times"
+                        (bytes.len() / 4) as u64 == u64::from(bit_len) * u64::from(revolutions),
+                        "floppy cell times do not cover every revolution"
                     );
+                }
+                let bitcell_ns =
+                    cell_bytes.map(|bytes| bytes.chunks_exact(4).map(le_u32).collect::<Vec<_>>());
+                if let Some(cells) = &bitcell_ns {
                     ensure!(cells.iter().all(|&ns| ns > 0), "zero floppy cell time");
                 }
                 let density = input.optional_array(6)?.map(|bytes| {

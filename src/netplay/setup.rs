@@ -602,7 +602,7 @@ impl Bundle {
             if let Kind::Floppy(drive) = info.kind {
                 emu.bus_mut()
                     .floppy
-                    .insert_memory_disk_image_bytes_with_limit(
+                    .insert_netplay_disk_image_bytes_with_limit(
                         drive as usize,
                         bytes.clone(),
                         format!("netplay-df{drive}").into(),

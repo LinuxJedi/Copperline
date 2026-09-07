@@ -622,8 +622,9 @@ impl FloppyController {
     }
 
     /// Capture disk media for netplay without losing raw-track timing or
-    /// legacy sync metadata. The result is accepted by the memory-backed
-    /// loader, contains no filesystem paths, and is bounded before copying.
+    /// legacy sync metadata. The result is accepted by
+    /// [`Self::insert_netplay_disk_image_bytes_with_limit`], contains no
+    /// filesystem paths, and is bounded before copying.
     pub fn export_netplay_disk_image(&self, drive_idx: usize, limit: usize) -> Result<Vec<u8>> {
         let image = self
             .drives
@@ -772,6 +773,47 @@ impl FloppyController {
         write_protected: bool,
         limit: usize,
     ) -> Result<()> {
+        self.insert_memory_disk_with_decoder(
+            drive_idx,
+            bytes,
+            label,
+            write_protected,
+            limit,
+            FloppyImage::from_memory_bytes,
+        )
+    }
+
+    /// Restore the disk-only container produced by
+    /// [`Self::export_netplay_disk_image`] into memory. Ordinary image loaders
+    /// never sniff this format, so an ADF bootblock cannot collide with its
+    /// signature. A rejected transfer leaves the mounted image unchanged.
+    pub fn insert_netplay_disk_image_bytes_with_limit(
+        &mut self,
+        drive_idx: usize,
+        bytes: Vec<u8>,
+        label: PathBuf,
+        write_protected: bool,
+        limit: usize,
+    ) -> Result<()> {
+        self.insert_memory_disk_with_decoder(
+            drive_idx,
+            bytes,
+            label,
+            write_protected,
+            limit,
+            FloppyImage::from_netplay_bytes,
+        )
+    }
+
+    fn insert_memory_disk_with_decoder(
+        &mut self,
+        drive_idx: usize,
+        bytes: Vec<u8>,
+        label: PathBuf,
+        write_protected: bool,
+        limit: usize,
+        decode: fn(Vec<u8>, PathBuf, bool, usize) -> Result<FloppyImage>,
+    ) -> Result<()> {
         ensure!(
             drive_idx < self.drives.len(),
             "invalid floppy drive df{}",
@@ -788,7 +830,7 @@ impl FloppyController {
              using a disk image in it"
         );
         ensure!(bytes.len() <= limit, "floppy image exceeds {limit} bytes");
-        let image = FloppyImage::from_memory_bytes(bytes, label, write_protected, limit)
+        let image = decode(bytes, label, write_protected, limit)
             .with_context(|| format!("loading floppy.df{} image", drive_idx))?;
         ensure!(
             write_protected || !image.write_protected,

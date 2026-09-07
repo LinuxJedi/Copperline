@@ -98,20 +98,6 @@ impl FloppyImage {
         write_protected: bool,
         expanded_limit: usize,
     ) -> Result<Self> {
-        if packed.starts_with(super::transfer::SIGNATURE) {
-            ensure!(
-                packed.len() <= expanded_limit,
-                "floppy transfer exceeds byte limit"
-            );
-            let (data, protected, legacy_extended_adf) = super::transfer::decode(&packed)?;
-            return Ok(Self {
-                path,
-                data,
-                write_protected: write_protected || protected,
-                legacy_extended_adf,
-                backing: FloppyImageBacking::Memory,
-            });
-        }
         Self::from_bytes_with_backing(
             packed,
             path,
@@ -119,6 +105,23 @@ impl FloppyImage {
             FloppyImageBacking::Memory,
             expanded_limit,
         )
+    }
+
+    pub(super) fn from_netplay_bytes(
+        packed: Vec<u8>,
+        path: PathBuf,
+        write_protected: bool,
+        limit: usize,
+    ) -> Result<Self> {
+        ensure!(packed.len() <= limit, "floppy transfer exceeds byte limit");
+        let (data, protected, legacy_extended_adf) = super::transfer::decode(&packed)?;
+        Ok(Self {
+            path,
+            data,
+            write_protected: write_protected || protected,
+            legacy_extended_adf,
+            backing: FloppyImageBacking::Memory,
+        })
     }
 
     fn from_bytes_with_backing(
