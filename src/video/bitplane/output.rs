@@ -9,6 +9,21 @@ use super::*;
 
 const INDEXED_OUTPUT_CACHE_LEN: usize = 8;
 
+/// Only these controls feed `denise_playfield_output`. Scroll, fetch, DMA,
+/// window and collision controls select samples or compose their output;
+/// they do not change the colour table for a given sample index. Keep whole
+/// register values here so mode, priority, EHB, PF2OF and BPLAM changes all
+/// invalidate the table, including undocumented combinations.
+fn indexed_color_key(control: ControlState) -> (bool, u16, u16, u16, u16) {
+    (
+        control.aga(),
+        control.bplcon0,
+        control.bplcon2,
+        control.bplcon3,
+        control.bplcon4,
+    )
+}
+
 struct IndexedOutputCacheEntry {
     control: ControlState,
     palette: Palette,
@@ -33,11 +48,10 @@ impl IndexedOutputCache {
         palette: &Palette,
     ) -> &[DenisePlayfieldOutput; 256] {
         debug_assert!(!control.ham());
-        if let Some(idx) = self
-            .entries
-            .iter()
-            .position(|entry| entry.control == control && entry.palette == *palette)
-        {
+        let color_key = indexed_color_key(control);
+        if let Some(idx) = self.entries.iter().position(|entry| {
+            indexed_color_key(entry.control) == color_key && entry.palette == *palette
+        }) {
             return &self.entries[idx].outputs;
         }
 
@@ -56,6 +70,10 @@ impl IndexedOutputCache {
         &self.entries.last().expect("just inserted").outputs
     }
 }
+
+#[cfg(test)]
+#[path = "output_cache_tests.rs"]
+mod output_cache_tests;
 
 #[inline(always)]
 pub(super) fn cached_indexed_output(

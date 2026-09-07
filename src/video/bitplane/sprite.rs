@@ -1881,3 +1881,165 @@ pub(super) fn sprite_control_words_from_parts(
     }
     (pos, ctl)
 }
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    /// Run this same test on both revisions to include each renderer's row
+    /// selection and sampler allocations in the measurement. Frame storage
+    /// and captured lines are prepared outside the timed region. Compare the
+    /// output hashes as well as timings; these are isolated render costs, not
+    /// whole-emulator speedups.
+    #[test]
+    #[ignore = "isolated performance measurement; run release builds with --nocapture"]
+    fn bench_attached_sprite_rows() {
+        const ROWS: usize = 256;
+        const ITERATIONS: usize = 1_000;
+        for (name, merged, width_words, odd_only_rows, attached_rows) in [
+            ("sorted-16", false, 1, false, ROWS),
+            ("merged-16", true, 1, false, ROWS),
+            ("odd-only-16", false, 1, true, ROWS),
+            ("merged-64", true, 4, false, ROWS),
+            ("sparse-one-merged-16", true, 1, false, 1),
+            ("sparse-two-merged-16", true, 1, false, 2),
+        ] {
+            // Sparse calls are much shorter; give them enough repetitions
+            // to measure without changing the established dense workloads.
+            let iterations = if attached_rows <= 2 {
+                100_000
+            } else {
+                ITERATIONS
+            };
+            let control = ControlState {
+                agnus_revision: if width_words == 4 {
+                    AgnusRevision::AgaAlice
+                } else {
+                    AgnusRevision::Ocs
+                },
+                bplcon2: 0x24,
+                bplcon4: 0x0011,
+                clxcon: 1 << 13,
+                ..ControlState::default()
+            };
+            let controls = vec![control; ROWS];
+            let control_segments = vec![Vec::new(); ROWS];
+            let mut palette = Palette::new();
+            for idx in 16..32 {
+                palette.write_ocs(idx, (idx as u16 - 15) * 0x111);
+            }
+            let palettes = vec![palette; ROWS];
+            let palette_segments = vec![Vec::new(); ROWS];
+            let enable_x = vec![Some(0); ROWS];
+            let mut even_lines = Vec::new();
+            let mut odd_lines = Vec::new();
+            for row in 0..ROWS {
+                let line = SpriteLine {
+                    hstart: DIW_HSTART_FB0 - crate::bus::SPRITE_OUTPUT_DELAY_LORES,
+                    hsub_70ns: false,
+                    beam_y: PAL_VISIBLE_LINE0 + row as i32,
+                    data: 0xA55A,
+                    datb: 0x3333,
+                    data_ext: [0xA55A; 3],
+                    datb_ext: [0x3333; 3],
+                    width_words,
+                    attached: row % (ROWS / attached_rows) == 0,
+                    x_start: 0,
+                    x_stop: FB_WIDTH,
+                };
+                odd_lines.push(line);
+                if !odd_only_rows || row % 2 == 0 {
+                    even_lines.push(SpriteLine {
+                        data: 0x5AA5,
+                        datb: 0x5555,
+                        ..line
+                    });
+                }
+            }
+            if merged {
+                // Register spans append after captured DMA rows. This keeps
+                // the same row order/overlap contract as the real merge.
+                for lines in [&mut even_lines, &mut odd_lines] {
+                    let captured_count = lines.len();
+                    for idx in 0..captured_count {
+                        lines.push(SpriteLine {
+                            hstart: lines[idx].hstart + 24,
+                            x_start: 32,
+                            x_stop: 160,
+                            ..lines[idx]
+                        });
+                    }
+                }
+            }
+            let beams: Vec<_> = (0..attached_rows)
+                .map(|row| PAL_VISIBLE_LINE0 + (row * ROWS / attached_rows) as i32)
+                .collect();
+            let len = FB_WIDTH * ROWS;
+            let mut fb = vec![rgb12_to_rgba8(0x000F); len];
+            let playfield_mask = vec![0; len];
+            let mut subpixels = SpriteSubpixelState::from_collapsed(&fb, &playfield_mask);
+            let mut collisions = vec![CollisionPixel::new(true, true, true, true); len];
+            let mut groups = vec![0b0101; len];
+            let mut render = || {
+                render_attached_sprite_pair_lines(
+                    2,
+                    black_box(&even_lines),
+                    black_box(&odd_lines),
+                    black_box(&beams),
+                    black_box(&mut fb),
+                    SpriteClip {
+                        x_start: 0,
+                        x_stop: FB_WIDTH,
+                        y_start: 0,
+                        y_stop: ROWS,
+                    },
+                    &palettes,
+                    &palette_segments,
+                    &controls,
+                    &control_segments,
+                    &enable_x,
+                    &playfield_mask,
+                    &mut subpixels,
+                    &mut collisions,
+                    &mut groups,
+                    PAL_VISIBLE_LINE0,
+                )
+            };
+            let mut clxdat = 0;
+            for _ in 0..10 {
+                clxdat |= black_box(render());
+            }
+            let start = Instant::now();
+            for _ in 0..iterations {
+                clxdat |= black_box(render());
+            }
+            let elapsed = start.elapsed();
+            assert_ne!(clxdat, 0);
+            assert!(fb.iter().any(|&pixel| pixel != rgb12_to_rgba8(0x000F)));
+            let mut hash = 0xcbf29ce484222325u64;
+            let mut hash_byte = |byte: u8| {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            };
+            for pixel in fb.iter().chain(subpixels.pixels.iter().flatten()) {
+                for byte in pixel.to_le_bytes() {
+                    hash_byte(byte);
+                }
+            }
+            for &mask in &groups {
+                hash_byte(mask);
+            }
+            for collision in &collisions {
+                hash_byte(collision.0);
+            }
+            for byte in clxdat.to_le_bytes() {
+                hash_byte(byte);
+            }
+            println!(
+                "{name}: iterations={iterations} ns_per_render={:.1} output_hash={hash:016x}",
+                elapsed.as_nanos() as f64 / iterations as f64,
+            );
+        }
+    }
+}

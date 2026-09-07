@@ -152,12 +152,19 @@ BPLCON0 mode decode, display-window edges, fetch-origin quantization,
 per-plane scroll delays) is constant and is computed once per run rather
 than per pixel. The per-pixel decisions inside a run are unchanged -- the
 chunking is a host-CPU optimisation, not a model change.
-History-independent colour modes also resolve their complete 256-entry
-Denise/Lisa index table once for each distinct control-and-palette state in
-the frame. HAM -- HAM6 and Lisa's HAM8 alike -- remains on the sequential
-path because every output depends on the preceding colour. Prepared planar rows similarly share a single byte
-lookup when the odd and even BPLCON1 taps have the same delay; the exhaustive
-prepared-pixel/word-sampler comparison covers both that common path and
+History-independent colour modes also cache their complete 256-entry
+Denise/Lisa index tables in up to eight frame-local entries. The cache
+compares the palette, the AGA colour-path selection and
+the complete BPLCON0, BPLCON2, BPLCON3 and BPLCON4 registers. Scroll, fetch,
+DMA, display-window and collision changes reuse that table: they affect
+which sample is drawn or how its output is composed, rather than the
+colour, colour latch and playfield mask resolved for a given sample index.
+HAM -- HAM6 and Lisa's HAM8 alike -- remains on the sequential path because
+every output depends on the preceding colour. An indexed lookup still
+seeds the held colour for a later switch into HAM. Prepared planar rows
+similarly share a single byte lookup when the odd and even BPLCON1 taps
+have the same delay; the exhaustive prepared-pixel/word-sampler comparison
+covers both that common path and
 separate dual-playfield taps.
 
 The horizontal display-window flip-flop is still the same 9-bit Denise

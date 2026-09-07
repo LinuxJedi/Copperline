@@ -72,6 +72,54 @@ the CPU model automatically and initializes cache state; on a standard 68000
 it displays only its header signature. Boot the probe from cold and power-cycle
 afterwards, as write benchmarking overwrites memory in each enumerated region.
 
+## Disjoint blitter performance workload
+
+`./build.sh bltbench-disjoint` builds a repeatable performance workload using
+separate, packed A/B source buffers and a D destination, with C reading D live.
+It runs 2048 pairs of 20-by-256-word copy and cookie-cut blits with BLTPRI set,
+then leaves the resulting bitmap on screen. CPU polling, display DMA and bus
+arbitration run normally. It measures host cost; the emulated timing must stay
+identical between builds.
+
+Use the headless core benchmark with explicit bundled ROM paths and a fixed
+configuration (A500, 512K chip, PAL). From the repository root:
+
+```sh
+cargo build --release --locked --no-default-features --features bench-bin --bin copperline-bench
+./target/release/copperline-bench --config bench-a500.toml \
+  --rom assets/aros/aros-amiga-m68k-rom.bin \
+  --ext assets/aros/aros-amiga-m68k-ext.bin \
+  --df0 timing-test/bltbench-disjoint.adf --seconds 60 --render
+```
+
+`bench-a500.toml` can contain:
+
+```toml
+[machine]
+profile = "A500"
+rtc_time = "2005-03-18 01:58:29"
+```
+
+Compare alternating runs of the same release profile and feature set on one
+host, with other builds and benchmarks stopped. The 60-second run includes
+booting and the idle tail after all blits finish; its percentage is a full
+machine result for this deliberately blitter-heavy workload, not a prediction
+for games. Keep representative boot/demo runs alongside it.
+
+Two asset-free renderer microbenchmarks are also available:
+
+```sh
+cargo test --release --locked --no-default-features --lib bench_attached_sprite_rows -- --ignored --nocapture --test-threads=1
+cargo test --release --locked --no-default-features --lib indexed_cache_lookup_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+They report timings and output hashes for dense/sparse attached sprites and
+constant/changing-scroll color-cache lookups. Carry the same benchmark code onto
+both revisions when comparing, and use the same compiler and feature set. Their
+results measure isolated renderer work, including row preparation or frame-local
+cache allocation, rather than complete frames. Fixture setup and output checks
+run outside the timed regions.
+
 ## Running
 
 - **Copperline:** `copperline --config timing-test.toml --screenshot-after 12 out.png`

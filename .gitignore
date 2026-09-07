@@ -56,6 +56,8 @@
 *.[Ii][Ss][Oo]
 # Asset-free serialized board fixture used across feature configurations.
 !/tests/fixtures/copperhf-board-v79.bin
+# Assembled source for the repeatable blitter performance workload.
+!/timing-test/bltbench-disjoint.bin
 
 # WHDLoad support archives: freely redistributable but fetched, not
 # committed (tools/fetch-whdload.sh; assets/whdboot/README.md stays).

@@ -142,6 +142,16 @@ A/B barrel-shifter carry is a datapath latch and survives BLTSIZE row
 boundaries; first/last masks, area-fill state, and modulos remain row
 scoped. ECS adds BLTSIZV/BLTSIZH for larger blits.
 
+Normal blits snapshot their A/B source words at BLTSIZE while C reads stay
+live. An ordered overlay records D writes so overlapping A/B reads can see
+the blit's own output. Ascending, zero-modulo transfers skip that overlay
+when the complete D byte span is disjoint from both enabled source spans
+and every span maps directly into populated chip RAM. Descending, strided,
+wrapping, aliased, or potentially overlapping transfers keep the general
+path. The snapshots, bus slots, and progressive D writes are unchanged.
+Save states retain the existing overlay fields: older active states with
+an overlay still resume, while new proven-disjoint blits save an empty one.
+
 ## Paula (`paula.rs`)
 
 Paula owns the interrupt system (INTENA/INTREQ, delivered through the
