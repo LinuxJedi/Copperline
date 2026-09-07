@@ -11,7 +11,9 @@ impl App {
         ));
         self.netplay = Some(session);
         self.netplay_input = Default::default();
-        self.netplay_keyboard_controller = true;
+        self.netplay_keyboard_controller = self.mouse_port().is_none();
+        self.mouse_delta_remainder = (0.0, 0.0);
+        self.last_display_cursor_pos = None;
         self.show_osd("Netplay: waiting for peer (F11 to cancel)".to_string());
     }
 
@@ -57,6 +59,7 @@ impl App {
     }
 
     pub(super) fn leave_netplay(&mut self, error: Option<String>) {
+        self.set_mouse_captured(false);
         self.netplay = None;
         self.netplay_input = Default::default();
         self.keyboard_joy_held = Default::default();
@@ -75,6 +78,9 @@ impl App {
     }
 
     pub(super) fn pump_netplay_input(&mut self) {
+        if self.mouse_port().is_some() {
+            return;
+        }
         let pad = self.gamepad.poll();
         let port = self.netplay.as_ref().unwrap().player();
         if pad.is_none() && self.auto_joy_engaged[port] {
@@ -87,7 +93,7 @@ impl App {
         }
         state.fire &=
             crate::config::autofire_asserted(self.autofire_hz, self.emu.bus().emulated_seconds());
-        self.netplay_input.buttons = [
+        self.netplay_input.held.buttons = [
             state.up,
             state.down,
             state.left,
@@ -109,13 +115,20 @@ impl App {
         let session = self.netplay.as_mut().unwrap();
         let before = session.status();
         let connected = before.connected;
-        let stepped = session.step(&mut self.emu, self.netplay_input, true)?;
+        let stepped = session.step_local(&mut self.emu, &mut self.netplay_input, true)?;
         let after = session.status();
         if after.rollbacks != before.rollbacks {
             self.reset_render_pipeline();
         }
         if !connected && after.connected {
-            self.show_osd("Netplay connected: arrows + right Ctrl, or gamepad".to_string());
+            self.show_osd(
+                if self.mouse_port().is_some() {
+                    "Netplay connected: mouse controls your port"
+                } else {
+                    "Netplay connected: arrows + right Ctrl, or gamepad"
+                }
+                .to_string(),
+            );
         }
         if !stepped {
             self.emu.reanchor_realtime_clock();
@@ -142,7 +155,7 @@ impl App {
         loop {
             let session = self.netplay.as_mut().unwrap();
             let before = session.status().rollbacks;
-            session.step(&mut self.emu, self.netplay_input, false)?;
+            session.step_local(&mut self.emu, &mut self.netplay_input, false)?;
             let status = session.status();
             if status.rollbacks != before {
                 self.reset_render_pipeline();
@@ -183,6 +196,9 @@ impl App {
                     match code {
                         KeyCode::KeyQ => event_loop.exit(),
                         KeyCode::KeyF => self.toggle_fullscreen(),
+                        KeyCode::KeyG if self.mouse_port().is_some() => {
+                            self.set_mouse_captured(!self.mouse_captured)
+                        }
                         _ => {}
                     }
                     return true;
@@ -194,7 +210,7 @@ impl App {
                     return true;
                 }
                 if *code == KeyCode::F12 {
-                    if pressed {
+                    if pressed && self.mouse_port().is_none() {
                         self.netplay_keyboard_controller = !self.netplay_keyboard_controller;
                         self.keyboard_joy_held = Default::default();
                         self.netplay_input = Default::default();
@@ -214,7 +230,7 @@ impl App {
                 {
                     self.keyboard_joy_held[0].set(*code, pressed);
                 } else if let Some(rawkey) = host_to_amiga_rawkey(*code) {
-                    self.netplay_input.set_key(rawkey, pressed);
+                    self.netplay_input.held.set_key(rawkey, pressed);
                 }
                 true
             }
@@ -225,8 +241,60 @@ impl App {
             WindowEvent::Focused(focused) => {
                 self.main_window_focused = *focused;
                 if !focused {
+                    self.set_mouse_captured(false);
+                    self.mouse_delta_remainder = (0.0, 0.0);
+                    self.last_display_cursor_pos = None;
                     self.netplay_input = Default::default();
                     self.keyboard_joy_held = Default::default();
+                }
+                true
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.last_cursor_phys = Some(*position);
+                let display_src = self.display_canvas_src();
+                let pos = self
+                    .render
+                    .as_ref()
+                    .and_then(|r| main_cursor_position(r, display_src, *position));
+                self.cursor_pos = pos;
+                if !self.mouse_captured && self.main_window_focused {
+                    self.track_uncaptured_cursor_motion(pos);
+                }
+                true
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_pos = None;
+                self.last_display_cursor_pos = None;
+                if !self.mouse_captured {
+                    self.release_mouse_buttons();
+                }
+                true
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if self.mouse_port().is_some() && self.main_window_focused {
+                    let pressed = *state == ElementState::Pressed;
+                    let over_display = self.cursor_pos.is_some_and(cursor_in_display);
+                    if pressed
+                        && !self.mouse_captured
+                        && over_display
+                        && self.mouse_capture != crate::config::MouseCapture::Manual
+                    {
+                        self.set_mouse_captured(true);
+                        if self.mouse_captured {
+                            return true;
+                        }
+                    }
+                    if !pressed || self.mouse_captured || over_display {
+                        let index = match button {
+                            MouseButton::Left => Some(0),
+                            MouseButton::Right => Some(1),
+                            MouseButton::Middle => Some(2),
+                            _ => None,
+                        };
+                        if let Some(index) = index {
+                            self.netplay_input.held.set_mouse_button(index, pressed);
+                        }
+                    }
                 }
                 true
             }

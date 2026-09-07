@@ -1407,7 +1407,7 @@ where
             })
             || joy_after.iter().any(|j| usize::from(j.3) != options.player)
         {
-            bail!("netplay supports cold boot, disks inserted at time 0, local-port --joy-after and keyboard input; state loads, media changes, mouse/analogue input, debugging, warp and recording are unavailable");
+            bail!("netplay supports cold boot, disks inserted at time 0, local-port --joy-after and keyboard input; state loads, media changes, scripted mouse/analogue input, debugging, warp and recording are unavailable");
         }
         Some(options)
     } else {

@@ -34,6 +34,9 @@ impl Machine for ToyMachine {
 fn input(frame: u64, player: u64) -> Input {
     let mut i = Input {
         buttons: ((frame * (player + 3) / 7) % 2048) as u16,
+        mouse_dx: (frame % 19) as i16 - 9,
+        mouse_dy: 11 - ((frame + player) % 23) as i16,
+        mouse_buttons: ((frame / 3 + player) % 8) as u8,
         ..Default::default()
     };
     i.set_key(0x40, (frame + player) % 11 < 3);
@@ -190,6 +193,27 @@ fn wire_round_trip_and_bounded_rejection() {
         checksum: Some((60, [3; 32])),
     };
     let bytes = packet.encode();
+    let mut full = packet.clone();
+    full.inputs = (0..wire::MAX_INPUTS as u64)
+        .map(|frame| {
+            (
+                frame,
+                Input {
+                    mouse_dx: i16::MIN,
+                    mouse_dy: i16::MAX,
+                    mouse_buttons: 7,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    let maximum = full.encode();
+    assert_eq!(maximum.len(), wire::MAX_PACKET);
+    assert!(maximum.len() <= 1200);
+    assert_eq!(wire::Packet::decode(&maximum), Some(full));
+    let mut invalid_mouse = bytes.clone();
+    invalid_mouse[wire::HEADER + wire::INPUT_RECORD - 1] = 8;
+    assert!(wire::Packet::decode(&invalid_mouse).is_none());
     assert_eq!(wire::Packet::decode(&bytes), Some(packet));
     for end in 0..bytes.len() {
         assert!(wire::Packet::decode(&bytes[..end]).is_none());
@@ -259,8 +283,21 @@ fn emulator() -> Result<Emulator> {
 
 #[test]
 fn emulator_replay_matches_uninterrupted_machine_bytes() -> Result<()> {
+    use crate::bus::PortDevice::{Cd32Pad, Joystick, Mouse};
+    for devices in [[Joystick; 2], [Cd32Pad; 2], [Mouse; 2], [Mouse, Cd32Pad]] {
+        replay_matches_devices(devices)?;
+    }
+    Ok(())
+}
+
+fn replay_matches_devices(devices: [crate::bus::PortDevice; 2]) -> Result<()> {
     let mut baseline = emulator()?;
     let mut predicted = emulator()?;
+    for emu in [&mut baseline, &mut predicted] {
+        for (port, device) in devices.into_iter().enumerate() {
+            emu.bus_mut().input.set_port_device(port, device);
+        }
+    }
     let mut rb = Rollback::new(0, 0, 8);
     let mut previous = [0; 16];
     for f in 0..60 {
@@ -669,5 +706,154 @@ fn udp_transport_discards_foreign_source_and_keeps_expected_peer() -> Result<()>
     expected.send_to(&[2, 3], transport.socket.local_addr()?)?;
     assert_eq!(receive(&mut transport, &mut bytes)?, Some(2));
     assert_eq!(&bytes[..2], &[2, 3]);
+    Ok(())
+}
+
+#[test]
+fn mouse_prediction_holds_buttons_without_repeating_motion() -> Result<()> {
+    let mut machine = emulator()?;
+    machine
+        .bus_mut()
+        .input
+        .set_port_device(1, crate::bus::PortDevice::Mouse);
+    let mut rb = Rollback::new(0, 0, 8);
+    rb.receive(
+        0,
+        Input {
+            mouse_dx: -17,
+            mouse_dy: 23,
+            mouse_buttons: 7,
+            ..Default::default()
+        },
+    )?;
+    for _ in 0..4 {
+        assert!(rb.advance(&mut EmulatedMachine(&mut machine), Input::default())?);
+        assert_eq!(machine.bus().input.joydat(1), 0x17ef);
+        let port = &machine.bus().input.ports[1];
+        assert!(port.fire && port.button2 && port.button3);
+    }
+    // A future packet must not seed motion or held buttons on an earlier frame.
+    rb.receive(
+        6,
+        Input {
+            mouse_dx: 80,
+            mouse_dy: -80,
+            ..Default::default()
+        },
+    )?;
+    assert!(rb.advance(&mut EmulatedMachine(&mut machine), Input::default())?);
+    assert_eq!(machine.bus().input.joydat(1), 0x17ef);
+    Ok(())
+}
+
+#[test]
+fn mouse_motion_is_consumed_once_when_sampling_through_stalls() -> Result<()> {
+    let mut machine = emulator()?;
+    machine
+        .bus_mut()
+        .input
+        .set_port_device(0, crate::bus::PortDevice::Mouse);
+    let mut cfg = crate::config::Config::try_from(crate::config::RawConfig::default())?;
+    cfg.serial.mode = crate::config::SerialMode::Off;
+    let settings = Settings {
+        player: 0,
+        session: [23; 16],
+        input_delay: 0,
+        rollback_frames: 1,
+    };
+    let mut peer =
+        Connection::with_transport(settings, PacketQueue::default(), &mut machine, &cfg)?;
+    let mut pending: LocalInput = Input {
+        mouse_dx: 250,
+        mouse_dy: -250,
+        mouse_buttons: 7,
+        ..Default::default()
+    }
+    .into();
+    assert!(!peer.step_local(&mut machine, &mut pending, true)?);
+    assert_eq!(pending.mouse_pending.0, 250, "handshake must retain motion");
+    // Isolate sampling from the handshake already exercised by the paired tests.
+    peer.connected = true;
+    assert!(!peer.step_local(&mut machine, &mut pending, false)?);
+    assert_eq!(
+        pending.mouse_pending.0, 250,
+        "confirmation polls must retain motion"
+    );
+    assert!(peer.step_local(&mut machine, &mut pending, true)?);
+    assert_eq!(pending.mouse_pending.0, 150);
+    assert!(!peer.step_local(&mut machine, &mut pending, true)?);
+    assert_eq!(
+        pending.mouse_pending.0, 50,
+        "a stalled frame is sampled once"
+    );
+    pending.add_mouse_delta(7, -7);
+    assert!(!peer.step_local(&mut machine, &mut pending, true)?);
+    assert_eq!(
+        pending.mouse_pending.0, 57,
+        "new motion waits for the next unsampled frame"
+    );
+    peer.rollback.receive(0, Input::default())?;
+    peer.rollback.acknowledge(2)?;
+    assert!(peer.step_local(&mut machine, &mut pending, true)?);
+    assert_eq!(pending.mouse_pending.0, 57);
+    peer.rollback.receive(1, Input::default())?;
+    assert!(peer.step_local(&mut machine, &mut pending, true)?);
+    assert_eq!(pending.mouse_pending, (0, 0));
+    assert_eq!(pending.held.mouse_buttons, 7);
+    assert_eq!(
+        machine.bus().input.joydat(0),
+        0xff01,
+        "257 counts wrap in hardware exactly once"
+    );
+    Ok(())
+}
+
+#[test]
+fn large_pending_mouse_motion_reaches_the_wire_without_truncation() -> Result<()> {
+    let mut machine = emulator()?;
+    machine
+        .bus_mut()
+        .input
+        .set_port_device(0, crate::bus::PortDevice::Mouse);
+    let mut peer = Connection::with_transport(
+        Settings {
+            player: 0,
+            session: [24; 16],
+            input_delay: 0,
+            rollback_frames: 1,
+        },
+        PacketQueue::default(),
+        &mut machine,
+        &safe_config()?,
+    )?;
+    let mut pending = LocalInput::default();
+    pending.add_mouse_delta(70_000, -90_000);
+    let mut transmitted = BTreeMap::new();
+    for frame in 0..900 {
+        let remote = wire::Packet {
+            session: [24; 16],
+            identity: peer.identity,
+            player: 1,
+            ready: true,
+            delay: 0,
+            window: 1,
+            ack: frame,
+            inputs: vec![(frame, Input::default())],
+            checksum: None,
+        };
+        peer.transport_mut().push(&remote.encode())?;
+        assert!(peer.step_local(&mut machine, &mut pending, true)?);
+        while let Some(bytes) = peer.transport_mut().pop() {
+            for (number, input) in wire::Packet::decode(&bytes).unwrap().inputs {
+                assert!(input.mouse_dx.abs() <= 100 && input.mouse_dy.abs() <= 100);
+                transmitted.insert(number, input);
+            }
+        }
+    }
+    assert_eq!(pending.mouse_pending, (0, 0));
+    let total = transmitted.values().fold((0i32, 0i32), |(x, y), input| {
+        (x + i32::from(input.mouse_dx), y + i32::from(input.mouse_dy))
+    });
+    assert_eq!(total, (70_000, -90_000));
     Ok(())
 }

@@ -9,7 +9,7 @@ import { SWAP_CHANNEL, SWAP_VERSION, DISK_LIMIT, DiskSwaps } from './netplay-swa
 // Signaling uses expiring room invitations or manual copy/paste codes.
 // Only bounded input packets use the data channel.
 const CODE_LIMIT = 96 * 1024;
-export const PACKET_LIMIT = 943;
+export const PACKET_LIMIT = 1103;
 const QUEUE_LIMIT = 64;
 const CHANNEL = 'copperline-netplay-v1';
 
@@ -17,7 +17,7 @@ export function validateSettings(value) {
   if (!value || !/^[0-9a-f]{32}$/i.test(value.session ?? '') ||
       !Number.isInteger(value.delay) || value.delay < 0 || value.delay > 6 ||
       !Number.isInteger(value.window) || value.window < 1 || value.window > 12 ||
-      !['joystick', 'cd32'].includes(value.controller) ||
+      !['joystick', 'cd32', 'mouse'].includes(value.controller) ||
       (value.media !== undefined && value.media !== MEDIA_VERSION) ||
       (value.swaps !== undefined && value.swaps !== SWAP_VERSION)) {
     throw new Error('Invalid netplay settings in connection code');
@@ -376,7 +376,8 @@ export function mountNetplayPanel(parent, { prepare, start, stop, getMedia, useM
     <button id="netplay-diagnostics" type="button" disabled>Copy diagnostics</button>
     <textarea id="netplay-report" rows="5" readonly hidden aria-label="Connection diagnostics"></textarea>
     <details id="netplay-advanced"><summary>Advanced</summary>
-      <label>Controllers <select id="netplay-controller"><option value="joystick">Joystick</option><option value="cd32">CD32 pad</option></select></label>
+      <label>Controllers <select id="netplay-controller"><option value="joystick">Joystick</option><option value="cd32">CD32 pad</option><option value="mouse">Two mice</option></select></label>
+      <p>For two-mouse games, choose Two mice before hosting. Each player’s mouse or touch trackpad controls their own Amiga port.</p>
       <label>Input delay <select id="netplay-delay">${[0,1,2,3,4,5,6].map(n => `<option ${n === 2 ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
       <label>Rollback limit <select id="netplay-window">${Array.from({length:12}, (_, i) => `<option ${i === 7 ? 'selected' : ''}>${i + 1}</option>`).join('')}</select></label>
       <label><input id="netplay-relay-only" type="checkbox"> Use relay only for room connections</label>

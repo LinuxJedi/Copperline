@@ -6,10 +6,10 @@
 use super::Input;
 
 const MAGIC: &[u8; 4] = b"CLNP";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const MAX_INPUTS: usize = 32;
 pub const HEADER: usize = 4 + 2 + 4 + 16 + 32 + 4 + 8 + 8 + 32 + 1;
-pub const INPUT_RECORD: usize = 8 + 2 + 16;
+pub const INPUT_RECORD: usize = 8 + 2 + 16 + 2 + 2 + 1;
 pub const MAX_PACKET: usize = HEADER + MAX_INPUTS * INPUT_RECORD;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +50,9 @@ impl Packet {
             out.extend_from_slice(&frame.to_le_bytes());
             out.extend_from_slice(&input.buttons.to_le_bytes());
             out.extend_from_slice(&input.keys);
+            out.extend_from_slice(&input.mouse_dx.to_le_bytes());
+            out.extend_from_slice(&input.mouse_dy.to_le_bytes());
+            out.push(input.mouse_buttons);
         }
         out
     }
@@ -107,13 +110,17 @@ impl Packet {
             {
                 return None;
             }
-            inputs.push((
-                number,
-                Input {
-                    buttons,
-                    keys: take(&mut bytes)?,
-                },
-            ));
+            let input = Input {
+                buttons,
+                keys: take(&mut bytes)?,
+                mouse_dx: i16::from_le_bytes(take(&mut bytes)?),
+                mouse_dy: i16::from_le_bytes(take(&mut bytes)?),
+                mouse_buttons: take::<1>(&mut bytes)?[0],
+            };
+            if input.mouse_buttons & !7 != 0 {
+                return None;
+            }
+            inputs.push((number, input));
         }
         Some(Self {
             session,

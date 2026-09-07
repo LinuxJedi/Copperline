@@ -5666,7 +5666,10 @@ fn netplay_setup_edits_all_controls_without_persisting_connection_details() -> R
     assert!(!state.row_applies(F::NetplayPeer));
     state.toggle_netplay();
     assert!(state.row_toggle(F::NetplayEnabled));
-    assert_eq!(state.setup.port_devices, [PortDevice::Joystick; 2]);
+    assert_eq!(
+        state.setup.port_devices,
+        [PortDevice::Mouse, PortDevice::Joystick]
+    );
     assert_eq!(state.setup.serial_mode, SerialMode::Off);
     for (field, value) in [
         (F::NetplayBind, "[::]:19732"),
@@ -5732,4 +5735,26 @@ fn netplay_setup_rejects_invalid_details_and_generates_fresh_codes() {
     }
     setup.enabled = false;
     assert!(setup.options().unwrap().is_none());
+}
+
+#[test]
+fn netplay_preserves_each_supported_port_device() {
+    let mut state = LauncherState::new(MachineSetup::default());
+    state.netplay.enabled = true;
+    for device in [
+        PortDevice::Mouse,
+        PortDevice::Joystick,
+        PortDevice::Cd32Pad,
+        PortDevice::Analogue,
+        PortDevice::GamepadMouse,
+        PortDevice::None,
+    ] {
+        state.setup.port_devices = [device; 2];
+        state.prepare_netplay_machine();
+        let expected = match device {
+            PortDevice::Mouse | PortDevice::Joystick | PortDevice::Cd32Pad => device,
+            _ => PortDevice::Joystick,
+        };
+        assert_eq!(state.setup.port_devices, [expected; 2]);
+    }
 }

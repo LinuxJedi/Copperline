@@ -29,7 +29,7 @@ test('connection codes round-trip only valid settings and the expected descripti
   for (const key of ['delay', 'window']) {
     for (const value of [-1, 1.5, 257, NaN, Infinity, '2']) assert.throws(() => validateSettings({ ...settings, [key]: value }));
   }
-  assert.throws(() => validateSettings({ ...settings, controller: 'mouse' }));
+  assert.throws(() => validateSettings({ ...settings, controller: 'analogue' }));
   assert.throws(() => validateSettings({ ...settings, session: 'bad' }));
   assert.notEqual(newSettings(0, 1, 'cd32').session, newSettings(0, 1, 'cd32').session);
   const shared = { ...settings, media: 'host-v1', swaps: 'disk-v1' };
@@ -127,13 +127,13 @@ test('packet queues bound throttled-browser bursts and respect send backpressure
   assert.equal(received.at(-1), 99);
   let drained = 0;
   const emu = { netplay_take_packet: () => ++drained < 3 ? new Uint8Array([1]) : new Uint8Array() };
-  channel.bufferedAmount = 943 * 64;
+  channel.bufferedAmount = 1103 * 64;
   link.send(emu);
   assert.equal(drained, 0);
   channel.bufferedAmount = 0;
   link.send(emu);
   assert.equal(channel.sent.length, 2);
-  channel.onmessage({ data: new ArrayBuffer(944) });
+  channel.onmessage({ data: new ArrayBuffer(1104) });
   assert.equal(link.closed, true);
 });
 
@@ -221,4 +221,11 @@ test('TURN query compatibility preserves UDP, TLS, credentials and relay-only po
     link.pc.setConfiguration = () => { throw new DOMException('credentials invalid', 'InvalidAccessError'); };
     assert.throws(() => link.configureIce(servers, true), { name: 'InvalidAccessError' });
   } finally { link.close(); }
+});
+
+test('two-mouse controller settings survive signaling', () => {
+  const mice = { ...settings, controller: 'mouse' };
+  assert.deepEqual(validateSettings(mice), mice);
+  const description = { type: 'offer', sdp: 'v=0\r\n' };
+  assert.deepEqual(decodeCode(encodeCode(description, mice), 'offer').settings, mice);
 });

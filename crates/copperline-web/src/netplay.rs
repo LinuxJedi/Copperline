@@ -48,11 +48,12 @@ impl WebEmu {
             rollback_frames: integer(window, 1, 12, "rollback window")?,
         };
         let device = match controller {
+            "mouse" => PortDevice::Mouse,
             "joystick" => PortDevice::Joystick,
             "cd32" => PortDevice::Cd32Pad,
             _ => {
                 return Err(JsValue::from_str(
-                    "Netplay controller must be joystick or cd32",
+                    "Netplay controller must be mouse, joystick or cd32",
                 ))
             }
         };
@@ -107,6 +108,7 @@ impl WebEmu {
     /// Release this peer's held keys/controller without touching the guest directly.
     pub fn netplay_release_input(&mut self) {
         self.netplay_input = Default::default();
+        self.mouse_remainder = (0.0, 0.0);
     }
 
     /// Freeze at the current frame while the reliable channel negotiates a
@@ -250,6 +252,12 @@ impl WebEmu {
 }
 
 impl WebEmu {
+    pub(super) fn netplay_mouse(&self) -> bool {
+        self.netplay.as_ref().is_some_and(|peer| {
+            self.emu.bus().input.ports[peer.player()].device == PortDevice::Mouse
+        })
+    }
+
     fn validate_netplay_disk(
         &self,
         drive: usize,
@@ -348,7 +356,7 @@ impl WebEmu {
         let started = Instant::now();
         let peer = self.netplay.as_mut().unwrap();
         let before = peer.status();
-        peer.step(&mut self.emu, self.netplay_input, false)
+        peer.step_local(&mut self.emu, &mut self.netplay_input, false)
             .map_err(js_err)?;
         if !before.connected {
             self.anchor = None;
@@ -368,7 +376,7 @@ impl WebEmu {
                 break;
             }
             if !peer
-                .step(&mut self.emu, self.netplay_input, true)
+                .step_local(&mut self.emu, &mut self.netplay_input, true)
                 .map_err(js_err)?
             {
                 self.anchor = Some((now_ms, self.emu.bus().emulated_seconds()));
@@ -449,6 +457,44 @@ mod tests {
     }
 
     #[test]
+    fn netplay_mouse_routes_both_players_without_touching_the_live_machine() -> anyhow::Result<()> {
+        for player in 0..2 {
+            let mut web = WebEmu::new(None, None, Some(0.0)).unwrap();
+            web.start_netplay_inner(settings(player), PortDevice::Mouse)?;
+            let before = web.emu.netplay_snapshot()?;
+            web.mouse_delta(12.5, -3.25);
+            web.mouse_delta(-1.0, 0.75);
+            assert_eq!(web.netplay_input.mouse_pending, (12, -3));
+            assert_eq!(web.mouse_remainder, (-0.5, 0.5));
+            web.mouse_delta(f64::NAN, f64::INFINITY);
+            for (button, bit) in [(0, 0), (1, 2), (2, 1)] {
+                web.mouse_button(button, true);
+                assert_eq!(web.netplay_input.held.mouse_buttons, 1 << bit);
+                web.set_joystick_port2(true, true, true, true, true, true);
+                web.set_cd32_buttons_port2(true, true, true, true, true);
+                assert_eq!(web.netplay_input.held.mouse_buttons, 1 << bit);
+                assert_eq!(web.netplay_input.held.buttons, 0);
+                web.mouse_button(button, false);
+                assert_eq!(web.netplay_input.held.mouse_buttons, 0);
+            }
+            web.key_event("ArrowUp", true);
+            assert_ne!(web.netplay_input.held.keys, [0; 16]);
+            assert!(
+                web.emu.netplay_snapshot()? == before,
+                "host input bypassed the timeline"
+            );
+            web.netplay_release_input();
+            assert_eq!(web.netplay_input, Default::default());
+            assert_eq!(web.mouse_remainder, (0.0, 0.0));
+            web.mouse_delta(70_000.0, -90_000.0);
+            assert_eq!(web.netplay_input.mouse_pending, (70_000, -90_000));
+            web.netplay_release_input();
+            assert_eq!(web.netplay_input.mouse_pending, (0, 0));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn netplay_routes_each_controller_button_and_keyboard_and_scales_local_audio(
     ) -> anyhow::Result<()> {
         for player in 0..2 {
@@ -458,18 +504,18 @@ mod tests {
                 let on = |i| i == bit;
                 web.set_joystick_port2(on(0), on(1), on(2), on(3), on(4), on(5));
                 web.set_cd32_buttons_port2(on(6), on(7), on(8), on(9), on(10));
-                assert_eq!(web.netplay_input.buttons, 1 << bit);
+                assert_eq!(web.netplay_input.held.buttons, 1 << bit);
                 // The secondary page controller cannot overwrite the primary.
                 web.set_joystick_port(1, false, false, false, false, false, false);
                 web.set_cd32_buttons_port(1, false, false, false, false, false);
-                assert_eq!(web.netplay_input.buttons, 1 << bit);
+                assert_eq!(web.netplay_input.held.buttons, 1 << bit);
             }
             assert!(web.key_event("Space", true));
             web.key_raw(0x20, true);
-            assert_eq!(web.netplay_input.keys[8], 1);
-            assert_eq!(web.netplay_input.keys[4], 1);
+            assert_eq!(web.netplay_input.held.keys[8], 1);
+            assert_eq!(web.netplay_input.held.keys[4], 1);
             web.key_raw(0x20, false);
-            assert_eq!(web.netplay_input.keys[4], 0);
+            assert_eq!(web.netplay_input.held.keys[4], 0);
             web.netplay_release_input();
             assert_eq!(web.netplay_input, Default::default());
             for volume in [0, 35, 100] {

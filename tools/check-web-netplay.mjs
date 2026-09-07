@@ -23,10 +23,10 @@ function fresh(model = 'A500', video = 'PAL') {
 }
 
 const [protocol, packetLimit, headerBytes, inputBytes] = WebEmu.netplay_packet_layout();
-assert.equal(protocol, 1);
+assert.equal(protocol, 2);
 assert.equal(packetLimit, PACKET_LIMIT, 'Rust and WebRTC packet limits must match');
 assert.equal(headerBytes, 111);
-assert.equal(inputBytes, 26);
+assert.equal(inputBytes, 31);
 const validation = fresh();
 try {
   for (const player of [-1, 0, 3, 1.5, 257, NaN, Infinity]) {
@@ -39,7 +39,7 @@ try {
     assert.throws(() => validation.start_netplay(1, code, 2, window, 'joystick'));
   }
   assert.throws(() => validation.start_netplay(1, 'bad', 2, 8, 'joystick'));
-  assert.throws(() => validation.start_netplay(1, code, 2, 8, 'mouse'));
+  assert.throws(() => validation.start_netplay(1, code, 2, 8, 'analogue'));
   const saved = validation.save_state();
   validation.start_netplay(1, code, 2, 8, 'joystick');
   for (const mutate of [() => validation.reset(), () => validation.save_state(),
@@ -55,15 +55,19 @@ try {
   assert.throws(() => warm.start_netplay(1, code, 2, 8, 'joystick'));
 } finally { warm.free(); }
 
-for (const [model, video, delay, window] of [['A500', 'PAL', 0, 8], ['A500', 'PAL', 2, 8], ['A1200', 'NTSC', 6, 1]]) {
+for (const [model, video, delay, window, controller] of [
+  ['A500', 'PAL', 0, 8, 'cd32'], ['A500', 'PAL', 2, 8, 'cd32'], ['A1200', 'NTSC', 6, 1, 'cd32'],
+  ['A500', 'PAL', 0, 8, 'mouse'], ['A500', 'PAL', 2, 8, 'mouse'], ['A1200', 'NTSC', 6, 1, 'mouse'],
+]) {
   const peers = [fresh(model, video), fresh(model, video)];
   try {
     peers.forEach((emu, player) => {
       emu.insert_floppy(0, new Uint8Array(901120), player ? 'other/path.adf' : 'disk.adf');
       emu.set_volume_percent(player ? 40 : 100);
-      emu.start_netplay(player + 1, code, delay, window, 'cd32');
+      emu.start_netplay(player + 1, code, delay, window, controller);
     });
     let queued = [];
+    const mouseFrame = [-1, -1];
     let packets = 0;
     let checkedSoundGuard = false;
     for (let tick = 0; tick < 1800; tick++) {
@@ -73,6 +77,13 @@ for (const [model, video, delay, window] of [['A500', 'PAL', 0, 8], ['A500', 'PA
         emu.set_joystick_port(2, frame % 9 < 3, false, false, false, frame % 7 < 3, false);
         emu.set_cd32_buttons_port(2, frame % 5 < 2, frame % 7 < 2, frame % 11 < 3, frame % 13 < 4, frame % 17 < 3);
         emu.key_event('Space', frame % 13 < 4);
+        if (controller === 'mouse' && mouseFrame[player] !== frame) {
+          emu.mouse_delta(frame % 19 - 9, 11 - (frame + player) % 23);
+          for (const [button, bit] of [[0, 0], [2, 1], [1, 2]]) {
+            emu.mouse_button(button, !!((frame % 8) & (1 << bit)));
+          }
+          mouseFrame[player] = frame;
+        }
         const advance = frame < 120 && (player !== 0 || tick % 90 < 30 || tick % 90 >= 42);
         // Deliberately different rendering cadence, display settings and audio
         // levels: host presentation must not enter machine checkpoint hashes.
@@ -96,7 +107,12 @@ for (const [model, video, delay, window] of [['A500', 'PAL', 0, 8], ['A500', 'PA
               | (sampled % 5 < 2 ? 64 : 0) | (sampled % 7 < 2 ? 128 : 0)
               | (sampled % 11 < 3 ? 256 : 0) | (sampled % 13 < 4 ? 512 : 0)
               | (sampled % 17 < 3 ? 1024 : 0);
-            assert.equal(view.getUint16(offset + 8, true), expected, 'controller routing');
+            assert.equal(view.getUint16(offset + 8, true), controller === 'mouse' ? 0 : expected, 'controller routing');
+            if (controller === 'mouse') {
+              assert.equal(view.getInt16(offset + 26, true), sampled % 19 - 9, 'mouse X sampled once');
+              assert.equal(view.getInt16(offset + 28, true), 11 - (sampled + player) % 23, 'mouse Y sampled once');
+              assert.equal(bytes[offset + 30], sampled % 8, 'three mouse buttons');
+            }
             assert.equal(bytes[offset + 10 + 8], sampled % 13 < 4 ? 1 : 0, 'Space key routing');
           }
           packets++;
@@ -128,7 +144,7 @@ for (const [model, video, delay, window] of [['A500', 'PAL', 0, 8], ['A500', 'PA
     const pixels = peers.map(emu => Buffer.from(new Uint8Array(wasm.memory.buffer,
       emu.present_ptr(), emu.present_width() * emu.present_rows() * 4)));
     assert.deepEqual(pixels[0], pixels[1]);
-    console.log(`${model}/${video} delay=${delay} window=${window}: 120 confirmed/checksummed frames; identical render`);
+    console.log(`${model}/${video} ${controller} delay=${delay} window=${window}: 120 confirmed/checksummed frames; identical render`);
   } finally { peers.forEach(emu => emu.free()); }
 }
 console.log('WASM netplay numeric boundaries, session guards, packet loss/reordering and presentation isolation passed');
