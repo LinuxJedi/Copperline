@@ -806,6 +806,24 @@ impl Agnus {
         self.video_standard.long_frame_lines()
     }
 
+    /// Mean colour clocks per video field for a frontend's refresh rate.
+    /// Interlace alternates long/short fields; NTSC can also alternate line
+    /// lengths. Programmable totals replace both standard timing rules.
+    pub fn nominal_frame_cck(&self) -> f64 {
+        let lines = f64::from(self.nominal_frame_lines())
+            - if self.lace && self.programmable_frame_lines().is_none() {
+                0.5
+            } else {
+                0.0
+            };
+        let line = if self.long_line_toggles() {
+            f64::from(self.line_cck_for(false) + self.line_cck_for(true)) / 2.0
+        } else {
+            f64::from(self.current_line_cck())
+        };
+        lines * line
+    }
+
     pub fn current_line_cck(&self) -> u32 {
         self.line_cck_for(self.lol)
     }

@@ -21,6 +21,7 @@ It boots out of the box with the bundled open-source AROS Kickstart replacement,
 - **Freezer cartridge**: Action Replay-style cartridge support with bundled HRTMon (`--cartridge hrtmon`), allowing running software to be frozen into the monitor via the menu, a hotkey, headless `--freeze-after`, or the control protocol.
 - **Direct launching**: Boot directly into WHDLoad game packages (`--whdload`) or host-built Amiga executables (`--run`, including bare Kickstart 1.3), with a WinUAE-compatible `uaelib` trap allowing guest code to control warp speed, log debug messages, and register debug resources.
 - **WebAssembly build**: Run directly in modern web browsers at [copperline.dev/try](https://copperline.dev/try/).
+- **Libretro core**: [Run A500/A1200 floppy software in RetroArch](docs/guide/libretro.md), with embedded AROS ROMs, disk playlists and save states.
 
 ## Installation
 

@@ -47,6 +47,7 @@ project:
         - file: guide/netplay.md
         - file: guide/headless.md
         - file: guide/browser.md
+        - file: guide/libretro.md
         - file: guide/publishing.md
     - title: Extending
       children:
@@ -109,6 +110,7 @@ project:
         - guide/netplay.md
         - guide/headless.md
         - guide/browser.md
+        - guide/libretro.md
         - guide/publishing.md
         - zorro.md
         - debugger/window.md

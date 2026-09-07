@@ -1,0 +1,20 @@
+# 68000 boot-block entry, assembled words in hexadecimal. No OS calls.
+# Disable interrupts and DMA, then emit a Paula square wave while painting
+# COLOR00 from VHPOSR. Both framebuffer and audio must be non-constant.
+# AROS calls boot blocks in user mode. INTENA masks custom-chip interrupts
+# without the privileged SR write that would fault before the test starts.
+4df9 00df f000            # lea $dff000,a6
+3d7c 7fff 009a            # move.w #$7fff,INTENA(a6)
+3d7c 7fff 009c            # move.w #$7fff,INTREQ(a6)
+3d7c 7fff 0096            # move.w #$7fff,DMACON(a6)
+3d7c 0000 0100            # move.w #0,BPLCON0(a6)
+3d7c 0040 00a8            # move.w #64,AUD0VOL(a6)
+3d7c 01ac 00a6            # move.w #428,AUD0PER(a6)
+3d7c 7f80 00aa            # loop: move.w #$7f80,AUD0DAT(a6)
+302e 0006                 # wait: move.w VHPOSR(a6),d0
+3d40 0180                 # move.w d0,COLOR00(a6)
+302e 001e                 # move.w INTREQR(a6),d0
+0240 0080                 # andi.w #$80,d0
+67ee                      # beq.s wait
+3d7c 0080 009c            # move.w #$80,INTREQ(a6)
+60e0                      # bra.s loop
