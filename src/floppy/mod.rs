@@ -27,7 +27,8 @@ pub const SIDES: usize = 2;
 pub const SECTORS_PER_TRACK: usize = 11;
 pub const BYTES_PER_SECTOR: usize = 512;
 pub const ADF_SIZE: usize = CYLINDERS * SIDES * SECTORS_PER_TRACK * BYTES_PER_SECTOR;
-const MAX_EXTENDED_TRACKS: usize = 2 * 83;
+// IPF and SCP represent cylinders 0..=83, including unformatted slots.
+const MAX_EXTENDED_TRACKS: usize = 2 * 84;
 const SCP_TRACKS: usize = 168;
 
 const CIAA_DSKCHANGE: u8 = 1 << 2;
@@ -618,6 +619,18 @@ impl FloppyController {
             }
             FloppyImageData::Tracks(tracks) => encode_uae_extended_adf(tracks),
         }
+    }
+
+    /// Capture disk media for netplay without losing raw-track timing or
+    /// legacy sync metadata. The result is accepted by the memory-backed
+    /// loader, contains no filesystem paths, and is bounded before copying.
+    pub fn export_netplay_disk_image(&self, drive_idx: usize, limit: usize) -> Result<Vec<u8>> {
+        let image = self
+            .drives
+            .get(drive_idx)
+            .and_then(|drive| drive.image.as_ref())
+            .with_context(|| format!("floppy.df{drive_idx} is empty or invalid"))?;
+        transfer::encode(image, limit)
     }
 
     /// Adopt disk contents for rollback and remove host-specific path metadata.
@@ -4605,6 +4618,7 @@ fn write_chip_word(chip_ram: &mut [u8], addr: u32, word: u16) {
 }
 
 mod formats;
+mod transfer;
 
 #[cfg(test)]
 mod tests;

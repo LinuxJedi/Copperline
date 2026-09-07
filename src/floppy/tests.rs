@@ -3851,6 +3851,15 @@ fn scp_flux_image_decodes_read_only_raw_mfm_track() -> Result<()> {
         .as_ref()
         .is_some_and(|image| image.write_protected));
 
+    let transfer = ctrl.export_netplay_disk_image(0, 16 * 1024 * 1024)?;
+    let received =
+        FloppyImage::from_memory_bytes(transfer, "received".into(), true, 16 * 1024 * 1024)?;
+    assert_eq!(
+        bincode::serialize(&received.data)?,
+        bincode::serialize(&ctrl.drives[0].image.as_ref().unwrap().data)?,
+        "netplay must retain the flux cell times as well as the decoded bits"
+    );
+
     let _ = fs::remove_file(path);
     Ok(())
 }
@@ -5942,5 +5951,182 @@ fn netplay_normalizes_all_floppy_paths_and_preserves_memory_backing() -> Result<
     assert_eq!(state, bincode::serialize(&peers[1])?);
     let restored: FloppyController = bincode::deserialize(&state)?;
     assert_eq!(restored.runahead_block_reason(), None);
+    Ok(())
+}
+
+#[test]
+fn netplay_ipf_transfer_preserves_all_tracks_and_mastered_density() -> Result<()> {
+    let mut host = FloppyController::default();
+    host.insert_disk_image_bytes(
+        0,
+        crate::ipf::tests::copylock_ipf_image(),
+        "master.ipf".into(),
+        true,
+    )?;
+    let source = host.drives[0].image.as_ref().unwrap();
+    let FloppyImageData::Tracks(tracks) = &source.data else {
+        panic!("expected IPF tracks")
+    };
+    assert_eq!(tracks.len(), 168);
+    let Some(FloppyTrackImage::RawMfm {
+        density: Some(density),
+        ..
+    }) = &tracks[0]
+    else {
+        panic!("missing mastered density")
+    };
+    assert!(density.iter().any(|span| span.permille != 1000));
+    let expected = bincode::serialize(&source.data)?;
+    let bytes = host.export_netplay_disk_image(0, 16 * 1024 * 1024)?;
+    let mut guest = FloppyController::default();
+    guest.insert_memory_disk_image_bytes_with_limit(
+        0,
+        bytes.clone(),
+        "received".into(),
+        true,
+        bytes.len(),
+    )?;
+    let received = guest.drives[0].image.as_ref().unwrap();
+    assert_eq!(bincode::serialize(&received.data)?, expected);
+    assert_eq!(received.backing, FloppyImageBacking::Memory);
+    assert!(received.write_protected);
+    // Rehosting after rollback must not depend on the original IPF or path.
+    host.prepare_netplay_images();
+    let restored: FloppyController = bincode::deserialize(&bincode::serialize(&host)?)?;
+    assert_eq!(restored.export_netplay_disk_image(0, bytes.len())?, bytes);
+    assert!(host.export_netplay_disk_image(0, bytes.len() - 1).is_err());
+    assert!(guest
+        .insert_memory_disk_image_bytes(0, bytes, "writable".into(), false)
+        .is_err());
+    // A normal ADF download still reloads all 168 slots, although that public
+    // format cannot represent the density profile carried by netplay.
+    let adf = host.export_disk_image(0)?;
+    assert!(adf.starts_with(UAE_EXT2_SIGNATURE));
+    let image = FloppyImage::from_bytes(adf, "export.adf".into(), true)?;
+    let FloppyImageData::Tracks(tracks) = image.data else {
+        panic!("expected extended tracks")
+    };
+    assert_eq!(tracks.len(), 168);
+    Ok(())
+}
+
+#[test]
+fn netplay_track_transfer_preserves_legacy_multi_revolution_and_empty_metadata() -> Result<()> {
+    let mut image = FloppyImage {
+        path: "local-only".into(),
+        data: FloppyImageData::Tracks(vec![
+            None,
+            Some(FloppyTrackImage::AmigaDos(vec![0x5a; 512])),
+            Some(FloppyTrackImage::RawMfm {
+                words: vec![0x4489, 0x1234, 0x5678],
+                bit_len: 35,
+                stored_len: 3,
+                revolutions: 1,
+                legacy_sync: Some(0x4489),
+                bitcell_ns: None,
+                density: Some(Vec::new()),
+            }),
+            Some(FloppyTrackImage::RawMfm {
+                words: vec![0x4489, 0x1234],
+                bit_len: 13,
+                stored_len: 4,
+                revolutions: 2,
+                legacy_sync: None,
+                bitcell_ns: Some(vec![2000; 26]),
+                density: None,
+            }),
+            Some(FloppyTrackImage::RawMfm {
+                words: Vec::new(),
+                bit_len: 0,
+                stored_len: 0,
+                revolutions: 1,
+                legacy_sync: None,
+                bitcell_ns: Some(Vec::new()),
+                density: None,
+            }),
+        ]),
+        write_protected: false,
+        legacy_extended_adf: true,
+        backing: FloppyImageBacking::File,
+    };
+    if let FloppyImageData::Tracks(tracks) = &mut image.data {
+        tracks.resize_with(168, || None);
+        tracks[167] = Some(FloppyTrackImage::AmigaDos(vec![0x69; 512]));
+    }
+    let bytes = transfer::encode(&image, 4096)?;
+    let received = FloppyImage::from_memory_bytes(bytes, "received".into(), false, 4096)?;
+    assert_eq!(
+        bincode::serialize(&received.data)?,
+        bincode::serialize(&image.data)?
+    );
+    assert!(received.legacy_extended_adf);
+    assert!(!received.write_protected);
+    assert_eq!(received.backing, FloppyImageBacking::Memory);
+    Ok(())
+}
+
+#[test]
+fn netplay_track_transfer_rejects_invalid_lengths_without_replacing_media() -> Result<()> {
+    let mut controller = FloppyController::default();
+    controller.insert_memory_disk_image_bytes(
+        0,
+        vec![0x5a; ADF_SIZE],
+        "existing.adf".into(),
+        false,
+    )?;
+    let mut raw = transfer::SIGNATURE.to_vec();
+    raw.extend_from_slice(&[0, 0, 1, 0, 2]); // flags, one raw track
+    raw.extend_from_slice(&16u32.to_le_bytes()); // bits
+    raw.extend_from_slice(&2u32.to_le_bytes()); // stored bytes
+    raw.extend_from_slice(&[1, 0]); // one revolution, no legacy sync
+    raw.extend_from_slice(&1u32.to_le_bytes()); // one word
+    raw.extend_from_slice(&0x4489u16.to_le_bytes());
+    raw.extend_from_slice(&u32::MAX.to_le_bytes()); // no cell times
+    raw.extend_from_slice(&u32::MAX.to_le_bytes()); // no density
+    assert!(transfer::decode(&raw).is_ok());
+    let mut invalid: Vec<Vec<u8>> = (0..raw.len()).map(|end| raw[..end].to_vec()).collect();
+    for (offset, value) in [(10, 169), (12, 3), (21, 0), (22, 2)] {
+        let mut bytes = raw.clone();
+        bytes[offset] = value;
+        invalid.push(bytes);
+    }
+    for offset in [13, 17, 23, 29, 33] {
+        // lengths and optional array counts
+        let mut bytes = raw.clone();
+        bytes[offset..offset + 4].copy_from_slice(&(u32::MAX - 1).to_le_bytes());
+        invalid.push(bytes);
+    }
+    let mut trailing = raw.clone();
+    trailing.push(0);
+    invalid.push(trailing);
+    for (start_bit, permille) in [(16u32, 1000u16), (0, 0)] {
+        let mut bytes = raw.clone();
+        bytes[33..37].copy_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&start_bit.to_le_bytes());
+        bytes.extend_from_slice(&permille.to_le_bytes());
+        invalid.push(bytes);
+    }
+    let mut unordered = raw.clone();
+    unordered[33..37].copy_from_slice(&2u32.to_le_bytes());
+    for start_bit in [4u32, 4] {
+        unordered.extend_from_slice(&start_bit.to_le_bytes());
+        unordered.extend_from_slice(&1000u16.to_le_bytes());
+    }
+    invalid.push(unordered);
+    for bytes in invalid {
+        assert!(controller
+            .insert_memory_disk_image_bytes_with_limit(0, bytes, "rejected".into(), false, 4096)
+            .is_err());
+    }
+    assert!(controller
+        .insert_memory_disk_image_bytes_with_limit(
+            0,
+            raw.clone(),
+            "too-large".into(),
+            false,
+            raw.len() - 1
+        )
+        .is_err());
+    assert_eq!(controller.export_disk_image(0)?, vec![0x5a; ADF_SIZE]);
     Ok(())
 }

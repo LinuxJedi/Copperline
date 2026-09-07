@@ -44,6 +44,18 @@ same cold setup, validate their initial fingerprints, then begin the input
 handshake. Guest launcher settings remain local. No remote emulator checkpoint
 is accepted or deserialized.
 
+Desktop setup exports standard ADFs directly. Track-based images use the
+versioned `CLFLOP01` media container rather than UAE extended ADF, which cannot
+carry IPF density profiles. It preserves all 168 possible track slots, raw MFM
+words, bit and stored lengths, revolution counts, legacy sync words, cell times
+and density spans. Counts are checked against the remaining payload before
+allocation; track geometry and timing spans are validated before insertion.
+Only the memory-backed loader accepts this container, and the existing 16 MiB
+floppy limit applies to its complete encoded size. It contains no controller
+state or paths and does not change the save-state format. Normal disk exports
+remain standard or UAE extended ADF; the extended ADF reader also accepts 168
+tracks, matching IPF and SCP exports.
+
 Setup and disk changes use a 32-packet selective-repeat window with cumulative
 and selective acknowledgements, sequence numbers and a 200 ms retransmission
 timer. Packets fit within the existing datagram bound and use the same peer and

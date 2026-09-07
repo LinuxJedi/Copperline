@@ -117,6 +117,10 @@ pages, including WHDLoad or supported hard-drive images. Enable **Netplay** on
 both computers. The guest receives the host's setup and needs no local copy of
 the game files.
 
+IPF disks work with both desktop connection methods. Setup preserves their
+raw tracks and protection-track timing, including all 168 track slots. They
+remain write-protected, just as in local play.
+
 ### Internet connections
 
 Choose **Connection → Internet** on both computers. This mode uses
