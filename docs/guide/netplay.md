@@ -288,6 +288,9 @@ keyboard typing enabled automatically. For two mice, pass
 `--port1 mouse --port2 mouse` on the host. Mixed mouse and joystick/CD32
 configurations also work on desktop.
 
+Audio output device selection (including Disabled), display preferences and
+host input preferences such as mouse sensitivity remain local to each player.
+
 For joystick/CD32 ports, press **F12** to switch between keyboard controller
 mode and typing on the Amiga keyboard. Typing mode sends keys such as Return and the arrows to the guest
 instead of consuming them as controller bindings. Keyboard input from the two

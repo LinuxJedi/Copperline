@@ -18,6 +18,29 @@ pub(super) const MAX_BUNDLE: usize = 512 * 1024 * 1024;
 pub(super) const FLOPPY_LIMIT: usize = 16 * 1024 * 1024;
 const MANIFEST_LIMIT: usize = 64 * 1024;
 
+/// The guest waits on a default machine, but its host presentation preferences
+/// still apply before and after receiving the host's emulated hardware.
+pub fn guest_config(local: &RawConfig) -> Result<Config> {
+    let mut raw = RawConfig {
+        display: local.display.clone(),
+        input: RawInput {
+            port1: None,
+            port2: None,
+            ..local.input.clone()
+        },
+        audio: RawAudio {
+            output_enabled: local.audio.output_enabled,
+            output_device: local.audio.output_device.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    raw.emulation.realtime_priority = local.emulation.realtime_priority;
+    raw.emulation.pacing_budget = local.emulation.pacing_budget.clone();
+    raw.serial.mode = Some("off".into());
+    Config::try_from(raw)
+}
+
 /// Turn directory mounts (including staged WHDLoad/--run volumes) into
 /// ordinary Amiga disk volumes. Their names and boot priorities survive;
 /// host-directory services and host file authority do not enter the game.
@@ -607,6 +630,31 @@ fn read_limited(path: &Path, limit: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_keeps_local_output_preferences_without_loading_local_game_settings() -> Result<()> {
+        let mut raw = RawConfig::default();
+        raw.cpu.model = Some("invalid local machine".into());
+        raw.rom = Some("missing-local.rom".into());
+        raw.whdload.game = Some("missing-local-game.lha".into());
+        raw.run_program_dir = Some("local-program-files".into());
+        raw.audio.output_enabled = Some(false);
+        raw.audio.output_device = Some("local output".into());
+        raw.display.full_screen = Some(true);
+        raw.input.mouse_sensitivity = Some(72);
+        raw.input.port1 = Some("analogue".into());
+        let cfg = guest_config(&raw)?;
+        assert!(!cfg.audio.output_enabled);
+        assert_eq!(cfg.audio.output_device.as_deref(), Some("local output"));
+        assert!(cfg.full_screen);
+        assert_eq!(cfg.mouse_sensitivity, 72);
+        assert_eq!(cfg.cpu, Config::default().cpu);
+        assert_eq!(cfg.port_devices, Config::default().port_devices);
+        assert!(cfg.run_program_dir.is_none());
+        assert_eq!(cfg.serial.mode, SerialMode::Off);
+        assert_ne!(cfg.rom_path, Path::new("missing-local.rom"));
+        Ok(())
+    }
 
     #[test]
     fn hardware_profiles_round_trip_without_host_paths() -> Result<()> {

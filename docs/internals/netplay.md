@@ -32,6 +32,8 @@ the shared input datagrams. The default `netplay-internet` feature adds iroh to
 native builds. The browser/core build keeps its existing transport boundary.
 
 The host sends a bounded JSON hardware manifest and checksummed media bytes.
+GUI and CLI guests retain local output, display and host input preferences on
+their placeholder machine while ignoring remembered machine and game settings.
 The manifest contains no host file paths, display/output preferences, plugin
 modules or host-device authority. Only generated filenames inside a private
 temporary directory reach the guest's machine builder. Both peers rebuild the

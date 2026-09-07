@@ -1387,10 +1387,11 @@ impl App {
         // The same validation Run has always used: the raw view through the
         // config pipeline (MachineSetup::build_config is exactly this over
         // its own to_raw()).
-        let mut cfg = Config::try_from(staged)?;
-        if guest {
-            cfg.serial.mode = crate::config::SerialMode::Off;
-        }
+        let mut cfg = if guest {
+            crate::netplay::guest_config(&raw)?
+        } else {
+            Config::try_from(staged)?
+        };
         if options.is_some() {
             crate::netplay::prepare_config(&mut cfg)?;
         }

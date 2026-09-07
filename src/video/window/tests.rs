@@ -11759,6 +11759,7 @@ fn netplay_gui_peers_connect_and_can_return_to_setup_and_retry() -> anyhow::Resu
                 );
                 assert!(app.ui.panel.is_none());
                 assert_eq!(app.emu.bus().emulated_cck(), 0);
+                assert_eq!(app.audio_output, crate::audio::AudioOutput::Disabled);
                 app.emu.set_paced(false);
                 // The launcher must leave the same frame-zero state as a direct CLI build.
                 let mut cfg = crate::config::Config::try_from(app.machine_config.clone())?;

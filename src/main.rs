@@ -793,10 +793,8 @@ fn main() -> Result<()> {
         .as_ref()
         .is_some_and(|options| options.settings().player == 1);
     let (cfg, mut raw_cfg) = if netplay_guest {
-        (
-            Config::default(),
-            load_raw_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?,
-        )
+        let raw = load_raw_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?;
+        (copperline::netplay::guest_config(&raw)?, raw)
     } else {
         load_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?
     };

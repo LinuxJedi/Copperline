@@ -12,6 +12,8 @@ pub mod internet;
 mod rollback;
 #[cfg(not(target_arch = "wasm32"))]
 mod setup;
+#[cfg(not(target_arch = "wasm32"))]
+pub use setup::guest_config;
 #[cfg(test)]
 mod tests;
 mod transport;
