@@ -423,8 +423,8 @@ belongs to the Amiga.
   A window effect only: captures stay untinted, the menu and the status bar
   keep their colours, and RTG scanout is never tinted.
 - **Fullscreen** (also `Cmd+F` / `Alt+F`): borderless fullscreen on the
-  window's current monitor. The picture keeps its aspect and letterboxes as
-  needed, exactly as when resizing the window.
+  window's current monitor. The picture keeps its aspect with black letterbox
+  bars as needed, exactly as when resizing the window.
 - **Status Bar** (also `Cmd+Shift+F` / `Alt+Shift+F`): show or hide the
   status bar. Handy alongside fullscreen for a clean, chrome-free picture.
 - **Monitor Bezel**: which monitor front the picture sits inside instead
