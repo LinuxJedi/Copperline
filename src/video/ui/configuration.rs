@@ -1901,18 +1901,15 @@ pub(in crate::video::ui) fn launcher_control_at(
         } else {
             0
         };
-        for (i, r) in launcher::rows(
-            state.tab,
-            state.setup.parallel_device(),
-            state.setup.serial_mode(),
-            state.setup.midi_out_is_mt32(),
-            state.setup.midi_out_is_csynth(),
-        )
-        .iter()
-        .filter(|r| state.setup.row_on_page(state.tab, r.field))
-        .enumerate()
+        for (i, r) in state
+            .rows()
+            .iter()
+            .filter(|r| state.setup.row_on_page(state.tab, r.field))
+            .enumerate()
         {
-            if !state.row_applies(r.field) {
+            if !state.row_applies(r.field)
+                && !launcher_second_action(r.field).is_some_and(|second| state.row_applies(second))
+            {
                 continue;
             }
             let row_y = launcher_row_y(rect, i) + row_offset;
@@ -2861,16 +2858,11 @@ pub(in crate::video::ui) fn draw_launcher(
     if state.tab == LauncherTab::Zorro {
         draw_launcher_zorro(frame, rect, state, hover, scale);
     } else {
-        for (i, r) in launcher::rows(
-            state.tab,
-            state.setup.parallel_device(),
-            state.setup.serial_mode(),
-            state.setup.midi_out_is_mt32(),
-            state.setup.midi_out_is_csynth(),
-        )
-        .iter()
-        .filter(|r| state.setup.row_on_page(state.tab, r.field))
-        .enumerate()
+        for (i, r) in state
+            .rows()
+            .iter()
+            .filter(|r| state.setup.row_on_page(state.tab, r.field))
+            .enumerate()
         {
             draw_launcher_row(frame, rect, state, r, i, row_offset, hover, scale);
         }
@@ -2924,13 +2916,22 @@ pub(in crate::video::ui) fn draw_launcher(
         draw_host_disk_page(frame, rect, state, hover, scale);
     }
     if state.tab == LauncherTab::Netplay {
-        let top = launcher_row_y(rect, 9) + row_offset;
-        for (i, line) in [
-            "Use the same machine, ROM and floppy contents.",
-            "Share one session code; choose opposite players.",
-            "Netplay sets digital ports, serial off and interpreter.",
-            "Run connects. F11 returns here. Settings last this session.",
-        ]
+        let top = launcher_row_y(rect, 10) + row_offset;
+        for (i, line) in if state.netplay.internet {
+            [
+                "Use the same build, machine, ROM and floppy contents.",
+                "Host: new invitation, copy code, then Run. Join: paste, Run.",
+                "Blank relay uses n0's public service; custom URL optional.",
+                "Run connects. F11 disconnects. Guest uses host timing.",
+            ]
+        } else {
+            [
+                "Use the same machine, ROM and floppy contents.",
+                "Share one session code; choose opposite players.",
+                "Netplay sets digital ports, serial off and interpreter.",
+                "Run connects. F11 returns here. Settings last this session.",
+            ]
+        }
         .iter()
         .enumerate()
         {

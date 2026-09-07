@@ -2909,6 +2909,22 @@ fn panels_render_into_their_rects() {
     assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
     save(&frame, "launcher-netplay");
 
+    #[cfg(feature = "netplay-internet")]
+    {
+        let mut state = LauncherState::new(launcher::MachineSetup::default());
+        state.toggle_netplay();
+        state.netplay.internet = true;
+        state.netplay.code = "CLNI1.eyJlbmRwb2ludCI6...".into();
+        state.tab = LauncherTab::Netplay;
+        let ui = UiState {
+            panel: Some(Panel::Launcher(Box::new(state))),
+            ..UiState::default()
+        };
+        let mut frame = vec![0u8; w * h * 4];
+        draw(&mut frame, scale, &ui, None, None);
+        save(&frame, "launcher-netplay-internet");
+    }
+
     // Configuration screen: the Input tab, with the live routing
     // summary spelled out under the rows (two joysticks, so the
     // numpad stand-in line shows).
@@ -4178,24 +4194,34 @@ fn panels_render_into_their_rects() {
 }
 #[test]
 fn netplay_controls_fit_and_are_reachable_by_mouse_and_navigation() {
+    check_netplay_controls(false, 0);
+}
+
+#[test]
+#[cfg(feature = "netplay-internet")]
+fn internet_netplay_controls_fit_and_are_reachable_by_mouse_and_navigation() {
+    check_netplay_controls(true, 0);
+    check_netplay_controls(true, 1);
+}
+
+fn check_netplay_controls(internet: bool, player: usize) {
     use crate::video::nav::{map, NavTarget};
     let mut state = LauncherState::new(launcher::MachineSetup::default());
     state.toggle_netplay();
+    state.netplay.internet = internet;
+    state.netplay.player = player;
     state.tab = LauncherTab::Netplay;
     let panel = Panel::Launcher(Box::new(state));
     let rect = panel_rect(&panel);
     let Panel::Launcher(state) = &panel else {
         unreachable!()
     };
-    let rows = launcher::rows(
-        state.tab,
-        state.setup.parallel_device(),
-        state.setup.serial_mode(),
-        false,
-        false,
-    );
+    let rows = state.rows();
     let mut controls = Vec::new();
     for (i, row) in rows.iter().enumerate() {
+        if !state.row_applies(row.field) && row.kind != RowKind::Action {
+            continue;
+        }
         let y = launcher_row_y(rect, i);
         let targets = match row.kind {
             RowKind::Toggle => vec![(
@@ -4242,6 +4268,11 @@ fn netplay_controls_fit_and_are_reachable_by_mouse_and_navigation() {
             _ => panic!("unexpected netplay widget"),
         };
         for (at, control) in targets {
+            if control == UiControl::LauncherNetplayAction(LauncherField::NetplayNewCode)
+                && !state.row_applies(LauncherField::NetplayNewCode)
+            {
+                continue;
+            }
             assert!(at.x >= rect.x && at.x + at.w <= rect.x + rect.w);
             assert!(at.y + at.h < launcher_status_y(rect));
             let point = ((at.x + at.w / 2) as i32, (at.y + at.h / 2) as i32);

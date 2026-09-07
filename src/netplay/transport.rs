@@ -7,12 +7,69 @@ use anyhow::{ensure, Result};
 use std::collections::VecDeque;
 
 pub trait Transport {
+    fn route(&self) -> &'static str {
+        "direct"
+    }
+    /// Connection setup may continue off-thread while the cold machine waits.
+    fn ready(&mut self) -> Result<bool> {
+        Ok(true)
+    }
     /// Read one complete packet without blocking. None means the queue is empty;
     /// a returned length must fit the supplied buffer. Some(0) means a packet
     /// was consumed and discarded (for example, a foreign UDP source).
     fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<usize>>;
     /// False means the transport is temporarily unable to accept this packet.
     fn send(&mut self, packet: &[u8]) -> Result<bool>;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub enum NativeTransport {
+    Udp(UdpTransport),
+    #[cfg(feature = "netplay-internet")]
+    Internet(Box<super::internet::InternetTransport>),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Transport for NativeTransport {
+    fn route(&self) -> &'static str {
+        match self {
+            Self::Udp(_) => "UDP",
+            #[cfg(feature = "netplay-internet")]
+            Self::Internet(t) => t.route(),
+        }
+    }
+    fn ready(&mut self) -> Result<bool> {
+        match self {
+            Self::Udp(t) => t.ready(),
+            #[cfg(feature = "netplay-internet")]
+            Self::Internet(t) => t.ready(),
+        }
+    }
+    fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<usize>> {
+        match self {
+            Self::Udp(t) => t.receive(buffer),
+            #[cfg(feature = "netplay-internet")]
+            Self::Internet(t) => t.receive(buffer),
+        }
+    }
+    fn send(&mut self, packet: &[u8]) -> Result<bool> {
+        match self {
+            Self::Udp(t) => t.send(packet),
+            #[cfg(feature = "netplay-internet")]
+            Self::Internet(t) => t.send(packet),
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl NativeTransport {
+    pub(super) fn socket(&self) -> &std::net::UdpSocket {
+        match self {
+            Self::Udp(t) => &t.socket,
+            #[cfg(feature = "netplay-internet")]
+            _ => panic!("expected UDP transport"),
+        }
+    }
 }
 
 /// The browser feeds incoming data-channel packets and drains outgoing packets.

@@ -102,11 +102,11 @@ pub(in crate::video::ui) fn launcher_row_control_at(
             }
         }
         RowKind::Action => {
-            if launcher_action_rect(rect, row_y).contains(pos) {
+            if state.row_applies(r.field) && launcher_action_rect(rect, row_y).contains(pos) {
                 return Some(launcher_row_action(r.field));
             }
             if let Some(second) = launcher_second_action(r.field) {
-                if launcher_action2_rect(rect, row_y).contains(pos) {
+                if state.row_applies(second) && launcher_action2_rect(rect, row_y).contains(pos) {
                     return Some(launcher_row_action(second));
                 }
             }
@@ -715,7 +715,7 @@ pub(in crate::video::ui) fn draw_launcher_row(
                     frame,
                     launcher_action2_rect(rect, row_y),
                     &label,
-                    !disabled,
+                    state.row_applies(second),
                     lit(hover, launcher_row_action(second)),
                     scale,
                 );

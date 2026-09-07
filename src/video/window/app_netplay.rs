@@ -7,7 +7,7 @@ use super::*;
 impl App {
     pub fn attach_netplay(&mut self, session: crate::netplay::Session) {
         self.netplay_setup = Some(crate::video::launcher::NetplaySetup::from(
-            session.options(),
+            &session.options(),
         ));
         self.netplay = Some(session);
         self.netplay_input = Default::default();
@@ -29,14 +29,21 @@ impl App {
             return;
         };
         state.edit_commit();
-        if !state.netplay.enabled || state.editing().is_some() {
+        if !state.netplay.field_enabled(field) || state.editing().is_some() {
             return;
         }
         if field == LauncherField::NetplayNewCode {
-            state.netplay.new_code();
-            state.status = Some(StatusMessage::ok("Share this code with the other player"));
+            state.status = Some(match state.netplay.generate_code() {
+                Ok(()) => StatusMessage::ok("Copy this code to the other player, then press Run"),
+                Err(error) => StatusMessage::err(error.to_string()),
+            });
         } else if field == LauncherField::NetplayCopyCode {
-            if let Err(error) = crate::netplay::parse_session_id(&state.netplay.code) {
+            let valid = if state.netplay.internet {
+                state.netplay.connection_options().map(|_| ())
+            } else {
+                crate::netplay::parse_session_id(&state.netplay.code).map(|_| ())
+            };
+            if let Err(error) = valid {
                 state.status = Some(StatusMessage::err(error.to_string()));
                 return;
             }
@@ -117,18 +124,17 @@ impl App {
         let connected = before.connected;
         let stepped = session.step_local(&mut self.emu, &mut self.netplay_input, true)?;
         let after = session.status();
+        let route = session.route();
         if after.rollbacks != before.rollbacks {
             self.reset_render_pipeline();
         }
         if !connected && after.connected {
-            self.show_osd(
-                if self.mouse_port().is_some() {
-                    "Netplay connected: mouse controls your port"
-                } else {
-                    "Netplay connected: arrows + right Ctrl, or gamepad"
-                }
-                .to_string(),
-            );
+            let controls = if self.mouse_port().is_some() {
+                "Netplay connected: mouse controls your port"
+            } else {
+                "Netplay connected: arrows + right Ctrl, or gamepad"
+            };
+            self.show_osd(format!("{controls} ({route})"));
         }
         if !stepped {
             self.emu.reanchor_realtime_clock();

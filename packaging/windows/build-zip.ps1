@@ -38,6 +38,8 @@ $stageName = "Copperline-$version-win-$arch"
 $stage = Join-Path $repoRoot $stageName
 $zipPath = Join-Path $repoRoot "$stageName.zip"
 
+& (Join-Path $here "enable-clang.ps1") -Target $target
+
 Write-Host "==> Building release binary ($target)"
 cargo build --release --locked --target $target
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }

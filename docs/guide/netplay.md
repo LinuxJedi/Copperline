@@ -7,9 +7,10 @@ remote input, then restores and replays frames when that prediction was wrong.
 This follows the approach described by [GGPO](https://github.com/pond3r/ggpo);
 it uses Copperline's own Rust implementation and wire protocol.
 
-Sessions connect directly to a known peer. Desktop builds use UDP; browsers use
-WebRTC with private room invitations and TURN relay fallback when the page has a
-room service configured. Manual connection codes remain available.
+Desktop builds offer direct UDP connections by IP address or encrypted Internet
+connections with automatic NAT traversal and relay fallback. Browsers use WebRTC
+with private room invitations and TURN relay fallback when the page has a room
+service configured. Browser manual connection codes remain available.
 There is no public lobby, spectator mode or automatic reconnect. Browser and desktop peers
 cannot connect to each other. Use the same Copperline build on both machines;
 mixed operating systems and browser engines have not yet been qualified.
@@ -114,7 +115,52 @@ Open **Machine Configuration → Netplay** (or start Copperline with no argument
 Choose the machine, ROM and floppy images on the existing configuration pages,
 then enable **Netplay** on both computers.
 
-![Netplay setup in the configuration screen](../images/ui-preview-launcher-netplay.png)
+### Internet connections
+
+Choose **Connection → Internet** on both computers. This mode uses
+[iroh](https://docs.rs/iroh/1.1.0/iroh/) to establish an encrypted connection and
+find a direct route through NAT. If a direct route is unavailable, packets travel
+through an HTTPS relay. No port forwarding is normally needed.
+
+![Internet netplay setup](../images/ui-preview-launcher-netplay-internet.png)
+
+1. The host chooses **Host (port 1)**, sets **Input delay** and **Rollback limit**,
+   then clicks **New invitation** and **Copy code**. Send that code privately to
+   the other player, then click **Run**.
+2. The guest chooses **Join (port 2)**, pastes the code into **Invitation**, and
+   clicks **Run**. The invitation supplies the host's timing and relay settings.
+   Both players still select matching machine settings, ROMs and floppy images
+   locally; desktop invitations do not transfer game files.
+3. The cold machine waits for the peer before running. The connection message
+   reports the route; the log records changes between direct and relay paths.
+   **F11** cancels setup or disconnects play. Setup times out after 15 minutes.
+
+Leave **Relay server** blank to use n0's public iroh relays. These are external services,
+with rate limits and availability controlled by their operator; n0 describes them
+as suitable for development and testing. For sustained use, the host can enter
+the HTTPS URL of a [self-hosted iroh relay](https://github.com/n0-computer/iroh/tree/main/iroh-relay).
+This field takes an iroh relay, not a STUN/TURN server. The invitation carries its
+relay addresses, so the guest needs no separate server setup. Address lookup
+services are not used. See [iroh's relay guidance](https://docs.iroh.computer/about/faq).
+
+**Route → Relay only** disables direct IP paths for troubleshooting or when you
+prefer to keep peer traffic on the relay. Relay operators can observe connection
+metadata and traffic volume, but the payload is encrypted end to end. Share the
+invitation privately: it identifies the host and authorizes one guest. Host keys
+stay in memory and are never included in invitations or saved configurations.
+Generate a new invitation for a new game, or after changing host timing or relay
+settings. A relay outage can prevent connection; **Direct IP** remains available
+for reachable peers. Networks that also block the relay's HTTPS connection may
+still require a permitted network path.
+
+Internet support is included in default native builds by the `netplay-internet`
+Cargo feature. Browser and desktop invitation formats are separate.
+
+### Direct IP connections
+
+Choose **Connection → Direct IP (UDP)** on both computers.
+
+![Direct IP netplay setup](../images/ui-preview-launcher-netplay.png)
 
 1. Choose **Player 1** on one computer and **Player 2** on the other.
 2. Leave **Local address** at `0.0.0.0:19732` to listen on all local IPv4
@@ -143,7 +189,7 @@ settings and press Run on both peers to start again from cold boot. The peer
 addresses, session code, player and delay/window settings are kept for the current
 app session; Save does not put them in machine configuration files.
 
-The GUI and CLI use the same protocol and can connect to each other.
+The GUI and CLI can connect to each other when both select the same transport.
 An app started with a control or GDB endpoint must be restarted without that
 endpoint before enabling netplay in the GUI.
 
@@ -155,7 +201,27 @@ differ between computers; Copperline checks the loaded contents. Put any
 additional disks in the other configured drives before starting. Media swaps
 are unavailable during a session.
 
-For example, on a LAN where the players are `192.168.1.10` and `192.168.1.11`:
+For Internet play, the host writes an invitation to a file:
+
+```sh
+copperline --factory --model A500 --serial off --port1 joystick --port2 joystick \
+  --netplay-host invitation.txt --insert-disk-after 0 df0 game.adf KICK13.ROM
+```
+
+The guest copies the code from that file and supplies it as one argument:
+
+```sh
+copperline --factory --model A500 --serial off --port1 joystick --port2 joystick \
+  --netplay-join 'CLNI1.PASTE_THE_FULL_CODE_HERE' \
+  --insert-disk-after 0 df0 game.adf KICK13.ROM
+```
+
+The host may add `--netplay-relay https://relay.example.com` for a custom iroh
+relay. Either peer may add `--netplay-relay-only`. The host chooses
+`--netplay-delay` and `--netplay-rollback`; the guest inherits them. Internet
+flags cannot be combined with direct IP, player or session-ID flags.
+
+For direct IP play on a LAN where the players are `192.168.1.10` and `192.168.1.11`:
 
 ```sh
 # Player 1, on 192.168.1.10:
@@ -176,7 +242,7 @@ peer; `openssl rand -hex 16` generates one. The example ID is illustrative.
 Allow the chosen UDP port through each host's firewall. Across the internet,
 both endpoints must be reachable at the addresses given to the other peer,
 usually through port forwarding or a private VPN. A VPN also supplies transport
-encryption and authentication: the netplay protocol itself sends inputs in
+encryption and authentication: the direct UDP transport sends inputs in
 cleartext, and its session ID distinguishes games rather than authenticating a
 person. Connect only to a trusted peer.
 
@@ -235,6 +301,21 @@ answer has a 60-second limit. Waiting for a player to paste a code has no timer.
 Audio plays once on the initial execution of a frame. Replayed frames are silent.
 A sound already played from an incorrect prediction cannot be taken back, so
 large corrections can produce audible as well as visual discontinuities.
+
+## Desktop diagnostics
+
+The console normally shows connection status, route changes and the final frame
+summary, plus warnings and errors. Detailed Internet transport and tracing logs
+are disabled by default. To enable them for troubleshooting, set the environment
+variable before starting Copperline:
+
+```sh
+COPPERLINE_NETPLAY_DEBUG=1 ./target/release/copperline
+```
+
+The flag is read once at startup; unset it to return to normal logging. Detailed
+transport logs can include peer and relay addresses. An explicit `RUST_LOG`
+setting takes precedence over this logging preset, including the debug flag.
 
 ## Supported machines and verification
 

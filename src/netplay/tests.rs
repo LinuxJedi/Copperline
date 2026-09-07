@@ -376,8 +376,8 @@ fn udp_pair_with_delay(delay: u8, window: u8) -> Result<()> {
         Session::new(session_options(1)?, &mut machines[1], &safe_config()?)?,
     ];
     let destinations = [
-        sessions[0].transport.socket.local_addr()?,
-        sessions[1].transport.socket.local_addr()?,
+        sessions[0].transport.socket().local_addr()?,
+        sessions[1].transport.socket().local_addr()?,
     ];
     let mut queued = Vec::<(u64, usize, Vec<u8>)>::new();
     let mut packets = 0u64;
@@ -447,7 +447,7 @@ fn mismatch_desync_and_disconnect_stop_the_session() -> Result<()> {
         inputs: vec![],
         checksum: None,
     };
-    peer.send_to(&packet.encode(), session.transport.socket.local_addr()?)?;
+    peer.send_to(&packet.encode(), session.transport.socket().local_addr()?)?;
     assert!(poll_error(&mut session, &mut emu)
         .to_string()
         .contains("mismatch"));
@@ -463,7 +463,7 @@ fn mismatch_desync_and_disconnect_stop_the_session() -> Result<()> {
     session.rollback.received = 60;
     session.rollback.hashes.insert(60, [1; 32]);
     packet.checksum = Some((60, [2; 32]));
-    peer.send_to(&packet.encode(), session.transport.socket.local_addr()?)?;
+    peer.send_to(&packet.encode(), session.transport.socket().local_addr()?)?;
     assert!(poll_error(&mut session, &mut emu)
         .to_string()
         .contains("desynchronized"));
@@ -524,7 +524,7 @@ fn capture_waits_for_the_peer_to_acknowledge_retransmitted_local_input() -> Resu
         inputs: vec![(0, input(0, 1))],
         checksum: None,
     };
-    peer.send_to(&packet.encode(), session.transport.socket.local_addr()?)?;
+    peer.send_to(&packet.encode(), session.transport.socket().local_addr()?)?;
     for _ in 0..100 {
         if session.step(&mut emu, input(0, 0), true)? {
             break;
@@ -555,7 +555,7 @@ fn capture_waits_for_the_peer_to_acknowledge_retransmitted_local_input() -> Resu
     );
     assert!(!session.status().ready_to_capture());
     packet.ack = 1;
-    peer.send_to(&packet.encode(), session.transport.socket.local_addr()?)?;
+    peer.send_to(&packet.encode(), session.transport.socket().local_addr()?)?;
     for _ in 0..100 {
         session.step(&mut emu, Input::default(), false)?;
         if session.status().ready_to_capture() {
@@ -855,5 +855,108 @@ fn large_pending_mouse_motion_reaches_the_wire_without_truncation() -> Result<()
         (x + i32::from(input.mouse_dx), y + i32::from(input.mouse_dy))
     });
     assert_eq!(total, (70_000, -90_000));
+    Ok(())
+}
+
+#[cfg(feature = "netplay-internet")]
+#[test]
+#[ignore = "uses public Internet relays; run explicitly with network access"]
+fn internet_netplay_automatic_confirms_machine_states() -> Result<()> {
+    internet_pair(false)
+}
+
+#[cfg(feature = "netplay-internet")]
+#[test]
+#[ignore = "uses public Internet relays with UDP disabled; run explicitly with network access"]
+fn internet_netplay_relay_only_confirms_machine_states() -> Result<()> {
+    internet_pair(true)
+}
+
+#[cfg(feature = "netplay-internet")]
+fn internet_pair(relay_only: bool) -> Result<()> {
+    let host = internet::Options::host(2, 8, "", relay_only)?;
+    let guest = internet::Options::join(&host.invitation.encode()?, relay_only)?;
+    let mut machines = [emulator()?, emulator()?];
+    let cfg = safe_config()?;
+    let mut sessions = [
+        Session::new(
+            ConnectionOptions::Internet(Box::new(host)),
+            &mut machines[0],
+            &cfg,
+        )?,
+        Session::new(
+            ConnectionOptions::Internet(Box::new(guest)),
+            &mut machines[1],
+            &cfg,
+        )?,
+    ];
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while std::time::Instant::now() < deadline {
+        for player in 0..2 {
+            let frame = sessions[player].status().frame;
+            sessions[player].step(
+                &mut machines[player],
+                input(frame, player as u64),
+                frame < 180,
+            )?;
+        }
+        if sessions
+            .iter()
+            .all(|s| s.status().frame == 180 && s.status().ready_to_capture())
+        {
+            assert_eq!(
+                machines[0].netplay_snapshot()?,
+                machines[1].netplay_snapshot()?
+            );
+            assert!(sessions.iter().all(|s| s.status().checked_frame >= 120));
+            if relay_only {
+                assert!(sessions.iter().all(|s| s.route() == "relay"));
+            }
+            eprintln!(
+                "Internet netplay: 180 matching frames; routes: {}, {}",
+                sessions[0].route(),
+                sessions[1].route()
+            );
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    anyhow::bail!("Internet peers did not confirm 180 frames before the deadline")
+}
+
+#[test]
+fn pending_transport_holds_cold_boot_and_input_until_setup_finishes() -> Result<()> {
+    struct Pending;
+    impl Transport for Pending {
+        fn ready(&mut self) -> Result<bool> {
+            Ok(false)
+        }
+        fn receive(&mut self, _: &mut [u8]) -> Result<Option<usize>> {
+            panic!("setup is pending")
+        }
+        fn send(&mut self, _: &[u8]) -> Result<bool> {
+            panic!("setup is pending")
+        }
+    }
+    let mut emu = emulator()?;
+    let mut peer = Connection::with_transport(
+        Settings {
+            player: 0,
+            session: [42; 16],
+            input_delay: 2,
+            rollback_frames: 8,
+        },
+        Pending,
+        &mut emu,
+        &safe_config()?,
+    )?;
+    let before = emu.netplay_snapshot()?;
+    let mut input = LocalInput::default();
+    input.add_mouse_delta(10, -20);
+    peer.started = Instant::now() - Duration::from_secs(90);
+    assert!(!peer.step_local(&mut emu, &mut input, true)?);
+    assert_eq!(input.mouse_pending, (10, -20));
+    assert_eq!(peer.status().frame, 0);
+    assert_eq!(before, emu.netplay_snapshot()?);
     Ok(())
 }

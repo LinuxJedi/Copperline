@@ -5758,3 +5758,56 @@ fn netplay_preserves_each_supported_port_device() {
         assert_eq!(state.setup.port_devices, [expected; 2]);
     }
 }
+
+#[cfg(feature = "netplay-internet")]
+#[test]
+fn internet_netplay_launcher_shares_invitation_and_adopts_host_timing() -> Result<()> {
+    let mut host = LauncherState::new(MachineSetup::default());
+    host.toggle_netplay();
+    host.tab = LauncherTab::Netplay;
+    host.netplay.cycle(F::NetplayMode, true);
+    host.netplay.delay = 6;
+    host.netplay.rollback = 12;
+    host.netplay.generate_code()?;
+    assert!(host.netplay.connection_options()?.is_some());
+    assert!(host.rows().iter().any(|row| row.field == F::NetplayRelay));
+    assert!(!host.row_applies(F::NetplayBind));
+    let mut guest = LauncherState::new(MachineSetup::default());
+    guest.toggle_netplay();
+    guest.netplay.cycle(F::NetplayMode, true);
+    guest.netplay.cycle(F::NetplayPlayer, true);
+    guest.begin_edit_netplay(F::NetplayCode);
+    for c in host.netplay.code.chars() {
+        guest.edit_push(c);
+    }
+    guest.edit_commit();
+    assert_eq!(guest.netplay.delay, 6);
+    assert_eq!(guest.netplay.rollback, 12);
+    let options = guest.netplay.connection_options()?.unwrap();
+    assert_eq!(options.settings().player, 1);
+    assert_eq!(options.settings().input_delay, 6);
+    assert_eq!(options.settings().rollback_frames, 12);
+    assert!(!guest.row_applies(F::NetplayDelay));
+    assert!(!guest.row_applies(F::NetplayRelay));
+    assert!(!guest.row_applies(F::NetplayNewCode));
+    assert!(guest.row_applies(F::NetplayCopyCode));
+    assert!(
+        !LauncherState::from_raw(&host.setup.to_raw())
+            .netplay
+            .internet
+    );
+    host.netplay.delay = 2;
+    assert!(host.netplay.connection_options().is_err());
+    host.netplay.generate_code()?;
+    assert!(host.netplay.connection_options().is_ok());
+    host.begin_edit_netplay(F::NetplayRelay);
+    host.clear_netplay_edit();
+    for c in "https://relay.example.com".chars() {
+        host.edit_push(c);
+    }
+    host.edit_commit();
+    assert!(host.netplay.connection_options().is_err());
+    host.netplay.generate_code()?;
+    assert!(host.netplay.connection_options().is_ok());
+    Ok(())
+}
