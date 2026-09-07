@@ -4,6 +4,9 @@
 
 use super::*;
 
+pub(super) type DiskPicker =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<rfd::FileHandle>>>>>;
+
 impl App {
     pub fn attach_netplay(&mut self, session: crate::netplay::Session) {
         self.netplay_setup = Some(crate::video::launcher::NetplaySetup::from(
@@ -66,6 +69,7 @@ impl App {
     }
 
     pub(super) fn leave_netplay(&mut self, error: Option<String>) {
+        self.netplay_disk_picker = None;
         self.set_mouse_captured(false);
         self.netplay = None;
         self.netplay_input = Default::default();
@@ -119,12 +123,50 @@ impl App {
     }
 
     pub(super) fn step_netplay(&mut self) -> Result<bool> {
+        if let Some((drive, picker)) = &mut self.netplay_disk_picker {
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            if let std::task::Poll::Ready(files) = picker.as_mut().poll(&mut context) {
+                let drive = *drive;
+                self.netplay_disk_picker = None;
+                if let Some(files) = files {
+                    self.insert_disk_playlist(
+                        drive,
+                        files.into_iter().map(|f| f.path().to_path_buf()).collect(),
+                    );
+                }
+            }
+        }
         let session = self.netplay.as_mut().unwrap();
         let before = session.status();
         let connected = before.connected;
         let stepped = session.step_local(&mut self.emu, &mut self.netplay_input, true)?;
         let after = session.status();
         let route = session.route();
+        let config = session.take_config();
+        let progress = session.take_progress();
+        let guest = session.player() == 1;
+        if let Some(cfg) = config {
+            self.netplay_input = Default::default();
+            self.netplay_keyboard_controller = self.mouse_port().is_none();
+            self.keyboard_joy_held = Default::default();
+            self.about_machine_lines = crate::config::about_machine_lines(&cfg);
+            self.disk_write_protected = std::array::from_fn(|drive| {
+                self.emu
+                    .bus()
+                    .floppy
+                    .disk_image_write_protected(drive)
+                    .unwrap_or(true)
+            });
+            if guest {
+                self.disk_playlists = Default::default();
+                self.disk_playlist_index = [0; 4];
+            }
+            self.reset_render_pipeline();
+        }
+        if let Some(progress) = progress {
+            log::debug!(target: "copperline::netplay", "netplay: {progress}");
+            self.show_osd(progress);
+        }
         if after.rollbacks != before.rollbacks {
             self.reset_render_pipeline();
         }
@@ -160,13 +202,17 @@ impl App {
         }
         loop {
             let session = self.netplay.as_mut().unwrap();
+            if session.ready_to_capture() {
+                return Ok(());
+            }
             let before = session.status().rollbacks;
             session.step_local(&mut self.emu, &mut self.netplay_input, false)?;
             let status = session.status();
+            let ready = session.ready_to_capture();
             if status.rollbacks != before {
                 self.reset_render_pipeline();
             }
-            if status.ready_to_capture() {
+            if ready {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -202,6 +248,9 @@ impl App {
                     match code {
                         KeyCode::KeyQ => event_loop.exit(),
                         KeyCode::KeyF => self.toggle_fullscreen(),
+                        KeyCode::KeyD if self.netplay.as_ref().is_some_and(|s| s.player() == 0) => {
+                            self.cycle_disk()
+                        }
                         KeyCode::KeyG if self.mouse_port().is_some() => {
                             self.set_mouse_captured(!self.mouse_captured)
                         }
@@ -256,6 +305,7 @@ impl App {
                 true
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let previous_cursor_pos = self.cursor_pos;
                 self.last_cursor_phys = Some(*position);
                 let display_src = self.display_canvas_src();
                 let pos = self
@@ -263,13 +313,20 @@ impl App {
                     .as_ref()
                     .and_then(|r| main_cursor_position(r, display_src, *position));
                 self.cursor_pos = pos;
+                if bar_hover_changed(&bar_layout(&self.media_bar()), previous_cursor_pos, pos) {
+                    self.request_redraw();
+                }
                 if !self.mouse_captured && self.main_window_focused {
                     self.track_uncaptured_cursor_motion(pos);
                 }
                 true
             }
             WindowEvent::CursorLeft { .. } => {
+                let previous_cursor_pos = self.cursor_pos;
                 self.cursor_pos = None;
+                if bar_hover_changed(&bar_layout(&self.media_bar()), previous_cursor_pos, None) {
+                    self.request_redraw();
+                }
                 self.last_display_cursor_pos = None;
                 if !self.mouse_captured {
                     self.release_mouse_buttons();
@@ -277,6 +334,24 @@ impl App {
                 true
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if *state == ElementState::Pressed
+                    && *button == MouseButton::Left
+                    && !self.mouse_captured
+                    && self.cursor_pos.is_some_and(cursor_in_status_bar)
+                {
+                    if let Some(pos) = self.cursor_pos {
+                        let layout = bar_layout(&self.media_bar());
+                        if let Some(
+                            control @ (BarControl::DriveLoad(_)
+                            | BarControl::DriveSwap(_)
+                            | BarControl::DriveEject(_)),
+                        ) = control_at(pos, &layout)
+                        {
+                            self.activate_bar_control(control);
+                        }
+                    }
+                    return true;
+                }
                 if self.mouse_port().is_some() && self.main_window_focused {
                     let pressed = *state == ElementState::Pressed;
                     let over_display = self.cursor_pos.is_some_and(cursor_in_display);
@@ -309,6 +384,9 @@ impl App {
             | WindowEvent::ScaleFactorChanged { .. }
             | WindowEvent::RedrawRequested
             | WindowEvent::Occluded(_) => false,
+            WindowEvent::HoveredFile(_)
+            | WindowEvent::HoveredFileCancelled
+            | WindowEvent::DroppedFile(_) => false,
             _ => true,
         }
     }

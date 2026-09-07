@@ -66,6 +66,15 @@ pub fn build_image(
     volume_name: &str,
     filesystem: crate::diskimage::FileSystem,
 ) -> anyhow::Result<Vec<u8>> {
+    build_image_limited(dir, volume_name, filesystem, MAX_IMAGE_BYTES)
+}
+
+pub(crate) fn build_image_limited(
+    dir: &Path,
+    volume_name: &str,
+    filesystem: crate::diskimage::FileSystem,
+    limit: u64,
+) -> anyhow::Result<Vec<u8>> {
     // Only `ffs`/plain-vs-not matters here: Kickstart 1.3 (the reason OFS
     // exists as an option at all) has no intl/dircache/longname support
     // either, so callers are only ever expected to pass FileSystem::OFS or
@@ -91,13 +100,13 @@ pub fn build_image(
         }
         total = rounded;
     }
-    if total * BSIZE as u64 > MAX_IMAGE_BYTES {
+    if total * BSIZE as u64 > limit {
         anyhow::bail!(
             "directory {} needs a {} MiB volume; refusing to build an in-memory \
              image larger than {} MiB",
             dir.display(),
             (total * BSIZE as u64) >> 20,
-            MAX_IMAGE_BYTES >> 20
+            limit >> 20
         );
     }
 

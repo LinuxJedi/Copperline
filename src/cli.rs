@@ -1447,9 +1447,7 @@ where
             options.validate()?;
             copperline::netplay::ConnectionOptions::Direct(options)
         };
-        if run.is_some()
-            || whdload.is_some()
-            || load_state.is_some()
+        if load_state.is_some()
             || load_uss.is_some()
             || benchmark_until.is_some()
             || gdb.is_some()
@@ -1469,15 +1467,12 @@ where
             || !mouse_after.is_empty()
             || !mouse_to_after.is_empty()
             || !pot_after.is_empty()
-            || disk_insert_after.iter().any(|d| match d {
-                CliDiskInsert::Explicit(s) => s.secs != 0.0,
-                CliDiskInsert::Configured { secs, .. } => *secs != 0.0,
-            })
+            || (options.settings().player == 1 && !disk_insert_after.is_empty())
             || joy_after
                 .iter()
                 .any(|j| usize::from(j.3) != options.settings().player)
         {
-            bail!("netplay supports cold boot, disks inserted at time 0, local-port --joy-after and keyboard input; state loads, media changes, scripted mouse/analogue input, debugging, warp and recording are unavailable");
+            bail!("netplay supports cold boot, host floppy changes, local-port --joy-after and keyboard input; state loads, guest media changes, scripted mouse/analogue input, debugging, warp and recording are unavailable");
         }
         Some(options)
     } else {

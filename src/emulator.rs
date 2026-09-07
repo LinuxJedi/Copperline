@@ -3306,6 +3306,89 @@ pub fn build_machine(
     paced: bool,
     rom_optional: bool,
 ) -> Result<Emulator> {
+    build_machine_inner(cfg, audio, paced, rom_optional, cfg.netplay_storage)
+}
+
+/// Build a cold machine whose hard-drive writes belong only to this session.
+/// Callers validate the config and supply local, staged media paths.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn build_netplay_machine(
+    cfg: &Config,
+    audio: Box<dyn AudioSink>,
+    paced: bool,
+) -> Result<Emulator> {
+    build_machine_inner(cfg, audio, paced, false, true)
+}
+
+fn build_machine_inner(
+    cfg: &Config,
+    audio: Box<dyn AudioSink>,
+    paced: bool,
+    rom_optional: bool,
+    netplay: bool,
+) -> Result<Emulator> {
+    let open_disk = |path: &std::path::Path,
+                     name: &str,
+                     bus: &'static str,
+                     volume: Option<&str>,
+                     priority: i8,
+                     filesystem: crate::diskimage::FileSystem| {
+        if netplay {
+            let mut disk = crate::harddrive::HardDriveImage::open_session(
+                path, name, bus, volume, priority, filesystem,
+            )?;
+            disk.set_session_read_only(cfg.netplay_read_only.iter().any(|p| p == path));
+            Ok(disk)
+        } else {
+            crate::harddrive::HardDriveImage::open(path, name, bus, volume, priority, filesystem)
+        }
+    };
+    let open_ide_target = |path: &std::path::Path,
+                           unit: usize,
+                           volume: Option<&str>,
+                           priority: i8,
+                           filesystem: crate::diskimage::FileSystem| {
+        if netplay {
+            anyhow::ensure!(
+                !crate::config::is_cd_image_path(path),
+                "netplay cannot use ATAPI CD images"
+            );
+            let disk = open_disk(
+                path,
+                &format!("DH{unit}"),
+                "ide",
+                volume,
+                priority,
+                filesystem,
+            )?;
+            Ok(crate::ata::AtaDevice::from(
+                crate::ata::IdeDrive::from_disk(disk),
+            ))
+        } else {
+            open_ide_target(path, unit, volume, priority, filesystem)
+        }
+    };
+    let open_scsi_target = |drive: &crate::config::DriveImage, unit| {
+        if netplay {
+            anyhow::ensure!(
+                !crate::config::is_cd_image_path(&drive.path),
+                "netplay cannot use SCSI CD images"
+            );
+            let disk = open_disk(
+                &drive.path,
+                &format!("DH{unit}"),
+                "scsi",
+                drive.volume_name.as_deref(),
+                drive.boot_pri,
+                drive.filesystem,
+            )?;
+            Ok(crate::scsi::ScsiTarget::from(
+                crate::scsi::ScsiDisk::from_disk(disk),
+            ))
+        } else {
+            open_scsi_target(drive, unit)
+        }
+    };
     let mut zorro = cfg.build_zorro_chain()?;
     // Functional Zorro-chain boards. Each board's autoconfig identity goes on
     // the chain (mapping its window to a device slot) while the device object
@@ -3484,7 +3567,7 @@ pub fn build_machine(
         let mut board = crate::copperhf::CopperhfBoard::new();
         for (unit, drive) in cfg.copperhf.units.iter().enumerate() {
             let Some(drive) = drive else { continue };
-            let disk = crate::harddrive::HardDriveImage::open(
+            let disk = open_disk(
                 &drive.path,
                 &format!("DH{unit}"),
                 "copperhf",

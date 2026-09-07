@@ -20,14 +20,57 @@ The implementation follows five steps:
 These steps are implemented in `src/netplay/`, `Emulator::step_netplay_frame`,
 `src/video/window/app_netplay.rs`, `crates/copperline-web/src/netplay.rs` and
 `crates/copperline-web/www/netplay.js`. The feature uses native Rust and does not
-link the GGPO SDK. Public matchmaking, spectators, reconnect, desktop media
-transfers, and transactional host filesystems remain separate work.
+link the GGPO SDK. Public matchmaking, spectators, reconnect and persistent
+host filesystem writes remain separate work.
 
 ## Native Internet transport
 
-`Session` is a `Connection<NativeTransport>`; the adapter selects direct UDP or
-`InternetTransport`. The default `netplay-internet` feature adds iroh to native
-builds. The browser/core build keeps its existing transport boundary.
+`Session` coordinates setup and media around a
+`Connection<Control<NativeTransport>>`; the adapter selects direct UDP or
+`InternetTransport`. `Control` multiplexes reliable setup/media messages with
+the shared input datagrams. The default `netplay-internet` feature adds iroh to
+native builds. The browser/core build keeps its existing transport boundary.
+
+The host sends a bounded JSON hardware manifest and checksummed media bytes.
+The manifest contains no host file paths, display/output preferences, plugin
+modules or host-device authority. Only generated filenames inside a private
+temporary directory reach the guest's machine builder. Both peers rebuild the
+same cold setup, validate their initial fingerprints, then begin the input
+handshake. Guest launcher settings remain local. No remote emulator checkpoint
+is accepted or deserialized.
+
+Setup and disk changes use a 32-packet selective-repeat window with cumulative
+and selective acknowledgements, sequence numbers and a 200 ms retransmission
+timer. Packets fit within the existing datagram bound and use the same peer and
+socket in both connection modes. The emulation thread polls bounded queues;
+file selection uses an asynchronous dialog. Setup expires after 15 minutes and
+a disk change after three minutes.
+
+WHDLoad, executable boot and other host-directory volumes are converted to
+Amiga OFS disk images with their volume names and boot priorities. Available
+motherboard IDE slots are used first, then SCSI slots. Configured IDE/SCSI/LIDE
+images keep their controller. The host exports complete virtual sectors,
+including any synthesized partition metadata, so the receiver never has to
+interpret host directory paths. The asynchronous `copperhf` controller and CD
+backends remain excluded from rollback.
+
+Synthesized RDB headers mark the final LUN without claiming to be the final
+target, allowing the ROM boot driver to discover subsequent IDE/SCSI volumes.
+
+Session hard drives share an immutable base by SHA-256 and serialize only a
+sorted overlay of changed sectors. Local checkpoint deserialization resolves
+the base through a process-local weak registry; it never opens a path. The live
+disk keeps its base alive. Read-only volumes reject writes, including writes to
+partition metadata. Persistent hardfiles and ordinary in-memory volumes retain
+their existing storage behavior. This adds the session backing to hard-drive
+state and bumps save-state format 79 to 80; old save states are rejected.
+
+For a floppy change, the host and guest hold their current frames, agree on the
+greater frame, and catch up while still exchanging inputs. At that fully
+confirmed boundary they compare state digests, transfer and validate the disk,
+apply insertion/ejection, compare again, then resume. Retained predictions
+cannot restore the previous disk. Only the host initiates changes, with one
+transaction outstanding at a time.
 
 Internet setup uses a host-generated Ed25519 endpoint key and an independent
 random 128-bit invitation capability. The bounded `CLNI1.` code contains the
@@ -68,8 +111,7 @@ Network frame zero begins at cold boot. Each network frame ends when Agnus next
 increments the emulated video-frame counter, at the first CPU instruction or
 STOP fast-forward boundary after the wrap. This uses precise CPU stepping and
 cycle accounting, independent of the ordinary frontend's CPU-budget quantum.
-The scheduler state and transport remain outside serialized guest state; the
-save-state version is unchanged.
+The scheduler state and transport remain outside serialized guest state.
 
 An input contains eleven digital controller bits, a 128-key held-state bitmap,
 signed mouse X/Y deltas and three held mouse buttons.
