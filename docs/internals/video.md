@@ -602,6 +602,12 @@ uses a sharp bilinear shader with texel snapping. `PresentLayout`
 (`window/present.rs`) is the single source of truth for display geometry, cursor
 coordinates, and overlay positioning.
 
+The scaler draws an opaque black background across the surface before drawing
+the picture and chrome. A render-pass clear alone can leave corrupt colour and
+alpha values in the letterbox bars on Intel Mac Metal presentation surfaces,
+even when the same clear works on an offscreen texture. The background draw
+also covers frames with no display rectangles.
+
 `[display] autocrop` samples the active content sub-rectangle of the canvas each
 frame (`RenderResult::content_rect`), computed from raster lines containing
 fetched bitplane data. Chrome elements (panels and status bar) are drawn

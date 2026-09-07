@@ -33,9 +33,10 @@
 //! keeps a magnified picture sharp without the shimmer of raw nearest
 //! sampling at a fractional scale.
 //!
-//! Like the built-in renderer, the pass clears the whole surface first
-//! (the letterbox borders are its clear colour) and then draws one
-//! viewport-restricted triangle.
+//! The pass paints the whole surface opaque black first, then draws the
+//! picture and chrome in their destination rectangles. A background draw
+//! is needed because a render-pass clear alone leaves corrupt letterbox
+//! pixels on Intel Mac Metal presentation surfaces.
 
 use pixels::wgpu;
 use std::borrow::Cow;
@@ -70,6 +71,11 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VOut {
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var<uniform> u: ScalerUniforms;
+
+@fragment
+fn fs_background() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
@@ -180,11 +186,12 @@ pub(super) fn clip_rect_for(
     ((sw - w) / 2, (sh - h) / 2, w, h)
 }
 
-/// The scaling pass: one pipeline, one linear sampler, and per-draw
+/// Background and resampling pipelines, one linear sampler, and per-draw
 /// uniform buffers with their bind groups against the current `pixels`
 /// backing texture.
 pub(super) struct PresentScaler {
     pipeline: wgpu::RenderPipeline,
+    background_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniforms: [wgpu::Buffer; MAX_DRAWS],
@@ -237,34 +244,40 @@ impl PresentScaler {
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("present_scaler_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let create_pipeline = |label, entry_point, layout| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout,
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry_point),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline =
+            create_pipeline("present_scaler_pipeline", "fs_main", Some(&pipeline_layout));
+        let background_pipeline =
+            create_pipeline("present_scaler_background", "fs_background", None);
         // One linear sampler serves both filters: the nearest path
         // samples exactly at texel centres, where linear filtering
         // returns that texel alone.
@@ -288,6 +301,7 @@ impl PresentScaler {
         });
         Self {
             pipeline,
+            background_pipeline,
             bind_group_layout,
             sampler,
             uniforms,
@@ -296,7 +310,7 @@ impl PresentScaler {
         }
     }
 
-    /// Draw `texture` onto `target`: clear the whole surface to black,
+    /// Draw `texture` onto `target`: paint the whole surface black,
     /// then run each of `draws` (at most [`MAX_DRAWS`]; extras are
     /// ignored) in order. An empty draw list, or one of empty rects,
     /// still clears, so a surface too small for any picture goes black
@@ -369,6 +383,12 @@ impl PresentScaler {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        // The default viewport covers the whole attachment. Write every
+        // pixel, including alpha: on Intel Mac Metal drawables a load-op
+        // clear can leave a red pattern and invalid alpha in untouched
+        // areas, even though clearing an offscreen texture works.
+        pass.set_pipeline(&self.background_pipeline);
+        pass.draw(0..3, 0..1);
         let Some(bind_groups) = self.bind_groups.as_ref() else {
             return;
         };
@@ -477,6 +497,26 @@ mod tests {
         clip: (u32, u32, u32, u32),
         filter: ScaleFilter,
     ) -> Vec<[u8; 4]> {
+        render_draws(
+            device,
+            queue,
+            texels,
+            tex_size,
+            target_size,
+            FORMAT,
+            &[ScalerDraw::full(clip, filter)],
+        )
+    }
+
+    fn render_draws(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texels: &[u32],
+        tex_size: (u32, u32),
+        target_size: (u32, u32),
+        target_format: wgpu::TextureFormat,
+        draws: &[ScalerDraw],
+    ) -> Vec<[u8; 4]> {
         let (tw, th) = tex_size;
         let (w, h) = target_size;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -524,7 +564,7 @@ mod tests {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
+            format: target_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -547,15 +587,8 @@ mod tests {
             occlusion_query_set: None,
             multiview_mask: None,
         }));
-        let mut scaler = PresentScaler::new(device, FORMAT);
-        scaler.render(
-            device,
-            queue,
-            &texture,
-            &mut encoder,
-            &view,
-            &[ScalerDraw::full(clip, filter)],
-        );
+        let mut scaler = PresentScaler::new(device, target_format);
+        scaler.render(device, queue, &texture, &mut encoder, &view, draws);
 
         let padded = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -612,6 +645,100 @@ mod tests {
         drop(mapped);
         readback.unmap();
         px
+    }
+
+    #[test]
+    fn retina_letterbox_borders_are_black() {
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        for format in [FORMAT, wgpu::TextureFormat::Bgra8UnormSrgb] {
+            for (w, h) in [(2880, 1800), (1800, 2880)] {
+                let clip = clip_rect_for((w, h), (716, 581), None);
+                let px = render_draws(
+                    gpu.device(),
+                    gpu.queue(),
+                    &[WHITE; 4],
+                    (2, 2),
+                    (w, h),
+                    format,
+                    &[ScalerDraw::full(clip, ScaleFilter::SharpBilinear)],
+                );
+                for y in 0..h {
+                    for x in 0..w {
+                        let inside = (clip.0..clip.0 + clip.2).contains(&x)
+                            && (clip.1..clip.1 + clip.3).contains(&y);
+                        let expected = if inside { [255; 4] } else { BLACK };
+                        assert_eq!(
+                            px[(y * w + x) as usize],
+                            expected,
+                            "{format:?} {w}x{h} at ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_draws_still_paint_the_whole_target_opaque_black() {
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        for draws in [
+            vec![],
+            vec![ScalerDraw::full((3, 2, 0, 5), ScaleFilter::Nearest)],
+        ] {
+            let px = render_draws(
+                gpu.device(),
+                gpu.queue(),
+                &[WHITE],
+                (1, 1),
+                (13, 11),
+                FORMAT,
+                &draws,
+            );
+            assert!(px.iter().all(|p| *p == BLACK));
+        }
+    }
+
+    #[test]
+    fn display_and_chrome_draws_preserve_the_black_background_between_them() {
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        let px = render_draws(
+            gpu.device(),
+            gpu.queue(),
+            &[RED, GREEN],
+            (1, 2),
+            (12, 10),
+            FORMAT,
+            &[
+                ScalerDraw {
+                    src: [0.0, 0.0, 1.0, 0.5],
+                    dst: (3, 1, 6, 4),
+                    filter: ScaleFilter::Nearest,
+                },
+                ScalerDraw {
+                    src: [0.0, 0.5, 1.0, 0.5],
+                    dst: (1, 7, 10, 2),
+                    filter: ScaleFilter::Nearest,
+                },
+            ],
+        );
+        for y in 0..10 {
+            for x in 0..12 {
+                let expected = if (3..9).contains(&x) && (1..5).contains(&y) {
+                    RED.to_le_bytes()
+                } else if (1..11).contains(&x) && (7..9).contains(&y) {
+                    GREEN.to_le_bytes()
+                } else {
+                    BLACK
+                };
+                assert_eq!(px[y * 12 + x], expected, "({x}, {y})");
+            }
+        }
     }
 
     /// A 2x2-canvas frame replicated into a 4x4 texture (supersample
