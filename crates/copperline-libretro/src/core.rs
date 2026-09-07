@@ -54,6 +54,7 @@ pub struct Core {
     fb: Vec<u32>,
     deinterlacer: Deinterlacer,
     machine_identity: [u8; 32],
+    pub(crate) presentation: present::PresentationLatch,
 }
 
 pub fn configuration(model: &str, video: &str, kickstart: bool, system: &Path) -> Result<Config> {
@@ -64,6 +65,7 @@ pub fn configuration(model: &str, video: &str, kickstart: bool, system: &Path) -
     let mut config = machine_profile_defaults(parse_machine_model(model)?);
     config.video_standard = parse_video_standard(video)?;
     config.rtc_seed_unix = Some(946_684_800);
+    config.rtc_present = true;
     config.floppy_connected = [true, false, false, false];
     if kickstart {
         let named = system.join(format!("kickstart-{}.rom", model.to_ascii_lowercase()));
@@ -117,6 +119,7 @@ impl Core {
             height: present::TV_GLASS_PRESENT_ROWS,
             deinterlacer: Deinterlacer::with_settings(false, 0.0),
             machine_identity,
+            presentation: present::PresentationLatch::default(),
         };
         if !core.disks.is_empty() {
             core.set_ejected(false)?;
@@ -169,8 +172,7 @@ impl Core {
         let double_rows = !geometry.programmable;
         let woven_rows = placement.rows * if lace || double_rows { 2 } else { 1 };
         let aperture = present::standard_tv_aperture_frame(geometry, woven_rows, &base);
-        let mut latch = present::PresentationLatch::default();
-        if let Some(rows) = latch.resolve_tv_aperture(aperture) {
+        if let Some(rows) = self.presentation.resolve_tv_aperture(aperture) {
             (self.height, self.width) = self.deinterlacer.present_field_region_into(
                 &self.fb,
                 placement.rows,
@@ -307,6 +309,17 @@ impl Core {
         for device in self.controls.devices {
             body.extend(device.to_le_bytes());
         }
+        body.push(u8::from(self.presentation.uses_standard_aperture()));
+        let audio = self.audio.borrow();
+        ensure!(
+            audio.len() <= 2 * MIX_SAMPLE_RATE as usize,
+            "pending audio exceeds one second"
+        );
+        body.extend((audio.len() as u32).to_le_bytes());
+        for sample in audio.iter() {
+            body.extend(sample.to_le_bytes());
+        }
+        drop(audio);
         body.extend((self.selected as u32).to_le_bytes());
         body.push(u8::from(self.ejected));
         body.push(self.disks.len() as u8);
@@ -367,6 +380,19 @@ impl Core {
                 "invalid controller"
             );
         }
+        let standard_aperture = reader.boolean()?;
+        let samples = reader.number()? as usize;
+        ensure!(
+            samples <= 2 * MIX_SAMPLE_RATE as usize && samples.is_multiple_of(2),
+            "invalid pending stereo audio"
+        );
+        let audio: Vec<_> = reader
+            .take(samples * 2)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|sample| i16::from_le_bytes(*sample))
+            .collect();
         let selected = reader.number()? as usize;
         let ejected = reader.boolean()?;
         ensure!(
@@ -396,7 +422,12 @@ impl Core {
         );
         self.emu.load_state_bytes(machine)?;
         self.emu.bus_mut().floppy.make_disk_images_memory_backed();
-        self.audio.borrow_mut().clear();
+        *self.audio.borrow_mut() = audio;
+        self.presentation.resolve_tv_aperture(if standard_aperture {
+            present::TvApertureFrame::Standard(0)
+        } else {
+            present::TvApertureFrame::Full
+        });
         self.controls = controls;
         self.selected = selected;
         self.ejected = ejected;

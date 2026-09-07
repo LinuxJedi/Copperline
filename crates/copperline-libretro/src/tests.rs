@@ -128,13 +128,79 @@ fn partial_audio_batches_keep_their_unconsumed_samples() {
     .unwrap();
     retro_set_audio_sample_batch(Some(audio_one_frame));
     retro_run();
+    let saved = state();
     retro_run();
     retro_run();
     assert_eq!(
         HOST.with(|host| host.borrow().audio.clone()),
         [100, -100, 200, -200, 300, -300]
     );
+    assert!(unsafe { retro_unserialize(saved.as_ptr().cast(), saved.len()) });
+    HOST.with(|host| host.borrow_mut().audio.clear());
+    retro_run();
+    retro_run();
+    assert_eq!(
+        HOST.with(|host| host.borrow().audio.clone()),
+        [200, -200, 300, -300]
+    );
     retro_deinit();
+}
+
+#[test]
+fn neutral_video_fields_retain_and_restore_the_aperture() {
+    use copperline::video::{present_common as present, present_common::TvApertureFrame, FB_WIDTH};
+    let root = tempfile::tempdir().unwrap();
+    setup(root.path(), false, false);
+    assert!(load(None));
+    with_core(|core| {
+        core.presentation.resolve_tv_aperture(TvApertureFrame::Full);
+        Ok(())
+    })
+    .unwrap();
+    retro_run();
+    with_core(|core| {
+        assert_eq!(
+            present::standard_tv_aperture_frame(
+                core.emu.bus().frame_geometry(),
+                copperline::video::deinterlace::OUT_HEIGHT,
+                &core.emu.bus().frame_render_base(),
+            ),
+            TvApertureFrame::Neutral(present::TV_PAL_PRESENT_HEIGHT)
+        );
+        assert!(!core.presentation.uses_standard_aperture());
+        assert_eq!(core.width, FB_WIDTH);
+        Ok(())
+    })
+    .unwrap();
+    let saved = state();
+    retro_reset();
+    with_core(|core| {
+        assert!(core.presentation.uses_standard_aperture());
+        Ok(())
+    })
+    .unwrap();
+    assert!(unsafe { retro_unserialize(saved.as_ptr().cast(), saved.len()) });
+    retro_run();
+    with_core(|core| {
+        assert!(!core.presentation.uses_standard_aperture());
+        assert_eq!(core.width, FB_WIDTH);
+        Ok(())
+    })
+    .unwrap();
+    retro_deinit();
+}
+
+#[test]
+fn both_models_fit_a_clock_seeded_in_emulated_time() {
+    let root = tempfile::tempdir().unwrap();
+    for model in ["A500", "A1200"] {
+        let config = core::configuration(model, "PAL", false, root.path()).unwrap();
+        let core = Core::load(&config, None, root.path().into(), true).unwrap();
+        assert!(core.emu.bus().rtc_present());
+        let clock = &core.emu.bus().rtc;
+        assert_eq!(clock.current_unix(0.0), 946_684_800);
+        assert_eq!(clock.current_unix(2.0), 946_684_802);
+    }
 }
 unsafe extern "C" fn poll() {
     HOST.with(|host| host.borrow_mut().frames += 1);

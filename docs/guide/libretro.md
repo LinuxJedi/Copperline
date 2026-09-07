@@ -51,7 +51,7 @@ system directory. The core first looks for `kickstart-a500.rom` or
 A missing or invalid selected ROM produces an error; it does not fall back to
 AROS. Commodore ROMs are not included.
 
-The host clock does not seed the emulated machine. A fitted RTC starts at
+The host clock does not seed the emulated machine. Both models fit an RTC starting at
 2000-01-01 00:00:00 UTC and advances with emulated time.
 
 ## Controls
@@ -113,7 +113,8 @@ can lose writes since the last eject.
 
 Frontend save states include the machine, every disk in the playlist, the
 selected image and eject state, controller selections, and pending mouse and
-keyboard input. Restoring a state also restores disk contents. Those contents
+keyboard input. They also retain pending audio samples and the video aperture
+classification. Restoring a state also restores disk contents. Those contents
 become the persistent copies on the next eject or normal close.
 
 States require the same machine, boot ROM, original playlist images and

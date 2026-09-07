@@ -436,6 +436,7 @@ pub extern "C" fn retro_reset() {
             core.audio.borrow_mut().clear();
             core.controls.keys.fill(false);
             core.controls.pending = [[0; 2]; 2];
+            core.presentation.reset();
             core.pixels.clear();
             Ok(())
         })
