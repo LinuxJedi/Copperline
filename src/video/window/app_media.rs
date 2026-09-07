@@ -9,6 +9,23 @@ impl App {
     /// the drive's swap playlist; the first image is inserted right away
     /// and the rest are queued for the swap button / shortcut.
     pub(super) fn load_drive_disks_from_dialog(&mut self, drive_idx: usize) {
+        if let Some(session) = &self.netplay {
+            if !session.can_change_disk() || self.netplay_disk_picker.is_some() {
+                self.show_osd("Only the host can change disks; wait for the session to be ready");
+                return;
+            }
+            // Keep servicing the peer while the native picker is open.
+            self.netplay_disk_picker = Some((
+                drive_idx,
+                Box::pin(
+                    rfd::AsyncFileDialog::new()
+                        .set_title(format!("Netplay: load DF{drive_idx} disk image(s)"))
+                        .add_filter("Amiga disk images", crate::floppy::IMAGE_EXTENSIONS)
+                        .pick_files(),
+                ),
+            ));
+            return;
+        }
         self.suspend_live_audio_for_host_io();
         let picked = rfd::FileDialog::new()
             .set_title(format!("Load DF{drive_idx} disk image(s)"))
@@ -35,10 +52,14 @@ impl App {
             return;
         };
         let count = paths.len();
-        self.disk_playlists[drive_idx] = paths;
-        self.disk_playlist_index[drive_idx] = 0;
+        if self.netplay.is_none() {
+            self.disk_playlists[drive_idx] = paths.clone();
+            self.disk_playlist_index[drive_idx] = 0;
+        }
         let name = display_file_name(&path);
         if self.insert_disk_image(drive_idx, path, self.disk_write_protected[drive_idx]) {
+            self.disk_playlists[drive_idx] = paths;
+            self.disk_playlist_index[drive_idx] = 0;
             if count > 1 {
                 self.show_osd(format!("DF{drive_idx}: {name} (1/{count})"));
             } else {
@@ -73,9 +94,12 @@ impl App {
         let next = (self.disk_playlist_index[drive_idx] + 1) % count;
         let path = self.disk_playlists[drive_idx][next].clone();
         let write_protected = self.disk_write_protected[drive_idx];
-        self.disk_playlist_index[drive_idx] = next;
+        if self.netplay.is_none() {
+            self.disk_playlist_index[drive_idx] = next;
+        }
         let name = display_file_name(&path);
         if self.insert_disk_image(drive_idx, path, write_protected) {
+            self.disk_playlist_index[drive_idx] = next;
             self.show_osd(format!("DF{drive_idx}: {name} ({}/{count})", next + 1));
         } else {
             self.show_osd(format!("DF{drive_idx}: swap failed (see log)"));
@@ -83,6 +107,12 @@ impl App {
     }
 
     pub(super) fn eject_drive_disk(&mut self, drive_idx: usize) {
+        if let Some(session) = &mut self.netplay {
+            if let Err(error) = session.change_disk(&self.emu, drive_idx, Vec::new(), false) {
+                self.show_osd(format!("DF{drive_idx}: {error}"));
+            }
+            return;
+        }
         if !self.emu.bus().floppy.disk_inserted(drive_idx) {
             self.show_osd(format!("DF{drive_idx}: no disk"));
             return;
@@ -147,6 +177,26 @@ impl App {
     /// an explanatory notice. winit reports drops with no cursor position,
     /// so the target drive can only be picked after the fact.
     pub(super) fn handle_dropped_files(&mut self, files: Vec<PathBuf>) {
+        if self.netplay.is_some() {
+            if !self.netplay.as_ref().is_some_and(|s| s.can_change_disk()) {
+                self.show_osd("Only the host can change disks; wait for the session to be ready");
+                return;
+            }
+            if files
+                .iter()
+                .any(|p| classify_dropped_media(p) != DroppedMediaKind::Floppy)
+            {
+                self.show_osd("During netplay, drop replacement floppy images only");
+                return;
+            }
+            if let Some(drive) = (0..4).find(|&drive| self.emu.bus().floppy.drive_connected(drive))
+            {
+                self.insert_disk_playlist(drive, files);
+            } else {
+                self.show_osd("No floppy drive is connected");
+            }
+            return;
+        }
         // The configuration screen runs on a placeholder machine: an insert
         // would target hardware the launcher is about to rebuild, and the
         // chooser would replace the launcher panel and its unsaved state.
@@ -296,6 +346,30 @@ impl App {
         path: PathBuf,
         write_protected: bool,
     ) -> bool {
+        if let Some(session) = &mut self.netplay {
+            let result = (|| -> anyhow::Result<()> {
+                anyhow::ensure!(
+                    session.can_change_disk(),
+                    "only the host can change disks; wait for the session to be ready"
+                );
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::fs::File::open(&path)?
+                    .take(16 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                anyhow::ensure!(!bytes.is_empty(), "the disk image is empty");
+                session.change_disk(&self.emu, drive_idx, bytes, !write_protected)
+            })();
+            if let Err(error) = result {
+                warn!("netplay disk change: {error:#}");
+                self.show_osd(format!("DF{drive_idx}: {error}"));
+                return false;
+            }
+            self.show_osd(format!(
+                "Sharing replacement DF{drive_idx} with the other player..."
+            ));
+            return true;
+        }
         self.suspend_live_audio_for_host_io();
         let result = match self.emu.bus_mut().floppy.insert_disk_image(
             drive_idx,

@@ -1,6 +1,6 @@
 # Rollback netplay
 
-Copperline can run a two-player floppy game across two desktop instances or two browsers.
+Copperline can run a two-player game across two desktop instances or two browsers.
 Each peer emulates the whole Amiga and owns one controller port. Both players
 see their own input after a small configurable delay. Copperline predicts late
 remote input, then restores and replays frames when that prediction was wrong.
@@ -112,8 +112,10 @@ the abandoned network timeline as local play.
 ## Set up in the GUI
 
 Open **Machine Configuration → Netplay** (or start Copperline with no arguments).
-Choose the machine, ROM and floppy images on the existing configuration pages,
-then enable **Netplay** on both computers.
+The host chooses the machine, ROM and game media on the existing configuration
+pages, including WHDLoad or supported hard-drive images. Enable **Netplay** on
+both computers. The guest receives the host's setup and needs no local copy of
+the game files.
 
 ### Internet connections
 
@@ -129,8 +131,8 @@ through an HTTPS relay. No port forwarding is normally needed.
    the other player, then click **Run**.
 2. The guest chooses **Join (port 2)**, pastes the code into **Invitation**, and
    clicks **Run**. The invitation supplies the host's timing and relay settings.
-   Both players still select matching machine settings, ROMs and floppy images
-   locally; desktop invitations do not transfer game files.
+   The host then transfers the machine settings, ROMs and game media. The guest's
+   saved configuration and original files remain unchanged.
 3. The cold machine waits for the peer before running. The connection message
    reports the route; the log records changes between direct and relay paths.
    **F11** cancels setup or disconnects play. Setup times out after 15 minutes.
@@ -171,17 +173,18 @@ Choose **Connection → Direct IP (UDP)** on both computers.
    other player. The other player pastes that code into **Session code**.
    Cmd+V on macOS or Ctrl+V elsewhere replaces the focused address/code box;
    Return commits an edit and Escape cancels it.
-4. Use the same **Input delay** and **Rollback limit**, then click **Run** on
-   both computers. The windows wait for each other before emulation begins.
+4. Player 1 chooses **Input delay** and **Rollback limit**. Click **Run** on
+   both computers. Player 1 sends the setup and files to player 2; both windows
+   wait for verification before emulation begins.
 
 Enabling netplay changes analogue, gamepad-mouse and empty ports to joysticks, turns serial
 and JIT off, disables run-ahead and warp boot, and enables power on. Existing
 mouse/joystick/CD32 ports stay selected. These changes are visible on the other
 configuration pages; Run reapplies them after model or configuration changes.
-ROMs, media and storage selections remain yours to choose;
-Run explains any incompatible device or connection setting. For a two-mouse
-game, select **Mouse** on both controller ports on both computers. For a
-two-joystick game, select **Joystick** on both ports.
+The host chooses ROMs, media, storage and controller devices; Run explains any
+incompatible setting. For a two-mouse game, the host selects **Mouse** on both
+ports; for a two-joystick game, **Joystick** on both ports. Joining temporarily
+replaces the guest's machine while retaining its saved configuration choices.
 
 **F11** disconnects and returns to the Netplay page with the connection details
 intact. A connection failure also returns there, showing its error. Correct the
@@ -195,11 +198,12 @@ endpoint before enabling netplay in the GUI.
 
 ## Start from the command line
 
-Give both players the same ROM, floppy contents, and machine settings. A floppy
-can come from the configuration or `--insert-disk-after 0 df0 PATH`. Paths can
-differ between computers; Copperline checks the loaded contents. Put any
-additional disks in the other configured drives before starting. Media swaps
-are unavailable during a session.
+Give the host the ROM, game files and machine settings. A floppy can come from
+the configuration or `--insert-disk-after 0 df0 PATH`. The guest supplies only
+connection details. The host can also use `--whdload game.lha`, `--run program`,
+directory volumes, or IDE/SCSI/LIDE hard-drive images. Netplay takes a private
+copy of these volumes; in-session writes and saves do not update the original
+game directory or hardfile.
 
 For Internet play, the host writes an invitation to a file:
 
@@ -211,9 +215,7 @@ copperline --factory --model A500 --serial off --port1 joystick --port2 joystick
 The guest copies the code from that file and supplies it as one argument:
 
 ```sh
-copperline --factory --model A500 --serial off --port1 joystick --port2 joystick \
-  --netplay-join 'CLNI1.PASTE_THE_FULL_CODE_HERE' \
-  --insert-disk-after 0 df0 game.adf KICK13.ROM
+copperline --netplay-join 'CLNI1.PASTE_THE_FULL_CODE_HERE'
 ```
 
 The host may add `--netplay-relay https://relay.example.com` for a custom iroh
@@ -230,11 +232,10 @@ copperline --factory --model A500 --serial off --port1 joystick --port2 joystick
   --netplay-player 1 --netplay-session 8b21488dae9544f591adf03e291ce976 \
   --insert-disk-after 0 df0 game.adf KICK13.ROM
 
-# Player 2, on 192.168.1.11:
-copperline --factory --model A500 --serial off --port1 joystick --port2 joystick \
+# Player 2, on 192.168.1.11 (no local ROM or disk required):
+copperline \
   --netplay-bind 0.0.0.0:19732 --netplay-peer 192.168.1.10:19732 \
-  --netplay-player 2 --netplay-session 8b21488dae9544f591adf03e291ce976 \
-  --insert-disk-after 0 df0 game.adf KICK13.ROM
+  --netplay-player 2 --netplay-session 8b21488dae9544f591adf03e291ce976
 ```
 
 Use a fresh 32-digit hexadecimal session ID for each game, shared with your
@@ -242,14 +243,38 @@ peer; `openssl rand -hex 16` generates one. The example ID is illustrative.
 Allow the chosen UDP port through each host's firewall. Across the internet,
 both endpoints must be reachable at the addresses given to the other peer,
 usually through port forwarding or a private VPN. A VPN also supplies transport
-encryption and authentication: the direct UDP transport sends inputs in
+encryption and authentication: the direct UDP transport sends inputs and game files in
 cleartext, and its session ID distinguishes games rather than authenticating a
 person. Connect only to a trusted peer.
 
-Both windows wait until their initial machine fingerprints match. Different
-build versions, ROMs, disk contents, controller devices, RAM, or hardware settings
-stop the connection. A fitted guest clock defaults to 2000-01-01 UTC for netplay;
-use the same `--rtc-time` on both peers to choose another starting time.
+Both windows wait until the transferred setup produces matching initial machine
+fingerprints. Different builds or corrupt transfers stop the connection. A
+fitted guest clock defaults to 2000-01-01 UTC; the host can choose another
+starting time with `--rtc-time`.
+
+### Change desktop floppy disks
+
+The host uses the status bar's load, next-disk and eject buttons for DF0–DF3.
+The load picker can select a playlist; Cmd+D on macOS or Alt+D elsewhere cycles
+it. Dropping floppy images loads a playlist into the first connected drive.
+The guest's media controls are disabled. The host can schedule a replacement
+with `--insert-disk-after SECS dfN PATH` at a nonzero emulated time.
+
+Both peers stop at a confirmed frame, verify and transfer the replacement,
+apply it together, then resume. A bad local file leaves the current game
+running; a failed transfer ends the session. The picker keeps the connection
+alive while the host selects files. Disk changes never write received data over
+the guest's original files.
+
+Desktop setup allows up to 512 MiB of media in total, with a 256 MiB limit per
+hard drive, 16 MiB per floppy (including decompression), and 2 MiB per ROM.
+Machine, expansion and video RAM together are limited to 64 MiB, and the
+rollback snapshot budget may require a smaller machine or prediction window.
+Host filesystem mounts, including WHDLoad and executable boot volumes, become
+OFS images, preserving their volume name and boot priority; normal Amiga
+filesystem filename limits apply. Directory mounts already on IDE, SCSI or LIDE
+keep their configured filesystem. Received ROM and hard-drive files are staged
+in a private temporary directory which is removed at disconnect.
 
 ## Controls
 
@@ -257,10 +282,14 @@ Player 1 controls Amiga port 1; player 2 controls port 2. For joystick/CD32
 ports, a connected gamepad drives the local port. Without a gamepad, the first
 keyboard controller mapping drives it: by default arrows move, right Ctrl fires, and
 left Alt is the second button. The existing saved input mappings apply.
-Either port may be `mouse`, `joystick` or `cd32`, provided both peers use the same
-settings. A mouse port takes that player's host mouse, with keyboard typing
-enabled automatically. For two mice, pass `--port1 mouse --port2 mouse` on both
-computers. Mixed mouse and joystick/CD32 configurations also work on desktop.
+The desktop host chooses `mouse`, `joystick` or `cd32` for each port; the guest
+inherits those choices. A mouse port takes that player's host mouse, with
+keyboard typing enabled automatically. For two mice, pass
+`--port1 mouse --port2 mouse` on the host. Mixed mouse and joystick/CD32
+configurations also work on desktop.
+
+Audio output device selection (including Disabled), display preferences and
+host input preferences such as mouse sensitivity remain local to each player.
 
 For joystick/CD32 ports, press **F12** to switch between keyboard controller
 mode and typing on the Amiga keyboard. Typing mode sends keys such as Return and the arrows to the guest
@@ -271,8 +300,8 @@ window focus releases local held controls on the next sampled frame.
 The host Quit and Fullscreen shortcuts remain available (Cmd+Q/Cmd+F on macOS,
 Alt+Q/Alt+F elsewhere). Click the display to capture the mouse; Cmd+G on macOS
 or Alt+G elsewhere releases or captures it. Menus, resets, pause, debugger access,
-save states, and media changes are unavailable while connected. Press F11 to
-return to setup, or close the window to end the session; the remaining peer stops
+save states, and media changes other than host floppy swaps are unavailable
+while connected. Press F11 to return to setup, or close the window to end the session; the remaining peer stops
 after its timeout. Scripted mouse and analogue input remain unavailable during
 netplay.
 
@@ -283,7 +312,7 @@ netplay.
 | `--netplay-delay` | 2 | 0–6 frames | Delays local input to reduce corrections |
 | `--netplay-rollback` | 8 | 1–12 frames | Caps prediction while waiting for input |
 
-Both peers must choose the same values. At PAL's nominal 50 Hz, two frames are
+Desktop guests inherit these values from the host. At PAL's nominal 50 Hz, two frames are
 about 40 ms. Zero delay gives immediate local input but can produce more visible
 corrections. Rollback reduces perceived latency; it cannot remove network delay.
 If input or its acknowledgement falls too far behind, emulation waits and resumes
@@ -324,9 +353,11 @@ configurations on both peers, serial off, and rewind/run-ahead disabled. Floppy 
 guest disk writes can be rolled back and do **not** modify the original files.
 Disk changes and in-session saves are not persisted.
 
-Host directory volumes (including `--run` and WHDLoad staging), hard-drive/ATAPI
-images, physical drives, live networking/MIDI/parallel peripherals, CD images,
-persistent NVRAM, debugger traces, and recordings are excluded. These devices or
+Desktop converts host directory volumes (including `--run` and WHDLoad staging)
+to private disks and supports IDE/SCSI/LIDE hardfiles. The `copperhf` asynchronous
+controller, ATAPI images, physical drives, live networking/MIDI/parallel peripherals, CD images,
+persistent NVRAM, debugger traces, and recordings are excluded. Netplay uses
+session-only clock/NVRAM storage. These devices or
 observers have state outside the rollback snapshots. A state file cannot be used
 to bypass these restrictions: this version does not accept `--load-state` or USS
 imports for netplay.
@@ -346,7 +377,7 @@ compares confirmed PNGs and checkpoint logs:
 
 ```sh
 python3 tools/check-netplay.py --binary target/release/copperline
-# Add identical machine options after --, for example:
+# Add the host's machine options after --, for example:
 python3 tools/check-netplay.py --seconds 10 -- --config game.toml
 ```
 

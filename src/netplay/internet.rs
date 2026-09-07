@@ -214,21 +214,26 @@ impl Transport for InternetTransport {
     fn ready(&mut self) -> Result<bool> {
         let shared = self.shared.lock().unwrap();
         if let Some(error) = &shared.failure {
+            if shared.packets.has_incoming() {
+                return Ok(shared.ready);
+            }
             bail!("{error}");
         }
         Ok(shared.ready)
     }
 
     fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<usize>> {
-        self.ready()?;
+        // Deliver the final acknowledgement before reporting a peer close.
+        // The next ready() poll surfaces failure after the queue is drained.
         self.shared.lock().unwrap().packets.receive(buffer)
     }
 
     fn send(&mut self, packet: &[u8]) -> Result<bool> {
-        if !self.ready()? {
+        let mut shared = self.shared.lock().unwrap();
+        if !shared.ready || shared.failure.is_some() {
             return Ok(false);
         }
-        self.shared.lock().unwrap().packets.send(packet)
+        shared.packets.send(packet)
     }
 }
 
@@ -346,6 +351,29 @@ async fn establish(endpoint: &Endpoint, options: &Options) -> Result<iroh::endpo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_final_packets_are_delivered_before_disconnect() -> Result<()> {
+        let mut state = Shared {
+            ready: true,
+            failure: Some("peer closed".into()),
+            ..Default::default()
+        };
+        state.packets.push(&[1, 2, 3])?;
+        let mut transport = InternetTransport {
+            options: Options::host(2, 8, "", false)?,
+            shared: Arc::new(Mutex::new(state)),
+            cancel: None,
+        };
+        assert!(transport.ready()?);
+        assert!(!transport.send(&[4])?);
+        let mut bytes = [0; 16];
+        assert_eq!(transport.receive(&mut bytes)?, Some(3));
+        assert_eq!(&bytes[..3], &[1, 2, 3]);
+        assert_eq!(transport.receive(&mut bytes)?, None);
+        assert!(transport.ready().is_err());
+        Ok(())
+    }
 
     #[test]
     fn invitations_keep_host_keys_private_and_validate_routes_and_settings() -> Result<()> {

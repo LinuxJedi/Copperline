@@ -56,7 +56,10 @@ def main():
             logs.append(log)
             command = [str(args.binary.resolve()), "--factory", "--model", "A500",
                        "--serial", "off", "--port1", "joystick", "--port2", "joystick"]
-            command += extra
+            # Only the host has game assets/configuration. The guest proves
+            # setup transfer by starting with its bare local defaults.
+            if player == 0:
+                command += extra
             if args.internet:
                 if player == 0:
                     command += ["--netplay-host", str(invitation)]

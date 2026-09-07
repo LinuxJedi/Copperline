@@ -1360,31 +1360,46 @@ impl App {
                 "Netplay requires restarting Copperline without the GDB endpoint"
             );
         }
-        let mut staged = raw.clone();
+        let guest = options
+            .as_ref()
+            .is_some_and(|options| options.settings().player == 1);
+        let mut staged = if guest {
+            RawConfig::default()
+        } else {
+            raw.clone()
+        };
         let (game, opts) = crate::whdload::game_and_options(&staged);
         if let Some(game) = game {
-            anyhow::ensure!(
-                options.is_none(),
-                "Netplay needs a floppy session; clear the WHDLoad game first"
-            );
             let prepared = crate::whdload::prepare(&game, &opts)?;
             crate::whdload::apply_to_raw(&mut staged, &prepared);
             info!(
-                "whdload: booting {} ({}) from {}, saves persist in {}",
+                "whdload: booting {} ({}) from {}",
                 prepared.slave_rel.display(),
                 prepared.slave.name.as_deref().unwrap_or("unnamed slave"),
-                game.display(),
-                prepared.game_dir.display()
+                game.display()
             );
+            if options.is_none() {
+                info!("whdload: saves persist in {}", prepared.game_dir.display());
+            } else {
+                info!("whdload: netplay saves last for this session only");
+            }
         }
         // The same validation Run has always used: the raw view through the
         // config pipeline (MachineSetup::build_config is exactly this over
         // its own to_raw()).
-        let mut cfg = Config::try_from(staged)?;
+        let mut cfg = if guest {
+            crate::netplay::guest_config(&raw)?
+        } else {
+            Config::try_from(staged)?
+        };
         if options.is_some() {
             crate::netplay::prepare_config(&mut cfg)?;
         }
-        crate::config::resolve_bundled_rom(&mut cfg)?;
+        if guest {
+            let _ = crate::config::resolve_bundled_rom(&mut cfg);
+        } else {
+            crate::config::resolve_bundled_rom(&mut cfg)?;
+        }
         self.build_and_run_machine(&cfg, raw, options)
     }
 
@@ -1421,7 +1436,10 @@ impl App {
         self.emu.bus_mut().floppy.release_bridges();
         // This path boots a fresh machine, never a save state, so a real
         // ROM is required here.
-        let built = crate::emulator::build_machine(cfg, audio, true, false).and_then(|mut emu| {
+        let guest = options
+            .as_ref()
+            .is_some_and(|options| options.settings().player == 1);
+        let built = crate::emulator::build_machine(cfg, audio, true, guest).and_then(|mut emu| {
             let session = options
                 .map(|options| crate::netplay::Session::new(options, &mut emu, cfg))
                 .transpose()?;

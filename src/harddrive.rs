@@ -14,6 +14,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+mod session;
+use session::SessionImage;
+
 pub const SECTOR_SIZE: usize = 512;
 
 /// Largest image a gzip-compressed hardfile may unpack to. Deflate has no
@@ -41,6 +44,7 @@ const RDB_LOCATION_LIMIT: usize = 16;
 enum Backing {
     File(File),
     Memory(Vec<u8>),
+    Session(SessionImage),
     /// A real disk attached to the host. Presents 512-byte sectors like the
     /// others; the block size the media actually uses, and the privilege the
     /// open needed, are the device's own business.
@@ -74,12 +78,14 @@ pub struct HardDriveImage {
 /// writes survive the round trip. Deserialization reopens file backings,
 /// which makes a missing/moved image a load-time error instead of a later
 /// I/O panic.
+/// Generic fields borrow media for serialization and own it on deserialization,
+/// keeping the same field order without cloning disk contents per checkpoint.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct HardDriveImageState {
-    path: PathBuf,
-    memory: Option<Vec<u8>>,
+struct HardDriveImageState<P = PathBuf, B = Vec<u8>, S = SessionImage> {
+    path: P,
+    memory: Option<B>,
     total_sectors: u64,
-    rdb_overlay: Option<Vec<u8>>,
+    rdb_overlay: Option<B>,
     overlay_write_warned: bool,
     scsi_bus: bool,
     /// The real disk this drive is, if it is one: the identifier a
@@ -91,6 +97,7 @@ struct HardDriveImageState {
     /// sector translation; without the access, a disk attached read-only
     /// would come back writable.
     host_device: Option<HostDiskState>,
+    session: Option<S>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -103,9 +110,9 @@ struct HostDiskState {
 impl serde::Serialize for HardDriveImage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         HardDriveImageState {
-            path: self.path.clone(),
+            path: &self.path,
             memory: match &self.backing {
-                Backing::Memory(image) => Some(image.clone()),
+                Backing::Memory(image) => Some(image.as_slice()),
                 // A physical disk is not ours to capture: the medium lives
                 // outside the emulator and can be swapped while a state is
                 // saved. What it is gets recorded instead, and resuming
@@ -113,7 +120,7 @@ impl serde::Serialize for HardDriveImage {
                 _ => None,
             },
             total_sectors: self.total_sectors,
-            rdb_overlay: self.rdb_overlay.clone(),
+            rdb_overlay: self.rdb_overlay.as_deref(),
             overlay_write_warned: self.overlay_write_warned,
             scsi_bus: self.bus_name == "scsi",
             host_device: match &self.backing {
@@ -127,6 +134,10 @@ impl serde::Serialize for HardDriveImage {
                 Backing::PendingDevice(device) => Some(device.clone()),
                 _ => None,
             },
+            session: match &self.backing {
+                Backing::Session(image) => Some(image),
+                _ => None,
+            },
         }
         .serialize(serializer)
     }
@@ -134,7 +145,7 @@ impl serde::Serialize for HardDriveImage {
 
 impl<'de> serde::Deserialize<'de> for HardDriveImage {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let state = HardDriveImageState::deserialize(deserializer)?;
+        let state: HardDriveImageState = HardDriveImageState::deserialize(deserializer)?;
         let bus_name = if state.scsi_bus { "scsi" } else { "ide" };
         if let Some(disk) = state.host_device {
             #[cfg(not(target_arch = "wasm32"))]
@@ -154,9 +165,13 @@ impl<'de> serde::Deserialize<'de> for HardDriveImage {
                 disk.id
             )));
         }
-        let backing = match state.memory {
-            Some(image) => Backing::Memory(image),
-            None => Backing::File(
+        let backing = match (state.session, state.memory) {
+            (Some(image), None) => Backing::Session(image),
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::custom("conflicting disk backings"))
+            }
+            (None, Some(image)) => Backing::Memory(image),
+            (None, None) => Backing::File(
                 OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -285,7 +300,9 @@ fn build_rdsk_block(total_cyls: u32) -> Vec<u8> {
     put_be32(&mut b, 4, 64); // size in longs
     put_be32(&mut b, 12, 7); // host id
     put_be32(&mut b, 16, SECTOR_SIZE as u32);
-    put_be32(&mut b, 20, 0x17); // flags: last disk/LUN/ID
+    // This disk has one LUN, but other targets may follow it. LAST/LASTTID
+    // would tell the boot driver to stop before probing a slave or SCSI unit.
+    put_be32(&mut b, 20, 0x12); // LASTLUN | DISKID
     put_be32(&mut b, 24, !0); // bad-block list: none
     put_be32(&mut b, 28, 1); // partition list at sector 1
     put_be32(&mut b, 32, !0); // filesystem-header list: none
@@ -363,7 +380,7 @@ fn build_part_block(total_cyls: u32, dostype: u32, name: &[u8], boot_pri: i8) ->
 /// route. Deflate cannot be seeked, so a compressed image is read whole here
 /// and served from memory afterwards -- which is also why it is capped at
 /// [`MAX_GZIP_IMAGE_BYTES`].
-fn read_gzip_hardfile(path: &Path, bus_name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+fn read_gzip_hardfile(path: &Path, bus_name: &str, limit: u64) -> anyhow::Result<Option<Vec<u8>>> {
     let mut file = File::open(path)
         .map_err(|e| anyhow::anyhow!("opening {bus_name} image {}: {e}", path.display()))?;
     let mut magic = [0u8; 2];
@@ -384,18 +401,18 @@ fn read_gzip_hardfile(path: &Path, bus_name: &str) -> anyhow::Result<Option<Vec<
     drop(file);
     let packed = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("reading {bus_name} image {}: {e}", path.display()))?;
-    let image = crate::gzip::inflate_members(&packed, Some(MAX_GZIP_IMAGE_BYTES)).map_err(|e| {
+    let image = crate::gzip::inflate_members(&packed, Some(limit)).map_err(|e| {
         anyhow::anyhow!(
             "decompressing gzip-compressed {bus_name} image {}: {e}",
             path.display()
         )
     })?;
-    if image.len() as u64 > MAX_GZIP_IMAGE_BYTES {
+    if image.len() as u64 > limit {
         anyhow::bail!(
             "gzip-compressed {bus_name} image {} unpacks to more than {} MiB, which does not \
              fit in memory as a whole disk; decompress it to a plain hardfile and attach that",
             path.display(),
-            MAX_GZIP_IMAGE_BYTES / (1 << 20)
+            limit / (1 << 20)
         );
     }
     Ok(Some(image))
@@ -519,13 +536,58 @@ impl HardDriveImage {
         boot_pri: i8,
         filesystem: crate::diskimage::FileSystem,
     ) -> anyhow::Result<Self> {
+        Self::open_inner(
+            path,
+            device_name,
+            bus_name,
+            volume_override,
+            boot_pri,
+            filesystem,
+            false,
+        )
+    }
+
+    /// Read a private session copy. Neither opening nor guest writes modify
+    /// the source. The shared base keeps rollback checkpoints small.
+    pub(crate) fn open_session(
+        path: &Path,
+        device_name: &str,
+        bus_name: &'static str,
+        volume_override: Option<&str>,
+        boot_pri: i8,
+        filesystem: crate::diskimage::FileSystem,
+    ) -> anyhow::Result<Self> {
+        Self::open_inner(
+            path,
+            device_name,
+            bus_name,
+            volume_override,
+            boot_pri,
+            filesystem,
+            true,
+        )
+    }
+
+    fn open_inner(
+        path: &Path,
+        device_name: &str,
+        bus_name: &'static str,
+        volume_override: Option<&str>,
+        boot_pri: i8,
+        filesystem: crate::diskimage::FileSystem,
+        session: bool,
+    ) -> anyhow::Result<Self> {
         let mut backing = if path.is_dir() {
             let volume = volume_override.map(str::to_string).unwrap_or_else(|| {
                 path.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             });
-            let image = crate::dirfs::build_image(path, &volume, filesystem)?;
+            let image = if session {
+                crate::dirfs::build_image_limited(path, &volume, filesystem, 256 * 1024 * 1024)?
+            } else {
+                crate::dirfs::build_image(path, &volume, filesystem)?
+            };
             log::warn!(
                 "{bus_name}: {} mounted as an in-memory volume \"{volume}\" built from the \
                  directory; guest writes to it are NOT written back to the host and are lost \
@@ -541,7 +603,15 @@ impl HardDriveImage {
                     path.display()
                 );
             }
-            match read_gzip_hardfile(path, bus_name)? {
+            match read_gzip_hardfile(
+                path,
+                bus_name,
+                if session {
+                    256 * 1024 * 1024
+                } else {
+                    MAX_GZIP_IMAGE_BYTES
+                },
+            )? {
                 Some(image) => {
                     log::warn!(
                         "{bus_name}: {} is a gzip-compressed hardfile, unpacked into memory \
@@ -555,7 +625,7 @@ impl HardDriveImage {
                 None => Backing::File(
                     OpenOptions::new()
                         .read(true)
-                        .write(true)
+                        .write(!session)
                         .open(path)
                         .map_err(|e| {
                             anyhow::anyhow!("opening {bus_name} image {}: {e}", path.display())
@@ -569,6 +639,7 @@ impl HardDriveImage {
                 .map_err(|e| anyhow::anyhow!("stat {bus_name} image {}: {e}", path.display()))?
                 .len(),
             Backing::Memory(image) => image.len() as u64,
+            Backing::Session(_) => unreachable!("session backing is installed after validation"),
             #[cfg(not(target_arch = "wasm32"))]
             Backing::Device(device) => device.total_sectors() * SECTOR_SIZE as u64,
             #[cfg(not(target_arch = "wasm32"))]
@@ -584,6 +655,10 @@ impl HardDriveImage {
                 SECTOR_SIZE
             );
         }
+        anyhow::ensure!(
+            !session || len <= 256 * 1024 * 1024,
+            "netplay hard-drive images are limited to 256 MiB each"
+        );
 
         // Sniff the first sectors: a bare partition hardfile (filesystem boot
         // block at sector 0, no RDSK block in the first 16 sectors) gets a
@@ -596,6 +671,7 @@ impl HardDriveImage {
                 .read_exact(&mut head)
                 .map_err(|e| anyhow::anyhow!("reading {bus_name} image {}: {e}", path.display()))?,
             Backing::Memory(image) => head.copy_from_slice(&image[..sniff_len]),
+            Backing::Session(_) => unreachable!("session backing is installed after validation"),
             #[cfg(not(target_arch = "wasm32"))]
             Backing::Device(device) => {
                 for (lba, sector) in head.chunks_mut(SECTOR_SIZE).enumerate() {
@@ -660,8 +736,25 @@ impl HardDriveImage {
 
         let overlay_sectors = rdb_overlay.as_ref().map_or(0, |_| u64::from(CYL_SECTORS));
         let total_sectors = len / SECTOR_SIZE as u64 + overlay_sectors;
+        if session {
+            let bytes = match backing {
+                Backing::Memory(bytes) => bytes,
+                Backing::File(mut file) => {
+                    file.rewind()?;
+                    let mut bytes = vec![0; len as usize];
+                    file.read_exact(&mut bytes)?;
+                    bytes
+                }
+                _ => unreachable!("only image files and directories are session sources"),
+            };
+            backing = Backing::Session(SessionImage::new(bytes, false));
+        }
         Ok(Self {
-            path: path.to_path_buf(),
+            path: if session {
+                PathBuf::from("netplay-disk")
+            } else {
+                path.to_path_buf()
+            },
             backing,
             total_sectors,
             rdb_overlay,
@@ -672,6 +765,12 @@ impl HardDriveImage {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn set_session_read_only(&mut self, read_only: bool) {
+        if let Backing::Session(image) = &mut self.backing {
+            image.set_read_only(read_only);
+        }
     }
 
     /// Whether this drive is a real disk of the host's rather than an image.
@@ -721,6 +820,7 @@ impl HardDriveImage {
                 buf[..SECTOR_SIZE].copy_from_slice(&image[off..off + SECTOR_SIZE]);
                 Ok(())
             }
+            Backing::Session(image) => image.read(file_lba, buf),
             #[cfg(not(target_arch = "wasm32"))]
             Backing::Device(device) => device.read_sector(file_lba, buf),
             #[cfg(not(target_arch = "wasm32"))]
@@ -731,6 +831,12 @@ impl HardDriveImage {
     }
 
     pub fn write_sector(&mut self, lba: u64, buf: &[u8]) -> std::io::Result<()> {
+        if matches!(&self.backing, Backing::Session(image) if image.read_only()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "session disk is read-only",
+            ));
+        }
         if let Some(overlay) = &mut self.rdb_overlay {
             if lba < u64::from(CYL_SECTORS) {
                 if !self.overlay_write_warned {
@@ -758,6 +864,7 @@ impl HardDriveImage {
                 image[off..off + SECTOR_SIZE].copy_from_slice(&buf[..SECTOR_SIZE]);
                 Ok(())
             }
+            Backing::Session(image) => image.write(file_lba, buf),
             #[cfg(not(target_arch = "wasm32"))]
             Backing::Device(device) => device.write_sector(file_lba, buf),
             #[cfg(not(target_arch = "wasm32"))]
@@ -877,6 +984,61 @@ mod tests {
         assert_eq!(&sector[..4], b"MARK");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn synthesized_rdb_keeps_later_targets_discoverable() {
+        let rdsk = build_rdsk_block(3);
+        assert_eq!(u32::from_be_bytes(rdsk[20..24].try_into().unwrap()) & 5, 0);
+        assert_eq!(
+            rdsk.chunks_exact(4).fold(0u32, |sum, word| {
+                sum.wrapping_add(u32::from_be_bytes(word.try_into().unwrap()))
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn session_disk_rolls_back_writes_without_reopening_or_changing_its_source() {
+        let bytes = bare_partition_bytes(2);
+        let path = temp_image("session.hdf", &bytes);
+        let mut original = HardDriveImage::open_session(
+            &path,
+            "DH0",
+            "ide",
+            None,
+            0,
+            crate::diskimage::FileSystem::FFS,
+        )
+        .unwrap();
+        let lba = u64::from(CYL_SECTORS) + 3;
+        original.write_sector(lba, &[0xA5; SECTOR_SIZE]).unwrap();
+        let encoded = bincode::serialize(&original).unwrap();
+        let owned: HardDriveImageState = HardDriveImageState {
+            path: original.path.clone(),
+            memory: None,
+            total_sectors: original.total_sectors,
+            rdb_overlay: original.rdb_overlay.clone(),
+            overlay_write_warned: original.overlay_write_warned,
+            scsi_bus: false,
+            host_device: None,
+            session: match &original.backing {
+                Backing::Session(image) => Some(image.clone()),
+                _ => unreachable!(),
+            },
+        };
+        assert_eq!(encoded, bincode::serialize(&owned).unwrap());
+        original.write_sector(lba, &[0x5A; SECTOR_SIZE]).unwrap();
+        original.flush().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(&path).unwrap();
+        let mut restored: HardDriveImage = bincode::deserialize(&encoded).unwrap();
+        let mut sector = [0; SECTOR_SIZE];
+        restored.read_sector(lba, &mut sector).unwrap();
+        assert_eq!(sector, [0xA5; SECTOR_SIZE]);
+        restored.set_session_read_only(true);
+        assert!(restored.write_sector(0, &[0; SECTOR_SIZE]).is_err());
+        assert!(restored.write_sector(lba, &[0; SECTOR_SIZE]).is_err());
     }
 
     #[test]
@@ -1065,8 +1227,9 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn serde_defers_physical_disk_acquisition() {
-        let state = HardDriveImageState {
+        let state: HardDriveImageState = HardDriveImageState {
             path: PathBuf::from("/dev/definitely-not-opened"),
+            session: None,
             memory: None,
             total_sectors: 1234,
             rdb_overlay: None,

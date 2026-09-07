@@ -39,7 +39,7 @@ default = [
 ]
 # Native NAT traversal and encrypted relay fallback. The portable/WASM core
 # keeps using its frontend-provided transport.
-netplay-internet = ["dep:iroh", "dep:tokio", "dep:base64", "dep:serde_json"]
+netplay-internet = ["dep:iroh", "dep:tokio", "dep:base64"]
 # MT-32 emulation through CopperlineHQ/mt32-rs, reachable as a MIDI-Out
 # target. Off builds carry none of it.
 mt32 = ["dep:mt32-rs"]
@@ -56,7 +56,7 @@ coppersynth = ["dep:coppersynth"]
 # Library page is absent, and `[whdload]` keys that only the library uses
 # are parsed and ignored so a configuration written by a full build still
 # loads. See src/gamelib/.
-game-library = ["dep:ureq", "dep:serde_json", "dep:zeroize", "dep:base64"]
+game-library = ["dep:ureq", "dep:zeroize", "dep:base64"]
 # The MHI virtual MPEG audio decoder board (src/mhi.rs, `[mhi]`): pulls in
 # Symphonia's pure-Rust MPEG audio decoder. Kept a default-on feature (not an
 # unconditional dependency) so builds that do not want the board -- the
@@ -128,7 +128,7 @@ bench-bin = []
 # over loopback TCP for driving the emulator from scripts and external tools
 # (`--control` headless, `--control-gui` windowed). Uses std::net + threads,
 # so browser builds (--no-default-features) compile it out.
-control = ["dep:serde_json", "dep:base64"]
+control = ["dep:base64"]
 # User-mode NAT backend for emulated NICs (`[a2065] net = "nat"`, src/net/nat/):
 # a slirp-style virtual gateway giving the guest outbound IPv4 with no host
 # privileges. Uses std::net + threads, so browser builds compile it out.
@@ -141,7 +141,7 @@ net-bridge = ["dep:pcap", "dep:libloading"]
 # The `copperline-ctl` command-line client for the control protocol, and
 # its `--mcp` mode (src/control/mcp.rs), an MCP server over stdio that
 # exposes the protocol as tools for coding agents.
-ctl-bin = ["dep:serde_json", "control", "dap"]
+ctl-bin = ["control", "dap"]
 # The `copperline-import-uae` converter for WinUAE/Amiberry/FS-UAE
 # configuration files.
 import-uae-bin = ["dep:toml_edit"]
@@ -156,7 +156,7 @@ gdb = ["control"]
 # the MCP mode, so it needs serde_json like `control`, plus gimli and
 # object for DWARF and ELF. Off in player builds with the rest of the
 # debugger surface.
-dap = ["control", "dep:serde_json", "dep:gimli", "dep:object"]
+dap = ["control", "dep:gimli", "dep:object"]
 # Real floppy drives through FluxBridge (src/fluxbridge/): the Greaseweazle
 # driver enabled on the dependency below stands in for a disk image on any bay.
 # FluxBridge is a pure-Rust library, so there is nothing to install and no C++
@@ -176,7 +176,7 @@ anyhow = "1"
 log = "0.4"
 env_logger = { version = "0.11", optional = true }
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", optional = true }
+serde_json = "1"
 base64 = { version = "0.23", optional = true }
 sha2 = { version = "0.11", default-features = false }
 # DWARF and ELF readers for the DAP adapter's debug-info module

@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Two-peer GGPO-style netplay. Only inputs and state digests cross the network.
+//! Two-peer GGPO-style netplay. Gameplay exchanges inputs and state digests;
+//! desktop setup and floppy changes also transfer the host's settings and media.
 
+#[cfg(not(target_arch = "wasm32"))]
+mod control;
+#[cfg(not(target_arch = "wasm32"))]
+mod desktop;
 #[cfg(all(feature = "netplay-internet", not(target_arch = "wasm32")))]
 pub mod internet;
 mod rollback;
+#[cfg(not(target_arch = "wasm32"))]
+mod setup;
+#[cfg(not(target_arch = "wasm32"))]
+pub use setup::guest_config;
 #[cfg(test)]
 mod tests;
 mod transport;
@@ -226,9 +235,30 @@ pub(crate) fn digest(bytes: &[u8]) -> [u8; 32] {
 
 /// Validate static host dependencies before building or connecting a machine.
 pub fn validate_config(cfg: &crate::config::Config) -> Result<()> {
-    if let Some(reason) = cfg.runahead_machine_block_reason() {
+    let mut dependencies = cfg.clone();
+    if cfg.netplay_storage {
+        dependencies.ide.master = None;
+        dependencies.ide.slave = None;
+        dependencies.scsi.units.fill(None);
+        dependencies.lide.drives.fill(None);
+    }
+    if let Some(reason) = dependencies.runahead_machine_block_reason() {
         anyhow::bail!("netplay cannot use {reason}");
     }
+    ensure!(
+        cfg.run_program_dir.is_none() && !cfg.emulation.uaelib_files,
+        "netplay cannot use host file commands"
+    );
+    ensure!(cfg.cd_image_path.is_none(), "netplay cannot use CD images");
+    ensure!(
+        [cfg.ide.master.as_ref(), cfg.ide.slave.as_ref()]
+            .into_iter()
+            .chain(cfg.scsi.units.iter().map(Option::as_ref))
+            .chain(cfg.lide.drives.iter().map(Option::as_ref))
+            .flatten()
+            .all(|drive| !crate::config::is_cd_image_path(&drive.path)),
+        "netplay cannot use ATAPI or SCSI CD images"
+    );
     // The sampler attaches in the frontend after session construction; reject
     // it here, before fingerprinting or opening any parallel host device.
     ensure!(
@@ -262,6 +292,8 @@ pub fn validate_config(cfg: &crate::config::Config) -> Result<()> {
 
 /// Apply the deterministic clock default before constructing a netplay machine.
 pub fn prepare_config(cfg: &mut crate::config::Config) -> Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    setup::prepare_sources(cfg)?;
     validate_config(cfg)?;
     if cfg.rtc_present && cfg.rtc_seed_unix.is_none() {
         cfg.rtc_seed_unix = Some(RTC_SEED);
@@ -272,7 +304,7 @@ pub fn prepare_config(cfg: &mut crate::config::Config) -> Result<()> {
 
 /// A session is serviced on the emulation thread; socket I/O never blocks it.
 #[cfg(not(target_arch = "wasm32"))]
-pub type Session = Connection<NativeTransport>;
+pub use desktop::Session;
 
 pub struct Connection<T: Transport> {
     transport: T,
@@ -345,6 +377,46 @@ impl Connection<NativeTransport> {
     }
 }
 
+fn initial_identity(
+    settings: &Settings,
+    emu: &mut Emulator,
+    cfg: &crate::config::Config,
+) -> Result<[u8; 32]> {
+    validate_config(cfg)?;
+    ensure!(
+        emu.bus().emulated_cck() == 0,
+        "netplay must start before the machine runs"
+    );
+    settings.validate()?;
+    // Paths are host metadata; normalize only after adopting the complete
+    // images into memory so replay cannot reopen or overwrite local files.
+    emu.bus_mut().floppy.prepare_netplay_images();
+    if let Some(reason) = emu
+        .bus()
+        .runahead_host_block_reason()
+        .or_else(|| emu.machine.runahead_debug_block_reason())
+    {
+        anyhow::bail!("netplay cannot use {reason}");
+    }
+    ensure!(
+        !emu.time_travel_enabled(),
+        "netplay cannot record reverse history"
+    );
+    ensure!(
+        emu.bus().input.ports.iter().all(|p| matches!(
+            p.device,
+            crate::bus::PortDevice::Mouse
+                | crate::bus::PortDevice::Joystick
+                | crate::bus::PortDevice::Cd32Pad
+        )),
+        "netplay requires mouse, joystick or CD32 controllers on both ports"
+    );
+    let mut identity_hash = Sha256::new();
+    identity_hash.update(env!("COPPERLINE_DISPLAY_VERSION").as_bytes());
+    identity_hash.update(emu.netplay_snapshot()?);
+    Ok(identity_hash.finalize().into())
+}
+
 impl<T: Transport> Connection<T> {
     pub fn route(&self) -> &'static str {
         self.transport.route()
@@ -355,39 +427,7 @@ impl<T: Transport> Connection<T> {
         emu: &mut Emulator,
         cfg: &crate::config::Config,
     ) -> Result<Self> {
-        validate_config(cfg)?;
-        ensure!(
-            emu.bus().emulated_cck() == 0,
-            "netplay must start before the machine runs"
-        );
-        settings.validate()?;
-        // Paths are host metadata; normalize only after adopting the complete
-        // images into memory so replay cannot reopen or overwrite local files.
-        emu.bus_mut().floppy.prepare_netplay_images();
-        if let Some(reason) = emu
-            .bus()
-            .runahead_host_block_reason()
-            .or_else(|| emu.machine.runahead_debug_block_reason())
-        {
-            anyhow::bail!("netplay cannot use {reason}");
-        }
-        ensure!(
-            !emu.time_travel_enabled(),
-            "netplay cannot record reverse history"
-        );
-        ensure!(
-            emu.bus().input.ports.iter().all(|p| matches!(
-                p.device,
-                crate::bus::PortDevice::Mouse
-                    | crate::bus::PortDevice::Joystick
-                    | crate::bus::PortDevice::Cd32Pad
-            )),
-            "netplay requires mouse, joystick or CD32 controllers on both ports"
-        );
-        let mut identity_hash = Sha256::new();
-        identity_hash.update(env!("COPPERLINE_DISPLAY_VERSION").as_bytes());
-        identity_hash.update(emu.netplay_snapshot()?);
-        let identity = identity_hash.finalize().into();
+        let identity = initial_identity(&settings, emu, cfg)?;
         let rollback = Rollback::new(
             settings.player,
             settings.input_delay,

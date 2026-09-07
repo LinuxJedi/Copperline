@@ -226,7 +226,7 @@ fn wire_round_trip_and_bounded_rejection() {
     }
 }
 
-fn emulator() -> Result<Emulator> {
+pub(super) fn emulator() -> Result<Emulator> {
     use crate::{
         audio::NullSink,
         bus::{Bus, PortDevice},
@@ -372,8 +372,8 @@ fn udp_pair_with_delay(delay: u8, window: u8) -> Result<()> {
         Ok(options)
     };
     let mut sessions = [
-        Session::new(session_options(0)?, &mut machines[0], &safe_config()?)?,
-        Session::new(session_options(1)?, &mut machines[1], &safe_config()?)?,
+        Connection::<NativeTransport>::new(session_options(0)?, &mut machines[0], &safe_config()?)?,
+        Connection::<NativeTransport>::new(session_options(1)?, &mut machines[1], &safe_config()?)?,
     ];
     let destinations = [
         sessions[0].transport.socket().local_addr()?,
@@ -435,7 +435,11 @@ fn udp_pair_with_delay(delay: u8, window: u8) -> Result<()> {
 fn mismatch_desync_and_disconnect_stop_the_session() -> Result<()> {
     let peer = UdpSocket::bind("127.0.0.1:0")?;
     let mut emu = emulator()?;
-    let mut session = Session::new(options(peer.local_addr()?, 0), &mut emu, &safe_config()?)?;
+    let mut session = Connection::<NativeTransport>::new(
+        options(peer.local_addr()?, 0),
+        &mut emu,
+        &safe_config()?,
+    )?;
     let mut packet = wire::Packet {
         session: [42; 16],
         identity: [0; 32],
@@ -455,7 +459,11 @@ fn mismatch_desync_and_disconnect_stop_the_session() -> Result<()> {
         session.step(&mut emu, Input::default(), true).is_err(),
         "failure stays latched"
     );
-    let mut session = Session::new(options(peer.local_addr()?, 0), &mut emu, &safe_config()?)?;
+    let mut session = Connection::<NativeTransport>::new(
+        options(peer.local_addr()?, 0),
+        &mut emu,
+        &safe_config()?,
+    )?;
     packet.identity = session.identity;
     session.connected = true;
     session.rollback.current = 60;
@@ -467,7 +475,11 @@ fn mismatch_desync_and_disconnect_stop_the_session() -> Result<()> {
     assert!(poll_error(&mut session, &mut emu)
         .to_string()
         .contains("desynchronized"));
-    let mut session = Session::new(options(peer.local_addr()?, 0), &mut emu, &safe_config()?)?;
+    let mut session = Connection::<NativeTransport>::new(
+        options(peer.local_addr()?, 0),
+        &mut emu,
+        &safe_config()?,
+    )?;
     session.connected = true;
     session.last_received = Instant::now() - Duration::from_secs(11);
     assert!(session
@@ -478,7 +490,7 @@ fn mismatch_desync_and_disconnect_stop_the_session() -> Result<()> {
     Ok(())
 }
 
-fn safe_config() -> Result<crate::config::Config> {
+pub(super) fn safe_config() -> Result<crate::config::Config> {
     let mut cfg = crate::config::Config::try_from(crate::config::RawConfig::default())?;
     cfg.serial.mode = crate::config::SerialMode::Off;
     Ok(cfg)
@@ -512,7 +524,11 @@ fn capture_waits_for_the_peer_to_acknowledge_retransmitted_local_input() -> Resu
     let peer = UdpSocket::bind("127.0.0.1:0")?;
     peer.set_read_timeout(Some(Duration::from_secs(1)))?;
     let mut emu = emulator()?;
-    let mut session = Session::new(options(peer.local_addr()?, 0), &mut emu, &safe_config()?)?;
+    let mut session = Connection::<NativeTransport>::new(
+        options(peer.local_addr()?, 0),
+        &mut emu,
+        &safe_config()?,
+    )?;
     let mut packet = wire::Packet {
         session: session.settings.session,
         identity: session.identity,
@@ -569,7 +585,7 @@ fn capture_waits_for_the_peer_to_acknowledge_retransmitted_local_input() -> Resu
     Ok(())
 }
 
-fn poll_error(session: &mut Session, emu: &mut Emulator) -> anyhow::Error {
+fn poll_error(session: &mut Connection<NativeTransport>, emu: &mut Emulator) -> anyhow::Error {
     for _ in 0..100 {
         if let Err(error) = session.step(emu, Input::default(), false) {
             return error;
@@ -879,12 +895,12 @@ fn internet_pair(relay_only: bool) -> Result<()> {
     let mut machines = [emulator()?, emulator()?];
     let cfg = safe_config()?;
     let mut sessions = [
-        Session::new(
+        Connection::<NativeTransport>::new(
             ConnectionOptions::Internet(Box::new(host)),
             &mut machines[0],
             &cfg,
         )?,
-        Session::new(
+        Connection::<NativeTransport>::new(
             ConnectionOptions::Internet(Box::new(guest)),
             &mut machines[1],
             &cfg,

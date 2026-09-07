@@ -940,6 +940,7 @@ pub struct App {
     netplay_input: crate::netplay::LocalInput,
     netplay_keyboard_controller: bool,
     netplay_setup: Option<crate::video::launcher::NetplaySetup>,
+    netplay_disk_picker: Option<(usize, app_netplay::DiskPicker)>,
     // Linux serves clipboard selections from the owning instance.
     host_clipboard: Option<arboard::Clipboard>,
     emu: Emulator,
@@ -2220,6 +2221,7 @@ impl App {
             netplay_input: Default::default(),
             netplay_keyboard_controller: true,
             netplay_setup: None,
+            netplay_disk_picker: None,
             host_clipboard: None,
             run_ahead_frames,
             runahead_machine_block,
@@ -3330,9 +3332,13 @@ impl App {
                 .tt_note_input(crate::inputsched::ReplayAction::Pot { port, x, y });
         }
         let mut disk_inserts = Vec::new();
+        let mut disk_change_available = self.netplay.as_ref().is_none_or(|s| s.can_change_disk());
         self.auto_disk_inserts.retain(|insert| {
-            if emu_secs >= insert.insert_at_emulated_secs {
+            if disk_change_available && emu_secs >= insert.insert_at_emulated_secs {
                 disk_inserts.push(insert.clone());
+                if self.netplay.is_some() {
+                    disk_change_available = false;
+                }
                 false
             } else {
                 true

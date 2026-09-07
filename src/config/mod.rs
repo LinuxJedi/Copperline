@@ -90,6 +90,12 @@ pub struct WasmBoardConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub rom_path: PathBuf,
+    /// Installed only by netplay preparation, never by a configuration file.
+    /// All hard-drive opens then use private rollback-aware session storage.
+    #[doc(hidden)]
+    pub netplay_storage: bool,
+    #[doc(hidden)]
+    pub netplay_read_only: Vec<PathBuf>,
     pub cpu: CpuModel,
     pub fpu: bool,
     /// CPU clock in MHz. Defaults to the model's stock speed
@@ -2389,6 +2395,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             rom_path: PathBuf::from(BUNDLED_AROS_ROM),
+            netplay_storage: false,
+            netplay_read_only: Vec::new(),
             cpu: CpuModel::M68000,
             fpu: CpuModel::M68000.default_fpu(),
             cpu_clock_mhz: CpuModel::M68000.default_clock_mhz(),

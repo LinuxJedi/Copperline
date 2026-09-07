@@ -693,6 +693,9 @@ fn main() -> Result<()> {
         for target in ["iroh", "noq", "netwatch", "tracing::span"] {
             log_builder.filter_module(target, netplay_level);
         }
+        if copperline::envcfg::flag("COPPERLINE_NETPLAY_DEBUG") {
+            log_builder.filter_module("copperline::netplay", log::LevelFilter::Debug);
+        }
     }
     log_builder.init();
 
@@ -785,12 +788,28 @@ fn main() -> Result<()> {
         )?);
     }
 
-    let (cfg, mut raw_cfg) = load_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?;
+    let netplay_guest = cli
+        .netplay
+        .as_ref()
+        .is_some_and(|options| options.settings().player == 1);
+    let (cfg, mut raw_cfg) = if netplay_guest {
+        let raw = load_raw_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?;
+        (copperline::netplay::guest_config(&raw)?, raw)
+    } else {
+        load_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?
+    };
     if let Some(p) = &cli.rom_path {
         raw_cfg.rom = Some(p.to_string_lossy().into_owned());
     }
 
-    let mut cfg = cfg.with_rom_override(cli.rom_path.clone());
+    let mut cfg = if netplay_guest {
+        cfg
+    } else {
+        cfg.with_rom_override(cli.rom_path.clone())
+    };
+    if netplay_guest {
+        cfg.serial.mode = copperline::config::SerialMode::Off;
+    }
     let uss = cli
         .load_uss
         .as_ref()
@@ -808,13 +827,19 @@ fn main() -> Result<()> {
     // An explicit --run outranks a game remembered in [whdload]: the two
     // stage competing boot volumes (--run with --whdload itself is already
     // a validation error).
-    let config_game = if (cli.run.is_some() || uss.is_some()) && config_game.is_some() {
-        info!("ignoring the configured [whdload] game for this session");
-        None
-    } else {
-        config_game
-    };
-    if let Some(game) = cli.whdload.clone().or(config_game) {
+    let config_game =
+        if (netplay_guest || cli.run.is_some() || uss.is_some()) && config_game.is_some() {
+            info!("ignoring the configured [whdload] game for this session");
+            None
+        } else {
+            config_game
+        };
+    if let Some(game) = cli
+        .whdload
+        .clone()
+        .or(config_game)
+        .filter(|_| !netplay_guest)
+    {
         let prepared = copperline::whdload::prepare(&game, &whdload_options)?;
         // Derive on a clone: the session keeps the user's own raw config
         // (plus the game itself), so a launcher opened later edits -- and
@@ -825,12 +850,16 @@ fn main() -> Result<()> {
         cfg = Config::try_from(derived)?;
         copperline::whdload::remember_game(&mut raw_cfg, &game);
         info!(
-            "whdload: booting {} ({}) from {}, saves persist in {}",
+            "whdload: booting {} ({}) from {}",
             prepared.slave_rel.display(),
             prepared.slave.name.as_deref().unwrap_or("unnamed slave"),
-            game.display(),
-            prepared.game_dir.display()
+            game.display()
         );
+        if cli.netplay.is_none() {
+            info!("whdload: saves persist in {}", prepared.game_dir.display());
+        } else {
+            info!("whdload: netplay saves last for this session only");
+        }
     }
     // Warp launch: stage the minimal boot volume around the executable and
     // mount its directory. Same derive-on-a-clone discipline as WHDLoad so
@@ -839,7 +868,7 @@ fn main() -> Result<()> {
     // configuration and CLI flags say.
     let mut run_prog_name: Option<String> = None;
     let mut run_warp: Option<copperline::runprog::WarpLaunch> = None;
-    if let Some(program) = &cli.run {
+    if let Some(program) = cli.run.as_ref().filter(|_| !netplay_guest) {
         let prepared = copperline::runprog::prepare_with_options(
             program,
             cli.run_args.as_deref(),
@@ -890,7 +919,10 @@ fn main() -> Result<()> {
              storage-idle heuristic or the fixed timestamp"
         ));
     }
-    if cli.load_state.is_some() {
+    if cli.netplay.is_some() {
+        copperline::netplay::prepare_config(&mut cfg)?;
+    }
+    if cli.load_state.is_some() || netplay_guest {
         // A save state restores the full ROM image, so a Kickstart file is not
         // required to load one. Still resolve the bundled-AROS sentinel when
         // AROS is installed (best effort, so the banner and any post-load reuse
@@ -900,10 +932,11 @@ fn main() -> Result<()> {
     } else {
         config::resolve_bundled_rom(&mut cfg)?;
     }
-    let mut disk_insert_after = resolve_disk_insert_after(&mut cfg, cli.disk_insert_after)?;
-    if cli.netplay.is_some() {
-        copperline::netplay::prepare_config(&mut cfg)?;
-    }
+    let mut disk_insert_after = if netplay_guest {
+        Vec::new()
+    } else {
+        resolve_disk_insert_after(&mut cfg, cli.disk_insert_after)?
+    };
 
     // Name the boot ROM in the banner: a Kickstart image is identified by
     // checksum (src/romdb.rs), so the log says which Kickstart is booting
@@ -994,7 +1027,12 @@ fn main() -> Result<()> {
         info!("emulation timing: paced to wall-clock because a physical floppy drive is attached");
     }
     info!("emulation timing: deterministic core, paced={paced}");
-    let mut emu = emulator::build_machine(&cfg, audio, paced, cli.load_state.is_some())?;
+    let mut emu = emulator::build_machine(
+        &cfg,
+        audio,
+        paced,
+        cli.load_state.is_some() || netplay_guest,
+    )?;
     if let Some(uss) = &uss {
         uss.load(&mut emu)?;
     }
@@ -1110,7 +1148,11 @@ fn main() -> Result<()> {
     // The warp-launch gate belongs to interactive sessions only: a capture
     // run is already unpaced end to end and must never be re-paced when the
     // program loads.
-    let run_warp_target = if headless_capture { None } else { run_warp };
+    let run_warp_target = if headless_capture || cli.netplay.is_some() {
+        None
+    } else {
+        run_warp
+    };
     // The general warp-boot gate: interactive sessions only, same rule as
     // the --run gate above (a capture run is already unpaced end to end).
     let warp_boot_gate = if headless_capture {
@@ -1123,7 +1165,11 @@ fn main() -> Result<()> {
         )
     };
     let netplay = if let Some(options) = cli.netplay {
-        for disk in disk_insert_after.drain(..) {
+        let (boot, later): (Vec<_>, Vec<_>) = std::mem::take(&mut disk_insert_after)
+            .into_iter()
+            .partition(|disk| disk.secs == 0.0);
+        disk_insert_after = later;
+        for disk in boot {
             emu.bus_mut().floppy.insert_disk_image(
                 disk.drive_idx,
                 disk.path,
@@ -2568,6 +2614,29 @@ mod netplay_cli_tests {
     }
 
     #[test]
+    fn netplay_host_accepts_boot_packages_and_scheduled_floppy_swaps() -> Result<()> {
+        for extra in [
+            vec!["--run", "program"],
+            vec!["--whdload", "game.lha"],
+            vec!["--insert-disk-after", "3", "df3", "disk.adf"],
+        ] {
+            args(&extra)?;
+        }
+        for when in ["0", "3"] {
+            assert!(args(&[
+                "--netplay-player",
+                "2",
+                "--insert-disk-after",
+                when,
+                "df0",
+                "disk.adf",
+            ])
+            .is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn netplay_rejects_incomplete_invalid_and_unilateral_operations() {
         assert!(parse_args_from(["--netplay-delay".to_string(), "2".to_string()]).is_err());
         for extra in [
@@ -2579,12 +2648,9 @@ mod netplay_cli_tests {
             vec!["--netplay-session", "bad"],
             vec!["--netplay-peer", "0.0.0.0:19732"],
             vec!["--load-state", "saved.clstate"],
-            vec!["--run", "program"],
-            vec!["--whdload", "game.lha"],
             vec!["--warp-boot"],
             vec!["--control", ":1234"],
             vec!["--audio-wav", "/tmp/netplay.wav"],
-            vec!["--insert-disk-after", "1", "df0", "disk.adf"],
             vec!["--joy-after", "1", "red", "100", "2"],
             vec!["--mouse-after", "1", "3", "4"],
         ] {

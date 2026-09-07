@@ -1235,6 +1235,8 @@ impl TryFrom<RawConfig> for Config {
         Ok(Config {
             host_disks,
             rom_path: raw.rom.map(PathBuf::from).unwrap_or(defaults.rom_path),
+            netplay_storage: false,
+            netplay_read_only: Vec::new(),
             cpu,
             fpu,
             cpu_clock_mhz,

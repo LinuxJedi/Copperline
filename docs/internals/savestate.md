@@ -196,6 +196,12 @@ files are refused with a clear version message instead of failing with a
 confusing decode error (or worse, decoding into nonsense). There is no
 migration machinery; old states are simply invalidated.
 
+Version 80 adds the private netplay hard-drive backing. Its immutable media
+reference is valid only while that disk is alive in the current process;
+rollback checkpoints store changed sectors separately. Normal file-backed and
+in-memory-volume saves retain their existing contents. Netplay does not expose
+file save/load operations or accept checkpoints from the other peer.
+
 ## Snapshot point and atomicity
 
 File saves write through a buffered compressor into a unique sibling temporary

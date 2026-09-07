@@ -81,6 +81,11 @@ pub struct PacketQueue {
 }
 
 impl PacketQueue {
+    #[cfg(all(feature = "netplay-internet", not(target_arch = "wasm32")))]
+    pub(super) fn has_incoming(&self) -> bool {
+        !self.incoming.is_empty()
+    }
+
     pub fn push(&mut self, packet: &[u8]) -> Result<()> {
         ensure!(packet.len() <= MAX_PACKET, "netplay packet is too large");
         if self.incoming.len() == 64 {

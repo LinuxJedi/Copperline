@@ -11609,48 +11609,56 @@ mod gdb_and_control {
 
 #[test]
 fn netplay_routes_local_inputs_and_blocks_unilateral_menu_actions() -> anyhow::Result<()> {
-    let mut app = test_app();
-    app.emu.bus_mut().rtc.set_seed(Some(946684800), false);
-    app.emu
-        .bus_mut()
-        .input
-        .set_port_device(0, crate::bus::PortDevice::Joystick);
-    app.emu.bus_mut().paula.serial = Box::new(crate::serial::NullSerialSink);
-    let mut cfg = crate::config::Config::try_from(crate::config::RawConfig::default())?;
-    cfg.serial.mode = crate::config::SerialMode::Off;
-    let options = crate::netplay::Options {
-        bind: "127.0.0.1:0".parse()?,
-        peer: "127.0.0.1:19732".parse()?,
-        player: 0,
-        session: [7; 16],
-        input_delay: 0,
-        rollback_frames: 8,
-    };
-    let session = crate::netplay::Session::new(options, &mut app.emu, &cfg)?;
-    app.attach_netplay(session);
-    let before = app.emu.runahead_snapshot()?;
-    app.handle_amiga_key_event(0x40, true);
-    app.auto_joy_held[0].red = true;
-    app.apply_auto_joy_state(0);
-    assert_ne!(app.netplay_input.held.keys[8] & 1, 0);
-    assert_eq!(app.netplay_input.held.buttons, 1 << 4);
-    app.auto_joy_held[1].up = true;
-    app.apply_auto_joy_state(1);
-    assert_eq!(
-        app.netplay_input.held.buttons,
-        1 << 4,
-        "the remote port cannot replace local input"
-    );
-    app.run_menu_action(crate::video::menu::MenuAction::ToggleRewind, None);
-    assert!(!app.rewind_armed);
-    assert_eq!(
-        app.emu.runahead_snapshot()?,
-        before,
-        "only the netplay timeline may touch the machine"
-    );
-    app.handle_amiga_key_event(0x40, false);
-    assert_eq!(app.netplay_input.held.keys[8], 0);
-    Ok(())
+    // Two complete machines plus cold setup exceed the default test stack.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| -> anyhow::Result<()> {
+            let mut app = test_app();
+            app.emu.bus_mut().rtc.set_seed(Some(946684800), false);
+            app.emu
+                .bus_mut()
+                .input
+                .set_port_device(0, crate::bus::PortDevice::Joystick);
+            app.emu.bus_mut().paula.serial = Box::new(crate::serial::NullSerialSink);
+            let mut cfg = crate::config::Config::try_from(crate::config::RawConfig::default())?;
+            cfg.serial.mode = crate::config::SerialMode::Off;
+            cfg.port_devices[0] = crate::bus::PortDevice::Joystick;
+            let options = crate::netplay::Options {
+                bind: "127.0.0.1:0".parse()?,
+                peer: "127.0.0.1:19732".parse()?,
+                player: 0,
+                session: [7; 16],
+                input_delay: 0,
+                rollback_frames: 8,
+            };
+            let session = crate::netplay::Session::new(options, &mut app.emu, &cfg)?;
+            app.attach_netplay(session);
+            let before = app.emu.runahead_snapshot()?;
+            app.handle_amiga_key_event(0x40, true);
+            app.auto_joy_held[0].red = true;
+            app.apply_auto_joy_state(0);
+            assert_ne!(app.netplay_input.held.keys[8] & 1, 0);
+            assert_eq!(app.netplay_input.held.buttons, 1 << 4);
+            app.auto_joy_held[1].up = true;
+            app.apply_auto_joy_state(1);
+            assert_eq!(
+                app.netplay_input.held.buttons,
+                1 << 4,
+                "the remote port cannot replace local input"
+            );
+            app.run_menu_action(crate::video::menu::MenuAction::ToggleRewind, None);
+            assert!(!app.rewind_armed);
+            assert_eq!(
+                app.emu.runahead_snapshot()?,
+                before,
+                "only the netplay timeline may touch the machine"
+            );
+            app.handle_amiga_key_event(0x40, false);
+            assert_eq!(app.netplay_input.held.keys[8], 0);
+            Ok(())
+        })?
+        .join()
+        .unwrap()
 }
 #[test]
 fn netplay_gui_run_rejects_errors_and_preserves_the_current_machine() {
@@ -11721,138 +11729,157 @@ fn netplay_gui_rejects_an_existing_gdb_endpoint() {
 
 #[test]
 fn netplay_gui_peers_connect_and_can_return_to_setup_and_retry() -> anyhow::Result<()> {
-    use crate::video::launcher::{LauncherField as F, LauncherTab};
-    use std::net::UdpSocket;
-    let reserved = [
-        UdpSocket::bind("127.0.0.1:0")?,
-        UdpSocket::bind("127.0.0.1:0")?,
-    ];
-    let addresses = [reserved[0].local_addr()?, reserved[1].local_addr()?];
-    drop(reserved);
-    let mut apps = [test_app(), test_app()];
-    for (player, app) in apps.iter_mut().enumerate() {
-        app.machine_config.audio.output_enabled = Some(false);
-        app.open_launcher();
-        app.activate_ui_control(UiControl::LauncherToggle(F::NetplayEnabled));
-        let state = app.launcher_state_mut().unwrap();
-        state.netplay.bind = addresses[player].to_string();
-        state.netplay.peer = addresses[1 - player].to_string();
-        state.netplay.player = player;
-        state.netplay.code = "0123456789abcdef0123456789abcdef".into();
-        app.launcher_run();
-        assert!(
-            app.netplay.is_some(),
-            "{:?}",
-            app.launcher_state().and_then(|s| s.status.as_ref())
-        );
-        assert!(app.ui.panel.is_none());
-        assert_eq!(app.emu.bus().emulated_cck(), 0);
-        app.emu.set_paced(false);
-        // The launcher must leave the same frame-zero state as a direct CLI build.
-        let mut cfg = crate::config::Config::try_from(app.machine_config.clone())?;
-        crate::netplay::prepare_config(&mut cfg)?;
-        crate::config::resolve_bundled_rom(&mut cfg)?;
-        let direct = crate::emulator::build_machine(&cfg, Box::new(NullSink), false, false)?;
-        assert_eq!(app.emu.netplay_snapshot()?, direct.netplay_snapshot()?);
-    }
-    for _ in 0..250 {
-        for app in &mut apps {
-            let session = app.netplay.as_mut().unwrap();
-            let advance = session.status().frame < 60;
-            session.step(&mut app.emu, Default::default(), advance)?;
-        }
-        if apps
-            .iter()
-            .all(|app| app.netplay.as_ref().unwrap().status().checked_frame == 60)
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    for app in &apps {
-        assert_eq!(app.netplay.as_ref().unwrap().status().checked_frame, 60);
-    }
-    assert_eq!(
-        apps[0].emu.netplay_snapshot()?,
-        apps[1].emu.netplay_snapshot()?
-    );
-    apps[0].leave_netplay(None);
-    let state = apps[0].launcher_state().unwrap();
-    assert_eq!(state.tab, LauncherTab::Netplay);
-    assert_eq!(state.netplay.peer, addresses[1].to_string());
-    assert!(apps[0].paused);
-    assert!(apps[0].netplay.is_none());
-    apps[1].leave_netplay(Some("peer timed out".into()));
-    assert!(apps[1]
-        .launcher_state()
+    // Two complete machines plus cold setup exceed the default test stack.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| -> anyhow::Result<()> {
+            use crate::video::launcher::{LauncherField as F, LauncherTab};
+            use std::net::UdpSocket;
+            let reserved = [
+                UdpSocket::bind("127.0.0.1:0")?,
+                UdpSocket::bind("127.0.0.1:0")?,
+            ];
+            let addresses = [reserved[0].local_addr()?, reserved[1].local_addr()?];
+            drop(reserved);
+            let mut apps = [test_app(), test_app()];
+            for (player, app) in apps.iter_mut().enumerate() {
+                app.machine_config.audio.output_enabled = Some(false);
+                app.open_launcher();
+                app.activate_ui_control(UiControl::LauncherToggle(F::NetplayEnabled));
+                let state = app.launcher_state_mut().unwrap();
+                state.netplay.bind = addresses[player].to_string();
+                state.netplay.peer = addresses[1 - player].to_string();
+                state.netplay.player = player;
+                state.netplay.code = "0123456789abcdef0123456789abcdef".into();
+                app.launcher_run();
+                assert!(
+                    app.netplay.is_some(),
+                    "{:?}",
+                    app.launcher_state().and_then(|s| s.status.as_ref())
+                );
+                assert!(app.ui.panel.is_none());
+                assert_eq!(app.emu.bus().emulated_cck(), 0);
+                assert_eq!(app.audio_output, crate::audio::AudioOutput::Disabled);
+                app.emu.set_paced(false);
+                // The launcher must leave the same frame-zero state as a direct CLI build.
+                let mut cfg = crate::config::Config::try_from(app.machine_config.clone())?;
+                crate::netplay::prepare_config(&mut cfg)?;
+                crate::config::resolve_bundled_rom(&mut cfg)?;
+                let direct =
+                    crate::emulator::build_machine(&cfg, Box::new(NullSink), false, false)?;
+                if player == 0 {
+                    assert_eq!(app.emu.netplay_snapshot()?, direct.netplay_snapshot()?);
+                }
+            }
+            for _ in 0..250 {
+                for app in &mut apps {
+                    let session = app.netplay.as_mut().unwrap();
+                    let advance = session.status().frame < 60;
+                    session.step(&mut app.emu, Default::default(), advance)?;
+                }
+                if apps
+                    .iter()
+                    .all(|app| app.netplay.as_ref().unwrap().status().checked_frame == 60)
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            for app in &apps {
+                assert_eq!(app.netplay.as_ref().unwrap().status().checked_frame, 60);
+            }
+            assert_eq!(
+                apps[0].emu.netplay_snapshot()?,
+                apps[1].emu.netplay_snapshot()?
+            );
+            apps[0].leave_netplay(None);
+            let state = apps[0].launcher_state().unwrap();
+            assert_eq!(state.tab, LauncherTab::Netplay);
+            assert_eq!(state.netplay.peer, addresses[1].to_string());
+            assert!(apps[0].paused);
+            assert!(apps[0].netplay.is_none());
+            apps[1].leave_netplay(Some("peer timed out".into()));
+            assert!(apps[1]
+                .launcher_state()
+                .unwrap()
+                .status
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("timed out"));
+            for app in &mut apps {
+                app.launcher_run();
+                assert!(
+                    app.netplay.is_some(),
+                    "retry must release and rebind the socket"
+                );
+                assert_eq!(app.emu.bus().emulated_cck(), 0);
+                assert!(!app.paused);
+            }
+            Ok(())
+        })?
+        .join()
         .unwrap()
-        .status
-        .as_ref()
-        .unwrap()
-        .text
-        .contains("timed out"));
-    for app in &mut apps {
-        app.launcher_run();
-        assert!(
-            app.netplay.is_some(),
-            "retry must release and rebind the socket"
-        );
-        assert_eq!(app.emu.bus().emulated_cck(), 0);
-        assert!(!app.paused);
-    }
-    Ok(())
 }
 
 #[test]
 fn netplay_host_mouse_owns_only_the_local_mouse_port() -> anyhow::Result<()> {
-    for player in 0..2 {
-        let mut app = test_app();
-        app.emu
-            .bus_mut()
-            .rtc
-            .set_seed(Some(crate::netplay::RTC_SEED), false);
-        app.emu.bus_mut().paula.serial = Box::new(crate::serial::NullSerialSink);
-        for port in 0..2 {
-            app.emu
-                .bus_mut()
-                .input
-                .set_port_device(port, crate::bus::PortDevice::Mouse);
-        }
-        let mut cfg = crate::config::Config::try_from(crate::config::RawConfig::default())?;
-        cfg.serial.mode = crate::config::SerialMode::Off;
-        let session = crate::netplay::Session::new(
-            crate::netplay::Options {
-                bind: "127.0.0.1:0".parse()?,
-                peer: "127.0.0.1:19732".parse()?,
-                player,
-                session: [31; 16],
-                input_delay: 0,
-                rollback_frames: 8,
-            },
-            &mut app.emu,
-            &cfg,
-        )?;
-        app.attach_netplay(session);
-        assert_eq!(app.mouse_port(), Some(player));
-        assert!(!app.netplay_keyboard_controller);
-        let before = app.emu.netplay_snapshot()?;
-        app.add_mouse_delta_i32(15, -23);
-        app.netplay_input.held.set_mouse_button(0, true);
-        app.pump_netplay_input();
-        assert_eq!(
-            (
-                app.netplay_input.mouse_pending.0,
-                app.netplay_input.mouse_pending.1
-            ),
-            (15, -23)
-        );
-        assert_eq!(app.netplay_input.held.mouse_buttons, 1);
-        assert!(app.emu.netplay_snapshot()? == before);
-        app.release_mouse_buttons();
-        assert_eq!(app.netplay_input, Default::default());
-        app.add_mouse_delta_i32(70_000, -90_000);
-        assert_eq!(app.netplay_input.mouse_pending, (70_000, -90_000));
-        assert!(app.emu.netplay_snapshot()? == before);
-    }
-    Ok(())
+    // Two complete machines plus cold setup exceed the default test stack.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| -> anyhow::Result<()> {
+            for player in 0..2 {
+                let mut app = test_app();
+                app.emu
+                    .bus_mut()
+                    .rtc
+                    .set_seed(Some(crate::netplay::RTC_SEED), false);
+                app.emu.bus_mut().paula.serial = Box::new(crate::serial::NullSerialSink);
+                for port in 0..2 {
+                    app.emu
+                        .bus_mut()
+                        .input
+                        .set_port_device(port, crate::bus::PortDevice::Mouse);
+                }
+                let mut cfg = crate::config::Config::try_from(crate::config::RawConfig::default())?;
+                cfg.serial.mode = crate::config::SerialMode::Off;
+                cfg.port_devices = [crate::bus::PortDevice::Mouse; 2];
+                let session = crate::netplay::Session::new(
+                    crate::netplay::Options {
+                        bind: "127.0.0.1:0".parse()?,
+                        peer: "127.0.0.1:19732".parse()?,
+                        player,
+                        session: [31; 16],
+                        input_delay: 0,
+                        rollback_frames: 8,
+                    },
+                    &mut app.emu,
+                    &cfg,
+                )?;
+                app.attach_netplay(session);
+                assert_eq!(app.mouse_port(), Some(player));
+                assert!(!app.netplay_keyboard_controller);
+                let before = app.emu.netplay_snapshot()?;
+                app.add_mouse_delta_i32(15, -23);
+                app.netplay_input.held.set_mouse_button(0, true);
+                app.pump_netplay_input();
+                assert_eq!(
+                    (
+                        app.netplay_input.mouse_pending.0,
+                        app.netplay_input.mouse_pending.1
+                    ),
+                    (15, -23)
+                );
+                assert_eq!(app.netplay_input.held.mouse_buttons, 1);
+                assert!(app.emu.netplay_snapshot()? == before);
+                app.release_mouse_buttons();
+                assert_eq!(app.netplay_input, Default::default());
+                app.add_mouse_delta_i32(70_000, -90_000);
+                assert_eq!(app.netplay_input.mouse_pending, (70_000, -90_000));
+                assert!(app.emu.netplay_snapshot()? == before);
+            }
+            Ok(())
+        })?
+        .join()
+        .unwrap()
 }

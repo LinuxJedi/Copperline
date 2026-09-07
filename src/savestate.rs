@@ -379,7 +379,9 @@ const STATE_MAGIC: &[u8; 8] = b"CLSSTATE";
 //      between dumps.
 //  79: Expansion-board kind IDs are explicit and feature-independent. Builds
 //      without an optional board reject its kind without renumbering others.
-pub const STATE_VERSION: u32 = 79;
+//  80: Hard-drive state distinguishes private netplay sector overlays from
+//      full in-memory volumes and persistent image files.
+pub const STATE_VERSION: u32 = 80;
 
 /// Default state file name, timestamped like the screenshot/recorder names.
 pub fn auto_filename() -> std::path::PathBuf {

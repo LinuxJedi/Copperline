@@ -164,6 +164,10 @@ impl IdeDrive {
             boot_pri,
             filesystem,
         )?;
+        Ok(Self::from_disk(disk))
+    }
+
+    pub(crate) fn from_disk(disk: HardDriveImage) -> Self {
         // The classic Amiga HDF geometry: 16 surfaces, 32 sectors per track
         // (what HDToolBox/RDB tooling defaults to), so the CHS the host
         // computes from an RDB's physical-drive block agrees with what the
@@ -172,7 +176,7 @@ impl IdeDrive {
         let spt = RDB_SPT as u8;
         let cylinders =
             (disk.total_sectors() / (u64::from(heads) * u64::from(spt))).clamp(1, 65535) as u16;
-        Ok(Self {
+        Self {
             disk,
             default_heads: heads,
             default_spt: spt,
@@ -180,7 +184,7 @@ impl IdeDrive {
             heads,
             spt,
             multiple: 0,
-        })
+        }
     }
 
     /// Open a real host disk as an IDE drive.
