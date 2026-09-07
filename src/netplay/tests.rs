@@ -763,43 +763,97 @@ fn mouse_motion_is_consumed_once_when_sampling_through_stalls() -> Result<()> {
     };
     let mut peer =
         Connection::with_transport(settings, PacketQueue::default(), &mut machine, &cfg)?;
-    let mut pending = Input {
+    let mut pending: LocalInput = Input {
         mouse_dx: 250,
         mouse_dy: -250,
         mouse_buttons: 7,
         ..Default::default()
-    };
+    }
+    .into();
     assert!(!peer.step_local(&mut machine, &mut pending, true)?);
-    assert_eq!(pending.mouse_dx, 250, "handshake must retain motion");
+    assert_eq!(pending.mouse_pending.0, 250, "handshake must retain motion");
     // Isolate sampling from the handshake already exercised by the paired tests.
     peer.connected = true;
     assert!(!peer.step_local(&mut machine, &mut pending, false)?);
     assert_eq!(
-        pending.mouse_dx, 250,
+        pending.mouse_pending.0, 250,
         "confirmation polls must retain motion"
     );
     assert!(peer.step_local(&mut machine, &mut pending, true)?);
-    assert_eq!(pending.mouse_dx, 150);
+    assert_eq!(pending.mouse_pending.0, 150);
     assert!(!peer.step_local(&mut machine, &mut pending, true)?);
-    assert_eq!(pending.mouse_dx, 50, "a stalled frame is sampled once");
+    assert_eq!(
+        pending.mouse_pending.0, 50,
+        "a stalled frame is sampled once"
+    );
     pending.add_mouse_delta(7, -7);
     assert!(!peer.step_local(&mut machine, &mut pending, true)?);
     assert_eq!(
-        pending.mouse_dx, 57,
+        pending.mouse_pending.0, 57,
         "new motion waits for the next unsampled frame"
     );
     peer.rollback.receive(0, Input::default())?;
     peer.rollback.acknowledge(2)?;
     assert!(peer.step_local(&mut machine, &mut pending, true)?);
-    assert_eq!(pending.mouse_dx, 57);
+    assert_eq!(pending.mouse_pending.0, 57);
     peer.rollback.receive(1, Input::default())?;
     assert!(peer.step_local(&mut machine, &mut pending, true)?);
-    assert_eq!((pending.mouse_dx, pending.mouse_dy), (0, 0));
-    assert_eq!(pending.mouse_buttons, 7);
+    assert_eq!(pending.mouse_pending, (0, 0));
+    assert_eq!(pending.held.mouse_buttons, 7);
     assert_eq!(
         machine.bus().input.joydat(0),
         0xff01,
         "257 counts wrap in hardware exactly once"
     );
+    Ok(())
+}
+
+#[test]
+fn large_pending_mouse_motion_reaches_the_wire_without_truncation() -> Result<()> {
+    let mut machine = emulator()?;
+    machine
+        .bus_mut()
+        .input
+        .set_port_device(0, crate::bus::PortDevice::Mouse);
+    let mut peer = Connection::with_transport(
+        Settings {
+            player: 0,
+            session: [24; 16],
+            input_delay: 0,
+            rollback_frames: 1,
+        },
+        PacketQueue::default(),
+        &mut machine,
+        &safe_config()?,
+    )?;
+    let mut pending = LocalInput::default();
+    pending.add_mouse_delta(70_000, -90_000);
+    let mut transmitted = BTreeMap::new();
+    for frame in 0..900 {
+        let remote = wire::Packet {
+            session: [24; 16],
+            identity: peer.identity,
+            player: 1,
+            ready: true,
+            delay: 0,
+            window: 1,
+            ack: frame,
+            inputs: vec![(frame, Input::default())],
+            checksum: None,
+        };
+        peer.transport_mut().push(&remote.encode())?;
+        assert!(peer.step_local(&mut machine, &mut pending, true)?);
+        while let Some(bytes) = peer.transport_mut().pop() {
+            for (number, input) in wire::Packet::decode(&bytes).unwrap().inputs {
+                assert!(input.mouse_dx.abs() <= 100 && input.mouse_dy.abs() <= 100);
+                transmitted.insert(number, input);
+            }
+        }
+    }
+    assert_eq!(pending.mouse_pending, (0, 0));
+    let total = transmitted.values().fold((0i32, 0i32), |(x, y), input| {
+        (x + i32::from(input.mouse_dx), y + i32::from(input.mouse_dy))
+    });
+    assert_eq!(total, (70_000, -90_000));
     Ok(())
 }

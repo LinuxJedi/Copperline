@@ -464,25 +464,32 @@ mod tests {
             let before = web.emu.netplay_snapshot()?;
             web.mouse_delta(12.5, -3.25);
             web.mouse_delta(-1.0, 0.75);
-            assert_eq!((web.netplay_input.mouse_dx, web.netplay_input.mouse_dy), (12, -3));
+            assert_eq!(web.netplay_input.mouse_pending, (12, -3));
             assert_eq!(web.mouse_remainder, (-0.5, 0.5));
             web.mouse_delta(f64::NAN, f64::INFINITY);
             for (button, bit) in [(0, 0), (1, 2), (2, 1)] {
                 web.mouse_button(button, true);
-                assert_eq!(web.netplay_input.mouse_buttons, 1 << bit);
+                assert_eq!(web.netplay_input.held.mouse_buttons, 1 << bit);
                 web.set_joystick_port2(true, true, true, true, true, true);
                 web.set_cd32_buttons_port2(true, true, true, true, true);
-                assert_eq!(web.netplay_input.mouse_buttons, 1 << bit);
-                assert_eq!(web.netplay_input.buttons, 0);
+                assert_eq!(web.netplay_input.held.mouse_buttons, 1 << bit);
+                assert_eq!(web.netplay_input.held.buttons, 0);
                 web.mouse_button(button, false);
-                assert_eq!(web.netplay_input.mouse_buttons, 0);
+                assert_eq!(web.netplay_input.held.mouse_buttons, 0);
             }
             web.key_event("ArrowUp", true);
-            assert_ne!(web.netplay_input.keys, [0; 16]);
-            assert!(web.emu.netplay_snapshot()? == before, "host input bypassed the timeline");
+            assert_ne!(web.netplay_input.held.keys, [0; 16]);
+            assert!(
+                web.emu.netplay_snapshot()? == before,
+                "host input bypassed the timeline"
+            );
             web.netplay_release_input();
             assert_eq!(web.netplay_input, Default::default());
             assert_eq!(web.mouse_remainder, (0.0, 0.0));
+            web.mouse_delta(70_000.0, -90_000.0);
+            assert_eq!(web.netplay_input.mouse_pending, (70_000, -90_000));
+            web.netplay_release_input();
+            assert_eq!(web.netplay_input.mouse_pending, (0, 0));
         }
         Ok(())
     }
@@ -497,18 +504,18 @@ mod tests {
                 let on = |i| i == bit;
                 web.set_joystick_port2(on(0), on(1), on(2), on(3), on(4), on(5));
                 web.set_cd32_buttons_port2(on(6), on(7), on(8), on(9), on(10));
-                assert_eq!(web.netplay_input.buttons, 1 << bit);
+                assert_eq!(web.netplay_input.held.buttons, 1 << bit);
                 // The secondary page controller cannot overwrite the primary.
                 web.set_joystick_port(1, false, false, false, false, false, false);
                 web.set_cd32_buttons_port(1, false, false, false, false, false);
-                assert_eq!(web.netplay_input.buttons, 1 << bit);
+                assert_eq!(web.netplay_input.held.buttons, 1 << bit);
             }
             assert!(web.key_event("Space", true));
             web.key_raw(0x20, true);
-            assert_eq!(web.netplay_input.keys[8], 1);
-            assert_eq!(web.netplay_input.keys[4], 1);
+            assert_eq!(web.netplay_input.held.keys[8], 1);
+            assert_eq!(web.netplay_input.held.keys[4], 1);
             web.key_raw(0x20, false);
-            assert_eq!(web.netplay_input.keys[4], 0);
+            assert_eq!(web.netplay_input.held.keys[4], 0);
             web.netplay_release_input();
             assert_eq!(web.netplay_input, Default::default());
             for volume in [0, 35, 100] {

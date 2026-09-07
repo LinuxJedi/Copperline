@@ -43,7 +43,8 @@ future inputs never seed an earlier prediction.
 
 A delayed local input is submitted only once, even when repeated polling stalls
 on the same frame. Interactive frontends use `Connection::step_local`, which
-consumes pending mouse motion only on that first submission. Handshake and
+consumes pending mouse motion only on that first submission. `LocalInput` keeps
+32-bit pending counts separate from the 16-bit per-frame wire deltas. Handshake and
 confirmation polls preserve it, as do subsequent polls of an already sampled
 frame. Each sample takes at most 100 counts per axis, retaining the remainder
 for later frames to avoid ambiguous 8-bit JOYDAT wraparound. Mouse ports receive

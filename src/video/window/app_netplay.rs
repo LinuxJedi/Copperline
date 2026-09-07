@@ -93,7 +93,7 @@ impl App {
         }
         state.fire &=
             crate::config::autofire_asserted(self.autofire_hz, self.emu.bus().emulated_seconds());
-        self.netplay_input.buttons = [
+        self.netplay_input.held.buttons = [
             state.up,
             state.down,
             state.left,
@@ -155,7 +155,7 @@ impl App {
         loop {
             let session = self.netplay.as_mut().unwrap();
             let before = session.status().rollbacks;
-            session.step(&mut self.emu, self.netplay_input, false)?;
+            session.step_local(&mut self.emu, &mut self.netplay_input, false)?;
             let status = session.status();
             if status.rollbacks != before {
                 self.reset_render_pipeline();
@@ -230,7 +230,7 @@ impl App {
                 {
                     self.keyboard_joy_held[0].set(*code, pressed);
                 } else if let Some(rawkey) = host_to_amiga_rawkey(*code) {
-                    self.netplay_input.set_key(rawkey, pressed);
+                    self.netplay_input.held.set_key(rawkey, pressed);
                 }
                 true
             }
@@ -292,7 +292,7 @@ impl App {
                             _ => None,
                         };
                         if let Some(index) = index {
-                            self.netplay_input.set_mouse_button(index, pressed);
+                            self.netplay_input.held.set_mouse_button(index, pressed);
                         }
                     }
                 }

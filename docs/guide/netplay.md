@@ -238,8 +238,8 @@ large corrections can produce audible as well as visual discontinuities.
 
 ## Supported machines and verification
 
-Use a cold boot with interpreter execution, both digital controllers, serial off,
-and rewind/run-ahead disabled. Floppy images become session-local memory images;
+Use a cold boot with interpreter execution, matching mouse/joystick/CD32 port
+configurations on both peers, serial off, and rewind/run-ahead disabled. Floppy images become session-local memory images;
 guest disk writes can be rolled back and do **not** modify the original files.
 Disk changes and in-session saves are not persisted.
 

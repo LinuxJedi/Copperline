@@ -39,16 +39,6 @@ pub struct Input {
 impl Input {
     pub const BUTTONS: u16 = 0x7ff;
 
-    pub fn add_mouse_delta(&mut self, dx: i32, dy: i32) {
-        let add = |old: i16, delta: i32| {
-            i32::from(old)
-                .saturating_add(delta)
-                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
-        };
-        self.mouse_dx = add(self.mouse_dx, dx);
-        self.mouse_dy = add(self.mouse_dy, dy);
-    }
-
     pub fn set_mouse_button(&mut self, button: u8, pressed: bool) {
         if button < 3 {
             let mask = 1 << button;
@@ -92,6 +82,38 @@ impl Input {
 
     fn merged_keys(inputs: [Self; 2]) -> [u8; 16] {
         std::array::from_fn(|i| inputs[0].keys[i] | inputs[1].keys[i])
+    }
+}
+
+/// Frontend-held controls and unsampled motion, outside the wire timeline.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LocalInput {
+    pub held: Input,
+    pub mouse_pending: (i32, i32),
+}
+
+impl LocalInput {
+    pub fn add_mouse_delta(&mut self, dx: i32, dy: i32) {
+        self.mouse_pending.0 = self.mouse_pending.0.saturating_add(dx);
+        self.mouse_pending.1 = self.mouse_pending.1.saturating_add(dy);
+    }
+
+    fn sample(&self) -> Input {
+        // Stay below the signed wrap limit of the 8-bit JOYDAT counters.
+        Input {
+            mouse_dx: self.mouse_pending.0.clamp(-100, 100) as i16,
+            mouse_dy: self.mouse_pending.1.clamp(-100, 100) as i16,
+            ..self.held
+        }
+    }
+}
+
+impl From<Input> for LocalInput {
+    fn from(input: Input) -> Self {
+        Self {
+            held: input.without_motion(),
+            mouse_pending: (i32::from(input.mouse_dx), i32::from(input.mouse_dy)),
+        }
     }
 }
 
@@ -368,8 +390,8 @@ impl<T: Transport> Connection<T> {
 
     /// Poll, repair late input, and optionally advance a frame. `false` is a
     /// normal wait for handshake/input. Continue polling while waiting.
-    pub fn step(&mut self, emu: &mut Emulator, mut input: Input, advance: bool) -> Result<bool> {
-        self.step_local(emu, &mut input, advance)
+    pub fn step(&mut self, emu: &mut Emulator, input: Input, advance: bool) -> Result<bool> {
+        self.step_local(emu, &mut input.into(), advance)
     }
 
     /// Consume mouse motion only when a new local frame is sampled. Motion
@@ -377,7 +399,7 @@ impl<T: Transport> Connection<T> {
     pub fn step_local(
         &mut self,
         emu: &mut Emulator,
-        input: &mut Input,
+        input: &mut LocalInput,
         advance: bool,
     ) -> Result<bool> {
         if let Some(error) = &self.failure {
@@ -390,7 +412,12 @@ impl<T: Transport> Connection<T> {
         result
     }
 
-    fn step_inner(&mut self, emu: &mut Emulator, input: &mut Input, advance: bool) -> Result<bool> {
+    fn step_inner(
+        &mut self,
+        emu: &mut Emulator,
+        input: &mut LocalInput,
+        advance: bool,
+    ) -> Result<bool> {
         // A finite receive budget keeps window input responsive under a burst.
         let mut buffer = [0; wire::MAX_PACKET + 1];
         for _ in 0..64 {
@@ -439,7 +466,7 @@ impl<T: Transport> Connection<T> {
             }
         }
         ensure!(
-            input.buttons & !Input::BUTTONS == 0 && input.mouse_buttons & !7 == 0,
+            input.held.buttons & !Input::BUTTONS == 0 && input.held.mouse_buttons & !7 == 0,
             "invalid local netplay controller input"
         );
         let now = Instant::now();
@@ -452,16 +479,11 @@ impl<T: Transport> Connection<T> {
             "netplay peer timed out"
         );
         let mut stepped = false;
-        // Stay below the signed wrap limit of the 8-bit JOYDAT counters.
-        let sampled = Input {
-            mouse_dx: input.mouse_dx.clamp(-100, 100),
-            mouse_dy: input.mouse_dy.clamp(-100, 100),
-            ..*input
-        };
+        let sampled = input.sample();
         if self.connected && advance {
             if self.rollback.submit_local(sampled) {
-                input.mouse_dx -= sampled.mouse_dx;
-                input.mouse_dy -= sampled.mouse_dy;
+                input.mouse_pending.0 -= i32::from(sampled.mouse_dx);
+                input.mouse_pending.1 -= i32::from(sampled.mouse_dy);
             }
             // Send sampled input before replay, emulation, or pacing can add
             // another frame of avoidable network latency.

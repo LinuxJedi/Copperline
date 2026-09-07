@@ -206,7 +206,7 @@ const MAX_CATCHUP_SECONDS: f64 = 0.1;
 #[wasm_bindgen]
 pub struct WebEmu {
     netplay: Option<copperline::netplay::Connection<copperline::netplay::PacketQueue>>,
-    netplay_input: copperline::netplay::Input,
+    netplay_input: copperline::netplay::LocalInput,
     // Netplay keeps Paula's serialized output gain fixed; the browser applies
     // this local preference when draining its host audio buffer instead.
     netplay_volume: u8,
@@ -896,7 +896,7 @@ impl WebEmu {
     /// reverse table would have to be duplicated in the page glue.
     pub fn key_raw(&mut self, rawkey: u8, pressed: bool) {
         if self.netplay.is_some() {
-            self.netplay_input.set_key(rawkey & 0x7f, pressed);
+            self.netplay_input.held.set_key(rawkey & 0x7f, pressed);
             return;
         }
         self.emu.bus_mut().enqueue_key_event(rawkey & 0x7F, pressed);
@@ -960,7 +960,7 @@ impl WebEmu {
         if self.netplay.is_some() {
             if self.netplay_mouse() {
                 if let Some(index) = [0, 2, 1].get(usize::from(button)) {
-                    self.netplay_input.set_mouse_button(*index, pressed);
+                    self.netplay_input.held.set_mouse_button(*index, pressed);
                 }
             }
             return;
@@ -996,6 +996,7 @@ impl WebEmu {
             // connection assigns it to this peer's negotiated Amiga port.
             if port == 2 && !self.netplay_mouse() {
                 self.netplay_input
+                    .held
                     .set_joystick([up, down, left, right, fire, button2]);
             }
             return;
@@ -1026,6 +1027,7 @@ impl WebEmu {
         if self.netplay.is_some() {
             if port == 2 && !self.netplay_mouse() {
                 self.netplay_input
+                    .held
                     .set_cd32_buttons([play, rwd, ffw, green, yellow]);
             }
             return;

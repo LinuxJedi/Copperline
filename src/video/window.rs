@@ -937,7 +937,7 @@ fn analyzer_default_heat_window(bus: &crate::bus::Bus) -> (u32, u32) {
 
 pub struct App {
     netplay: Option<crate::netplay::Session>,
-    netplay_input: crate::netplay::Input,
+    netplay_input: crate::netplay::LocalInput,
     netplay_keyboard_controller: bool,
     netplay_setup: Option<crate::video::launcher::NetplaySetup>,
     // Linux serves clipboard selections from the owning instance.
@@ -2356,9 +2356,9 @@ impl App {
         }
     }
 
-    /// The port live host-mouse input drives: the lowest-numbered port with
-    /// a mouse plugged in. With no mouse on either port, live mouse input is
-    /// dropped.
+    /// Live host-mouse input drives the lowest-numbered mouse port locally.
+    /// During netplay it drives only this peer's assigned port, if that port
+    /// holds a mouse. Otherwise live mouse input is dropped.
     fn mouse_port(&self) -> Option<usize> {
         if let Some(peer) = &self.netplay {
             let port = peer.player();
@@ -2924,7 +2924,7 @@ impl App {
         let held = self.auto_joy_held[port];
         if let Some(session) = &self.netplay {
             if port == session.player() {
-                self.netplay_input.buttons = [
+                self.netplay_input.held.buttons = [
                     held.up,
                     held.down,
                     held.left,

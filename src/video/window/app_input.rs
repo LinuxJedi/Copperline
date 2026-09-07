@@ -195,9 +195,8 @@ impl App {
 
     pub(super) fn release_mouse_buttons(&mut self) {
         if self.netplay.is_some() {
-            self.netplay_input.mouse_buttons = 0;
-            self.netplay_input.mouse_dx = 0;
-            self.netplay_input.mouse_dy = 0;
+            self.netplay_input.held.mouse_buttons = 0;
+            self.netplay_input.mouse_pending = (0, 0);
             return;
         }
         if let Some(port) = self.mouse_port() {
@@ -512,7 +511,7 @@ impl App {
     /// A transition from the host keyboard.
     pub(super) fn handle_amiga_key_event(&mut self, rawkey: u8, pressed: bool) {
         if self.netplay.is_some() {
-            self.netplay_input.set_key(rawkey, pressed);
+            self.netplay_input.held.set_key(rawkey, pressed);
             return;
         }
         self.handle_amiga_key_event_from(KeySource::Host, rawkey, pressed);
