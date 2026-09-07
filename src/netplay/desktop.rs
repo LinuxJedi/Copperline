@@ -187,7 +187,7 @@ pub struct Session {
     pub(super) connection: Connection<Control<NativeTransport>>,
     options: ConnectionOptions,
     phase: Phase,
-    bundle: Option<Vec<u8>>,
+    bundle: Option<Vec<Vec<u8>>>,
     directory: Option<tempfile::TempDir>,
     changed_config: Option<Config>,
     started: Instant,
@@ -216,7 +216,7 @@ impl Session {
         // or moving its output sink. The host also uses the transmitted setup.
         let staged = if settings.player == 0 {
             let bundle = Bundle::capture(cfg, emu)?;
-            Some((bundle.stage()?, bundle.encode()?))
+            Some((bundle.stage()?, bundle.into_parts()?))
         } else {
             None
         };
@@ -571,11 +571,13 @@ impl Session {
             }
             if self.phase == Phase::GuestBundle {
                 ensure!(bytes.first() == Some(&2), "expected host setup bundle");
+                let bundle = Bundle::decode(&bytes[1..])?;
+                drop(bytes);
                 let Staged {
                     emu: mut received,
                     cfg,
                     directory,
-                } = Bundle::decode(&bytes[1..])?.stage()?;
+                } = bundle.stage()?;
                 // Reuse the same validation as initial session construction.
                 self.connection.identity =
                     initial_identity(&self.connection.settings, &mut received, &cfg)?;
@@ -615,9 +617,9 @@ impl Session {
                         delay: self.connection.settings.input_delay,
                         window: self.connection.settings.rollback_frames,
                     })?;
-                    let mut bytes = vec![2];
-                    bytes.extend(self.bundle.take().unwrap());
-                    self.connection.transport.send_message(bytes)?;
+                    let mut parts = vec![vec![2]];
+                    parts.extend(self.bundle.take().unwrap());
+                    self.connection.transport.send_parts(parts)?;
                     self.phase = Phase::HostVerified;
                     self.progress = Some("Sending machine configuration and game files...".into());
                 }

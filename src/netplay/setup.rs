@@ -254,7 +254,9 @@ impl Hardware {
         // of bundled-asset lookup while validating the hardware selection.
         if let Some(controller) = &self.scsi {
             raw.scsi.controller = Some(controller.clone());
-            raw.scsi.rom = Some(String::new());
+            if !controller.eq_ignore_ascii_case("A3000") {
+                raw.scsi.rom = Some(String::new());
+            }
         }
         if let Some(board) = &self.lide {
             raw.lide.board = Some(board.clone());
@@ -474,19 +476,20 @@ impl Bundle {
         Ok(())
     }
 
-    pub fn encode(&self) -> Result<Vec<u8>> {
+    pub fn into_parts(self) -> Result<Vec<Vec<u8>>> {
         let manifest = serde_json::to_vec(&self.manifest)?;
         ensure!(
             manifest.len() <= MANIFEST_LIMIT,
             "netplay manifest too large"
         );
-        let mut bytes = (manifest.len() as u32).to_le_bytes().to_vec();
-        bytes.extend(manifest);
-        for file in &self.files {
-            bytes.extend(file);
-        }
-        ensure!(bytes.len() <= MAX_BUNDLE, "netplay bundle exceeds 512 MiB");
-        Ok(bytes)
+        let len = 4 + manifest.len() + self.files.iter().map(Vec::len).sum::<usize>();
+        ensure!(len <= MAX_BUNDLE, "netplay bundle exceeds 512 MiB");
+        let mut header = Vec::with_capacity(4 + manifest.len());
+        header.extend((manifest.len() as u32).to_le_bytes());
+        header.extend(manifest);
+        let mut parts = vec![header];
+        parts.extend(self.files);
+        Ok(parts)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -721,6 +724,11 @@ mod tests {
             if profile == "A3000" {
                 assert_eq!(cfg.scsi.controller, ScsiController::A3000);
             }
+            let restored = Hardware::capture(&cfg).config()?;
+            assert_eq!(restored.scsi.controller, cfg.scsi.controller);
+            if profile == "A3000" {
+                assert!(restored.scsi.rom.is_none());
+            }
         }
         Ok(())
     }
@@ -750,8 +758,15 @@ mod tests {
                 let emu = super::super::tests::emulator()?;
                 let cfg = super::super::tests::safe_config()?;
                 let bundle = Bundle::capture(&cfg, &emu)?;
-                let bytes = bundle.encode()?;
                 let host = bundle.stage()?;
+                let buffers: Vec<_> = bundle.files.iter().map(Vec::as_ptr).collect();
+                let parts = bundle.into_parts()?;
+                assert_eq!(
+                    parts[1..].iter().map(Vec::as_ptr).collect::<Vec<_>>(),
+                    buffers,
+                    "transfer owns the original media allocations"
+                );
+                let bytes: Vec<_> = parts.into_iter().flatten().collect();
                 let guest = Bundle::decode(&bytes)?.stage()?;
                 assert_eq!(host.emu.netplay_snapshot()?, guest.emu.netplay_snapshot()?);
                 assert_ne!(host.directory.path(), guest.directory.path());

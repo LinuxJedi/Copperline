@@ -78,12 +78,14 @@ pub struct HardDriveImage {
 /// writes survive the round trip. Deserialization reopens file backings,
 /// which makes a missing/moved image a load-time error instead of a later
 /// I/O panic.
+/// Generic fields borrow media for serialization and own it on deserialization,
+/// keeping the same field order without cloning disk contents per checkpoint.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct HardDriveImageState {
-    path: PathBuf,
-    memory: Option<Vec<u8>>,
+struct HardDriveImageState<P = PathBuf, B = Vec<u8>, S = SessionImage> {
+    path: P,
+    memory: Option<B>,
     total_sectors: u64,
-    rdb_overlay: Option<Vec<u8>>,
+    rdb_overlay: Option<B>,
     overlay_write_warned: bool,
     scsi_bus: bool,
     /// The real disk this drive is, if it is one: the identifier a
@@ -95,7 +97,7 @@ struct HardDriveImageState {
     /// sector translation; without the access, a disk attached read-only
     /// would come back writable.
     host_device: Option<HostDiskState>,
-    session: Option<SessionImage>,
+    session: Option<S>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -108,9 +110,9 @@ struct HostDiskState {
 impl serde::Serialize for HardDriveImage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         HardDriveImageState {
-            path: self.path.clone(),
+            path: &self.path,
             memory: match &self.backing {
-                Backing::Memory(image) => Some(image.clone()),
+                Backing::Memory(image) => Some(image.as_slice()),
                 // A physical disk is not ours to capture: the medium lives
                 // outside the emulator and can be swapped while a state is
                 // saved. What it is gets recorded instead, and resuming
@@ -118,7 +120,7 @@ impl serde::Serialize for HardDriveImage {
                 _ => None,
             },
             total_sectors: self.total_sectors,
-            rdb_overlay: self.rdb_overlay.clone(),
+            rdb_overlay: self.rdb_overlay.as_deref(),
             overlay_write_warned: self.overlay_write_warned,
             scsi_bus: self.bus_name == "scsi",
             host_device: match &self.backing {
@@ -133,7 +135,7 @@ impl serde::Serialize for HardDriveImage {
                 _ => None,
             },
             session: match &self.backing {
-                Backing::Session(image) => Some(image.clone()),
+                Backing::Session(image) => Some(image),
                 _ => None,
             },
         }
@@ -143,7 +145,7 @@ impl serde::Serialize for HardDriveImage {
 
 impl<'de> serde::Deserialize<'de> for HardDriveImage {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let state = HardDriveImageState::deserialize(deserializer)?;
+        let state: HardDriveImageState = HardDriveImageState::deserialize(deserializer)?;
         let bus_name = if state.scsi_bus { "scsi" } else { "ide" };
         if let Some(disk) = state.host_device {
             #[cfg(not(target_arch = "wasm32"))]
@@ -1012,6 +1014,20 @@ mod tests {
         let lba = u64::from(CYL_SECTORS) + 3;
         original.write_sector(lba, &[0xA5; SECTOR_SIZE]).unwrap();
         let encoded = bincode::serialize(&original).unwrap();
+        let owned: HardDriveImageState = HardDriveImageState {
+            path: original.path.clone(),
+            memory: None,
+            total_sectors: original.total_sectors,
+            rdb_overlay: original.rdb_overlay.clone(),
+            overlay_write_warned: original.overlay_write_warned,
+            scsi_bus: false,
+            host_device: None,
+            session: match &original.backing {
+                Backing::Session(image) => Some(image.clone()),
+                _ => unreachable!(),
+            },
+        };
+        assert_eq!(encoded, bincode::serialize(&owned).unwrap());
         original.write_sector(lba, &[0x5A; SECTOR_SIZE]).unwrap();
         original.flush().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
@@ -1211,7 +1227,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn serde_defers_physical_disk_acquisition() {
-        let state = HardDriveImageState {
+        let state: HardDriveImageState = HardDriveImageState {
             path: PathBuf::from("/dev/definitely-not-opened"),
             session: None,
             memory: None,

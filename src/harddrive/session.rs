@@ -25,9 +25,9 @@ pub(super) struct SessionImage {
 }
 
 #[derive(Serialize, Deserialize)]
-struct State {
+struct State<W = BTreeMap<u64, Vec<u8>>> {
     id: [u8; 32],
-    writes: BTreeMap<u64, Vec<u8>>,
+    writes: W,
     read_only: bool,
 }
 
@@ -35,7 +35,7 @@ impl Serialize for SessionImage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         State {
             id: self.id,
-            writes: self.writes.clone(),
+            writes: &self.writes,
             read_only: self.read_only,
         }
         .serialize(serializer)
@@ -44,7 +44,7 @@ impl Serialize for SessionImage {
 
 impl<'de> Deserialize<'de> for SessionImage {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let state = State::deserialize(deserializer)?;
+        let state: State = State::deserialize(deserializer)?;
         let base = bases()
             .lock()
             .unwrap()

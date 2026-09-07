@@ -25,7 +25,7 @@ pub(super) struct Control<T> {
     player: usize,
     next_send: u64,
     next_receive: u64,
-    sending: VecDeque<Vec<u8>>,
+    sending: VecDeque<VecDeque<Vec<u8>>>,
     send_offset: usize,
     outgoing: BTreeMap<u64, Outgoing>,
     incoming: BTreeMap<u64, Vec<u8>>,
@@ -57,13 +57,21 @@ impl<T: Transport> Control<T> {
     }
 
     pub fn send_message(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.send_parts(vec![bytes])
+    }
+
+    /// Take ownership of each media buffer, copying only packet-sized chunks.
+    pub fn send_parts(&mut self, parts: Vec<Vec<u8>>) -> Result<()> {
+        let len = parts
+            .iter()
+            .try_fold(0usize, |len, part| len.checked_add(part.len()))
+            .context("netplay control message length overflow")?;
         ensure!(
-            bytes.len() <= super::setup::MAX_BUNDLE + 1 && self.sending.len() < 4,
+            len > 0 && len <= super::setup::MAX_BUNDLE + 1 && self.sending.len() < 4,
             "netplay control send queue is full"
         );
-        let mut framed = Vec::with_capacity(bytes.len() + 4);
-        framed.extend((bytes.len() as u32).to_le_bytes());
-        framed.extend(bytes);
+        let mut framed = VecDeque::from([(len as u32).to_le_bytes().to_vec()]);
+        framed.extend(parts.into_iter().filter(|part| !part.is_empty()));
         self.sending.push_back(framed);
         Ok(())
     }
@@ -165,11 +173,12 @@ impl<T: Transport> Control<T> {
             .first_key_value()
             .map_or(self.next_send, |(&n, _)| n);
         while self.next_send - base < WINDOW {
-            let Some(message) = self.sending.front() else {
+            let Some(message) = self.sending.front_mut() else {
                 break;
             };
-            let end = (self.send_offset + CHUNK).min(message.len());
-            let chunk = message[self.send_offset..end].to_vec();
+            let part = message.front().unwrap();
+            let end = (self.send_offset + CHUNK).min(part.len());
+            let chunk = part[self.send_offset..end].to_vec();
             self.outgoing.insert(
                 self.next_send,
                 Outgoing {
@@ -182,8 +191,11 @@ impl<T: Transport> Control<T> {
                 .checked_add(1)
                 .context("setup sequence exhausted")?;
             self.send_offset = end;
-            if end == message.len() {
-                self.sending.pop_front();
+            if end == part.len() {
+                message.pop_front();
+                if message.is_empty() {
+                    self.sending.pop_front();
+                }
                 self.send_offset = 0;
             }
         }
@@ -229,6 +241,16 @@ impl<T: Transport> Control<T> {
         while !bytes.is_empty() {
             let target = self.expected.unwrap_or(4);
             let take = (target - self.assembling.len()).min(bytes.len());
+            if self.assembling.len() + take > self.assembling.capacity() {
+                let capacity = self
+                    .assembling
+                    .capacity()
+                    .max(CHUNK)
+                    .saturating_mul(2)
+                    .min(target);
+                self.assembling
+                    .reserve_exact(capacity - self.assembling.len());
+            }
             self.assembling.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
             if self.assembling.len() != target {
@@ -240,6 +262,8 @@ impl<T: Transport> Control<T> {
                     len <= super::setup::MAX_BUNDLE + 1 && len > 0,
                     "invalid setup message length"
                 );
+                // Grow only as data arrives, capped at the validated length.
+                // A near-limit message type byte must not double allocation.
                 self.assembling.clear();
                 self.expected = Some(len);
             } else {
@@ -288,12 +312,38 @@ impl<T: Transport> Transport for Control<T> {
 mod tests {
     use super::*;
     use crate::netplay::PacketQueue;
+
+    #[test]
+    fn receive_allocation_grows_with_data_and_stays_within_message_length() -> Result<()> {
+        let mut control = Control::new(PacketQueue::default(), [3; 16], 0);
+        let limit = (super::super::setup::MAX_BUNDLE + 1) as u32;
+        control.assemble(&limit.to_le_bytes())?;
+        control.assemble(&[1])?;
+        assert!(control.assembling.capacity() <= 2 * CHUNK);
+
+        let mut control = Control::new(PacketQueue::default(), [3; 16], 0);
+        let len = CHUNK * 3 + 1;
+        control.assemble(&(len as u32).to_le_bytes())?;
+        for chunk in vec![7; len].chunks(CHUNK) {
+            control.assemble(chunk)?;
+            assert!(control.assembling.capacity() <= len);
+        }
+        let message = control.take_message().unwrap();
+        assert_eq!(message, vec![7; len]);
+        assert!(message.capacity() <= len);
+        Ok(())
+    }
+
     #[test]
     fn transfer_survives_loss_reordering_duplicates_and_backpressure() -> Result<()> {
         let mut a = Control::new(PacketQueue::default(), [3; 16], 0);
         let mut b = Control::new(PacketQueue::default(), [3; 16], 1);
         let payload: Vec<_> = (0..120_000).map(|n| (n % 251) as u8).collect();
-        a.send_message(payload.clone())?;
+        a.send_parts(vec![
+            payload[..123].to_vec(),
+            vec![],
+            payload[123..].to_vec(),
+        ])?;
         b.send_message(b"reply".to_vec())?;
         let mut now = Instant::now();
         let mut received = None;

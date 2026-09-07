@@ -32,6 +32,9 @@ the shared input datagrams. The default `netplay-internet` feature adds iroh to
 native builds. The browser/core build keeps its existing transport boundary.
 
 The host sends a bounded JSON hardware manifest and checksummed media bytes.
+The control channel takes ownership of separate media buffers and copies only
+packet-sized chunks. It releases each buffer as it is queued, and the receiver
+grows its buffer with incoming data up to the validated message length.
 GUI and CLI guests retain local output, display and host input preferences on
 their placeholder machine while ignoring remembered machine and game settings.
 The manifest contains no host file paths, display/output preferences, plugin
@@ -61,7 +64,8 @@ target, allowing the ROM boot driver to discover subsequent IDE/SCSI volumes.
 
 Session hard drives share an immutable base by SHA-256 and serialize only a
 sorted overlay of changed sectors. Local checkpoint deserialization resolves
-the base through a process-local weak registry; it never opens a path. The live
+the base through a process-local weak registry; serialization borrows the
+overlay without cloning dirty sectors. Deserialization never opens a path. The live
 disk keeps its base alive. Read-only volumes reject writes, including writes to
 partition metadata. Persistent hardfiles and ordinary in-memory volumes retain
 their existing storage behavior. This adds the session backing to hard-drive
