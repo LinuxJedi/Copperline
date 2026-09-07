@@ -11823,6 +11823,139 @@ fn netplay_gui_peers_connect_and_can_return_to_setup_and_retry() -> anyhow::Resu
 }
 
 #[test]
+fn netplay_continuous_mouse_corrections_present_every_frame() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| -> anyhow::Result<()> {
+            use crate::netplay::{Options, Session};
+            use std::net::UdpSocket;
+            use std::time::{Duration, Instant};
+
+            let reserved = [
+                UdpSocket::bind("127.0.0.1:0")?,
+                UdpSocket::bind("127.0.0.1:0")?,
+            ];
+            let addresses = [reserved[0].local_addr()?, reserved[1].local_addr()?];
+            drop(reserved);
+            // Read the remote mouse's JOYDAT into COLOR00, then repeat. The
+            // framebuffer must change as delayed movement corrects prediction.
+            let program = [0x33f9, 0x00df, 0xf00c, 0x00df, 0xf180, 0x60f4];
+            let mut apps = std::array::from_fn::<_, 2, _>(|_| {
+                test_app_with_audio_cpu_and_program(
+                    Box::new(NullSink),
+                    crate::config::CpuModel::M68000,
+                    &program,
+                )
+            });
+            let mut cfg = crate::config::Config::try_from(crate::config::RawConfig::default())?;
+            cfg.serial.mode = crate::config::SerialMode::Off;
+            cfg.port_devices = [crate::bus::PortDevice::Mouse; 2];
+            for (player, app) in apps.iter_mut().enumerate() {
+                app.emu
+                    .bus_mut()
+                    .rtc
+                    .set_seed(Some(crate::netplay::RTC_SEED), false);
+                app.emu.bus_mut().paula.serial = Box::new(crate::serial::NullSerialSink);
+                for port in 0..2 {
+                    app.emu
+                        .bus_mut()
+                        .input
+                        .set_port_device(port, crate::bus::PortDevice::Mouse);
+                }
+                let session = Session::new(
+                    Options {
+                        bind: addresses[player],
+                        peer: addresses[1 - player],
+                        player,
+                        session: [32; 16],
+                        input_delay: 2,
+                        rollback_frames: 8,
+                    },
+                    &mut app.emu,
+                    &cfg,
+                )?;
+                app.attach_netplay(session);
+                app.render_worker = Some(super::RenderWorker::new());
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !apps
+                .iter()
+                .all(|app| app.netplay.as_ref().unwrap().status().connected)
+            {
+                for app in &mut apps {
+                    app.netplay
+                        .as_mut()
+                        .unwrap()
+                        .step(&mut app.emu, Default::default(), false)?;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "setup did not connect");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Keep the host four frames ahead of the guest. With the default
+            // two-frame delay, every moving guest sample arrives too late.
+            for _ in 0..4 {
+                assert!(apps[0].step_netplay()?);
+                apps[0].render_emulated_frame_if_needed();
+            }
+            let mut corrections = 0;
+            let mut changed = 0;
+            for _ in 0..24 {
+                apps[1].add_mouse_delta_i32(7, -3);
+                assert!(apps[1].step_netplay()?);
+                apps[0].add_mouse_delta_i32(-5, 2);
+                let before = apps[0].netplay.as_ref().unwrap().status().rollbacks;
+                let picture = apps[0].present_fb.clone();
+                assert!(apps[0].step_netplay()?);
+                if apps[0].netplay.as_ref().unwrap().status().rollbacks > before {
+                    corrections += 1;
+                    assert_eq!(
+                        apps[0].last_rendered_emulated_frame,
+                        Some(apps[0].emu.bus().emulated_frames()),
+                        "continuous corrections must not starve desktop presentation"
+                    );
+                    changed += usize::from(apps[0].present_fb != picture);
+                    // Compare the worker output with synchronous rendering of
+                    // this corrected machine, and prove rendering is host-only.
+                    let state = apps[0].emu.netplay_snapshot()?;
+                    let threaded = apps[0].present_fb.clone();
+                    apps[0].last_rendered_emulated_frame = None;
+                    assert!(apps[0].render_emulated_frame_sync());
+                    assert!(
+                        apps[0].present_fb == threaded,
+                        "corrected rendering differs"
+                    );
+                    assert!(
+                        apps[0].emu.netplay_snapshot()? == state,
+                        "rendering changed machine state"
+                    );
+                }
+                apps[0].render_emulated_frame_if_needed();
+            }
+            assert!(corrections >= 20, "exercise sustained late mouse movement");
+            assert!(
+                changed >= 20,
+                "corrected mouse input must reach the display"
+            );
+            let target = apps[0].netplay.as_ref().unwrap().status().frame + 2;
+            while !apps.iter().all(|app| {
+                let status = app.netplay.as_ref().unwrap().status();
+                status.frame == target && status.ready_to_capture()
+            }) {
+                for app in &mut apps {
+                    let session = app.netplay.as_mut().unwrap();
+                    let advance = session.status().frame < target;
+                    session.step_local(&mut app.emu, &mut app.netplay_input, advance)?;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "mouse input did not converge");
+            }
+            assert!(apps[0].emu.netplay_snapshot()? == apps[1].emu.netplay_snapshot()?);
+            Ok(())
+        })?
+        .join()
+        .unwrap()
+}
+
+#[test]
 fn netplay_host_mouse_owns_only_the_local_mouse_port() -> anyhow::Result<()> {
     // Two complete machines plus cold setup exceed the default test stack.
     std::thread::Builder::new()

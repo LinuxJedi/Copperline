@@ -169,6 +169,12 @@ impl App {
         }
         if after.rollbacks != before.rollbacks {
             self.reset_render_pipeline();
+            // Continuous remote motion can correct every frame. Finish this
+            // image before the next correction invalidates the worker result,
+            // or the desktop can keep displaying the same old framebuffer.
+            if !self.headless_capture_active() {
+                self.finish_render_for_current_frame();
+            }
         }
         if !connected && after.connected {
             let controls = if self.mouse_port().is_some() {

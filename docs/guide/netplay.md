@@ -319,6 +319,13 @@ netplay.
 Desktop guests inherit these values from the host. At PAL's nominal 50 Hz, two frames are
 about 40 ms. Zero delay gives immediate local input but can produce more visible
 corrections. Rollback reduces perceived latency; it cannot remove network delay.
+Mouse movement is combined into one sample per emulated frame, so moving faster
+does not send more input packets. Continuous movement can still require frequent
+corrections when remote input arrives late. The desktop finishes rendering each
+corrected frame so repeated corrections cannot starve the background renderer.
+If movement also causes audio or emulation to slow down, try increasing the
+host's input delay to 3 or 4 frames to reduce replay work.
+
 If input or its acknowledgement falls too far behind, emulation waits and resumes
 when it arrives. History uses at most 256 MiB; an oversized snapshot window stops
 with a memory-budget error.

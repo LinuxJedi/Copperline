@@ -171,7 +171,11 @@ presentation-only, including the synchronous fallback. Replay is unpaced and
 suppresses live audio and speculative host output.
 It does not increment committed-frame statistics. The desktop renderer's
 generation is invalidated after a correction, so an asynchronous result from
-the old timeline cannot replace the corrected image. Scheduled headless captures
+the old timeline cannot replace the corrected image. Interactive desktop sessions
+finish rendering the corrected frame before returning to the window loop.
+Otherwise, a rollback on every iteration can invalidate each queued render result
+before the main thread collects it, freezing presentation during continuous mouse
+movement even while emulation advances. Scheduled headless captures
 wait for confirmation and local-input acknowledgement before rendering their
 target, so they keep retransmitting inputs still needed by the other peer.
 
@@ -370,6 +374,9 @@ The regression suite covers:
 - Byte-identical replay against an uninterrupted 68000 workload that reads both
   JOYDAT registers and CIA fire inputs, writes RAM, and drives a display colour,
   with two mice, two joysticks, two CD32 pads and mixed mouse/CD32 ports.
+- Desktop presentation during sustained late mouse movement at the default input
+  delay, including agreement between threaded and synchronous rendering without
+  changing machine state.
 - Two complete emulators connected through local UDP proxies with deterministic
   loss, delay, duplication, reordering, and asymmetric pauses, with zero, default,
   and maximum input delay; both must confirm the same checkpoint and end with
