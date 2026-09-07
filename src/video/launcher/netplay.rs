@@ -139,7 +139,10 @@ impl LauncherState {
             self.setup.warp_boot = false;
             self.setup.warp_until = None;
             for port in &mut self.setup.port_devices {
-                if !matches!(port, PortDevice::Joystick | PortDevice::Cd32Pad) {
+                if !matches!(
+                    port,
+                    PortDevice::Mouse | PortDevice::Joystick | PortDevice::Cd32Pad
+                ) {
                     *port = PortDevice::Joystick;
                 }
             }

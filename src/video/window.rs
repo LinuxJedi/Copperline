@@ -2360,6 +2360,13 @@ impl App {
     /// a mouse plugged in. With no mouse on either port, live mouse input is
     /// dropped.
     fn mouse_port(&self) -> Option<usize> {
+        if let Some(peer) = &self.netplay {
+            let port = peer.player();
+            return self.emu.bus().input.ports[port]
+                .device
+                .is_mouse()
+                .then_some(port);
+        }
         self.emu
             .bus()
             .input
@@ -4819,6 +4826,11 @@ impl ApplicationHandler for App {
         event: DeviceEvent,
     ) {
         if self.netplay.is_some() {
+            if let DeviceEvent::MouseMotion { delta } = event {
+                if self.mouse_captured && self.main_window_focused {
+                    self.add_host_mouse_delta(delta.0, delta.1);
+                }
+            }
             return;
         }
         match event {

@@ -113,6 +113,7 @@ let netplayMachineReady = false;
 let netplayTimer = null;
 let machineGeneration = 0;
 const netplayBusy = () => !!netplayPanel?.link;
+const netplayMouse = () => netplayBusy() && netplayPanel.link.settings?.controller === 'mouse';
 const netplayDisabled = new Map();
 const NETPLAY_LOCKED_IDS = ['boot', 'machine', 'video', 'reset', 'pause', 'savestate',
   'loadstate', 'quicksave', 'quickload', 'savedstates', 'kick', 'kickurl', 'kicklist',
@@ -1792,6 +1793,7 @@ function applyJoystick() {
 
 // Returns true when the key was captured for the joystick.
 function joystickKey(code, pressed) {
+  if (netplayMouse()) return false;
   const map =
     joyMode === 'keys'
       ? JOY_KEYS_TWO_BUTTON
@@ -1806,6 +1808,7 @@ function joystickKey(code, pressed) {
 }
 
 function setJoyMode(mode) {
+  if (netplayMouse()) mode = 'off';
   joyMode = mode;
   $('joy').textContent = `Joystick: ${joyMode}`;
   if (fsUi) fsUi.joy.textContent = `Joystick: ${joyMode}`;
@@ -2045,7 +2048,7 @@ const cssToEmu = () => {
 canvas.addEventListener('mousedown', (e) => {
   if (!emu || !running) return;
   e.preventDefault();
-  if (!netplayBusy() && document.pointerLockElement !== canvas && e.button === 0) {
+  if ((!netplayBusy() || netplayMouse()) && document.pointerLockElement !== canvas && e.button === 0) {
     canvas.requestPointerLock?.();
   }
   emu.mouse_button(e.button, true);
@@ -2072,6 +2075,7 @@ window.addEventListener('mousemove', (e) => {
 });
 document.addEventListener('pointerlockchange', () => {
   lastPos = null;
+  if (netplayMouse() && document.pointerLockElement !== canvas) emu?.netplay_release_input();
 });
 
 // --- touch ---------------------------------------------------------------
@@ -7599,7 +7603,7 @@ if (typeof WebEmu.prototype.start_netplay === 'function') {
         // machines can then report a mismatch even if one closes first.
         emu.run_hidden(performance.now(), 0);
         link.send(emu);
-        setJoyMode(hasTouch ? 'touch' : settings.controller === 'cd32' ? 'cd32' : 'keys');
+        setJoyMode(settings.controller === 'mouse' ? 'off' : hasTouch ? 'touch' : settings.controller === 'cd32' ? 'cd32' : 'keys');
         let lastStatus = 0;
         netplayTimer = setInterval(() => {
           if (!netplayMachineReady || netplayPanel.link !== link || !emu) return;

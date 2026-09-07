@@ -11802,3 +11802,52 @@ fn netplay_gui_peers_connect_and_can_return_to_setup_and_retry() -> anyhow::Resu
     }
     Ok(())
 }
+
+#[test]
+fn netplay_host_mouse_owns_only_the_local_mouse_port() -> anyhow::Result<()> {
+    for player in 0..2 {
+        let mut app = test_app();
+        app.emu
+            .bus_mut()
+            .rtc
+            .set_seed(Some(crate::netplay::RTC_SEED), false);
+        app.emu.bus_mut().paula.serial = Box::new(crate::serial::NullSerialSink);
+        for port in 0..2 {
+            app.emu
+                .bus_mut()
+                .input
+                .set_port_device(port, crate::bus::PortDevice::Mouse);
+        }
+        let mut cfg = crate::config::Config::try_from(crate::config::RawConfig::default())?;
+        cfg.serial.mode = crate::config::SerialMode::Off;
+        let session = crate::netplay::Session::new(
+            crate::netplay::Options {
+                bind: "127.0.0.1:0".parse()?,
+                peer: "127.0.0.1:19732".parse()?,
+                player,
+                session: [31; 16],
+                input_delay: 0,
+                rollback_frames: 8,
+            },
+            &mut app.emu,
+            &cfg,
+        )?;
+        app.attach_netplay(session);
+        assert_eq!(app.mouse_port(), Some(player));
+        assert!(!app.netplay_keyboard_controller);
+        let before = app.emu.netplay_snapshot()?;
+        app.add_mouse_delta_i32(15, -23);
+        app.netplay_input.set_mouse_button(0, true);
+        app.pump_netplay_input();
+        assert_eq!(
+            (app.netplay_input.mouse_dx, app.netplay_input.mouse_dy),
+            (15, -23)
+        );
+        assert_eq!(app.netplay_input.mouse_buttons, 1);
+        assert!(app.emu.netplay_snapshot()? == before);
+        app.release_mouse_buttons();
+        assert_eq!(app.netplay_input, Default::default());
+        assert!(app.emu.netplay_snapshot()? == before);
+    }
+    Ok(())
+}

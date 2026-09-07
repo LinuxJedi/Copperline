@@ -112,11 +112,16 @@ impl Rollback {
     }
 
     fn simulate(&mut self, machine: &mut impl Machine, number: u64, replay: bool) -> Result<()> {
-        let remote = self
-            .remote
-            .range(..=number)
-            .next_back()
-            .map_or(Input::default(), |(_, v)| *v);
+        let remote = self.remote.range(..=number).next_back().map_or(
+            Input::default(),
+            |(&frame, &input)| {
+                if frame == number {
+                    input
+                } else {
+                    input.without_motion()
+                }
+            },
+        );
         let local = *self
             .local
             .get(&number)
@@ -189,8 +194,15 @@ impl Rollback {
         Ok(())
     }
 
-    pub fn submit_local(&mut self, input: Input) {
-        self.local.entry(self.current + self.delay).or_insert(input);
+    pub fn submit_local(&mut self, input: Input) -> bool {
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.local.entry(self.current + self.delay)
+        {
+            entry.insert(input);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn advance(&mut self, machine: &mut impl Machine, input: Input) -> Result<bool> {

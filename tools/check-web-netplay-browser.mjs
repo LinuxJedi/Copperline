@@ -86,11 +86,11 @@ try {
     const emu = window.__emu;
     const take = emu.netplay_take_packet.bind(emu);
     const [protocol, , headerBytes, inputBytes] = emu.constructor.netplay_packet_layout();
-    if (protocol !== 1 || headerBytes !== 111 || inputBytes !== 26) throw new Error('Packet decoder layout changed');
+    if (protocol !== 2 || headerBytes !== 111 || inputBytes !== 31) throw new Error('Packet decoder layout changed');
     window.__testKeyFrames = [];
     emu.netplay_take_packet = () => {
       const packet = take();
-      // Protocol v1: 111-byte header, then 26-byte input records. Check the
+      // Protocol v2: 111-byte header, then 31-byte input records. Check the
       // emitted held-key states, not merely the UI's keydown/up callbacks.
       const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
       for (let offset = headerBytes; offset + inputBytes <= packet.length; offset += inputBytes) {
@@ -124,9 +124,45 @@ try {
   await host.locator('#netplay-panel').screenshot({ path: `${output}/netplay-desktop.png` });
   await host.locator('#netplay-disconnect').click();
   await Promise.all(pages.map(page => page.waitForFunction(() => !window.__emu && !document.querySelector('#netplay-host').disabled)));
+  await host.locator('#netplay-controller').selectOption('mouse');
   await connect();
   await Promise.all(pages.map(page => page.waitForFunction(() => window.__emu?.netplay_status()[6] >= 60,
     null, { timeout: 60000 })));
+  for (const page of pages) {
+    await page.bringToFront();
+    assert.equal(await page.locator('#joy').textContent(), 'Joystick: off');
+    await page.evaluate(() => {
+      const emu = window.__emu;
+      const take = emu.netplay_take_packet.bind(emu);
+      window.__testMouseFrames = [];
+      emu.netplay_take_packet = () => {
+        const packet = take();
+        const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+        for (let offset = 111; offset + 31 <= packet.length; offset += 31) {
+          window.__testMouseFrames.push([Number(view.getBigUint64(offset, true)),
+            view.getInt16(offset + 26, true), view.getInt16(offset + 28, true), packet[offset + 30]]);
+        }
+        return packet;
+      };
+      const canvas = document.querySelector('canvas');
+      canvas.dispatchEvent(new MouseEvent('mousemove', { clientX: 40, clientY: 40, bubbles: true }));
+      canvas.dispatchEvent(new MouseEvent('mousemove', { clientX: 46, clientY: 43, bubbles: true }));
+      // Right and middle clicks exercise the DOM-to-Amiga button mapping
+      // without requesting pointer lock from a synthetic gesture.
+      canvas.dispatchEvent(new MouseEvent('mousedown', { button: 2, bubbles: true }));
+      canvas.dispatchEvent(new MouseEvent('mousedown', { button: 1, bubbles: true }));
+    });
+    await page.waitForFunction(() => window.__testMouseFrames.some(([, dx, dy, buttons]) => dx > 0 && dy > 0 && buttons === 6));
+    await page.evaluate(() => {
+      window.dispatchEvent(new MouseEvent('mouseup', { button: 2 }));
+      window.dispatchEvent(new MouseEvent('mouseup', { button: 1 }));
+    });
+    await page.waitForFunction(() => {
+      const frames = window.__testMouseFrames;
+      const held = frames.find(([, , , buttons]) => buttons === 6);
+      return held && frames.some(([frame, dx, dy, buttons]) => frame > held[0] && dx === 0 && dy === 0 && buttons === 0);
+    });
+  }
   await guest.locator('#netplay-disconnect').click();
   await Promise.all(pages.map(page => page.locator('#netplay-host:enabled').waitFor()));
   // Manual signaling also transfers the host setup over the peer connection.
@@ -142,5 +178,5 @@ try {
   await host.locator('#sidebar-toggle').click();
   await host.locator('#netplay-panel').screenshot({ path: `${output}/netplay-mobile.png` });
   assert.deepEqual(errors, []);
-  console.log('Host/Join, cancellation, restart, control locking, host setup transfer and browser rendering passed');
+  console.log('Host/Join, cancellation, restart, two-mouse input, control locking, host setup transfer and browser rendering passed');
 } finally { await browser.close(); }

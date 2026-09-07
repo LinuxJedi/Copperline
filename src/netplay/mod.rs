@@ -24,16 +24,43 @@ use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::SocketAddr;
 
-/// A held digital controller and Amiga keyboard, sampled once per frame.
+/// Controller buttons, relative mouse motion and held keys for one frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Input {
     /// Up, down, left, right, red, blue, play, rewind, forward, green, yellow.
     pub buttons: u16,
     pub keys: [u8; 16],
+    pub mouse_dx: i16,
+    pub mouse_dy: i16,
+    /// Left, right and middle mouse buttons.
+    pub mouse_buttons: u8,
 }
 
 impl Input {
     pub const BUTTONS: u16 = 0x7ff;
+
+    pub fn add_mouse_delta(&mut self, dx: i32, dy: i32) {
+        let add = |old: i16, delta: i32| {
+            i32::from(old)
+                .saturating_add(delta)
+                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+        };
+        self.mouse_dx = add(self.mouse_dx, dx);
+        self.mouse_dy = add(self.mouse_dy, dy);
+    }
+
+    pub fn set_mouse_button(&mut self, button: u8, pressed: bool) {
+        if button < 3 {
+            let mask = 1 << button;
+            self.mouse_buttons = (self.mouse_buttons & !mask) | (u8::from(pressed) << button);
+        }
+    }
+
+    fn without_motion(mut self) -> Self {
+        self.mouse_dx = 0;
+        self.mouse_dy = 0;
+        self
+    }
 
     /// Direction switches, red/fire and blue/second button, in wire order.
     pub fn set_joystick(&mut self, held: [bool; 6]) {
@@ -274,8 +301,15 @@ impl<T: Transport> Connection<T> {
             !emu.time_travel_enabled(),
             "netplay cannot record reverse history"
         );
-        ensure!(emu.bus().input.ports.iter().all(|p| matches!(p.device, crate::bus::PortDevice::Joystick | crate::bus::PortDevice::Cd32Pad)),
-            "netplay requires joystick or CD32 controllers on both ports (--port1 joystick --port2 joystick)");
+        ensure!(
+            emu.bus().input.ports.iter().all(|p| matches!(
+                p.device,
+                crate::bus::PortDevice::Mouse
+                    | crate::bus::PortDevice::Joystick
+                    | crate::bus::PortDevice::Cd32Pad
+            )),
+            "netplay requires mouse, joystick or CD32 controllers on both ports"
+        );
         let mut identity_hash = Sha256::new();
         identity_hash.update(env!("COPPERLINE_DISPLAY_VERSION").as_bytes());
         identity_hash.update(emu.netplay_snapshot()?);
@@ -334,7 +368,18 @@ impl<T: Transport> Connection<T> {
 
     /// Poll, repair late input, and optionally advance a frame. `false` is a
     /// normal wait for handshake/input. Continue polling while waiting.
-    pub fn step(&mut self, emu: &mut Emulator, input: Input, advance: bool) -> Result<bool> {
+    pub fn step(&mut self, emu: &mut Emulator, mut input: Input, advance: bool) -> Result<bool> {
+        self.step_local(emu, &mut input, advance)
+    }
+
+    /// Consume mouse motion only when a new local frame is sampled. Motion
+    /// arriving during a handshake or a repeated stalled poll stays pending.
+    pub fn step_local(
+        &mut self,
+        emu: &mut Emulator,
+        input: &mut Input,
+        advance: bool,
+    ) -> Result<bool> {
         if let Some(error) = &self.failure {
             anyhow::bail!("{error}");
         }
@@ -345,7 +390,7 @@ impl<T: Transport> Connection<T> {
         result
     }
 
-    fn step_inner(&mut self, emu: &mut Emulator, input: Input, advance: bool) -> Result<bool> {
+    fn step_inner(&mut self, emu: &mut Emulator, input: &mut Input, advance: bool) -> Result<bool> {
         // A finite receive budget keeps window input responsive under a burst.
         let mut buffer = [0; wire::MAX_PACKET + 1];
         for _ in 0..64 {
@@ -394,7 +439,7 @@ impl<T: Transport> Connection<T> {
             }
         }
         ensure!(
-            input.buttons & !Input::BUTTONS == 0,
+            input.buttons & !Input::BUTTONS == 0 && input.mouse_buttons & !7 == 0,
             "invalid local netplay controller input"
         );
         let now = Instant::now();
@@ -407,8 +452,17 @@ impl<T: Transport> Connection<T> {
             "netplay peer timed out"
         );
         let mut stepped = false;
+        // Stay below the signed wrap limit of the 8-bit JOYDAT counters.
+        let sampled = Input {
+            mouse_dx: input.mouse_dx.clamp(-100, 100),
+            mouse_dy: input.mouse_dy.clamp(-100, 100),
+            ..*input
+        };
         if self.connected && advance {
-            self.rollback.submit_local(input);
+            if self.rollback.submit_local(sampled) {
+                input.mouse_dx -= sampled.mouse_dx;
+                input.mouse_dy -= sampled.mouse_dy;
+            }
             // Send sampled input before replay, emulation, or pacing can add
             // another frame of avoidable network latency.
             self.send_packet(true)?;
@@ -417,7 +471,7 @@ impl<T: Transport> Connection<T> {
             let mut machine = EmulatedMachine(emu);
             self.rollback.reconcile(&mut machine)?;
             if advance {
-                stepped = self.rollback.advance(&mut machine, input)?;
+                stepped = self.rollback.advance(&mut machine, sampled)?;
             }
             for (&frame, expected) in &self.peer_hashes {
                 if let Some(actual) = self.rollback.hashes.get(&frame) {
@@ -494,6 +548,22 @@ impl Machine for EmulatedMachine<'_> {
     }
     fn frame(&mut self, inputs: [Input; 2], previous_keys: [u8; 16], replay: bool) -> Result<()> {
         for (port, input) in inputs.iter().enumerate() {
+            if self.0.bus().input.ports[port].device == crate::bus::PortDevice::Mouse {
+                let hardware = &mut self.0.bus_mut().input;
+                hardware.add_mouse_delta(
+                    port,
+                    i32::from(input.mouse_dx),
+                    i32::from(input.mouse_dy),
+                );
+                for button in 0..3 {
+                    hardware.set_mouse_button(
+                        port,
+                        button,
+                        input.mouse_buttons & (1 << button) != 0,
+                    );
+                }
+                continue;
+            }
             let on = |bit: u32| input.buttons & (1u16 << bit) != 0u16;
             self.0
                 .bus_mut()

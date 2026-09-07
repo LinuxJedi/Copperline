@@ -913,7 +913,7 @@ impl WebEmu {
     /// Relative mouse motion in emulated hi-res pixels (pointer-lock
     /// movementX/Y, or scaled cursor deltas when unlocked).
     pub fn mouse_delta(&mut self, dx: f64, dy: f64) {
-        if self.netplay.is_some() {
+        if self.netplay.is_some() && !self.netplay_mouse() {
             return;
         }
         if !dx.is_finite() || !dy.is_finite() {
@@ -923,6 +923,10 @@ impl WebEmu {
         self.mouse_remainder.1 += dy;
         let ix = take_integral_delta(&mut self.mouse_remainder.0);
         let iy = take_integral_delta(&mut self.mouse_remainder.1);
+        if self.netplay.is_some() {
+            self.netplay_input.add_mouse_delta(ix, iy);
+            return;
+        }
         // Into the pending pool, not the counters: `run` drains it a
         // bounded amount per emulated frame (see `mouse_pending`).
         self.mouse_pending.0 = self.mouse_pending.0.saturating_add(ix);
@@ -954,6 +958,11 @@ impl WebEmu {
     /// Mouse buttons: 0 = left, 1 = middle, 2 = right (MouseEvent.button).
     pub fn mouse_button(&mut self, button: u8, pressed: bool) {
         if self.netplay.is_some() {
+            if self.netplay_mouse() {
+                if let Some(index) = [0, 2, 1].get(usize::from(button)) {
+                    self.netplay_input.set_mouse_button(*index, pressed);
+                }
+            }
             return;
         }
         let input = &mut self.emu.bus_mut().input;
@@ -985,7 +994,7 @@ impl WebEmu {
         if self.netplay.is_some() {
             // The page's primary controller always arrives on port 2; the
             // connection assigns it to this peer's negotiated Amiga port.
-            if port == 2 {
+            if port == 2 && !self.netplay_mouse() {
                 self.netplay_input
                     .set_joystick([up, down, left, right, fire, button2]);
             }
@@ -1015,7 +1024,7 @@ impl WebEmu {
         yellow: bool,
     ) {
         if self.netplay.is_some() {
-            if port == 2 {
+            if port == 2 && !self.netplay_mouse() {
                 self.netplay_input
                     .set_cd32_buttons([play, rwd, ffw, green, yellow]);
             }

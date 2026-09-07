@@ -194,6 +194,12 @@ impl App {
     }
 
     pub(super) fn release_mouse_buttons(&mut self) {
+        if self.netplay.is_some() {
+            self.netplay_input.mouse_buttons = 0;
+            self.netplay_input.mouse_dx = 0;
+            self.netplay_input.mouse_dy = 0;
+            return;
+        }
         if let Some(port) = self.mouse_port() {
             let input = &mut self.emu.bus_mut().input;
             for index in 0..3 {
@@ -351,6 +357,10 @@ impl App {
         let Some(port) = self.mouse_port() else {
             return;
         };
+        if self.netplay.is_some() {
+            self.netplay_input.add_mouse_delta(dx, dy);
+            return;
+        }
         self.apply_scripted_mouse_delta(port as u8, dx, dy);
     }
 

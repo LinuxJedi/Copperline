@@ -40,8 +40,15 @@ contains an opaque room ID, with no ROM URLs, connection codes or credentials.
 Host owns Amiga port 1; Join owns port 2. On each page, the usual first gamepad,
 keyboard joystick or touch controls drive that player's port. The keyboard
 joystick mode is enabled on desktop browsers; touch devices start with touch
-controls. Cycle **Joystick** off to type ordinary Amiga keys. Both keyboards contribute to the shared keyboard. Mouse input is
-disabled. The desktop F11/F12 netplay shortcuts do not apply to the browser.
+controls. Cycle **Joystick** off to type ordinary Amiga keys. Both keyboards
+contribute to the shared keyboard. The desktop F11/F12 netplay shortcuts do not
+apply to the browser.
+
+For games that use two mice, such as two-player Lemmings, the host chooses
+**Advanced → Controllers → Two mice** before hosting. Each player's mouse then
+drives their own Amiga port, including left, right and middle mouse buttons.
+Touch devices can use the canvas trackpad for movement and left/right clicks.
+Click the screen to capture the mouse; Escape releases it. Keyboard joystick mode stays off so both players can type ordinary Amiga keys.
 
 Room setup uses a small signaling service. WebRTC tries direct routes and can
 fall back to a TURN relay. **Advanced → Use relay only** forces that route for
@@ -121,12 +128,14 @@ then enable **Netplay** on both computers.
 4. Use the same **Input delay** and **Rollback limit**, then click **Run** on
    both computers. The windows wait for each other before emulation begins.
 
-Enabling netplay changes mouse/analogue/empty ports to joysticks, turns serial
+Enabling netplay changes analogue, gamepad-mouse and empty ports to joysticks, turns serial
 and JIT off, disables run-ahead and warp boot, and enables power on. Existing
-joystick/CD32 ports stay selected. These changes are visible on the other
+mouse/joystick/CD32 ports stay selected. These changes are visible on the other
 configuration pages; Run reapplies them after model or configuration changes.
 ROMs, media and storage selections remain yours to choose;
-Run explains any incompatible device or connection setting.
+Run explains any incompatible device or connection setting. For a two-mouse
+game, select **Mouse** on both controller ports on both computers. For a
+two-joystick game, select **Joystick** on both ports.
 
 **F11** disconnects and returns to the Netplay page with the connection details
 intact. A connection failure also returns there, showing its error. Correct the
@@ -178,22 +187,28 @@ use the same `--rtc-time` on both peers to choose another starting time.
 
 ## Controls
 
-Player 1 controls Amiga port 1; player 2 controls port 2. On either computer,
-a connected gamepad drives the local port. Without a gamepad, the first keyboard
-controller mapping drives it: by default arrows move, right Ctrl fires, and
+Player 1 controls Amiga port 1; player 2 controls port 2. For joystick/CD32
+ports, a connected gamepad drives the local port. Without a gamepad, the first
+keyboard controller mapping drives it: by default arrows move, right Ctrl fires, and
 left Alt is the second button. The existing saved input mappings apply.
-Either port may be `joystick` or `cd32`, provided both peers use the same settings.
+Either port may be `mouse`, `joystick` or `cd32`, provided both peers use the same
+settings. A mouse port takes that player's host mouse, with keyboard typing
+enabled automatically. For two mice, pass `--port1 mouse --port2 mouse` on both
+computers. Mixed mouse and joystick/CD32 configurations also work on desktop.
 
-Press **F12** to switch between keyboard controller mode and typing on the
-Amiga keyboard. Typing mode sends keys such as Return and the arrows to the guest
+For joystick/CD32 ports, press **F12** to switch between keyboard controller
+mode and typing on the Amiga keyboard. Typing mode sends keys such as Return and the arrows to the guest
 instead of consuming them as controller bindings. Keyboard input from the two
 peers is combined: a key stays pressed while either player holds it. Losing
 window focus releases local held controls on the next sampled frame.
 
 The host Quit and Fullscreen shortcuts remain available (Cmd+Q/Cmd+F on macOS,
-Alt+Q/Alt+F elsewhere). Menus, resets, pause, debugger access, mouse input, save
-states, and media changes are unavailable while connected. Press F11 to return to setup, or close the window to end the session;
-the remaining peer stops after its timeout.
+Alt+Q/Alt+F elsewhere). Click the display to capture the mouse; Cmd+G on macOS
+or Alt+G elsewhere releases or captures it. Menus, resets, pause, debugger access,
+save states, and media changes are unavailable while connected. Press F11 to
+return to setup, or close the window to end the session; the remaining peer stops
+after its timeout. Scripted mouse and analogue input remain unavailable during
+netplay.
 
 ## Delay and connection limits
 

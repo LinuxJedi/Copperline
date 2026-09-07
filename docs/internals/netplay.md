@@ -32,15 +32,23 @@ cycle accounting, independent of the ordinary frontend's CPU-budget quantum.
 The scheduler state and transport remain outside serialized guest state; the
 save-state version is unchanged.
 
-An input contains eleven digital controller bits and a 128-key held-state bitmap.
+An input contains eleven digital controller bits, a 128-key held-state bitmap,
+signed mouse X/Y deltas and three held mouse buttons.
 Each peer owns one port. Key bitmaps are ORed, and transitions from the previous
 merged bitmap are enqueued in raw-key order at the frame boundary. Controller
-and keyboard prediction both repeat the most recent remote input at or before
-that frame. Out-of-order future inputs never seed an earlier prediction.
+buttons and keyboard prediction repeat the most recent remote held state at or
+before that frame. Predicted mouse motion is zero: relative movement belongs to
+one frame and must not repeat while waiting for another packet. Out-of-order
+future inputs never seed an earlier prediction.
 
 A delayed local input is submitted only once, even when repeated polling stalls
-on the same frame. Both timelines start with the negotiated number of neutral
-delay frames. A frame can advance only while both remote input and the remote
+on the same frame. Interactive frontends use `Connection::step_local`, which
+consumes pending mouse motion only on that first submission. Handshake and
+confirmation polls preserve it, as do subsequent polls of an already sampled
+frame. Each sample takes at most 100 counts per axis, retaining the remainder
+for later frames to avoid ambiguous 8-bit JOYDAT wraparound. Mouse ports receive
+motion and mouse buttons; digital-controller updates cannot replace their device.
+Both timelines start with the negotiated number of neutral delay frames. A frame can advance only while both remote input and the remote
 acknowledgement remain within the configured prediction window. This also bounds
 unacknowledged local history when only one direction of the connection works.
 
@@ -74,12 +82,15 @@ for replay. It retains eight recent checkpoint hashes. Snapshot storage has a
 
 ## Wire protocol
 
-`wire.rs` defines protocol version 1. Packets carry `CLNP`, protocol and
+`wire.rs` defines protocol version 2. Packets carry `CLNP`, protocol and
 save-state versions, a 16-byte session ID, a 32-byte initial-machine fingerprint,
 player index, handshake-ready flag, delay/window settings, cumulative input
 acknowledgement, the latest confirmed checkpoint, and up to 32 input records.
 Integers are little-endian. Records contain an eight-byte frame number, two-byte
-controller bitmap, and sixteen-byte key bitmap. The maximum packet is 943 bytes.
+controller bitmap, sixteen-byte key bitmap, two signed two-byte mouse deltas,
+and one byte containing the three mouse buttons. Each record is 31 bytes and
+the maximum packet is 1103 bytes. Version 1 peers are rejected as incompatible;
+the file save-state version is unchanged.
 
 The initial fingerprint hashes Copperline's display build version and the entire
 normalized initial machine snapshot, including ROM and in-memory floppy data.
@@ -115,7 +126,7 @@ session ID, input delay and prediction limit. Timers use `timebase::Instant` on
 both targets. Neither target serializes transport or wall-clock state.
 
 The web wrapper owns `Connection<PacketQueue>`. Each direction holds at most
-64 packets of at most 943 bytes. Incoming bursts evict the oldest datagram, relying
+64 packets of at most 1103 bytes. Incoming bursts evict the oldest datagram, relying
 on subsequent retransmissions; a full outgoing queue reports backpressure.
 `netplay.js` also bounds its receive queue and stops draining Rust's send queue
 when the channel's buffered amount reaches 64 maximum-size packets.
@@ -194,7 +205,7 @@ disconnect path. No save-state or input-packet format changes are required.
 
 Host/Join freezes the chosen cold-boot media and frees any local emulator.
 After media verification, the wrapper builds a fresh machine, fixes the RTC seed,
-disables serial and sets both digital controllers before fingerprinting it.
+disables serial and sets both selected controllers before fingerprinting it.
 JS numeric settings enter Rust as `f64` and are checked for finiteness, integer
 values and range before narrowing. Setup operations carry their connection
 identity across awaits so cancellation cannot publish a late machine or code.
@@ -249,10 +260,13 @@ the caller normally.
 
 The regression suite covers:
 
-- Zero and nonzero input delay, repeat-last prediction, batched late arrivals,
-  duplicate inputs, bounded stalls, recovery, and once-only local sampling.
+- Zero and nonzero input delay, held-state prediction with zero predicted mouse
+  motion, batched late arrivals,
+  duplicate inputs, bounded stalls, recovery, and once-only local sampling,
+  including pending mouse movement accumulated across stalls.
 - Byte-identical replay against an uninterrupted 68000 workload that reads both
-  JOYDAT registers and CIA fire inputs, writes RAM, and drives a display colour.
+  JOYDAT registers and CIA fire inputs, writes RAM, and drives a display colour,
+  with two mice, two joysticks, two CD32 pads and mixed mouse/CD32 ports.
 - Two complete emulators connected through local UDP proxies with deterministic
   loss, delay, duplication, reordering, and asymmetric pauses, with zero, default,
   and maximum input delay; both must confirm the same checkpoint and end with
@@ -283,7 +297,9 @@ the other page modules. For a served local page, the optional Playwright check
 `node tools/check-web-netplay-browser.mjs http://127.0.0.1:8000/` exercises actual
 Host/Join, cancellation, reconnect by cold boot, locked controls and mismatch
 rejection in two Chromium contexts. It also verifies that a device-keyboard tap
-appears as a held key and subsequent release in transmitted input frames.
+appears as a held key and subsequent release in transmitted input frames, and
+that two-mouse sessions route DOM movement and button press/release events on
+both pages while leaving keyboard joystick mode off.
 `CHROME_PATH` selects an installed Chrome;
 `PLAYWRIGHT_MODULE` can point to a local Playwright module.
 
