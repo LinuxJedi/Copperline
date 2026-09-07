@@ -11,6 +11,11 @@ yanked = "deny"
 # Each exception is dated, narrow, and explains why an upgrade cannot remove
 # it. Published vulnerabilities still fail the job by default.
 ignore = [
+    # 2026-09-07: iroh 1.1 -> netwatch 0.19 -> netlink-packet-core 0.8
+    # uses paste 1.0.15, an unmaintained compile-time token-pasting macro.
+    # No vulnerability or compatible upgrade is available. Remove when
+    # netwatch adopts the newer netlink stack; revisit by 2026-12-07.
+    "RUSTSEC-2024-0436",
     # 2026-08-21: unmaintained warning, not a vulnerability, and there is
     # no safe upgrade -- it arrives transitively through
     # winit -> sctk-adwaita -> ab_glyph -> owned_ttf_parser. Revisit when

@@ -4937,7 +4937,7 @@ impl LauncherState {
     /// Whether a row can be used at all, from wherever it lives.
     pub fn row_applies(&self, field: LauncherField) -> bool {
         if field.is_netplay() {
-            return field == F::NetplayEnabled || self.netplay.enabled;
+            return self.netplay.field_enabled(field);
         }
         if Self::is_workshop(field) {
             self.workshop_applies(field)
@@ -5346,7 +5346,15 @@ impl LauncherState {
     pub fn edit_push(&mut self, c: char) {
         let Some(target) = self.editing else { return };
         if let EditTarget::Netplay(field) = target {
-            let limit = if field == F::NetplayCode { 32 } else { 64 };
+            let limit = if field == F::NetplayCode && self.netplay.internet {
+                4096
+            } else if field == F::NetplayRelay {
+                512
+            } else if field == F::NetplayCode {
+                32
+            } else {
+                64
+            };
             if c.is_ascii() && !c.is_control() && self.edit_buffer.len() < limit {
                 self.edit_caret.insert(&mut self.edit_buffer, c);
             }

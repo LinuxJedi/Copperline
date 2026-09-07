@@ -1316,7 +1316,7 @@ impl App {
             Some(raw) => raw,
             None => return,
         };
-        let options = match self.launcher_state().unwrap().netplay.options() {
+        let options = match self.launcher_state().unwrap().netplay.connection_options() {
             Ok(options) => options,
             Err(error) => {
                 self.set_launcher_status(StatusMessage::err(short_status_error(&error)));
@@ -1345,7 +1345,7 @@ impl App {
     fn stage_and_run_with_netplay(
         &mut self,
         raw: RawConfig,
-        options: Option<crate::netplay::Options>,
+        options: Option<crate::netplay::ConnectionOptions>,
     ) -> Result<()> {
         if options.is_some() {
             // These endpoints belong to App and survive a machine replacement.
@@ -1397,7 +1397,7 @@ impl App {
         &mut self,
         cfg: &Config,
         raw: RawConfig,
-        options: Option<crate::netplay::Options>,
+        options: Option<crate::netplay::ConnectionOptions>,
     ) -> Result<()> {
         // Remember the session's realtime request so later live sink rebuilds
         // (device switch, disconnect recovery) reuse it.

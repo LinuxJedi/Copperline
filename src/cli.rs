@@ -14,7 +14,8 @@ use copperline::video::HOST_SHORTCUT_MODIFIER_LABEL;
 
 #[derive(Debug)]
 pub struct CliArgs {
-    pub netplay: Option<copperline::netplay::Options>,
+    pub netplay: Option<copperline::netplay::ConnectionOptions>,
+    pub netplay_invitation_out: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub rom_path: Option<PathBuf>,
     /// `--whdload GAME`: stage a WHDLoad package (.lha archive or
@@ -343,6 +344,10 @@ where
     I: IntoIterator<Item = String>,
 {
     let args = expand_script_files(args.into_iter().collect())?;
+    let mut netplay_host = None::<PathBuf>;
+    let mut netplay_join = None::<String>;
+    let mut netplay_relay = None::<String>;
+    let mut netplay_relay_only = false;
     let mut netplay_bind = None;
     let mut netplay_peer = None;
     let mut netplay_player = None;
@@ -760,6 +765,28 @@ where
                         .map_err(|_| anyhow!("--autofire rate must be a whole number of Hz"))?,
                 );
             }
+            "--netplay-host" => {
+                netplay_host = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            anyhow!("--netplay-host requires an invitation output path")
+                        })?
+                        .into(),
+                );
+            }
+            "--netplay-join" => {
+                netplay_join = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--netplay-join requires an invitation code"))?,
+                );
+            }
+            "--netplay-relay" => {
+                netplay_relay =
+                    Some(args.next().ok_or_else(|| {
+                        anyhow!("--netplay-relay requires an HTTPS iroh relay URL")
+                    })?);
+            }
+            "--netplay-relay-only" => netplay_relay_only = true,
             "--netplay-bind" => {
                 netplay_bind = Some(next_arg(
                     &mut args,
@@ -1356,29 +1383,70 @@ where
             "--hostsocket-interface conflicts with an explicit non-bridge --hostsocket-net"
         ));
     }
-    let netplay = if netplay_bind.is_some()
+    let internet_requested = netplay_host.is_some()
+        || netplay_join.is_some()
+        || netplay_relay.is_some()
+        || netplay_relay_only;
+    let netplay = if internet_requested
+        || netplay_bind.is_some()
         || netplay_peer.is_some()
         || netplay_player.is_some()
         || netplay_session.is_some()
         || netplay_delay.is_some()
         || netplay_rollback.is_some()
     {
-        let usage = "netplay requires --netplay-bind IP:PORT, --netplay-peer IP:PORT, --netplay-player 1|2 and --netplay-session HEX";
-        let player = netplay_player.ok_or_else(|| anyhow!(usage))?;
-        if !(1..=2).contains(&player) {
-            bail!("--netplay-player must be 1 or 2");
-        }
-        let code: String = netplay_session.ok_or_else(|| anyhow!(usage))?;
-        let session = copperline::netplay::parse_session_id(&code)?;
-        let options = copperline::netplay::Options {
-            bind: netplay_bind.ok_or_else(|| anyhow!(usage))?,
-            peer: netplay_peer.ok_or_else(|| anyhow!(usage))?,
-            player: usize::from(player - 1),
-            session,
-            input_delay: netplay_delay.unwrap_or(2),
-            rollback_frames: netplay_rollback.unwrap_or(8),
+        let options = if internet_requested {
+            if netplay_bind.is_some()
+                || netplay_peer.is_some()
+                || netplay_player.is_some()
+                || netplay_session.is_some()
+            {
+                bail!("Internet netplay cannot be combined with direct IP/session/player flags");
+            }
+            #[cfg(not(feature = "netplay-internet"))]
+            bail!("This build does not include Internet netplay");
+            #[cfg(feature = "netplay-internet")]
+            {
+                use copperline::netplay::{internet, ConnectionOptions};
+                let options = match (&netplay_host, &netplay_join) {
+                    (Some(_), None) => internet::Options::host(
+                        netplay_delay.unwrap_or(2),
+                        netplay_rollback.unwrap_or(8),
+                        netplay_relay.as_deref().unwrap_or(""),
+                        netplay_relay_only,
+                    )?,
+                    (None, Some(code)) => {
+                        if netplay_delay.is_some()
+                            || netplay_rollback.is_some()
+                            || netplay_relay.is_some()
+                        {
+                            bail!("The Internet invitation supplies the host's timing and relay settings");
+                        }
+                        internet::Options::join(code, netplay_relay_only)?
+                    }
+                    _ => bail!("Choose --netplay-host PATH or --netplay-join CODE"),
+                };
+                ConnectionOptions::Internet(Box::new(options))
+            }
+        } else {
+            let usage = "netplay requires --netplay-bind IP:PORT, --netplay-peer IP:PORT, --netplay-player 1|2 and --netplay-session HEX";
+            let player = netplay_player.ok_or_else(|| anyhow!(usage))?;
+            if !(1..=2).contains(&player) {
+                bail!("--netplay-player must be 1 or 2");
+            }
+            let code: String = netplay_session.ok_or_else(|| anyhow!(usage))?;
+            let session = copperline::netplay::parse_session_id(&code)?;
+            let options = copperline::netplay::Options {
+                bind: netplay_bind.ok_or_else(|| anyhow!(usage))?,
+                peer: netplay_peer.ok_or_else(|| anyhow!(usage))?,
+                player: usize::from(player - 1),
+                session,
+                input_delay: netplay_delay.unwrap_or(2),
+                rollback_frames: netplay_rollback.unwrap_or(8),
+            };
+            options.validate()?;
+            copperline::netplay::ConnectionOptions::Direct(options)
         };
-        options.validate()?;
         if run.is_some()
             || whdload.is_some()
             || load_state.is_some()
@@ -1405,7 +1473,9 @@ where
                 CliDiskInsert::Explicit(s) => s.secs != 0.0,
                 CliDiskInsert::Configured { secs, .. } => *secs != 0.0,
             })
-            || joy_after.iter().any(|j| usize::from(j.3) != options.player)
+            || joy_after
+                .iter()
+                .any(|j| usize::from(j.3) != options.settings().player)
         {
             bail!("netplay supports cold boot, disks inserted at time 0, local-port --joy-after and keyboard input; state loads, media changes, scripted mouse/analogue input, debugging, warp and recording are unavailable");
         }
@@ -1415,6 +1485,7 @@ where
     };
     Ok(CliArgs {
         netplay,
+        netplay_invitation_out: netplay_host,
         config_path,
         rom_path,
         whdload,
@@ -1580,6 +1651,10 @@ fn print_help() {
          --port2 DEVICE                 controller in port 2 (default: joystick;\n  \
          \x20                            cd32 on the CD32 profile)\n  \
          --autofire HZ                  pulse a held fire button at HZ (0 = off, the default)\n  \
+         --netplay-host PATH            host Internet netplay; write invitation to PATH\n  \
+         --netplay-join CODE            join a desktop Internet invitation\n  \
+         --netplay-relay URL            host using a custom HTTPS iroh relay\n  \
+         --netplay-relay-only           force Internet traffic through the relay\n  \
          --netplay-bind IP:PORT         local UDP endpoint for two-player rollback netplay\n  \
          --netplay-peer IP:PORT         remote player's UDP endpoint\n  \
          --netplay-player 1|2           controller port owned by this player\n  \

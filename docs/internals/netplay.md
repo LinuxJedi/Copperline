@@ -20,8 +20,41 @@ The implementation follows five steps:
 These steps are implemented in `src/netplay/`, `Emulator::step_netplay_frame`,
 `src/video/window/app_netplay.rs`, `crates/copperline-web/src/netplay.rs` and
 `crates/copperline-web/www/netplay.js`. The feature uses native Rust and does not
-link the GGPO SDK. Matchmaking, relays, spectators, reconnect, shared
-media operations, and transactional host filesystems remain separate work.
+link the GGPO SDK. Public matchmaking, spectators, reconnect, desktop media
+transfers, and transactional host filesystems remain separate work.
+
+## Native Internet transport
+
+`Session` is a `Connection<NativeTransport>`; the adapter selects direct UDP or
+`InternetTransport`. The default `netplay-internet` feature adds iroh to native
+builds. The browser/core build keeps its existing transport boundary.
+
+Internet setup uses a host-generated Ed25519 endpoint key and an independent
+random 128-bit invitation capability. The bounded `CLNI1.` code contains the
+host's public endpoint ID, relay addresses, capability and delay/window. The
+private key stays in the launcher's in-memory setup. Host and guest use a dedicated
+QUIC ALPN. A bounded reliable stream checks the capability before accepting the
+second player; unrelated or incomplete handshakes do not claim the session.
+Invitation parsers reject unsupported routes and invalid timeline settings.
+
+A dedicated thread owns a Tokio runtime and iroh endpoint. It connects through
+an HTTPS relay, attempts NAT traversal, and uses direct paths when available.
+The relay-only option removes IP transports entirely. Public relay addresses
+come from iroh's production relay map; a custom relay replaces that map. The
+minimal endpoint preset avoids public address lookup/publishing and automatic
+router port mapping. No browser signaling or TURN credentials are involved.
+
+Inputs use unordered, unreliable QUIC datagrams. The shared protocol continues
+to own retransmission, acknowledgement and rollback. Receive/send queues each
+hold at most 64 packets, and QUIC datagram buffers are bounded too. The worker
+checks selected routes for address-free diagnostics. Socket discovery and all
+network timers remain outside emulator and save-state data.
+
+`Transport::ready` holds the cold machine at frame zero during setup. An Internet
+setup deadline of 15 minutes is separate from the protocol's 60-second handshake
+and 10-second connected-peer timeouts. Dropping the transport cancels the worker
+and closes its endpoint without blocking the UI. Runtime errors return through
+the ordinary netplay error path. Run after F11 builds a new cold machine.
 
 ## Frame ownership
 
@@ -100,7 +133,8 @@ build the same source. This input protocol carries no executable, ROM, disk imag
 or serialized guest state. Browser setup transfers ROMs and disks over a separate
 reliable channel before the input handshake. An ID separates sessions; the packet format supplies
 neither cryptographic peer authentication nor encryption. Browser WebRTC adds
-transport encryption; native UDP needs a VPN for that protection.
+transport encryption; native Internet mode adds QUIC encryption and invitation
+authorization. Direct UDP needs a VPN for that protection.
 
 Every datagram repeats the session fingerprint and settings. Peers announce
 whether they have seen a matching peer; emulation starts after receiving that
@@ -121,8 +155,8 @@ Same-process checkpoints include the CPU adapter's sampled interrupt level and
 microcode poll hold. Restoring the chipset without these latches can recognize
 an interrupt one instruction early after replay. They remain outside file save
 states; the rollback prefix and initial fingerprint change with the build.
-`Session` remains the native alias for `Connection<UdpTransport>`; `Options`
-contains its UDP endpoints. Transport-independent `Settings` contains the player,
+`Session` is the native alias for `Connection<NativeTransport>`;
+`ConnectionOptions` selects direct UDP `Options` or Internet invitation settings. Transport-independent `Settings` contains the player,
 session ID, input delay and prediction limit. Timers use `timebase::Instant` on
 both targets. Neither target serializes transport or wall-clock state.
 
@@ -245,8 +279,8 @@ machine. Existing App-level control/GDB endpoints block netplay startup because
 they survive machine replacement. Static validation rejects parallel host
 devices before construction, including the sampler attached later by the
 frontend, and rejects Toccata's noncanonical serialized resampler map.
-It creates the UDP session before replacing the live machine, so a
-validation or bind failure leaves that machine intact and reports the error in
+It creates the native transport before replacing the live machine, so a
+validation or immediate bind failure leaves that machine intact and reports the error in
 the launcher. The successful session then uses the same `attach_netplay` path as
 a CLI launch. Session code generation uses host randomness for a fresh identifier;
 it does not add peer authentication.
@@ -313,3 +347,11 @@ emulation frames. `NETPLAY_BROWSER=webkit` selects an installed Playwright WebKi
 Desktop WebKit and mobile viewport tests do not qualify iOS hardware or beta Safari.
 The QR encoder is the unmodified `qrcode-generator` 2.0.4 ES module, distributed
 with its MIT license; no external image or QR service receives invitations.
+
+Explicit Internet qualification uses
+`cargo test --profile ci --locked --lib internet_netplay_ -- --ignored --nocapture`.
+It runs two local emulators through public relays, once with automatic routes
+and once with IP transports disabled, and requires 180 confirmed frames, checked
+checkpoints and identical machine snapshots. These tests are opt-in because they
+depend on an external service. The ordinary suite exercises encrypted loopback
+traffic, capability rejection, invitation validation and launcher/CLI controls.

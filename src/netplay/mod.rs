@@ -2,13 +2,15 @@
 
 //! Two-peer GGPO-style netplay. Only inputs and state digests cross the network.
 
+#[cfg(all(feature = "netplay-internet", not(target_arch = "wasm32")))]
+pub mod internet;
 mod rollback;
 #[cfg(test)]
 mod tests;
 mod transport;
 mod wire;
 #[cfg(not(target_arch = "wasm32"))]
-use transport::UdpTransport;
+use transport::{NativeTransport, UdpTransport};
 pub use transport::{PacketQueue, Transport};
 /// Fixed wire layout, also exposed to browser glue for compatibility checks.
 pub use wire::{HEADER as PACKET_HEADER, INPUT_RECORD, MAX_PACKET, VERSION as PROTOCOL_VERSION};
@@ -167,6 +169,32 @@ pub struct Options {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug)]
+pub enum ConnectionOptions {
+    Direct(Options),
+    #[cfg(feature = "netplay-internet")]
+    Internet(Box<internet::Options>),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<Options> for ConnectionOptions {
+    fn from(options: Options) -> Self {
+        Self::Direct(options)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ConnectionOptions {
+    pub fn settings(&self) -> Settings {
+        match self {
+            Self::Direct(options) => options.settings(),
+            #[cfg(feature = "netplay-internet")]
+            Self::Internet(options) => options.settings(),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Options {
     fn settings(&self) -> Settings {
         Settings {
@@ -244,7 +272,7 @@ pub fn prepare_config(cfg: &mut crate::config::Config) -> Result<()> {
 
 /// A session is serviced on the emulation thread; socket I/O never blocks it.
 #[cfg(not(target_arch = "wasm32"))]
-pub type Session = Connection<UdpTransport>;
+pub type Session = Connection<NativeTransport>;
 
 pub struct Connection<T: Transport> {
     transport: T,
@@ -283,20 +311,44 @@ impl Status {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl Connection<UdpTransport> {
-    pub fn new(options: Options, emu: &mut Emulator, cfg: &crate::config::Config) -> Result<Self> {
-        options.validate()?;
-        let settings = options.settings();
-        let transport = UdpTransport::new(options)?;
+impl Connection<NativeTransport> {
+    pub fn new(
+        options: impl Into<ConnectionOptions>,
+        emu: &mut Emulator,
+        cfg: &crate::config::Config,
+    ) -> Result<Self> {
+        let (settings, transport) = match options.into() {
+            ConnectionOptions::Direct(options) => {
+                options.validate()?;
+                (
+                    options.settings(),
+                    NativeTransport::Udp(UdpTransport::new(options)?),
+                )
+            }
+            #[cfg(feature = "netplay-internet")]
+            ConnectionOptions::Internet(options) => (
+                options.settings(),
+                NativeTransport::Internet(Box::new(internet::InternetTransport::new(*options)?)),
+            ),
+        };
         Self::with_transport(settings, transport, emu, cfg)
     }
 
-    pub fn options(&self) -> &Options {
-        &self.transport.options
+    pub fn options(&self) -> ConnectionOptions {
+        match &self.transport {
+            NativeTransport::Udp(t) => ConnectionOptions::Direct(t.options.clone()),
+            #[cfg(feature = "netplay-internet")]
+            NativeTransport::Internet(t) => {
+                ConnectionOptions::Internet(Box::new(t.options.clone()))
+            }
+        }
     }
 }
 
 impl<T: Transport> Connection<T> {
+    pub fn route(&self) -> &'static str {
+        self.transport.route()
+    }
     pub fn with_transport(
         settings: Settings,
         transport: T,
@@ -418,6 +470,10 @@ impl<T: Transport> Connection<T> {
         input: &mut LocalInput,
         advance: bool,
     ) -> Result<bool> {
+        if !self.transport.ready()? {
+            self.started = Instant::now();
+            return Ok(false);
+        }
         // A finite receive budget keeps window input responsive under a burst.
         let mut buffer = [0; wire::MAX_PACKET + 1];
         for _ in 0..64 {

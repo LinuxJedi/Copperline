@@ -369,6 +369,9 @@ pub enum LauncherField {
     NewGeomAuto,
     // Per-session connection settings.
     NetplayEnabled,
+    NetplayMode,
+    NetplayRelay,
+    NetplayRelayOnly,
     NetplayBind,
     NetplayPeer,
     NetplayPlayer,
@@ -1285,12 +1288,25 @@ pub(super) const NEW_GEOMETRY_ROWS: [Row; 10] = [
     row(F::NewGeomSave, "", RowKind::Action),
 ];
 
-pub(super) const NETPLAY_ROWS: [Row; 8] = [
+pub(super) const NETPLAY_ROWS: [Row; 9] = [
     row(F::NetplayEnabled, "Netplay", Toggle),
+    row(F::NetplayMode, "Connection", Cycle),
     row(F::NetplayPlayer, "Local player", Cycle),
     row(F::NetplayBind, "Local address", RowKind::Text),
     row(F::NetplayPeer, "Peer address", RowKind::Text),
     row(F::NetplayCode, "Session code", RowKind::Text),
+    row(F::NetplayDelay, "Input delay", Cycle),
+    row(F::NetplayRollback, "Rollback limit", Cycle),
+    row(F::NetplayNewCode, "", RowKind::Action),
+];
+
+pub(super) const INTERNET_NETPLAY_ROWS: [Row; 9] = [
+    row(F::NetplayEnabled, "Netplay", Toggle),
+    row(F::NetplayMode, "Connection", Cycle),
+    row(F::NetplayPlayer, "Local player", Cycle),
+    row(F::NetplayCode, "Invitation", RowKind::Text),
+    row(F::NetplayRelay, "Relay server", RowKind::Text),
+    row(F::NetplayRelayOnly, "Route", Cycle),
     row(F::NetplayDelay, "Input delay", Cycle),
     row(F::NetplayRollback, "Rollback limit", Cycle),
     row(F::NetplayNewCode, "", RowKind::Action),

@@ -1118,7 +1118,27 @@ fn main() -> Result<()> {
                 disk.write_protected,
             )?;
         }
-        Some(copperline::netplay::Session::new(options, &mut emu, &cfg)?)
+        let session = copperline::netplay::Session::new(options, &mut emu, &cfg)?;
+        #[cfg(feature = "netplay-internet")]
+        if let Some(path) = &cli.netplay_invitation_out {
+            if let copperline::netplay::ConnectionOptions::Internet(options) = session.options() {
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let mut file = tempfile::NamedTempFile::new_in(parent)?;
+                std::io::Write::write_all(&mut file, options.invitation.encode()?.as_bytes())?;
+                file.persist(path)
+                    .map_err(|error| anyhow!("Writing netplay invitation: {}", error.error))?;
+                log::info!(
+                    "netplay: invitation written to {}; waiting for guest",
+                    path.display()
+                );
+            }
+        }
+        #[cfg(not(feature = "netplay-internet"))]
+        let _ = &cli.netplay_invitation_out;
+        Some(session)
     } else {
         None
     };
@@ -2519,7 +2539,7 @@ mod netplay_cli_tests {
             "df0",
             "game.adf",
         ])?;
-        let options = cli.netplay.as_ref().unwrap();
+        let options = cli.netplay.as_ref().unwrap().settings();
         assert_eq!(options.player, 0);
         assert_eq!(options.input_delay, 2);
         assert_eq!(options.rollback_frames, 8);
@@ -2528,6 +2548,7 @@ mod netplay_cli_tests {
             args(&["--netplay-delay", "0", "--netplay-rollback", "12"])?
                 .netplay
                 .unwrap()
+                .settings()
                 .input_delay,
             0
         );
@@ -2557,5 +2578,64 @@ mod netplay_cli_tests {
         ] {
             assert!(args(&extra).is_err(), "accepted {extra:?}");
         }
+    }
+}
+
+#[cfg(all(test, feature = "netplay-internet"))]
+mod internet_netplay_cli_tests {
+    use super::*;
+
+    #[test]
+    fn host_and_join_negotiate_roles_and_reject_conflicting_cli_settings() -> Result<()> {
+        let parse = |args: &[&str]| parse_args_from(args.iter().map(|arg| arg.to_string()));
+        let host = parse(&[
+            "--netplay-host",
+            "/tmp/invitation.txt",
+            "--netplay-delay",
+            "4",
+            "--netplay-relay-only",
+        ])?;
+        assert_eq!(
+            host.netplay_invitation_out.as_deref(),
+            Some(std::path::Path::new("/tmp/invitation.txt"))
+        );
+        assert!(!launcher_requested(&host));
+        let Some(copperline::netplay::ConnectionOptions::Internet(options)) = host.netplay else {
+            panic!("expected Internet options")
+        };
+        assert!(options.relay_only);
+        assert_eq!(options.settings().player, 0);
+        let code = options.invitation.encode()?;
+        let join = parse(&["--netplay-join", &code])?;
+        assert_eq!(join.netplay.as_ref().unwrap().settings().player, 1);
+        assert_eq!(join.netplay.as_ref().unwrap().settings().input_delay, 4);
+        for args in [
+            vec![
+                "--netplay-host",
+                "/tmp/invitation.txt",
+                "--netplay-join",
+                &code,
+            ],
+            vec![
+                "--netplay-host",
+                "/tmp/invitation.txt",
+                "--netplay-peer",
+                "127.0.0.1:1",
+            ],
+            vec![
+                "--netplay-host",
+                "/tmp/invitation.txt",
+                "--netplay-relay",
+                "http://relay.test",
+            ],
+            vec!["--netplay-join", &code, "--netplay-delay", "2"],
+            vec!["--netplay-join", &code, "--netplay-player", "2"],
+            vec!["--netplay-join", &code, "--control", ":0"],
+            vec!["--netplay-join", "bad"],
+            vec!["--netplay-relay-only"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+        Ok(())
     }
 }

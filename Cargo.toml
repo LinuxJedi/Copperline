@@ -35,7 +35,11 @@ default = [
     "cd32-fmv",
     "gdb",
     "dap",
+    "netplay-internet",
 ]
+# Native NAT traversal and encrypted relay fallback. The portable/WASM core
+# keeps using its frontend-provided transport.
+netplay-internet = ["dep:iroh", "dep:tokio", "dep:base64", "dep:serde_json"]
 # MT-32 emulation through CopperlineHQ/mt32-rs, reachable as a MIDI-Out
 # target. Off builds carry none of it.
 mt32 = ["dep:mt32-rs"]
@@ -46,9 +50,8 @@ coppersynth = ["dep:coppersynth"]
 # The WHDLoad game library: the launcher's Library page, the local game
 # database it reads, and the OpenRetro sync that fills it.
 #
-# This is the only part of Copperline that talks to the internet on its own
-# account, so it is the only part that needs an HTTP client and a TLS stack.
-# Off, none of that is linked and none of it is compiled: WHDLoad boots from
+# This uses a blocking HTTP client and TLS stack. Off, the library client is
+# not linked or compiled: WHDLoad boots from
 # a path in the configuration exactly as it does with the feature on, the
 # Library page is absent, and `[whdload]` keys that only the library uses
 # are parsed and ignored so a configuration written by a full build still
@@ -298,7 +301,9 @@ ureq = { version = "3", default-features = false, features = [
 # rustls would do on x86-64, but its crypto provider (`ring`) compiles C and
 # assembly, and on ARM64 Windows `ring` ignores MSVC and demands clang -- see
 # the FIXME in its build.rs -- so a default build fails on a machine carrying
-# exactly the toolchain Rust itself asks for. Nothing here needs a C compiler.
+# exactly the toolchain Rust itself asks for. This HTTP client needs no C
+# compiler; the separate netplay-internet feature uses ring and needs clang
+# on Windows ARM64 (packaging/windows/enable-clang.ps1).
 [target.'cfg(windows)'.dependencies]
 ureq = { version = "3", default-features = false, features = [
     "native-tls",
@@ -310,6 +315,8 @@ ureq = { version = "3", default-features = false, features = [
 # hostile process swaps symlinks concurrently. Browser builds have no host
 # filesystem authority and do not compile this dependency.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+iroh = { version = "1.1", default-features = false, features = ["tls-ring"], optional = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
 cap-std = "4.0"
 tempfile = { version = "3", default-features = false }
 
