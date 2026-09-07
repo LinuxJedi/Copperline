@@ -50,6 +50,12 @@ hold at most 64 packets, and QUIC datagram buffers are bounded too. The worker
 checks selected routes for address-free diagnostics. Socket discovery and all
 network timers remain outside emulator and save-state data.
 
+The desktop logger keeps iroh, its QUIC/network-watcher dependencies and bridged
+tracing spans at warning level by default. `COPPERLINE_NETPLAY_DEBUG` enables
+debug-level transport logs through the startup `envcfg` snapshot. An explicit
+`RUST_LOG` overrides the preset. Copperline's own connection, route and final
+frame summaries remain at info level.
+
 `Transport::ready` holds the cold machine at frame zero during setup. An Internet
 setup deadline of 15 minutes is separate from the protocol's 60-second handshake
 and 10-second connected-peer timeouts. Dropping the transport cancels the worker

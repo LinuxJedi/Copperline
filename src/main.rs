@@ -681,6 +681,18 @@ fn main() -> Result<()> {
         // RUST_LOG still opts back in for JIT debugging.
         log_builder.filter_module("cranelift_jit", log::LevelFilter::Warn);
         log_builder.filter_module("cranelift_codegen", log::LevelFilter::Warn);
+        // iroh instruments every datagram send with an info-level span.
+        // Its log bridge also emits span records under tracing::span, so
+        // filter both targets to keep routine netplay quiet. Keep our own
+        // connection/route summaries and all transport warnings visible.
+        let netplay_level = if copperline::envcfg::flag("COPPERLINE_NETPLAY_DEBUG") {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Warn
+        };
+        for target in ["iroh", "noq", "netwatch", "tracing::span"] {
+            log_builder.filter_module(target, netplay_level);
+        }
     }
     log_builder.init();
 

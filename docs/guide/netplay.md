@@ -302,6 +302,21 @@ Audio plays once on the initial execution of a frame. Replayed frames are silent
 A sound already played from an incorrect prediction cannot be taken back, so
 large corrections can produce audible as well as visual discontinuities.
 
+## Desktop diagnostics
+
+The console normally shows connection status, route changes and the final frame
+summary, plus warnings and errors. Detailed Internet transport and tracing logs
+are disabled by default. To enable them for troubleshooting, set the environment
+variable before starting Copperline:
+
+```sh
+COPPERLINE_NETPLAY_DEBUG=1 ./target/release/copperline
+```
+
+The flag is read once at startup; unset it to return to normal logging. Detailed
+transport logs can include peer and relay addresses. An explicit `RUST_LOG`
+setting takes precedence over this logging preset, including the debug flag.
+
 ## Supported machines and verification
 
 Use a cold boot with interpreter execution, matching mouse/joystick/CD32 port
